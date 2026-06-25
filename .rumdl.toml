@@ -1,0 +1,59 @@
+# rumdl configuration for YamlSigil Markdown.
+#
+# This file is the repository's source of Markdown lint configuration. Use
+# it with `rumdl check` when editing in-scope Markdown as described in
+# AGENTS.md. The rumdl-vscode editor extension
+# (https://github.com/rvben/rumdl-vscode) can also read it.
+#
+# Only rules whose configuration differs from rumdl's built-in defaults
+# are listed below. Anything not mentioned uses the rumdl default.
+#
+# Reference: https://github.com/rvben/rumdl and https://rumdl.dev/
+
+[global]
+# Template partials included into parent documents via mdbook's
+# {{#include path/to/partial.md}} preprocessor directive are fragments,
+# not standalone documents. MD041 (first line must be H1) and MD052
+# (reference-style link labels defined in the parent file) fire false
+# positives on them.
+#
+# SUMMARY.md is mdBook's chapter index: multiple level-1 headings
+# partition the book into sections (Best Practices, How-To, ...).
+# That multi-H1 layout is required by mdBook's parser, so MD025
+# (multiple top-level headings) is a false positive on this file by
+# design.
+#
+# drafts/** holds work-in-progress material (drafts/README.md itself
+# says "don't read") where prose, structure, and references are all
+# still in flux. Holding drafts to the same lint standard as the
+# published guidelines produces noise without actionable value; linting
+# resumes once a draft graduates out of this directory.
+exclude = ["partials/**", "SUMMARY.md", "drafts/**"]
+
+# MD059 flags non-descriptive link text like `[here]` or `[this]`.
+# Descriptive link text is an accessibility best practice, but MD059's
+# findings in this repo are judgment calls on prose style rather than
+# mechanical formatting (unlike MD013 line length or MD047 EOF newline).
+# Disable globally so the lint pass stays noise-free; tighten link-text
+# wording in editorial review passes instead.
+disable = ["MD059"]
+
+# --------------------------------------------------------------------
+# Rule overrides
+# --------------------------------------------------------------------
+
+[MD010]
+# markdownlint's default for `spaces_per_tab` is 1; rumdl's default is
+# 4. Align with the 2-space list-indent convention (MD007) so that
+# `rumdl check --fix` produces consistent output if a stray tab lands
+# in a Markdown source.
+spaces-per-tab = 2
+
+[MD013]
+# Reference: https://rumdl.dev/md013/
+code-blocks = false
+
+[MD033]
+# The HTML tags the editorial conventions actually use in prose.
+# Anything else fires MD033. Reference: https://rumdl.dev/md033/
+allowed-elements = ["br", "img", "li", "p", "ul"]

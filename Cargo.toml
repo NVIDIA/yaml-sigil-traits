@@ -1,0 +1,26 @@
+[package]
+name = "yaml-sigil-traits"
+description = "Shared trait + DTO surface for the YamlSigil v1alpha1 signing / transcription / verification APIs"
+version = "0.2.2-rc.1"
+edition = "2024"
+rust-version = "1.95.0"
+license = "Apache-2.0"
+repository = "https://github.com/NVIDIA-dev/yaml-sigil-traits"
+publish = false
+exclude = [".agents/**", ".gitmodules", "source-spec", "source-spec/**"]
+
+[package.metadata.cargo-semver-checks.lints]
+function_must_use_added = "warn"
+inherent_method_must_use_added = "warn"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+# NOTE(ddurst-nvidia): We really don't want this here.
+thiserror = "2.0"
+ed25519-dalek = { version = "2.1", default-features = false, features = [
+    "alloc",
+    "rand_core",
+] }
+p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
