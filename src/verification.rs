@@ -85,6 +85,8 @@ pub struct VerifierCapabilities {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerifierState {
     /// Cryptographic success; returns exact signed payload bytes.
+    ///
+    /// A signature document within `payload` remains payload content.
     Verified {
         payload: Vec<u8>,
         algorithm: AlgorithmId,
