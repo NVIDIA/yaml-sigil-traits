@@ -25,6 +25,9 @@ This crate exposes the portable contract for these API areas.
 extension. Callers select forms through `OutputForm`, `TranscriptionForm`, and
 `ArtifactForm`.
 
+The YAML decompose and verify APIs require complete artifacts because
+last-marker selection requires EOF.
+
 The modules group the contract by concern:
 
 - `algorithm` defines `AlgorithmId` and the canonical YAML `alg` string mapping.
