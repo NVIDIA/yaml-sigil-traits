@@ -80,10 +80,10 @@ pub async fn verify_with<V: AsyncVerifier>(
 }
 ```
 
-Downstream implementations may narrow behavior when their contract requires it.
-For example, a verifier backed by a configured trust store may reject arbitrary
-caller-supplied key bytes. Document those narrowings in the implementation
-crate, not in this trait crate.
+`PublicKeys` carries caller-authorized keys indexed by algorithm. An artifact's
+unsigned `keyid` may narrow that set but never select an unauthorized key.
+Downstream implementations may narrow behavior further, such as requiring a
+configured trust store. Document those narrowings in the implementation crate.
 
 ## Specification source
 

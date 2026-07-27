@@ -95,7 +95,7 @@ pub enum VerifierState {
     MalformedAttemptedSigned,
     /// Artifact is fine; this verifier build does not implement the algorithm.
     SignedButAlgorithmUnsupported { algorithm: AlgorithmId },
-    /// Crypto attempted and failed (bad signature, wrong key, etc.).
+    /// Trust policy rejected the algorithm-key binding or crypto failed.
     SignedButFailedVerification,
 }
 
@@ -182,7 +182,9 @@ pub fn resolve_p256_verifying_key(
         .map_err(|_| InvocationError::KeyResolutionFailure)
 }
 
-/// Public key material for the two supported algorithms (caller chooses which is populated).
+/// Caller-authorized verification keys, indexed by algorithm.
+///
+/// An artifact's unsigned `keyid` may narrow this set but must not broaden it.
 #[derive(Debug, Clone, Copy)]
 pub struct PublicKeys<'a> {
     pub ed25519: Option<&'a ed25519_dalek::VerifyingKey>,
@@ -234,6 +236,7 @@ pub enum PreVerifyOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnverifiedSignature {
     pub algorithm: AlgorithmId,
+    /// Unsigned lookup hint that may narrow the caller-authorized key set.
     pub keyid: Option<String>,
     pub signature_octets: Vec<u8>,
 }
