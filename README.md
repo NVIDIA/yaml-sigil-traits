@@ -21,6 +21,10 @@ This crate exposes the portable contract for these API areas.
 | Transcription | `Transcriber` | `AsyncTranscriber` | `TranscriberCapabilities` |
 | Verification | `Verifier` | `AsyncVerifier` | `VerifierCapabilities` |
 
+`v1alpha1` defines no magic bytes, registered media type, or required file
+extension. Callers select forms through `OutputForm`, `TranscriptionForm`, and
+`ArtifactForm`.
+
 The modules group the contract by concern:
 
 - `algorithm` defines `AlgorithmId` and the canonical YAML `alg` string mapping.
