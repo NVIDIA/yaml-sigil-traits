@@ -48,6 +48,8 @@ pub enum TranscriberInvocationError {
 pub enum TranscriberError {
     #[error("invalid payload bytes")]
     InvalidPayloadBytes,
+    #[error("signature carrier contains a constrained marker at a line start")]
+    InvalidSignatureCarrier,
 }
 
 /// Unified Compose result.

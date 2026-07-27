@@ -45,7 +45,7 @@ pub enum SignInvocationError {
     InvalidAlgorithmParameters,
     #[error("invalid or unsupported output form")]
     InvalidOrUnsupportedOutputForm,
-    #[error("invalid keyid (present-but-empty or longer than 1024 UTF-8 octets)")]
+    #[error("invalid keyid (empty, over 1024 UTF-8 octets, or contains CR or LF)")]
     InvalidKeyid,
 }
 
@@ -66,7 +66,7 @@ pub enum SignError {
     InvalidAlgorithmParameters,
     #[error("invalid or unsupported output form")]
     InvalidOrUnsupportedOutputForm,
-    #[error("invalid keyid (present-but-empty or longer than 1024 UTF-8 octets)")]
+    #[error("invalid keyid (empty, over 1024 UTF-8 octets, or contains CR or LF)")]
     InvalidKeyid,
     #[error("key operation failed")]
     KeyOperationFailure,
@@ -97,6 +97,8 @@ pub struct SignRequest<'a> {
     pub payload: &'a [u8],
     pub algorithm: AlgorithmId,
     pub key: SigningKey<'a>,
+    /// Optional unsigned lookup hint. When present, it contains 1..=1024 UTF-8
+    /// octets without CR or LF.
     pub keyid: Option<&'a str>,
     pub append_missing_final_newline: bool,
     pub output_form: OutputForm,
