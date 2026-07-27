@@ -6,6 +6,16 @@ Use `.agents/skills/yaml-sigil-traits-spec-update/SKILL.md` when updating the
 pinned `yaml-sigil-spec` submodule or reconciling trait and DTO vocabulary after
 YamlSigil specification changes.
 
+## Agent Documentation Standards
+
+Project-local skills exist under `.agents/skills/` and should remain
+discoverable by agents working in this repository. Maintain those skills
+according to the
+[Agent Skills specification](https://agentskills.io/specification), and
+maintain this file according to the
+[AGENTS.md standard](https://agents.md/). Keep both portable across compatible
+agent clients, without assumptions about user-specific paths or session state.
+
 This repository is the standalone home for the `yaml-sigil-traits` crate.
 
 ## Scope

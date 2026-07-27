@@ -1,6 +1,6 @@
 ---
 name: yaml-sigil-traits-spec-update
-description: Use when updating the pinned yaml-sigil-spec submodule in yaml-sigil-traits or reconciling trait and DTO vocabulary after YamlSigil specification changes.
+description: Use when updating the pinned yaml-sigil-spec submodule in yaml-sigil-traits or reconciling its public trait and DTO vocabulary after YamlSigil specification changes.
 ---
 
 # yaml-sigil-traits Spec Update
@@ -32,7 +32,7 @@ a proposed specification update for impact on this crate.
 
 1. Start from a clean worktree and initialize the submodule if needed:
 
-   ```bash
+   ```shell
    git status --short
    git submodule update --init source-spec
    git -C source-spec remote -v
@@ -41,7 +41,7 @@ a proposed specification update for impact on this crate.
 2. Record the current pin, fetch the spec, and check out the target
    spec commit:
 
-   ```bash
+   ```shell
    old_spec="$(git rev-parse HEAD:source-spec)"
    git -C source-spec fetch origin
    git -C source-spec checkout <new-spec-commit>
@@ -52,13 +52,13 @@ a proposed specification update for impact on this crate.
    starting point, not a closed list. First inspect the full repository diff
    stat so unlisted spec files are not missed:
 
-   ```bash
+   ```shell
    git -C source-spec diff --stat "$old_spec..$new_spec"
    ```
 
    Then inspect the known trait-relevant paths:
 
-   ```bash
+   ```shell
    git -C source-spec diff --stat "$old_spec..$new_spec" -- \
      README.md \
      signing-api.md \
@@ -90,28 +90,28 @@ a proposed specification update for impact on this crate.
    - `src/conformance.rs`: advertised conformance profiles and policy enums.
 
    If none of the reviewed spec changes affect these surfaces, record that
-   conclusion in the commit or MR description and leave the Rust contract
+   conclusion in the commit or change description and leave the Rust contract
    unchanged.
 
 5. Stage the submodule pin and any contract updates together:
 
-   ```bash
+   ```shell
    git add source-spec src Cargo.toml Cargo.lock README.md AGENTS.md
    git diff --cached --submodule=log
    ```
 
 6. Run the crate quality loop:
 
-   ```bash
+   ```shell
    cargo fmt --all --check
    cargo clippy --all-targets --all-features -- -D warnings
    cargo test --all-features
    cargo package
    ```
 
-7. Coordinate release order after review:
+7. Record release impact after review:
 
-   Publishing is disabled in this prelaunch cleanup branch. When publishing is
-   re-enabled, update `yaml-sigil-traits` first when the public contract
-   changes, then update `yaml-sigil-rs` and downstream implementation
-   repositories from their own branches.
+   Publishing is disabled in this prelaunch cleanup branch. Do not publish or
+   coordinate downstream implementation updates from this repository. When
+   publishing is re-enabled, record that this crate must publish before
+   downstream implementation repositories update to a changed public contract.
