@@ -30,8 +30,11 @@ impl AlgorithmId {
         }
     }
 
+    /// Parses an exact canonical YAML `alg` scalar value.
+    ///
+    /// This function does not trim or otherwise normalize the input.
     pub fn from_yaml_str(s: &str) -> Option<Self> {
-        match s.trim() {
+        match s {
             "ED25519_PUREEDDSA_RAW_RS64_CANONICAL" => Some(AlgorithmId::Ed25519),
             "ECDSA_SECP256R1_SHA256_RAW_RS64" => Some(AlgorithmId::EcdsaP256Sha256),
             _ => None,
@@ -58,7 +61,7 @@ mod tests {
             Some(AlgorithmId::Ed25519)
         );
         assert_eq!(
-            AlgorithmId::from_yaml_str("  ECDSA_SECP256R1_SHA256_RAW_RS64  "),
+            AlgorithmId::from_yaml_str("ECDSA_SECP256R1_SHA256_RAW_RS64"),
             Some(AlgorithmId::EcdsaP256Sha256)
         );
         assert_eq!(AlgorithmId::from_yaml_str("nope"), None);
@@ -71,6 +74,18 @@ mod tests {
             AlgorithmId::Ed25519.as_yaml_str(),
             "ED25519_PUREEDDSA_RAW_RS64_CANONICAL"
         );
+    }
+
+    #[test]
+    fn yaml_str_mapping_rejects_surrounding_whitespace() {
+        for value in [
+            " ED25519_PUREEDDSA_RAW_RS64_CANONICAL",
+            "ED25519_PUREEDDSA_RAW_RS64_CANONICAL ",
+            "\tECDSA_SECP256R1_SHA256_RAW_RS64",
+            "ECDSA_SECP256R1_SHA256_RAW_RS64\n",
+        ] {
+            assert_eq!(AlgorithmId::from_yaml_str(value), None);
+        }
     }
 
     #[test]
