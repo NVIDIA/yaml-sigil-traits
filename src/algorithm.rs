@@ -8,6 +8,12 @@
 //! the protobuf `Algorithm` enum uses Buf-prefixed constants
 //! (`ALGORITHM_…_…`). This module keeps the portable, protobuf-crate-free
 //! contract identifier. Protobuf enum conversions live in `yaml-sigil-core`.
+//!
+//! The identifiers refer to Ed25519 as specified by RFC 8032 and to P-256
+//! domain parameters from *Standards for Efficient Cryptography 2 (SEC 2)*.
+//! They do not embed the RFC test vectors or SEC 2 parameter table. The
+//! standards material is not relicensed under this file's Apache-2.0
+//! declaration; see the repository `THIRD_PARTY_NOTICES.md`.
 
 /// Implementation-authoritative algorithm identifiers (wire + YAML).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

@@ -165,14 +165,19 @@ pub fn resolve_ed25519_verifying_key(
     Ok(vk)
 }
 
-/// Resolve raw P-256 SEC1 public-key bytes into a typed [`p256::ecdsa::VerifyingKey`].
+/// Resolve raw P-256 public-key bytes encoded per *Standards for Efficient
+/// Cryptography 1 (SEC 1)* into a typed [`p256::ecdsa::VerifyingKey`].
 ///
 /// Mirrors the spec's "key resolution" stage. Rejected cases:
 ///
-/// - the SEC1 §2.3.3 single-byte `0x00` identity encoding (the point at infinity);
+/// - the SEC 1 §2.3.3 single-byte `0x00` identity encoding (the point at infinity);
 /// - the all-zero 65-octet "uncompressed identity" some callers emit;
 /// - any input that `p256::ecdsa::VerifyingKey::from_sec1_bytes` rejects
 ///   (off-curve, wrong length, wrong curve, etc.).
+///
+/// The SEC 1 encoding rule is third-party standards material, not material
+/// relicensed under this file's Apache-2.0 declaration. See the repository
+/// `THIRD_PARTY_NOTICES.md` for the source notice and patent/IP caveat.
 ///
 /// See `source-spec/conformance/alg-ecdsa/bad-key-*.txt`.
 pub fn resolve_p256_verifying_key(
@@ -349,7 +354,7 @@ pub trait Verifier {
     ) -> Result<ed25519_dalek::VerifyingKey, InvocationError> {
         resolve_ed25519_verifying_key(bytes)
     }
-    /// Resolve raw P-256 SEC1 public-key bytes into a typed key (key-resolution stage).
+    /// Resolve raw P-256 SEC 1 public-key bytes into a typed key (key-resolution stage).
     ///
     /// Default impl delegates to the free function
     /// [`resolve_p256_verifying_key`]. Downstream implementations MAY narrow
@@ -431,7 +436,7 @@ pub trait AsyncVerifier: Send + Sync {
     + 'a {
         async move { resolve_ed25519_verifying_key(bytes) }
     }
-    /// Resolve raw P-256 SEC1 public-key bytes into a typed key.
+    /// Resolve raw P-256 SEC 1 public-key bytes into a typed key.
     ///
     /// Default impl delegates to the synchronous free function
     /// [`resolve_p256_verifying_key`]; downstream verifiers that own async

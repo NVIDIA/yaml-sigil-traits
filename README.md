@@ -106,6 +106,19 @@ this crate's public trait and DTO contract. Do not add generated protobuf
 dependencies or coordinate downstream implementation updates from this
 repository.
 
+## Third-party material
+
+NVIDIA-authored crate material is licensed under Apache-2.0. The crate mirrors
+standards-derived identifiers and public-key format behavior without
+relicensing the cited standards material. Copyright, source, warranty,
+patent/IP, and non-endorsement notices are collected in
+[`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md).
+
+The pinned specification has its own complete notice at
+[`source-spec/THIRD_PARTY_NOTICES.md`](./source-spec/THIRD_PARTY_NOTICES.md).
+The crate package excludes `source-spec/`; repository distributions that
+initialize the submodule must preserve its notice.
+
 ## Build and test
 
 Rust is pinned to `1.95.0` through `rust-toolchain.toml`.

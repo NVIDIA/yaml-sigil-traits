@@ -35,6 +35,45 @@ this repository's public trait and DTO contract; do not add generated protobuf
 dependencies, and do not coordinate downstream implementation updates from this
 repo.
 
+## Third-party material and attribution
+
+`THIRD_PARTY_NOTICES.md` is the canonical attribution and redistribution
+record for third-party standards material referenced or incorporated by this
+crate. The pinned specification retains its complete, separately scoped notice
+at `source-spec/THIRD_PARTY_NOTICES.md`; treat that file and the rest of the
+submodule as read-only.
+
+When adding or changing third-party material:
+
+- Update the root `THIRD_PARTY_NOTICES.md` in the same change. Record the exact
+  source, version, section, copyright holder, applicable copying conditions,
+  warranty disclaimer, and patent or other intellectual-property caveat.
+- Read the source's own copyright notice and terms. For an RFC, check its
+  publication stream and the BCP 78 or IETF Trust terms in effect on its
+  publication date. Do not assume that RFC test data, tables, ABNF, or code
+  blocks are IETF Code Components or covered by a BSD license.
+- Ensure every file or other independently distributed material that mentions
+  or references either SEC source identifies it by its full title:
+  *Standards for Efficient Cryptography 1 (SEC 1)* or
+  *Standards for Efficient Cryptography 2 (SEC 2)*. Use the full title on the
+  first source reference in each file; the `SEC 1` and `SEC 2` short forms may
+  follow within that file.
+- Add a short provenance comment next to copied or derived constants,
+  algorithms, encodings, or validation rules. State when identified
+  third-party material is not covered by a file's Apache-2.0 declaration.
+- Do not add standards text, test vectors, parameter tables, or generated
+  specification artifacts to the crate merely because they exist in
+  `source-spec/`. Keep normal builds and crate packages independent of the
+  submodule.
+- Preserve applicable non-endorsement language. Do not present this crate as
+  an official publication of, or as affiliated with or endorsed by, a cited
+  author, publisher, or standards organization.
+
+Keep these instructions durable and repository-focused. Do not record private
+correspondence, reviewer identities, or approval history in repository
+documentation. A specification-pin update may leave the Rust contract
+unchanged when the imported delta affects attribution only.
+
 ## Documentation Style Guide
 
 These rules apply to Markdown files in this trait crate, including README files,
