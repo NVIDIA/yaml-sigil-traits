@@ -94,8 +94,12 @@ pub enum VerifierState {
     /// No signing attempt (YAML only; protobuf inputs never produce this).
     Unsigned,
     /// Structural or metadata validation failed before or instead of successful crypto.
+    ///
+    /// This includes empty decoded signature octets. Full verification applies that check before
+    /// runtime algorithm-support classification.
     MalformedAttemptedSigned,
-    /// Artifact is fine; this verifier build does not implement the algorithm.
+    /// Artifact metadata and algorithm-independent signature content are valid, but this verifier
+    /// build does not implement the algorithm.
     SignedButAlgorithmUnsupported { algorithm: AlgorithmId },
     /// Trust policy rejected the algorithm-key binding or crypto failed.
     SignedButFailedVerification,
@@ -228,9 +232,18 @@ pub struct VerifyResult {
 /// Outcome of structural pre-verification (IDL `PreVerifyOutcome`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PreVerifyOutcome {
+    /// Structural processing and metadata extraction succeeded.
+    ///
+    /// The extracted signature octets may be empty because the non-empty check belongs to full
+    /// verification.
     Ok,
+    /// The YAML artifact contains no signing attempt.
     Unsigned,
+    /// The artifact could not be structurally decomposed.
     StructuralFailure,
+    /// Signature metadata extraction failed.
+    ///
+    /// This includes a missing or incorrect YAML signature-document schema identity.
     MetadataParseFailure,
 }
 
@@ -240,6 +253,11 @@ pub struct UnverifiedSignature {
     pub algorithm: AlgorithmId,
     /// Unsigned lookup hint that may narrow the caller-authorized key set.
     pub keyid: Option<String>,
+    /// Raw decoded signature octets.
+    ///
+    /// These may be empty in a [`PreVerifyOutcome::Ok`] result. Full verification classifies an
+    /// empty signature as [`VerifierState::MalformedAttemptedSigned`] before runtime
+    /// algorithm-support classification.
     pub signature_octets: Vec<u8>,
 }
 
@@ -278,6 +296,9 @@ pub trait Verifier {
     /// Capability surface this verifier advertises.
     fn capabilities(&self) -> VerifierCapabilities;
     /// Structural + metadata pre-verify (IDL `PreVerify`).
+    ///
+    /// This stage does not enforce the runtime non-empty signature rule or classify runtime
+    /// algorithm support.
     fn pre_verify(
         &self,
         input_bytes: &[u8],
@@ -286,6 +307,9 @@ pub trait Verifier {
         include_parser_observations: bool,
     ) -> PreVerifyResponse;
     /// Full verify (IDL `Verify`).
+    ///
+    /// This stage enforces the non-empty signature rule before classifying runtime algorithm
+    /// support.
     fn verify(
         &self,
         input_bytes: &[u8],
@@ -303,6 +327,9 @@ pub trait Verifier {
         include_parser_observations: bool,
     ) -> Result<VerifyResult, InvocationError>;
     /// Run only the verification stage from a prior [`PreVerifyResponse`] (IDL `VerifyFromPreVerify`).
+    ///
+    /// This stage enforces the non-empty signature rule before classifying runtime algorithm
+    /// support.
     fn verify_from_pre_verify(
         &self,
         pre: &PreVerifyResponse,
@@ -351,6 +378,9 @@ pub trait AsyncVerifier: Send + Sync {
     /// Capability surface this verifier advertises.
     fn capabilities(&self) -> VerifierCapabilities;
     /// Structural + metadata pre-verify (IDL `PreVerify`).
+    ///
+    /// This stage does not enforce the runtime non-empty signature rule or classify runtime
+    /// algorithm support.
     fn pre_verify<'a>(
         &'a self,
         input_bytes: &'a [u8],
@@ -359,6 +389,9 @@ pub trait AsyncVerifier: Send + Sync {
         include_parser_observations: bool,
     ) -> impl core::future::Future<Output = PreVerifyResponse> + Send + 'a;
     /// Full verify (IDL `Verify`).
+    ///
+    /// This stage enforces the non-empty signature rule before classifying runtime algorithm
+    /// support.
     fn verify<'a>(
         &'a self,
         input_bytes: &'a [u8],
@@ -376,6 +409,9 @@ pub trait AsyncVerifier: Send + Sync {
         include_parser_observations: bool,
     ) -> impl core::future::Future<Output = Result<VerifyResult, InvocationError>> + Send + 'a;
     /// Run only the verification stage from a prior [`PreVerifyResponse`] (IDL `VerifyFromPreVerify`).
+    ///
+    /// This stage enforces the non-empty signature rule before classifying runtime algorithm
+    /// support.
     fn verify_from_pre_verify<'a>(
         &'a self,
         pre: &'a PreVerifyResponse,
