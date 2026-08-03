@@ -87,10 +87,10 @@ pub async fn verify_with<V: AsyncVerifier>(
 }
 ```
 
-`PublicKeys` carries caller-authorized keys indexed by algorithm. An artifact's
-unsigned `keyid` may narrow that set but never select an unauthorized key.
-Downstream implementations may narrow behavior further, such as requiring a
-configured trust store. Document those narrowings in the implementation crate.
+`PublicKeys` carries caller-supplied verification keys indexed by algorithm.
+The artifact's unsigned `keyid` remains a deployment-specific lookup hint.
+Downstream implementations may narrow behavior, such as requiring a configured
+trust store. Document those narrowings in the implementation crate.
 
 ## Specification source
 

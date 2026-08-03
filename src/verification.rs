@@ -101,7 +101,7 @@ pub enum VerifierState {
     /// Artifact metadata and algorithm-independent signature content are valid, but this verifier
     /// build does not implement the algorithm.
     SignedButAlgorithmUnsupported { algorithm: AlgorithmId },
-    /// Trust policy rejected the algorithm-key binding or crypto failed.
+    /// Cryptographic verification was attempted with an implemented algorithm and failed.
     SignedButFailedVerification,
 }
 
@@ -193,9 +193,10 @@ pub fn resolve_p256_verifying_key(
         .map_err(|_| InvocationError::KeyResolutionFailure)
 }
 
-/// Caller-authorized verification keys, indexed by algorithm.
+/// Caller-supplied verification keys, indexed by algorithm.
 ///
-/// An artifact's unsigned `keyid` may narrow this set but must not broaden it.
+/// Implementations own deployment-specific key selection and trust-policy behavior. An artifact's
+/// unsigned `keyid` is only a lookup hint.
 #[derive(Debug, Clone, Copy)]
 pub struct PublicKeys<'a> {
     pub ed25519: Option<&'a ed25519_dalek::VerifyingKey>,
@@ -256,7 +257,7 @@ pub enum PreVerifyOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnverifiedSignature {
     pub algorithm: AlgorithmId,
-    /// Unsigned lookup hint that may narrow the caller-authorized key set.
+    /// Unsigned lookup hint for deployment-specific key selection.
     pub keyid: Option<String>,
     /// Raw decoded signature octets.
     ///
