@@ -2,6 +2,7 @@
 name = "yaml-sigil-traits"
 description = "Shared trait + DTO surface for the YamlSigil v1alpha1 signing / transcription / verification APIs"
 version = "0.3.0-rc.1"
+authors = ["yaml-sigil-dev <yaml-sigil-dev+crates-io@nvidia.com>"]
 edition = "2024"
 # TODO: We seek to reduce this, we just need to do the testing.
 rust-version = "1.95.0"
