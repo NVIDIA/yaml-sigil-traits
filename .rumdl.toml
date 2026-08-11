@@ -28,7 +28,15 @@
 # still in flux. Holding drafts to the same lint standard as the
 # published guidelines produces noise without actionable value; linting
 # resumes once a draft graduates out of this directory.
-exclude = ["partials/**", "SUMMARY.md", "drafts/**"]
+exclude = [
+    "partials/**",
+    "SUMMARY.md",
+    "drafts/**",
+    "CONTRIBUTING.md",
+    "CODE_OF_CONDUCT.md",
+    "source-spec/CONTRIBUTING.md",
+    "source-spec/CODE_OF_CONDUCT.md",
+]
 
 # MD059 flags non-descriptive link text like `[here]` or `[this]`.
 # Descriptive link text is an accessibility best practice, but MD059's
