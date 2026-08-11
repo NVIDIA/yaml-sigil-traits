@@ -121,7 +121,9 @@ initialize the submodule must preserve its notice.
 
 ## Build and test
 
-Rust is pinned to `1.95.0` through `rust-toolchain.toml`.
+The development toolchain follows Rust `stable` through
+`rust-toolchain.toml`. The minimum supported Rust version (MSRV) is Rust
+`1.95.0`, as declared in `Cargo.toml`.
 
 ```shell
 cargo fmt --all --check
