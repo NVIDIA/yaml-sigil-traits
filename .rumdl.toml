@@ -11,27 +11,9 @@
 # Reference: https://github.com/rvben/rumdl and https://rumdl.dev/
 
 [global]
-# Template partials included into parent documents via mdbook's
-# {{#include path/to/partial.md}} preprocessor directive are fragments,
-# not standalone documents. MD041 (first line must be H1) and MD052
-# (reference-style link labels defined in the parent file) fire false
-# positives on them.
-#
-# SUMMARY.md is mdBook's chapter index: multiple level-1 headings
-# partition the book into sections (Best Practices, How-To, ...).
-# That multi-H1 layout is required by mdBook's parser, so MD025
-# (multiple top-level headings) is a false positive on this file by
-# design.
-#
-# drafts/** holds work-in-progress material (drafts/README.md itself
-# says "don't read") where prose, structure, and references are all
-# still in flux. Holding drafts to the same lint standard as the
-# published guidelines produces noise without actionable value; linting
-# resumes once a draft graduates out of this directory.
+# These externally provided community documents are excluded from
+# repository-specific Markdown linting.
 exclude = [
-    "partials/**",
-    "SUMMARY.md",
-    "drafts/**",
     "CONTRIBUTING.md",
     "CODE_OF_CONDUCT.md",
     "source-spec/CONTRIBUTING.md",
