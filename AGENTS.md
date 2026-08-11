@@ -18,6 +18,13 @@ agent clients, without assumptions about user-specific paths or session state.
 
 This repository is the standalone home for the `yaml-sigil-traits` crate.
 
+## Commit messages
+
+Use Conventional Commits for every commit. Format the subject as
+`<type>(<optional scope>): <description>`, keep it under 72 characters, and
+choose the smallest accurate type. Follow the sign-off requirements in
+`CONTRIBUTING.md`.
+
 ## Scope
 
 Keep this crate independent from the rest of the YamlSigil Rust implementation.
