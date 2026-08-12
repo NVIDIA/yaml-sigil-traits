@@ -1,3 +1,3 @@
 [submodule "source-spec"]
 	path = source-spec
-	url = https://github.com/NVIDIA-dev/yaml-sigil-spec.git
+	url = https://github.com/NVIDIA/yaml-sigil-spec.git

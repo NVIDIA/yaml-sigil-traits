@@ -1,6 +1,6 @@
 # yaml-sigil-traits
 
-Rust Traits for [yaml-sigil](https://github.com/NVIDIA-dev/yaml-sigil-spec).
+Rust Traits for [yaml-sigil](https://github.com/NVIDIA/yaml-sigil-spec).
 
 `yaml-sigil-traits` defines the shared Rust trait and DTO contract for the
 YamlSigil `v1alpha1` signing, transcription, and verification APIs.
@@ -95,7 +95,7 @@ trust store. Document those narrowings in the implementation crate.
 ## Specification source
 
 The normative YamlSigil specification lives in
-[yaml-sigil-spec](https://github.com/NVIDIA-dev/yaml-sigil-spec). It is
+[yaml-sigil-spec](https://github.com/NVIDIA/yaml-sigil-spec). It is
 maintenance input for reviewing this crate's public trait and DTO vocabulary.
 Normal builds, docs.rs builds, and published crates do not require a local spec
 checkout.
