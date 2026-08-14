@@ -1,0 +1,16 @@
+# SPDX-FileCopyrightText: Copyright 2026 NVIDIA CORPORATION & AFFILIATES
+# SPDX-License-Identifier: Apache-2.0
+
+[workspace]
+
+[package]
+name = "xtask"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+description = "Developer-only tasks for yaml-sigil-traits."
+
+[[bin]]
+name = "xtask"
+path = "src/main.rs"

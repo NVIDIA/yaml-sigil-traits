@@ -1,3 +1,4 @@
 /target/
+/xtask/target/
 /Cargo.lock
 /.rumdl_cache

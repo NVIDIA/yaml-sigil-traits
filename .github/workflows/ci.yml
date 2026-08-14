@@ -1,0 +1,183 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  commit_policy:
+    name: Commit policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Accept trusted push
+        if: ${{ github.event_name == 'push' }}
+        run: echo "Commit policy is evaluated on pull requests."
+
+      - name: Check out pull request history
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Check pull request commits
+        if: ${{ github.event_name == 'pull_request' }}
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        shell: bash
+        run: .github/scripts/check-pull-request-commits.sh
+
+  workflow_lint:
+    name: GitHub Actions
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Lint GitHub Actions workflows
+        uses: devops-actions/actionlint@9fb9c192862f19e684586ca84b500461bcd8a541 # v0.1.12 (actionlint v1.7.12)
+
+      # This section would benefit by a change to the action allowlist
+      - name: Lint shell scripts
+        uses: ludeeus/action-shellcheck@00cae500b08a931fb5698e11e79bfbd38e612a38 # 2.0.0
+        with:
+          check_together: true
+          scandir: .github/scripts
+          version: v0.11.0
+
+  # TODO: remove after repository publication
+  checks:
+    name: Checks
+    if: ${{ github.event_name == 'push' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      checks: write
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # TODO: remove after repository publication
+      - name: Resolve pinned specification commit
+        id: source-spec
+        run: echo "sha=$(git rev-parse HEAD:source-spec)" >> "$GITHUB_OUTPUT"
+
+      # TODO: remove after repository publication
+      - name: Check out pinned specification
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: source-spec
+          persist-credentials: false
+          ref: ${{ steps.source-spec.outputs.sha }}
+          repository: NVIDIA/yaml-sigil-spec
+          token: ${{ secrets.YAML_SIGIL_SPEC_READ_PAT }}
+
+      - name: Lint Markdown
+        # Refresh this immutable pin frequently to keep pace with rumdl releases.
+        uses: rvben/rumdl@95a982d941d00cf41a0dcef4d0788bd15a29be1b # v0.2.54
+        with:
+          version: "0.2.54"
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache: false
+          components: clippy, rustfmt
+
+      # This section would benefit by a change to the action allowlist
+      - name: Install cargo-machete
+        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2.83.2
+        with:
+          checksum: true
+          fallback: none
+          tool: cargo-machete@0.9.2
+
+      - name: Cache Rust build inputs
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-bin: false
+          save-if: ${{ github.event_name == 'push' }}
+          workspaces: |
+            . -> target
+            xtask -> target
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Check xtask formatting
+        run: cargo fmt --manifest-path xtask/Cargo.toml --all --check
+
+      - name: Lint
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Lint xtask
+        run: cargo clippy --locked --manifest-path xtask/Cargo.toml --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo test --all-features
+
+      - name: Test xtask
+        run: cargo test --locked --manifest-path xtask/Cargo.toml
+
+      - name: Check unused Rust dependencies
+        run: cargo-machete --with-metadata
+
+      - name: Audit Rust dependencies
+        uses: rustsec/audit-check@858dc40f52ca2b8570b7a997c1c4e35c6fc9a432 # main (unreleased Node 24 revision)
+        with:
+          token: ${{ github.token }}
+
+  required_ci:
+    name: Required CI
+    if: ${{ always() }}
+    needs:
+      - commit_policy
+      - workflow_lint
+      - checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Require successful CI jobs
+        env:
+          COMMIT_POLICY_RESULT: ${{ needs.commit_policy.result }}
+          GITHUB_ACTIONS_RESULT: ${{ needs.workflow_lint.result }}
+          CHECKS_RESULT: ${{ needs.checks.result }}
+        run: |
+          require_success() {
+            local job="$1"
+            local result="$2"
+            if [[ "${result}" != "success" ]]; then
+              printf '%s finished with result %s; success is required.\n' \
+                "${job}" "${result}"
+              exit 1
+            fi
+          }
+
+          require_success "Commit policy" "${COMMIT_POLICY_RESULT}"
+          require_success "GitHub Actions" "${GITHUB_ACTIONS_RESULT}"
+          require_success "Checks" "${CHECKS_RESULT}"

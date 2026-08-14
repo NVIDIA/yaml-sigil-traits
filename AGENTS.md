@@ -29,8 +29,7 @@ choose the smallest accurate type. Follow the sign-off requirements in
 
 Keep this crate independent from the rest of the YamlSigil Rust implementation.
 It may depend on crypto/error crates needed to type public DTOs, but it must not
-depend on `yaml-sigil-core`, `yaml-sigil-signing`, `yaml-sigil-verification`, or
-`yaml-sigil-transcription`.
+depend on any crate delivered by the `yaml-sigil-rs` workspace.
 
 The normative specification lives in `yaml-sigil-spec`. This crate mirrors
 vocabulary from that spec but does not own it. Ordinary builds, docs.rs builds,
@@ -160,17 +159,89 @@ review.
   and compatibility guarantees.
 - Mirror specification vocabulary when documenting spec-derived terms, but do
   not imply this crate owns the normative specification.
-- Use generic trait-bound examples. Do not require `yaml-sigil-rs`,
-  generated protobuf code, or runtime transport dependencies in examples for
-  this crate.
+- Use generic trait-bound examples. Do not require any crate delivered by the
+  `yaml-sigil-rs` workspace, generated protobuf code, or runtime transport
+  dependencies in examples for this crate.
 
 ## Commands
 
+Run the complete non-release CI validation sequence from the repository root:
+
 ```shell
+cargo xtask ci
+```
+
+The command runs these checks in order:
+
+```shell
+rumdl check .
 cargo fmt --all --check
+cargo fmt --manifest-path xtask/Cargo.toml --all --check
 cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --locked --manifest-path xtask/Cargo.toml --all-targets --all-features -- -D warnings
 cargo test --all-features
-cargo package --dry-run
+cargo test --locked --manifest-path xtask/Cargo.toml
+cargo-machete --with-metadata
+cargo audit
+```
+
+Install `rumdl`, `cargo-audit`, and `cargo-machete` with Cargo before running
+the wrapper:
+
+```shell
+cargo install rumdl
+cargo install cargo-audit
+cargo install --locked cargo-machete --version 0.9.2
+```
+
+Keep the cargo-machete version aligned with hosted CI. The
+`--with-metadata` check resolves normal, development, and build dependency
+names across all features, but remains an unused-dependency heuristic; retain
+the all-target, all-feature Clippy and test checks as the compilation proof.
+
+Treat `cargo xtask ci` as the provider-neutral local validation entry point.
+Keep its command plan and this exact-command documentation aligned. Do not make
+the xtask parse, include, or test configuration owned by a hosted CI provider.
+Validate provider-specific workflow syntax and policy with provider-appropriate
+tooling instead.
+
+Hosted CI should expose equivalent validation commands as independent steps
+where practical. It may also add provider-specific policy checks that do not
+belong in the local command sequence. Document intentional differences between
+hosted and local validation.
+
+Validate shell scripts under `.github/scripts` with Shuck before landing
+changes. Install it from the `shuck-cli` crate and run it from the repository
+root:
+
+```shell
+cargo install shuck-cli
+shuck check .github/scripts
+```
+
+ShellCheck is an acceptable fallback:
+
+```shell
+shellcheck .github/scripts/check-pull-request-commits.sh
+```
+
+Hosted CI runs its pinned ShellCheck Action for these provider-specific scripts.
+Keep this validation outside `cargo xtask ci`.
+
+Treat every hosted Action `uses:` pin update as a potential
+validation-behavior change. Compare the current and candidate immutable SHAs,
+including commands, inputs and defaults, runtime, and transitive `uses:`
+dependencies. When an update changes provider-neutral validation behavior,
+reify that change in the xtask command plan and this exact-command
+documentation without making the xtask depend on provider configuration.
+
+The root crate does not commit `Cargo.lock`, so its Cargo checks must work from
+a clean checkout without `--locked`.
+
+Package validation is deliberately separate from the non-release CI sequence:
+
+```shell
+cargo package
 ```
 
 Publishing is disabled in this prelaunch cleanup branch. Do not add a custom

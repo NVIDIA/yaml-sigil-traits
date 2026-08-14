@@ -100,6 +100,15 @@ maintenance input for reviewing this crate's public trait and DTO vocabulary.
 Normal builds, docs.rs builds, and published crates do not require a local spec
 checkout.
 
+The submodule uses `update = none` so Cargo consumers of this Git repository do
+not fetch specification material that is not build input. Initialize the pinned
+specification explicitly when reviewing a specification update:
+
+```shell
+git -c submodule.source-spec.update=checkout \
+  submodule update --init source-spec
+```
+
 When the specification pin changes, use the repo-local
 `.agents/skills/yaml-sigil-traits-spec-update` skill. Keep the update scoped to
 this crate's public trait and DTO contract. Do not add generated protobuf
@@ -126,11 +135,15 @@ The development toolchain follows Rust `stable` through
 `1.95.0`, as declared in `Cargo.toml`.
 
 ```shell
-cargo fmt --all --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-features
-cargo package --dry-run
+cargo xtask ci
+cargo package
 ```
+
+`cargo xtask ci` also checks Markdown, the standalone xtask workspace, and
+dependency advisories. The GitHub Actions workflow runs the same validation as
+independent steps. `cargo package` performs separate local package assembly and
+verification without uploading anything; it is not part of the non-release CI
+sequence.
 
 ## Publishing
 

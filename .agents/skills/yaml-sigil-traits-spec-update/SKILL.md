@@ -20,6 +20,8 @@ a proposed specification update for impact on this crate.
 - Use the public GitHub URL for the `source-spec` remote.
 - Treat `source-spec/` as read-only in this repository.
 - Keep normal Cargo builds independent of `source-spec/`.
+- Keep the submodule's default update strategy set to `none`. Override it only
+  for an explicit specification-maintenance checkout.
 - Do not add dependencies on `yaml-sigil-rs`, `yaml-sigil-core`, or generated
   protobuf crates.
 - Do not add or reintroduce a custom publishing wrapper.
@@ -34,7 +36,8 @@ a proposed specification update for impact on this crate.
 
    ```shell
    git status --short
-   git submodule update --init source-spec
+   git -c submodule.source-spec.update=checkout \
+     submodule update --init source-spec
    git -C source-spec remote -v
    ```
 
@@ -96,18 +99,20 @@ a proposed specification update for impact on this crate.
 5. Stage the submodule pin and any contract updates together:
 
    ```shell
-   git add source-spec src Cargo.toml Cargo.lock README.md AGENTS.md
+   git add .gitmodules source-spec src Cargo.toml Cargo.lock README.md AGENTS.md
    git diff --cached --submodule=log
    ```
 
 6. Run the crate quality loop:
 
    ```shell
-   cargo fmt --all --check
-   cargo clippy --all-targets --all-features -- -D warnings
-   cargo test --all-features
+   cargo xtask ci
    cargo package
    ```
+
+   `cargo xtask ci` is the complete non-release validation gate. Keep the
+   package assembly and verification step separate because CI does not package
+   or publish artifacts.
 
 7. Record release impact after review:
 

@@ -16,8 +16,7 @@
 exclude = [
     "CONTRIBUTING.md",
     "CODE_OF_CONDUCT.md",
-    "source-spec/CONTRIBUTING.md",
-    "source-spec/CODE_OF_CONDUCT.md",
+    "source-spec/**",
 ]
 
 # MD059 flags non-descriptive link text like `[here]` or `[this]`.
