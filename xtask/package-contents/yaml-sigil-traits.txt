@@ -1,0 +1,15 @@
+.cargo_vcs_info.json
+CONTRIBUTING.md
+Cargo.lock
+Cargo.toml
+Cargo.toml.orig
+LICENSE
+README.md
+SECURITY.md
+THIRD_PARTY_NOTICES.md
+src/algorithm.rs
+src/conformance.rs
+src/lib.rs
+src/signing.rs
+src/transcription.rs
+src/verification.rs

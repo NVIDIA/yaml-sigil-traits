@@ -5,6 +5,7 @@
 //! `cargo xtask <COMMAND>`.
 
 mod ci;
+mod package_content;
 
 use std::env;
 use std::path::PathBuf;
@@ -23,16 +24,25 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        "package-content" if remaining.is_empty() => {
+            match package_content::run(&workspace_root()) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("package-content failed: {error}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         "" | "help" | "--help" | "-h" => {
             print_usage();
             ExitCode::SUCCESS
         }
-        "ci" if is_help_request(&remaining) => {
+        "ci" | "package-content" if is_help_request(&remaining) => {
             print_usage();
             ExitCode::SUCCESS
         }
-        "ci" => {
-            eprintln!("ci does not accept arguments");
+        "ci" | "package-content" => {
+            eprintln!("{command} does not accept arguments");
             print_usage();
             ExitCode::FAILURE
         }
@@ -57,7 +67,8 @@ fn is_help_request(args: &[String]) -> bool {
 
 fn print_usage() {
     eprintln!(
-        "usage:\n  cargo xtask ci\n\n\
-         Runs the repository's complete non-release validation sequence."
+        "usage:\n  cargo xtask ci\n  cargo xtask package-content\n\n\
+         commands:\n  ci               Run the complete non-release validation sequence.\n  \
+         package-content  Compare Cargo's source list with the committed inventory."
     );
 }

@@ -131,6 +131,11 @@ jobs:
       - name: Check xtask formatting
         run: cargo fmt --manifest-path xtask/Cargo.toml --all --check
 
+      # Compares yaml-sigil-traits' Cargo source list with its committed
+      # inventory. This does not assemble or publish a crate archive.
+      - name: Check package contents
+        run: cargo xtask package-content
+
       - name: Lint
         run: cargo clippy --all-targets --all-features -- -D warnings
 

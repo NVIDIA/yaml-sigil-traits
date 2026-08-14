@@ -8,8 +8,16 @@ edition = "2024"
 rust-version = "1.95.0"
 license = "Apache-2.0"
 repository = "https://github.com/NVIDIA/yaml-sigil-traits"
+readme = "README.md"
 publish = false
-exclude = [".agents/**", ".gitmodules", "source-spec", "source-spec/**"]
+include = [
+    "/src/**",
+    "/README.md",
+    "/LICENSE",
+    "/SECURITY.md",
+    "/CONTRIBUTING.md",
+    "/THIRD_PARTY_NOTICES.md",
+]
 
 [package.metadata.cargo-semver-checks.lints]
 function_must_use_added = "warn"

@@ -7,6 +7,8 @@ use std::io;
 use std::path::Path;
 use std::process::Command;
 
+use crate::package_content;
+
 const CARGO_MACHETE_INSTALL_COMMAND: &str = "cargo install --locked cargo-machete --version 0.9.2";
 
 #[derive(Clone, Copy, Debug)]
@@ -25,7 +27,7 @@ impl Step {
     }
 }
 
-const CI_STEPS: &[Step] = &[
+const PRE_PACKAGE_STEPS: &[Step] = &[
     Step {
         label: "Markdown lint",
         program: "rumdl",
@@ -47,6 +49,9 @@ const CI_STEPS: &[Step] = &[
             "--check",
         ],
     },
+];
+
+const POST_PACKAGE_STEPS: &[Step] = &[
     Step {
         label: "Rust lint",
         program: "cargo",
@@ -101,19 +106,28 @@ const CI_STEPS: &[Step] = &[
 
 pub(crate) fn run(root: &Path) -> io::Result<()> {
     require_cargo_machete()?;
-    for step in CI_STEPS {
-        eprintln!("+ {} (cwd {})", step.command_line(), root.display());
-        let status = Command::new(step.program)
-            .args(step.args)
-            .current_dir(root)
-            .status()
-            .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", step.label)))?;
-        if !status.success() {
-            return Err(io::Error::other(format!(
-                "{} failed with {status}",
-                step.label
-            )));
-        }
+    for step in PRE_PACKAGE_STEPS {
+        run_step(root, *step)?;
+    }
+    package_content::run(root)?;
+    for step in POST_PACKAGE_STEPS {
+        run_step(root, *step)?;
+    }
+    Ok(())
+}
+
+fn run_step(root: &Path, step: Step) -> io::Result<()> {
+    eprintln!("+ {} (cwd {})", step.command_line(), root.display());
+    let status = Command::new(step.program)
+        .args(step.args)
+        .current_dir(root)
+        .status()
+        .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", step.label)))?;
+    if !status.success() {
+        return Err(io::Error::other(format!(
+            "{} failed with {status}",
+            step.label
+        )));
     }
     Ok(())
 }

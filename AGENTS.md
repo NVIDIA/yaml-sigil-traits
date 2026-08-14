@@ -177,6 +177,7 @@ The command runs these checks in order:
 rumdl check .
 cargo fmt --all --check
 cargo fmt --manifest-path xtask/Cargo.toml --all --check
+cargo package --list --allow-dirty --exclude-lockfile --package yaml-sigil-traits
 cargo clippy --all-targets --all-features -- -D warnings
 cargo clippy --locked --manifest-path xtask/Cargo.toml --all-targets --all-features -- -D warnings
 cargo test --all-features
@@ -237,6 +238,34 @@ documentation without making the xtask depend on provider configuration.
 
 The root crate does not commit `Cargo.lock`, so its Cargo checks must work from
 a clean checkout without `--locked`.
+
+Static package-content validation is part of the non-release CI sequence. Run
+it independently with:
+
+```shell
+cargo xtask package-content
+```
+
+The command runs this exact list-only Cargo operation:
+
+```shell
+cargo package --list --allow-dirty --exclude-lockfile --package yaml-sigil-traits
+```
+
+It compares Cargo's source list with
+`xtask/package-contents/yaml-sigil-traits.txt`. The committed inventory must be
+UTF-8, contain one normalized crate-relative path per line, end with a newline,
+and remain bytewise sorted with no blank lines, comments, or duplicates.
+`--allow-dirty` permits inspection of a candidate worktree without altering
+the contents Cargo selects. `--exclude-lockfile` prevents an ignored root
+`Cargo.lock` from changing registry resolution during this list-only check; the
+xtask adds Cargo's generated `Cargo.lock` path to the observed set before
+comparison. Keep the raw command, generated-path model, committed inventory,
+hosted check, and xtask tests aligned whenever package metadata or contents
+change.
+
+The following package-validation guidance refers to full archive assembly and
+verification, not the static path-list comparison above.
 
 Package validation is deliberately separate from the non-release CI sequence:
 
