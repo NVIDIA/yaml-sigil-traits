@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_dispatch:
   pull_request:
     branches:
       - main
@@ -23,9 +24,9 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Accept trusted push
-        if: ${{ github.event_name == 'push' }}
-        run: echo "Commit policy is evaluated on pull requests."
+      - name: Accept trusted invocation
+        if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
+        run: echo "Commit policy is evaluated on pull requests, not trusted direct invocations."
 
       - name: Check out pull request history
         if: ${{ github.event_name == 'pull_request' }}
@@ -69,7 +70,7 @@ jobs:
   # TODO: remove after repository publication
   checks:
     name: Checks
-    if: ${{ github.event_name == 'push' }}
+    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
