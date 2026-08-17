@@ -67,19 +67,8 @@ jobs:
           scandir: .github/scripts
           version: v0.11.0
 
-  # TODO: remove after repository publication
   checks:
     name: Checks
-    if: >-
-      ${{
-        github.event_name == 'push' ||
-        github.event_name == 'workflow_dispatch' ||
-        (
-          github.event_name == 'pull_request' &&
-          github.event.pull_request.head.repo.full_name == github.repository &&
-          github.event.pull_request.user.login != 'dependabot[bot]'
-        )
-      }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
@@ -91,20 +80,15 @@ jobs:
         with:
           persist-credentials: false
 
-      # TODO: remove after repository publication
-      - name: Resolve pinned specification commit
-        id: source-spec
-        run: echo "sha=$(git rev-parse HEAD:source-spec)" >> "$GITHUB_OUTPUT"
-
-      # TODO: remove after repository publication
       - name: Check out pinned specification
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          path: source-spec
-          persist-credentials: false
-          ref: ${{ steps.source-spec.outputs.sha }}
-          repository: NVIDIA/yaml-sigil-spec
-          token: ${{ secrets.YAML_SIGIL_SPEC_READ_PAT }}
+        env:
+          GIT_ASKPASS: /bin/false
+          GIT_CONFIG_GLOBAL: /dev/null
+          GIT_CONFIG_NOSYSTEM: "1"
+          GIT_TERMINAL_PROMPT: "0"
+        run: >-
+          git -c credential.helper= submodule update --init --depth 1
+          --checkout -- source-spec
 
       - name: Lint Markdown
         # Refresh this immutable pin frequently to keep pace with rumdl releases.
