@@ -1,0 +1,134 @@
+name: Publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Validate the current release or publish it to crates.io.
+        required: true
+        default: validate
+        type: choice
+        options:
+          - validate
+          - publish
+
+permissions: {}
+
+env:
+  # release-plz needs the named crates.io registry to resolve manifests whose
+  # publish allowlist is `["crates-io"]`.
+  CARGO_REGISTRIES_CRATES_IO_INDEX: https://github.com/rust-lang/crates.io-index
+
+# Publication is resumable, so never cancel a run that might have uploaded a
+# crate while a replacement waits for the same protected environment.
+concurrency:
+  group: publish-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  validation:
+    name: Validate release
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # A manual dispatch may name another ref. Keep release authority on the
+      # protected default branch whose pull requests passed Required CI.
+      - name: Validate invocation
+        env:
+          EXPECTED_REPOSITORY: NVIDIA/yaml-sigil-traits
+        run: |
+          if [[ "${GITHUB_REPOSITORY}" != "${EXPECTED_REPOSITORY}" ]]; then
+            echo "This workflow runs only in ${EXPECTED_REPOSITORY}." >&2
+            exit 1
+          fi
+          if [[ "${GITHUB_REF}" != "refs/heads/main" ]]; then
+            echo "This workflow must be dispatched from main." >&2
+            exit 1
+          fi
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache: false
+
+      # `autobins = false` prevents implicit executable targets. Reject an
+      # explicit `[[bin]]` target too, before either release-plz invocation.
+      - name: Require a library-only release package
+        run: |
+          cargo metadata --no-deps --format-version 1 \
+            | jq --exit-status '
+                [.packages[] | select(.name == "yaml-sigil-traits")] as $packages
+                | ($packages | length) == 1
+                  and all($packages[].targets[]; .kind | index("bin") | not)
+              ' >/dev/null
+
+      # Use Cargo's normal package assembly and verification instead of a
+      # repository-specific archive parser.
+      - name: Package with Cargo
+        run: cargo package
+
+      # This exercises release-plz package selection and publication planning
+      # without requesting an OIDC token or uploading a crate.
+      - name: Validate release-plz publication plan
+        uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          command: release
+          config: .release-plz.toml
+          dry_run: true
+          manifest_path: Cargo.toml
+          version: "0.3.160"
+
+  publication:
+    name: Publish release
+    if: ${{ inputs.operation == 'publish' }}
+    needs: validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: crates-io
+    permissions:
+      # Create the version tag and source-only GitHub Release after publishing.
+      contents: write
+      pull-requests: read
+      id-token: write
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache: false
+
+      # release-plz exchanges the job's OIDC identity for a short-lived
+      # crates.io credential, then creates the configured version tag and
+      # source-only GitHub Release. It does not build or attach binary assets.
+      # Deliberately omit both a registry token and the dry_run input; any
+      # nonempty dry_run value would enable dry-run mode.
+      - name: Publish with Trusted Publishing
+        uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          command: release
+          config: .release-plz.toml
+          manifest_path: Cargo.toml
+          version: "0.3.160"
+
+      # Read each expected version from Cargo metadata, wait for crates.io to
+      # expose it as non-yanked, and confirm Cargo can resolve it.
+      - name: Verify crates.io publication
+        run: bash .github/scripts/verify-crates-io-packages.sh yaml-sigil-traits

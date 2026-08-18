@@ -4,6 +4,9 @@ description = "Shared trait + DTO surface for the YamlSigil v1alpha1 signing / t
 version = "0.3.0-rc.1"
 authors = ["yaml-sigil-dev <yaml-sigil-dev+crates-io@nvidia.com>"]
 edition = "2024"
+# Keep this package library-only. An executable target requires an explicit
+# manifest change and is also rejected by the release workflow.
+autobins = false
 # TODO: We seek to reduce this, we just need to do the testing.
 rust-version = "1.95.0"
 license = "Apache-2.0"
@@ -12,6 +15,7 @@ readme = "README.md"
 publish = ["crates-io"]
 include = [
     "/src/**",
+    "/CHANGELOG.md",
     "/README.md",
     "/LICENSE",
     "/SECURITY.md",
