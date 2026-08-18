@@ -278,8 +278,11 @@ Package validation is deliberately separate from the non-release CI sequence:
 cargo package
 ```
 
-Publishing is disabled in this prelaunch cleanup branch. Do not add a custom
-publishing wrapper for this single-crate repository.
+Publish `yaml-sigil-traits` only as a crates.io `.crate` source package. Do not
+add a custom publishing wrapper or distribute compiled native executables,
+executable WebAssembly, installers, containers, retained CI or build outputs,
+GitHub Release assets, or separately generated source archives. Local and
+ephemeral compilation remains permitted for validation.
 
 ## Async Traits
 

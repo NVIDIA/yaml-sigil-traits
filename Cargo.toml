@@ -9,7 +9,7 @@ rust-version = "1.95.0"
 license = "Apache-2.0"
 repository = "https://github.com/NVIDIA/yaml-sigil-traits"
 readme = "README.md"
-publish = false
+publish = ["crates-io"]
 include = [
     "/src/**",
     "/README.md",

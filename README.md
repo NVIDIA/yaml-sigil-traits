@@ -147,5 +147,4 @@ sequence.
 
 ## Publishing
 
-Publishing is disabled in this prelaunch cleanup branch. Re-enable and validate
-crates.io metadata in a later release-preparation change.
+We publish to crates.io now.

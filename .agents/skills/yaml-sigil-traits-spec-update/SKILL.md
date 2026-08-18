@@ -116,7 +116,9 @@ a proposed specification update for impact on this crate.
 
 7. Record release impact after review:
 
-   Publishing is disabled in this prelaunch cleanup branch. Do not publish or
-   coordinate downstream implementation updates from this repository. When
-   publishing is re-enabled, record that this crate must publish before
-   downstream implementation repositories update to a changed public contract.
+   Publish this crate only as a crates.io `.crate` source package, and publish
+   it before downstream implementation repositories update to a changed public
+   contract. Do not distribute compiled native executables, executable
+   WebAssembly, installers, containers, retained CI or build outputs, GitHub
+   Release assets, or separately generated source archives. Local and
+   ephemeral compilation remains permitted for validation.
