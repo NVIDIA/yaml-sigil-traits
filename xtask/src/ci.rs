@@ -176,9 +176,10 @@ mod tests {
 \tpath = source-spec\n\
 \turl = https://github.com/NVIDIA/yaml-sigil-spec.git\n\
 \tupdate = none";
+        let gitmodules = GITMODULES.replace("\r\n", "\n");
 
         assert!(
-            GITMODULES.contains(SOURCE_SPEC),
+            gitmodules.contains(SOURCE_SPEC),
             "source-spec must remain excluded from automatic submodule updates"
         );
     }
