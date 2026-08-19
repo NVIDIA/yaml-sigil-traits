@@ -39,10 +39,10 @@ repository writer can dispatch the `Release proposal` workflow with
 explicit override in the release pull request so later updates preserve it.
 Dispatch `auto` to clear that override and return to automatic calculation.
 
-While the release-proposal GitHub App is unavailable, repository writers use
-the temporary manual release-proposal procedure in `RELEASING.md`. Contributors
-still express version intent here and do not edit versions on their change
-branches.
+When the release-proposal GitHub App is unavailable or cannot safely update its
+owned branch, repository writers use the permanent manual release-proposal
+fallback in `RELEASING.md`. Contributors still express version intent here and
+do not edit versions on their change branches.
 
 Pull-request snapshot publication does not change the contributor's branch.
 The workflow applies its `0.pr` version only in an ephemeral checkout.
