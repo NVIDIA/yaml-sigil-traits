@@ -209,6 +209,8 @@ fn assert_copy<T: Copy>() {}
 
 fn assert_send<T: Send>(_: T) {}
 
+// Generic key parameters must not weaken the DTOs' existing copy and
+// redacted-debug guarantees or impose key-type trait bounds.
 #[test]
 fn generic_key_dtos_preserve_copy_and_redacted_debug_without_key_bounds() {
     assert_copy::<SigningKey<'static, LocalEd25519SigningKey, LocalP256SigningKey>>();
@@ -220,6 +222,8 @@ fn generic_key_dtos_preserve_copy_and_redacted_debug_without_key_bounds() {
     assert_eq!(format!("{signing_key:?}"), "SigningKey::Ed25519(***)");
 }
 
+// Explicit associated-key bindings keep the synchronous interfaces usable
+// through trait objects after key ownership moves to implementations.
 #[test]
 fn synchronous_traits_remain_object_safe_with_explicit_key_bindings() {
     let signer: &dyn Signer<Ed25519SigningKey = LocalEd25519SigningKey, P256SigningKey = LocalP256SigningKey> =
@@ -239,6 +243,8 @@ fn synchronous_traits_remain_object_safe_with_explicit_key_bindings() {
     );
 }
 
+// Concrete local key types must preserve the Send contract on futures
+// returned by both asynchronous interfaces.
 #[test]
 fn async_trait_futures_are_send_with_local_key_types() {
     let signing_key = LocalEd25519SigningKey;
