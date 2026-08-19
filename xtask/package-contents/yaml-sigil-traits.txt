@@ -1,4 +1,5 @@
 .cargo_vcs_info.json
+CHANGELOG.md
 CONTRIBUTING.md
 Cargo.lock
 Cargo.toml
