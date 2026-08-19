@@ -1,6 +1,6 @@
 [package]
 name = "yaml-sigil-traits"
-description = "Shared trait + DTO surface for the YamlSigil v1alpha1 signing / transcription / verification APIs"
+description = "Shared traits and data types for signing, transcription, and verification"
 version = "0.3.0-rc.1"
 authors = ["yaml-sigil-dev <yaml-sigil-dev+crates-io@nvidia.com>"]
 edition = "2024"
@@ -11,7 +11,10 @@ autobins = false
 rust-version = "1.95.0"
 license = "Apache-2.0"
 repository = "https://github.com/NVIDIA/yaml-sigil-traits"
+documentation = "https://docs.rs/yaml-sigil-traits"
 readme = "README.md"
+keywords = ["yaml", "agent", "digital-signature", "cryptography", "traits"]
+categories = ["authentication", "cryptography"]
 publish = ["crates-io"]
 include = [
     "/src/**",

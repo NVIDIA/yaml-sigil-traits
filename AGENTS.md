@@ -155,6 +155,18 @@ review.
 
 ### Repository-Specific Documentation Rules
 
+- Write repository READMEs for human readers. Keep agent workflows and durable
+  repository instructions in `AGENTS.md`.
+- Use absolute links in READMEs packaged with published crates so the links work
+  on crates.io and docs.rs.
+- Prefer inline-code `yaml-sigil` in prose. Use “YAML Sigil” when code styling
+  reads awkwardly.
+- Reserve `YamlSigil` and `YamlSigil.v1alpha1` for code or exact identifiers.
+- Usually omit the protocol version. When the version is necessary, write the
+  lowercase inline-code form `v1alpha1`.
+- Link other crates with inline-code names and absolute crates.io URLs.
+- Explain behavior in ordinary language before introducing specification
+  terminology.
 - Keep documentation centered on public traits, DTOs, errors, feature flags,
   and compatibility guarantees.
 - Mirror specification vocabulary when documenting spec-derived terms, but do

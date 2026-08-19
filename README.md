@@ -1,15 +1,19 @@
 # yaml-sigil-traits
 
-Rust Traits for [yaml-sigil](https://github.com/NVIDIA/yaml-sigil-spec).
+[![GitHub license](https://img.shields.io/github/license/NVIDIA/yaml-sigil-traits)](https://github.com/NVIDIA/yaml-sigil-traits/blob/main/LICENSE)
+[![CI](https://github.com/NVIDIA/yaml-sigil-traits/actions/workflows/ci.yml/badge.svg)](https://github.com/NVIDIA/yaml-sigil-traits/actions/workflows/ci.yml)
 
-`yaml-sigil-traits` defines the shared Rust trait and DTO contract for the
-YamlSigil `v1alpha1` signing, transcription, and verification APIs.
+[![crates.io](https://img.shields.io/crates/v/yaml-sigil-traits.svg)](https://crates.io/crates/yaml-sigil-traits)
+[![docs.rs](https://docs.rs/yaml-sigil-traits/badge.svg)](https://docs.rs/yaml-sigil-traits)
 
-Use this crate when you need a stable in-process boundary between callers and
-YamlSigil implementations. The crate mirrors vocabulary from the pinned
-YamlSigil specification, but the specification owns protocol semantics. This
-crate owns the Rust trait shapes, request DTOs, response DTOs, capability DTOs,
-error enums, and helper functions that those traits expose.
+`yaml-sigil-traits` defines the shared Rust traits and data types for
+[`yaml-sigil`](https://github.com/NVIDIA/yaml-sigil-spec#tldr) signing,
+transcription, and verification.
+
+Use this crate when callers and implementations need a stable in-process API.
+The specification defines document and signature behavior. This crate defines
+the Rust trait shapes, request and response data, capabilities, errors, and
+helper functions exposed by those traits.
 
 ## Contract surface
 
@@ -45,13 +49,6 @@ The crate does not provide default signing, transcription, or verification
 implementations. Implementation crates own free-function APIs such as `sign`,
 `compose`, and `verify`, default zero-sized types, YAML parsing, protobuf
 decoding, cryptographic operations, trust-store behavior, and transport policy.
-
-## Dependency boundary
-
-`yaml-sigil-traits` stays independent from the rest of the YamlSigil Rust
-implementation. It may depend on crates needed to type public DTOs, including
-`ed25519-dalek`, `p256`, and `thiserror`, but we do seek to reduce those over
-time.
 
 ## Trait usage
 
@@ -94,8 +91,8 @@ trust store. Document those narrowings in the implementation crate.
 
 ## Specification source
 
-The normative YamlSigil specification lives in
-[yaml-sigil-spec](https://github.com/NVIDIA/yaml-sigil-spec). It is
+The normative `yaml-sigil` specification lives in
+[`yaml-sigil-spec`](https://github.com/NVIDIA/yaml-sigil-spec). It is
 maintenance input for reviewing this crate's public trait and DTO vocabulary.
 Normal builds, docs.rs builds, and published crates do not require a local spec
 checkout.
@@ -109,24 +106,9 @@ git -c submodule.source-spec.update=checkout \
   submodule update --init source-spec
 ```
 
-When the specification pin changes, use the repo-local
-`.agents/skills/yaml-sigil-traits-spec-update` skill. Keep the update scoped to
-this crate's public trait and DTO contract. Do not add generated protobuf
-dependencies or coordinate downstream implementation updates from this
-repository.
-
-## Third-party material
-
-NVIDIA-authored crate material is licensed under Apache-2.0. The crate mirrors
-standards-derived identifiers and public-key format behavior without
-relicensing the cited standards material. Copyright, source, warranty,
-patent/IP, and non-endorsement notices are collected in
-[`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md).
-
-The pinned specification has its own complete notice at
-[`source-spec/THIRD_PARTY_NOTICES.md`](./source-spec/THIRD_PARTY_NOTICES.md).
-The crate package excludes `source-spec/`; repository distributions that
-initialize the submodule must preserve its notice.
+Keep specification-pin updates scoped to this crate's public trait and DTO
+contract. Do not add generated protobuf dependencies or coordinate downstream
+implementation updates from this repository.
 
 ## Build and test
 
@@ -147,4 +129,28 @@ sequence.
 
 ## Publishing
 
-We publish to crates.io now.
+Releases are published to
+[`yaml-sigil-traits` on crates.io](https://crates.io/crates/yaml-sigil-traits).
+The manifest limits publication to the crates.io registry.
+
+## Dependency boundary
+
+`yaml-sigil-traits` stays independent from the rest of the `yaml-sigil` Rust
+implementation. It may depend on crates needed to type public DTOs, including
+[`ed25519-dalek`](https://crates.io/crates/ed25519-dalek),
+[`p256`](https://crates.io/crates/p256), and
+[`thiserror`](https://crates.io/crates/thiserror), but we do seek to reduce
+those over time.
+
+## Third-party material
+
+NVIDIA-authored crate material is licensed under Apache-2.0. The crate mirrors
+standards-derived identifiers and public-key format behavior without
+relicensing the cited standards material. Copyright, source, warranty,
+patent/IP, and non-endorsement notices are collected in
+[`THIRD_PARTY_NOTICES.md`](https://github.com/NVIDIA/yaml-sigil-traits/blob/main/THIRD_PARTY_NOTICES.md).
+
+The pinned specification has its own complete notice at
+[`source-spec/THIRD_PARTY_NOTICES.md`](https://github.com/NVIDIA/yaml-sigil-spec/blob/0fa13f2bf7aac43afb492d9c7dad8e3bf9cfa2bc/THIRD_PARTY_NOTICES.md).
+The crate package excludes `source-spec/`; repository distributions that
+initialize the submodule must preserve that notice.
