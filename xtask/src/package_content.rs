@@ -145,7 +145,8 @@ fn parse_inventory(contents: &str) -> Result<BTreeSet<String>, String> {
 
 fn parse_cargo_list(contents: &str) -> io::Result<BTreeSet<String>> {
     let mut paths = BTreeSet::new();
-    for (index, path) in contents.lines().enumerate() {
+    let normalized_contents = normalize_platform_separators(contents, std::path::MAIN_SEPARATOR);
+    for (index, path) in normalized_contents.lines().enumerate() {
         validate_inventory_path(path, index + 1).map_err(|message| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -166,6 +167,10 @@ fn parse_cargo_list(contents: &str) -> io::Result<BTreeSet<String>> {
         ));
     }
     Ok(paths)
+}
+
+fn normalize_platform_separators(contents: &str, separator: char) -> String {
+    contents.replace(separator, "/")
 }
 
 fn validate_inventory_path(path: &str, line_number: usize) -> Result<(), String> {
@@ -236,7 +241,7 @@ fn format_difference(difference: &InventoryDifference) -> String {
 mod tests {
     use super::{
         InventoryDifference, PACKAGE_SPECS, cargo_package_list_args, compare_inventories,
-        format_difference, parse_inventory,
+        format_difference, normalize_platform_separators, parse_inventory,
     };
     use std::collections::BTreeSet;
 
@@ -293,6 +298,18 @@ mod tests {
                 "expected `{expected_message}` in `{error}`"
             );
         }
+    }
+
+    #[test]
+    fn cargo_output_normalizes_only_the_platform_separator() {
+        assert_eq!(
+            normalize_platform_separators("src\\lib.rs\n", '\\'),
+            "src/lib.rs\n"
+        );
+        assert_eq!(
+            normalize_platform_separators("src\\lib.rs\n", '/'),
+            "src\\lib.rs\n"
+        );
     }
 
     #[test]

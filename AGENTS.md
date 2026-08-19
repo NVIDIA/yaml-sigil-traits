@@ -177,6 +177,7 @@ The command runs these checks in order:
 rumdl check .
 cargo fmt --all --check
 cargo fmt --manifest-path xtask/Cargo.toml --all --check
+cargo xtask release-version check
 cargo package --list --allow-dirty --exclude-lockfile --package yaml-sigil-traits
 cargo clippy --all-targets --all-features -- -D warnings
 cargo clippy --locked --manifest-path xtask/Cargo.toml --all-targets --all-features -- -D warnings
@@ -211,10 +212,13 @@ where practical. It may also add provider-specific policy checks that do not
 belong in the local command sequence. Document intentional differences between
 hosted and local validation.
 
-Hosted CI additionally repeats `cargo test --all-features` on GitHub's moving
-`macos-latest` and `windows-latest` runner labels. That minimal platform matrix
-tests the root crate; it does not repeat the complete `cargo xtask ci` sequence
-or imply that the local command launches other operating systems.
+Hosted CI runs the provider-neutral Rust and Cargo portion of this sequence on
+GitHub's moving `ubuntu-latest`, `macos-latest`, and `windows-latest` runner
+labels. Every matrix leg checks formatting, release-version validity, package
+contents, Clippy, tests, unused dependencies, and the dependency audit against
+that platform's resolved dependency graph. Markdown and provider workflow
+validation remain single-platform hosted checks. The local command does not
+launch other operating systems.
 
 Validate shell scripts under `.github/scripts` with Shuck before landing
 changes. Install it from the `shuck-cli` crate and run it from the repository

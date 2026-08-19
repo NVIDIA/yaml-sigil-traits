@@ -14,3 +14,6 @@ description = "Developer-only tasks for yaml-sigil-traits."
 [[bin]]
 name = "xtask"
 path = "src/main.rs"
+
+[dependencies]
+semver = "1.0"

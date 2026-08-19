@@ -1,0 +1,3 @@
+# Package-content inventories are canonical data consumed byte-for-byte by
+# xtask.
+xtask/package-contents/*.txt text eol=lf

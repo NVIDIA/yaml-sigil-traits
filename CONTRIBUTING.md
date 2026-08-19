@@ -25,6 +25,28 @@ documentation that you cannot defend without the agent open.
 - **Do not** use agents as a substitute for reading the relevant code, specs,
   and maintainer guidance.
 
+## Express release-version intent
+
+Use an accurate Conventional Commit type and breaking-change marker when the
+change itself establishes its release impact. Do not edit the package version
+on an ordinary feature or fix branch. The release-proposal workflow calculates
+and commits release versions on its dedicated `release-plz-*` branch.
+
+When the required `major`, `minor`, or `patch` advance is not discoverable from
+the commits, state the intended impact in the contribution pull request. A
+repository writer can dispatch the `Release proposal` workflow with
+`next-candidate` and the matching bump override. The workflow records an
+explicit override in the release pull request so later updates preserve it.
+Dispatch `auto` to clear that override and return to automatic calculation.
+
+While the release-proposal GitHub App is unavailable, repository writers use
+the temporary manual release-proposal procedure in `RELEASING.md`. Contributors
+still express version intent here and do not edit versions on their change
+branches.
+
+Pull-request snapshot publication does not change the contributor's branch.
+The workflow applies its `0.pr` version only in an ephemeral checkout.
+
 #### Signing Off Your Work
 
 * We require that all contributors "sign-off" on their commits. This certifies that the contribution is your original work, or you have rights to submit it under the same license, or a compatible license.

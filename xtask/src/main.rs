@@ -6,6 +6,7 @@
 
 mod ci;
 mod package_content;
+mod release_version;
 
 use std::env;
 use std::path::PathBuf;
@@ -33,6 +34,13 @@ fn main() -> ExitCode {
                 }
             }
         }
+        "release-version" => match release_version::run(&workspace_root(), &remaining) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("release-version failed: {error}");
+                ExitCode::FAILURE
+            }
+        },
         "" | "help" | "--help" | "-h" => {
             print_usage();
             ExitCode::SUCCESS
@@ -67,8 +75,10 @@ fn is_help_request(args: &[String]) -> bool {
 
 fn print_usage() {
     eprintln!(
-        "usage:\n  cargo xtask ci\n  cargo xtask package-content\n\n\
+        "usage:\n  cargo xtask ci\n  cargo xtask package-content\n  \
+         cargo xtask release-version <COMMAND>\n\n\
          commands:\n  ci               Run the complete non-release validation sequence.\n  \
-         package-content  Compare Cargo's source list with the committed inventory."
+         package-content  Compare Cargo's source list with the committed inventory.\n  \
+         release-version  Manage provider-neutral release version transactions."
     );
 }

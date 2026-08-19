@@ -7,7 +7,7 @@ use std::io;
 use std::path::Path;
 use std::process::Command;
 
-use crate::package_content;
+use crate::{package_content, release_version};
 
 const CARGO_MACHETE_INSTALL_COMMAND: &str = "cargo install --locked cargo-machete --version 0.9.2";
 
@@ -109,6 +109,7 @@ pub(crate) fn run(root: &Path) -> io::Result<()> {
     for step in PRE_PACKAGE_STEPS {
         run_step(root, *step)?;
     }
+    release_version::check(root).map_err(io::Error::other)?;
     package_content::run(root)?;
     for step in POST_PACKAGE_STEPS {
         run_step(root, *step)?;
