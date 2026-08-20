@@ -11,8 +11,6 @@ set -euo pipefail
 : "${GH_TOKEN:?GH_TOKEN must contain the GitHub App installation token}"
 : "${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required}"
 : "${GITHUB_SHA:?GITHUB_SHA must identify the checked-out main commit}"
-: "${GITHUB_RUN_ID:?GITHUB_RUN_ID is required}"
-: "${GITHUB_RUN_ATTEMPT:?GITHUB_RUN_ATTEMPT is required}"
 : "${APP_SLUG:?APP_SLUG is required}"
 : "${RELEASE_BRANCH:?RELEASE_BRANCH is required}"
 : "${RELEASE_TITLE:?RELEASE_TITLE is required}"
@@ -98,23 +96,23 @@ if target_ref="$(
   fi
 fi
 
-additions='[]'
-deletions='[]'
+tree_entries='[]'
 while IFS=$'\t' read -r status path; do
-  # Translate the already allowlisted text diff into GraphQL file changes.
+  # Translate the already allowlisted text diff into one exact Git tree.
   case "${status}" in
     A | M)
-      contents="$(base64 --wrap=0 "${path}")"
-      additions="$(
+      tree_entries="$(
         jq --compact-output \
-          --arg path "${path}" --arg contents "${contents}" \
-          '. + [{path: $path, contents: $contents}]' <<<"${additions}"
+          --arg path "${path}" --rawfile contents "${path}" \
+          ". + [{path: \$path, mode: \"100644\", type: \"blob\", content: \$contents}]" \
+          <<<"${tree_entries}"
       )"
       ;;
     D)
-      deletions="$(
+      tree_entries="$(
         jq --compact-output --arg path "${path}" \
-          '. + [{path: $path}]' <<<"${deletions}"
+          ". + [{path: \$path, mode: \"100644\", type: \"blob\", sha: null}]" \
+          <<<"${tree_entries}"
       )"
       ;;
     *)
@@ -124,76 +122,78 @@ while IFS=$'\t' read -r status path; do
   esac
 done < <(git diff --name-status --no-renames)
 
-staging_branch="automation/release-staging-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-staging_created=false
-cleanup_staging() {
-  # Best-effort cleanup prevents temporary signing branches from accumulating.
-  if [[ "${staging_created}" == "true" ]]; then
-    gh api --method DELETE \
-      "repos/${GITHUB_REPOSITORY}/git/refs/heads/${staging_branch}" \
-      >/dev/null 2>&1 || true
-  fi
-}
-trap cleanup_staging EXIT
-
-staging_ref=""
-# The REST response supplies the exact Ref node that GraphQL must commit to.
-if ! staging_ref="$(
-  gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
-    -f "ref=refs/heads/${staging_branch}" -f "sha=${GITHUB_SHA}"
-)"; then
-  echo "GitHub did not create the App staging branch." >&2
-  exit 1
-fi
-staging_created=true
-staging_id="$(jq --raw-output '.node_id // empty' <<<"${staging_ref}")"
-# Refuse a name-based fallback because a newly created ref may not yet resolve
-# consistently across the REST and GraphQL APIs.
-if [[ -z "${staging_id}" ]]; then
-  echo "GitHub did not return the App staging Ref node ID." >&2
-  exit 1
-fi
-
 message_body="Signed-off-by: ${bot_login} <${bot_email}>"
-mutation="mutation(\$input: CreateCommitOnBranchInput!) {
-  createCommitOnBranch(input: \$input) { commit { oid } }
-}"
-payload="$(
+commit_message="${RELEASE_TITLE}"$'\n\n'"${message_body}"
+tree_payload="$(
   jq --null-input \
-    --arg query "${mutation}" \
-    --arg staging_id "${staging_id}" \
-    --arg expected "${GITHUB_SHA}" \
-    --arg headline "${RELEASE_TITLE}" \
-    --arg body "${message_body}" \
-    --argjson additions "${additions}" \
-    --argjson deletions "${deletions}" \
-    '{
-      query: $query,
-      variables: {
-        input: {
-          branch: {id: $staging_id},
-          expectedHeadOid: $expected,
-          message: {headline: $headline, body: $body},
-          fileChanges: {additions: $additions, deletions: $deletions}
-        }
-      }
-    }'
+    --arg base_tree "${GITHUB_SHA}" \
+    --argjson tree "${tree_entries}" \
+    "{base_tree: \$base_tree, tree: \$tree}"
 )"
-response="$(gh api graphql --input - <<<"${payload}")"
-commit_sha="$(jq --raw-output '.data.createCommitOnBranch.commit.oid // empty' <<<"${response}")"
-# A missing object indicates a GraphQL validation or authorization failure.
+tree_response=""
+# A tree based on the triggering SHA makes every generated path explicit.
+if ! tree_response="$(
+  gh api --method POST "repos/${GITHUB_REPOSITORY}/git/trees" \
+    --input - <<<"${tree_payload}"
+)"; then
+  echo "GitHub did not create the generated release tree." >&2
+  exit 1
+fi
+tree_sha="$(jq --raw-output '.sha // empty' <<<"${tree_response}")"
+# Refuse to create a commit without the exact generated tree identity.
+if [[ -z "${tree_sha}" ]]; then
+  echo "GitHub did not return the generated release tree SHA." >&2
+  exit 1
+fi
+
+commit_payload="$(
+  jq --null-input \
+    --arg message "${commit_message}" \
+    --arg tree "${tree_sha}" \
+    --arg parent "${GITHUB_SHA}" \
+    "{message: \$message, tree: \$tree, parents: [\$parent]}"
+)"
+commit_response=""
+# Installation-token commit creation invokes GitHub's App signing service.
+if ! commit_response="$(
+  gh api --method POST "repos/${GITHUB_REPOSITORY}/git/commits" \
+    --input - <<<"${commit_payload}"
+)"; then
+  echo "GitHub did not create the App release proposal commit." >&2
+  exit 1
+fi
+commit_sha="$(jq --raw-output '.sha // empty' <<<"${commit_response}")"
+# A missing object indicates a Git Database validation or authorization failure.
 if [[ -z "${commit_sha}" ]]; then
   echo "GitHub did not create the release proposal commit." >&2
-  jq '.errors // .' <<<"${response}" >&2
   exit 1
 fi
 
 commit="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${commit_sha}")"
-# Move no durable release ref until GitHub reports a valid signature.
+# Move no durable release ref until GitHub reports the exact App-authored,
+# bot-DCO-compliant, single-parent commit with a valid signature.
 if ! jq --exit-status \
-  '.commit.verification.verified == true and .commit.verification.reason == "valid"' \
+  --arg bot "${bot_login}" \
+  --arg dco "${message_body}" \
+  --arg parent "${GITHUB_SHA}" \
+  ".author.login == \$bot
+    and .commit.verification.verified == true
+    and .commit.verification.reason == \"valid\"
+    and (.commit.message | endswith(\$dco))
+    and (.parents | length == 1)
+    and .parents[0].sha == \$parent" \
   <<<"${commit}" >/dev/null; then
-  echo "GitHub did not report the generated commit as Verified." >&2
+  echo "GitHub did not report the generated App commit as valid." >&2
+  exit 1
+fi
+
+# Main must remain the exact proposal parent until the durable ref moves.
+remote_main="$(
+  gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha
+)"
+# Do not publish a proposal based on a main commit that is no longer current.
+if [[ "${remote_main}" != "${GITHUB_SHA}" ]]; then
+  echo "Main advanced while the release proposal commit was being signed." >&2
   exit 1
 fi
 
