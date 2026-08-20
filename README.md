@@ -50,6 +50,10 @@ implementations. Implementation crates own free-function APIs such as `sign`,
 `compose`, and `verify`, default zero-sized types, YAML parsing, protobuf
 decoding, cryptographic operations, trust-store behavior, and transport policy.
 
+Signer and verifier implementations choose the concrete key types they accept.
+The shared `SigningKey`, `SignRequest`, and `PublicKeys` data types borrow those
+keys without constructing or parsing them.
+
 ## Trait usage
 
 Use the synchronous traits through generic bounds or trait objects.
@@ -140,10 +144,9 @@ The manifest limits publication to the crates.io registry.
 ## Dependency boundary
 
 `yaml-sigil-traits` stays independent from the rest of the `yaml-sigil` Rust
-implementation and from concrete cryptographic libraries. Signer and verifier
-implementations bind their key types through associated types. The generic
-`SigningKey`, `SignRequest`, and `PublicKeys` DTOs carry references to those
-implementation-selected types.
+implementation and does not choose a cryptography library. Implementations
+connect the generic signing and verification key slots to their concrete key
+types through associated types.
 
 ## Third-party material
 
