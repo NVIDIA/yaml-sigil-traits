@@ -11,6 +11,8 @@ set -euo pipefail
 : "${GH_TOKEN:?GH_TOKEN must contain the GitHub App installation token}"
 : "${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required}"
 : "${GITHUB_SHA:?GITHUB_SHA must identify the checked-out main commit}"
+: "${GITHUB_RUN_ID:?GITHUB_RUN_ID is required}"
+: "${GITHUB_RUN_ATTEMPT:?GITHUB_RUN_ATTEMPT is required}"
 : "${APP_SLUG:?APP_SLUG is required}"
 : "${RELEASE_BRANCH:?RELEASE_BRANCH is required}"
 : "${RELEASE_TITLE:?RELEASE_TITLE is required}"
@@ -122,6 +124,27 @@ while IFS=$'\t' read -r status path; do
   esac
 done < <(git diff --name-status --no-renames)
 
+staging_branch="automation/release-staging-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+staging_created=false
+cleanup_staging() {
+  # Best-effort cleanup prevents temporary signing branches from accumulating.
+  if [[ "${staging_created}" == "true" ]]; then
+    gh api --method DELETE \
+      "repos/${GITHUB_REPOSITORY}/git/refs/heads/${staging_branch}" \
+      >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup_staging EXIT
+
+# Start from an exact-main ref that the App can fast-forward after signing.
+if ! gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+  -f "ref=refs/heads/${staging_branch}" -f "sha=${GITHUB_SHA}" \
+  >/dev/null; then
+  echo "GitHub did not create the exact-main staging branch." >&2
+  exit 1
+fi
+staging_created=true
+
 message_body="Signed-off-by: ${bot_login} <${bot_email}>"
 commit_message="${RELEASE_TITLE}"$'\n\n'"${message_body}"
 tree_payload="$(
@@ -200,14 +223,64 @@ if [[ "${remote_main}" != "${GITHUB_SHA}" ]]; then
   exit 1
 fi
 
+# Fast-forwarding an existing ref is GitHub's documented final App-signing
+# step and makes the verified commit reachable before any durable ref moves.
+if ! gh api --method PATCH \
+  "repos/${GITHUB_REPOSITORY}/git/refs/heads/${staging_branch}" \
+  -f "sha=${commit_sha}" -F force=false >/dev/null; then
+  echo "GitHub did not fast-forward the App staging branch." >&2
+  exit 1
+fi
+reachable_commit=""
+# Require the repository view to resolve the same commit through its new ref.
+if ! reachable_commit="$(
+  gh api "repos/${GITHUB_REPOSITORY}/commits/${commit_sha}"
+)"; then
+  echo "GitHub did not resolve the staged App commit." >&2
+  exit 1
+fi
+# Recheck the repository-visible identity, signature, DCO, and exact parent.
+if ! jq --exit-status \
+  --arg bot "${bot_login}" \
+  --arg dco "${message_body}" \
+  --arg parent "${GITHUB_SHA}" \
+  ".author.login == \$bot
+    and .commit.verification.verified == true
+    and .commit.verification.reason == \"valid\"
+    and (.commit.message | endswith(\$dco))
+    and (.parents | length == 1)
+    and .parents[0].sha == \$parent" \
+  <<<"${reachable_commit}" >/dev/null; then
+  echo "GitHub did not report the staged App commit as valid." >&2
+  exit 1
+fi
+
 # Update an owned branch atomically, or create it for the first release train.
 if [[ -n "${target_ref}" ]]; then
-  gh api --method PATCH \
+  # Refuse to continue if GitHub cannot update the already App-owned branch.
+  if ! gh api --method PATCH \
     "repos/${GITHUB_REPOSITORY}/git/refs/heads/${RELEASE_BRANCH}" \
-    -f "sha=${commit_sha}" -F force=true >/dev/null
+    -f "sha=${commit_sha}" -F force=true >/dev/null; then
+    echo "GitHub did not update the App-owned release branch." >&2
+    exit 1
+  fi
 else
-  gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
-    -f "ref=refs/heads/${RELEASE_BRANCH}" -f "sha=${commit_sha}" >/dev/null
+  # Refuse to continue if GitHub cannot create the first release branch.
+  if ! gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+    -f "ref=refs/heads/${RELEASE_BRANCH}" -f "sha=${commit_sha}" \
+    >/dev/null; then
+    echo "GitHub did not create the App-owned release branch." >&2
+    exit 1
+  fi
+fi
+release_sha="$(
+  gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${RELEASE_BRANCH}" \
+    --jq .object.sha
+)"
+# Do not open or update a PR until the durable branch resolves exactly.
+if [[ "${release_sha}" != "${commit_sha}" ]]; then
+  echo "The App-owned release branch does not identify the verified commit." >&2
+  exit 1
 fi
 
 pulls="$(
