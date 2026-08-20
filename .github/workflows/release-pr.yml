@@ -204,10 +204,10 @@ jobs:
       - name: Recheck clean generated release source
         if: ${{ steps.published.outputs.available == 'true' }}
         env:
-          GITHUB_TOKEN: ${{ github.token }}
+          GIT_TOKEN: ${{ github.token }}
         run: |
           cargo xtask release-version check
           test -z "$(git status --porcelain --untracked-files=no)"
           cargo metadata --no-deps --format-version 1 >/dev/null
-          # Recheck the exact App-authored branch without publishing anything.
-          release-plz release --dry-run --config .release-plz.toml
+          # The read-only job token permits forge checks; dry-run cannot publish.
+          release-plz release --dry-run --forge github --config .release-plz.toml
