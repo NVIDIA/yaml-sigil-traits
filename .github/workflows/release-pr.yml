@@ -204,6 +204,8 @@ jobs:
       - name: Recheck clean generated release source
         if: ${{ steps.published.outputs.available == 'true' }}
         env:
+          # Resolve manifests whose publish allowlist names crates-io.
+          CARGO_REGISTRIES_CRATES_IO_INDEX: https://github.com/rust-lang/crates.io-index
           GIT_TOKEN: ${{ github.token }}
         run: |
           cargo xtask release-version check
