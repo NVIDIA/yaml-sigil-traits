@@ -47,6 +47,20 @@ do not edit versions on their change branches.
 Pull-request snapshot publication does not change the contributor's branch.
 The workflow applies its `0.pr` version only in an ephemeral checkout.
 
+## Pull-request CI
+
+Pull-request CI runs from a repository-owned `pull-request/<number>` branch at
+the exact latest pull-request head. Do not push to these branches. Signed
+commits from trusted organization members are copied automatically after the
+pull request is ready for review; draft pull requests do not auto-sync.
+
+If the copy bot requests validation, a maintainer must review the exact latest
+head and comment `/ok to test <head-sha>`. Automated App-authored commits and
+other untrusted heads require this SHA-bound approval. Every new untrusted head
+requires a new review and comment. The copied branch reports checks to the
+matching pull-request head and is removed when the pull request closes or
+merges.
+
 #### Signing Off Your Work
 
 * We require that all contributors "sign-off" on their commits. This certifies that the contribution is your original work, or you have rights to submit it under the same license, or a compatible license.

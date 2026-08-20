@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 
 # Validate the exact commit range proposed by a pull request. The workflow
-# checks out the pull request head with full history and supplies the immutable
-# event SHAs so this script does not have to infer refs or inspect a synthetic
-# merge commit.
+# checks out the pull request head with full history and supplies immutable base
+# and head SHAs so this script does not have to infer refs or inspect a
+# synthetic merge commit.
 set -euo pipefail
 
 : "${BASE_SHA:?BASE_SHA must identify the pull request base commit}"

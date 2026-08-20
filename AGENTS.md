@@ -225,12 +225,12 @@ belong in the local command sequence. Document intentional differences between
 hosted and local validation.
 
 Hosted CI runs the provider-neutral Rust and Cargo portion of this sequence on
-GitHub's moving `ubuntu-latest`, `macos-latest`, and `windows-latest` runner
-labels. Every matrix leg checks formatting, release-version validity, package
-contents, Clippy, tests, unused dependencies, and the dependency audit against
-that platform's resolved dependency graph. Markdown and provider workflow
-validation remain single-platform hosted checks. The local command does not
-launch other operating systems.
+NVIDIA's `linux-amd64-cpu8` runner and GitHub's moving `macos-latest` and
+`windows-latest` labels. Every matrix leg checks formatting, release-version
+validity, package contents, Clippy, tests, unused dependencies, and the
+dependency audit against that platform's resolved dependency graph. Linux
+commit-policy, Markdown, provider-workflow, and aggregation jobs run on
+`linux-amd64-cpu4`. The local command does not launch other operating systems.
 
 Validate shell scripts under `.github/scripts` with Shuck before landing
 changes. Install it from the `shuck-cli` crate and run it from the repository
