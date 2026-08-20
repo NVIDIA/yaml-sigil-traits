@@ -104,6 +104,15 @@ jobs:
             echo "The checked-out main commit does not match the triggering commit." >&2
             exit 1
           fi
+          # release-plz requires an attached branch with an upstream to resolve
+          # repository history. Keep the event-bound commit while attaching it.
+          git switch --force-create main "${GITHUB_SHA}"
+          git branch --set-upstream-to=origin/main main
+          # Branch attachment must preserve the exact event source commit.
+          if [[ "$(git rev-parse HEAD)" != "${GITHUB_SHA}" ]]; then
+            echo "Attaching main changed the triggering commit." >&2
+            exit 1
+          fi
 
       # Do not advance a release proposal while the version integrated on main
       # is still awaiting publication. This makes release-PR merge and package
