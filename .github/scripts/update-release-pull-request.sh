@@ -169,20 +169,23 @@ if [[ -z "${commit_sha}" ]]; then
   exit 1
 fi
 
-commit="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${commit_sha}")"
+# The create-commit response is authoritative before any ref makes the commit
+# reachable through the repository's higher-level commits API.
 # Move no durable release ref until GitHub reports the exact App-authored,
 # bot-DCO-compliant, single-parent commit with a valid signature.
 if ! jq --exit-status \
   --arg bot "${bot_login}" \
+  --arg bot_email "${bot_email}" \
   --arg dco "${message_body}" \
   --arg parent "${GITHUB_SHA}" \
-  ".author.login == \$bot
-    and .commit.verification.verified == true
-    and .commit.verification.reason == \"valid\"
-    and (.commit.message | endswith(\$dco))
+  ".author.name == \$bot
+    and .author.email == \$bot_email
+    and .verification.verified == true
+    and .verification.reason == \"valid\"
+    and (.message | endswith(\$dco))
     and (.parents | length == 1)
     and .parents[0].sha == \$parent" \
-  <<<"${commit}" >/dev/null; then
+  <<<"${commit_response}" >/dev/null; then
   echo "GitHub did not report the generated App commit as valid." >&2
   exit 1
 fi

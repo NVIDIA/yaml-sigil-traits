@@ -160,9 +160,9 @@ jobs:
           RELEASE_MARKER: ${{ steps.intent.outputs.marker }}
         run: bash .github/scripts/generate-release-proposal.sh
 
-      # GitHub's createCommitOnBranch mutation signs the commit. The helper
-      # derives the App bot identity for the matching DCO trailer, rejects
-      # foreign branch commits, and keeps the generated file set narrow.
+      # GitHub signs Git Database commits created with the App installation
+      # token. The helper derives the bot's DCO identity, rejects foreign
+      # branch commits, and keeps the generated file set narrow.
       - name: Create or update release pull request
         id: release-pr
         if: ${{ steps.published.outputs.available == 'true' }}
