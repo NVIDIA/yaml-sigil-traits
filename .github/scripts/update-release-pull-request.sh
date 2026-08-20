@@ -82,11 +82,11 @@ bot_email="${bot_id}+${bot_login}@users.noreply.github.com"
 
 # Never overwrite unique commits that were not authored by this App. Commits
 # already integrated into main are not unique and do not block a new train.
-target_ref=""
+target_exists=false
 # Inspect ownership only when the reusable release branch already exists.
-if target_ref="$(
-  gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${RELEASE_BRANCH}" 2>/dev/null
-)"; then
+if gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${RELEASE_BRANCH}" \
+  >/dev/null 2>&1; then
+  target_exists=true
   compare="$(
     gh api "repos/${GITHUB_REPOSITORY}/compare/main...${RELEASE_BRANCH}"
   )"
@@ -256,7 +256,7 @@ if ! jq --exit-status \
 fi
 
 # Update an owned branch atomically, or create it for the first release train.
-if [[ -n "${target_ref}" ]]; then
+if [[ "${target_exists}" == "true" ]]; then
   # Refuse to continue if GitHub cannot update the already App-owned branch.
   if ! gh api --method PATCH \
     "repos/${GITHUB_REPOSITORY}/git/refs/heads/${RELEASE_BRANCH}" \
