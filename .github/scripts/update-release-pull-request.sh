@@ -136,9 +136,23 @@ cleanup_staging() {
 }
 trap cleanup_staging EXIT
 
-gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
-  -f "ref=refs/heads/${staging_branch}" -f "sha=${GITHUB_SHA}" >/dev/null
+staging_ref=""
+# The REST response supplies the exact Ref node that GraphQL must commit to.
+if ! staging_ref="$(
+  gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+    -f "ref=refs/heads/${staging_branch}" -f "sha=${GITHUB_SHA}"
+)"; then
+  echo "GitHub did not create the App staging branch." >&2
+  exit 1
+fi
 staging_created=true
+staging_id="$(jq --raw-output '.node_id // empty' <<<"${staging_ref}")"
+# Refuse a name-based fallback because a newly created ref may not yet resolve
+# consistently across the REST and GraphQL APIs.
+if [[ -z "${staging_id}" ]]; then
+  echo "GitHub did not return the App staging Ref node ID." >&2
+  exit 1
+fi
 
 message_body="Signed-off-by: ${bot_login} <${bot_email}>"
 mutation="mutation(\$input: CreateCommitOnBranchInput!) {
@@ -147,8 +161,7 @@ mutation="mutation(\$input: CreateCommitOnBranchInput!) {
 payload="$(
   jq --null-input \
     --arg query "${mutation}" \
-    --arg repository "${GITHUB_REPOSITORY}" \
-    --arg branch "${staging_branch}" \
+    --arg staging_id "${staging_id}" \
     --arg expected "${GITHUB_SHA}" \
     --arg headline "${RELEASE_TITLE}" \
     --arg body "${message_body}" \
@@ -158,10 +171,7 @@ payload="$(
       query: $query,
       variables: {
         input: {
-          branch: {
-            repositoryNameWithOwner: $repository,
-            branchName: $branch
-          },
+          branch: {id: $staging_id},
           expectedHeadOid: $expected,
           message: {headline: $headline, body: $body},
           fileChanges: {additions: $additions, deletions: $deletions}
