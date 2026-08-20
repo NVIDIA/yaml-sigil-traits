@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0-rc.2](https://github.com/NVIDIA/yaml-sigil-traits/compare/v0.3.0-rc.1...v0.3.0-rc.2) - 2026-08-20
+
+### Added
+
+- *(release)* automate release candidates and snapshots
+
+### Fixed
+
+- *(release)* configure proposal registry index
+- *(release)* configure proposal dry-run forge
+- *(release)* attach proposal recheck branch
+- *(release)* distinguish absent proposal branch
+- *(release)* stage App-signed commit
+- *(release)* verify unreferenced App commit
+- *(release)* use App commit signing API
+- *(release)* bind signed commit to staging ref
+- *(release)* attach proposal source branch
+- *(release)* restore proposal and snapshot validation
+
+### Other
+
+- improve crate discovery and reader guidance
+- enable copied pull request testing
+
 ## [0.3.0-rc.1](https://github.com/NVIDIA/yaml-sigil-traits/releases/tag/v0.3.0-rc.1) - 2026-08-18
 
 ### Fixed
