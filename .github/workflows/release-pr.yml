@@ -183,6 +183,24 @@ jobs:
           persist-credentials: false
           ref: ${{ steps.release-pr.outputs.commit_sha }}
 
+      - name: Attach generated release branch
+        if: ${{ steps.published.outputs.available == 'true' }}
+        env:
+          RELEASE_BRANCH: release-plz-next
+          RELEASE_COMMIT: ${{ steps.release-pr.outputs.commit_sha }}
+        run: |
+          # release-plz needs an attached branch and upstream. Bind both local
+          # refs to the exact App commit already verified by the helper.
+          git update-ref "refs/remotes/origin/${RELEASE_BRANCH}" "${RELEASE_COMMIT}"
+          git switch --force-create "${RELEASE_BRANCH}" "${RELEASE_COMMIT}"
+          git branch --set-upstream-to="origin/${RELEASE_BRANCH}" "${RELEASE_BRANCH}"
+          # Branch attachment must preserve the exact generated commit twice.
+          if [[ "$(git rev-parse HEAD)" != "${RELEASE_COMMIT}" \
+            || "$(git rev-parse '@{upstream}')" != "${RELEASE_COMMIT}" ]]; then
+            echo "Attaching the release branch changed the generated commit." >&2
+            exit 1
+          fi
+
       - name: Recheck clean generated release source
         if: ${{ steps.published.outputs.available == 'true' }}
         env:
