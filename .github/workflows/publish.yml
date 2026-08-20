@@ -222,8 +222,20 @@ jobs:
       - name: Check out exact PR head
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0
           persist-credentials: false
           ref: ${{ needs.resolve_pr.outputs.sha }}
+
+      # release-plz requires an attached branch with an upstream. Preserve the
+      # resolver's immutable PR head while attaching it to trusted main.
+      - name: Attach exact PR head for release-plz
+        env:
+          PR_NUMBER: ${{ needs.resolve_pr.outputs.number }}
+          PR_SHA: ${{ needs.resolve_pr.outputs.sha }}
+        run: |
+          git switch --create "release-plz-pr-${PR_NUMBER}"
+          git branch --set-upstream-to=origin/main
+          test "$(git rev-parse HEAD)" = "${PR_SHA}"
 
       - name: Apply ephemeral snapshot version
         id: snapshot
@@ -306,8 +318,20 @@ jobs:
       - name: Check out exact PR head
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0
           persist-credentials: false
           ref: ${{ needs.resolve_pr.outputs.sha }}
+
+      # Keep the separately authorized publication on the exact rechecked SHA
+      # while satisfying release-plz's attached-upstream requirement.
+      - name: Attach exact PR head for release-plz
+        env:
+          PR_NUMBER: ${{ needs.resolve_pr.outputs.number }}
+          PR_SHA: ${{ needs.resolve_pr.outputs.sha }}
+        run: |
+          git switch --create "release-plz-pr-${PR_NUMBER}"
+          git branch --set-upstream-to=origin/main
+          test "$(git rev-parse HEAD)" = "${PR_SHA}"
 
       - name: Reapply exact ephemeral snapshot version
         env:
