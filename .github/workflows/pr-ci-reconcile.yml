@@ -1,0 +1,79 @@
+name: Protected PR check reconciliation
+
+on:
+  workflow_run:
+    workflows:
+      - Protected pull request CI
+    types:
+      - completed
+  schedule:
+    - cron: "17 9 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: protected-pr-check-reconciliation-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    name: Reconcile App checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: protected-automation
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Create least-privilege GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.YAML_SIGIL_RELEASE_PR_APP_CLIENT_ID }}
+          private-key: ${{ secrets.YAML_SIGIL_RELEASE_PR_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-checks: write
+          permission-contents: read
+
+      # Reconciliation is checkout-free and can only update checks created by
+      # the exact configured App using the current protected-main policy.
+      - name: Load protected check policy
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          POLICY_SHA: ${{ github.sha }}
+        run: |
+          install -d "${RUNNER_TEMP}/protected-pr-ci"
+          gh api \
+            "repos/${GITHUB_REPOSITORY}/contents/.github/scripts/protected_pr_ci.py?ref=${POLICY_SHA}" \
+            --jq .content | base64 --decode > "${RUNNER_TEMP}/protected-pr-ci/controller.py"
+          gh api \
+            "repos/${GITHUB_REPOSITORY}/contents/.github/protected-pr-ci.json?ref=${POLICY_SHA}" \
+            --jq .content | base64 --decode > "${RUNNER_TEMP}/protected-pr-ci/policy.json"
+          test -s "${RUNNER_TEMP}/protected-pr-ci/controller.py"
+          test -s "${RUNNER_TEMP}/protected-pr-ci/policy.json"
+          python3 -m py_compile "${RUNNER_TEMP}/protected-pr-ci/controller.py"
+
+      - name: Close check left by completed workflow
+        if: ${{ github.event_name == 'workflow_run' }}
+        env:
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python3 "${RUNNER_TEMP}/protected-pr-ci/controller.py" reconcile-run
+          --event "${GITHUB_EVENT_PATH}"
+          --config "${RUNNER_TEMP}/protected-pr-ci/policy.json"
+          --repository "${GITHUB_REPOSITORY}"
+
+      - name: Sweep orphaned checks
+        if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+        env:
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python3 "${RUNNER_TEMP}/protected-pr-ci/controller.py" sweep
+          --config "${RUNNER_TEMP}/protected-pr-ci/policy.json"
+          --repository "${GITHUB_REPOSITORY}"

@@ -1,0 +1,38 @@
+name: Protected pull request command
+run-name: PR #${{ github.event.issue.number }} test command
+
+on:
+  issue_comment:
+    types:
+      - created
+
+permissions: {}
+
+jobs:
+  dispatch:
+    name: Inspect test command
+    if: ${{ github.event.action == 'created' && github.event.issue.pull_request != null }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      contents: read
+      pull-requests: read
+    steps:
+      # The receiver executes only protected-main code. Non-command comments
+      # exit successfully without copying their bodies into workflow metadata.
+      - name: Check out protected policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Dispatch exact authorized command
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          POLICY_SHA: ${{ github.sha }}
+        run: >-
+          python3 .github/scripts/protected_pr_ci.py dispatch-comment
+          --event "${GITHUB_EVENT_PATH}"
+          --config .github/protected-pr-ci.json

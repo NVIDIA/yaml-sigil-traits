@@ -15,6 +15,13 @@ range="${BASE_SHA}..${HEAD_SHA}"
 git cat-file -e "${BASE_SHA}^{commit}"
 git cat-file -e "${HEAD_SHA}^{commit}"
 
+# Strict required checks apply to current main, so a candidate must contain the
+# exact base commit rather than relying on GitHub's eventual mergeability.
+if ! git merge-base --is-ancestor "${BASE_SHA}" "${HEAD_SHA}"; then
+  echo "::error::The pull request head is not based on the exact current main commit."
+  exit 1
+fi
+
 # Target-branch linear-history rules do not reject merge commits hidden inside
 # a pull request that is later squash-merged. Inspect parent counts directly.
 mapfile -t merge_commits < <(git rev-list --merges "${range}")
