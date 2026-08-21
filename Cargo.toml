@@ -19,6 +19,7 @@ publish = ["crates-io"]
 include = [
     "/src/**",
     "/CHANGELOG.md",
+    "/tests/**",
     "/README.md",
     "/LICENSE",
     "/SECURITY.md",
@@ -34,10 +35,4 @@ inherent_method_must_use_added = "warn"
 unsafe_code = "forbid"
 
 [dependencies]
-# NOTE(ddurst-nvidia): We really don't want this here.
 thiserror = "2.0"
-ed25519-dalek = { version = "2.1", default-features = false, features = [
-    "alloc",
-    "rand_core",
-] }
-p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }

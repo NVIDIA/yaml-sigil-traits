@@ -14,3 +14,4 @@ src/lib.rs
 src/signing.rs
 src/transcription.rs
 src/verification.rs
+tests/key_bindings.rs

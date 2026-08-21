@@ -93,10 +93,10 @@ pub struct SignSuccess {
 }
 
 /// Unified sign request (subset of IDL `SignRequest`: no private-key handle).
-pub struct SignRequest<'a> {
+pub struct SignRequest<'a, Ed25519: ?Sized, P256: ?Sized> {
     pub payload: &'a [u8],
     pub algorithm: AlgorithmId,
-    pub key: SigningKey<'a>,
+    pub key: SigningKey<'a, Ed25519, P256>,
     /// Optional unsigned lookup hint. When present, it contains 1..=1024 UTF-8
     /// octets without CR or LF.
     pub keyid: Option<&'a str>,
@@ -106,13 +106,20 @@ pub struct SignRequest<'a> {
 }
 
 /// Private key material for supported algorithms (never logged).
-#[derive(Clone, Copy)]
-pub enum SigningKey<'a> {
-    Ed25519(&'a ed25519_dalek::SigningKey),
-    EcdsaP256Sha256(&'a p256::ecdsa::SigningKey),
+pub enum SigningKey<'a, Ed25519: ?Sized, P256: ?Sized> {
+    Ed25519(&'a Ed25519),
+    EcdsaP256Sha256(&'a P256),
 }
 
-impl fmt::Debug for SigningKey<'_> {
+impl<Ed25519: ?Sized, P256: ?Sized> Clone for SigningKey<'_, Ed25519, P256> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<Ed25519: ?Sized, P256: ?Sized> Copy for SigningKey<'_, Ed25519, P256> {}
+
+impl<Ed25519: ?Sized, P256: ?Sized> fmt::Debug for SigningKey<'_, Ed25519, P256> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SigningKey::Ed25519(_) => f.write_str("SigningKey::Ed25519(***)"),
@@ -130,10 +137,18 @@ impl fmt::Debug for SigningKey<'_> {
 /// belong in the implementation crate's README,
 /// not in this trait's contract.
 pub trait Signer {
+    /// Concrete Ed25519 signing-key type accepted by this implementation.
+    type Ed25519SigningKey: ?Sized;
+    /// Concrete ECDSA P-256 signing-key type accepted by this implementation.
+    type P256SigningKey: ?Sized;
+
     /// Capability surface this signer advertises (IDL `SignerCapabilitiesResponse`).
     fn capabilities(&self) -> SignerCapabilities;
     /// Unified sign entry (IDL `Sign`).
-    fn sign(&self, req: &SignRequest<'_>) -> SignOutcome;
+    fn sign(
+        &self,
+        req: &SignRequest<'_, Self::Ed25519SigningKey, Self::P256SigningKey>,
+    ) -> SignOutcome;
 }
 
 /// Async sibling of [`Signer`]. Same method semantics; the only difference is
@@ -148,11 +163,16 @@ pub trait Signer {
 /// Downstream implementations MAY document the same contract narrowings
 /// the sync trait permits.
 pub trait AsyncSigner: Send + Sync {
+    /// Concrete Ed25519 signing-key type accepted by this implementation.
+    type Ed25519SigningKey: Sync + ?Sized;
+    /// Concrete ECDSA P-256 signing-key type accepted by this implementation.
+    type P256SigningKey: Sync + ?Sized;
+
     /// Capability surface this signer advertises (same shape as the sync trait).
     fn capabilities(&self) -> SignerCapabilities;
     /// Unified async sign entry.
     fn sign<'a>(
         &'a self,
-        req: &'a SignRequest<'_>,
+        req: &'a SignRequest<'_, Self::Ed25519SigningKey, Self::P256SigningKey>,
     ) -> impl core::future::Future<Output = SignOutcome> + Send + 'a;
 }

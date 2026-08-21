@@ -2,8 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Verification API: the `Verifier` / `AsyncVerifier` extension-trait pair and
-//! the request/response/error/capability DTOs their signatures reference, plus
-//! the key-resolution helpers their default method bodies delegate to.
+//! the request/response/error/capability DTOs their signatures reference.
 //!
 //! The verify free-function surface (`verify`, `pre_verify`, …) and the
 //! `DefaultVerifier` / `DefaultAsyncVerifier` ZSTs live in
@@ -140,68 +139,23 @@ pub enum InvocationError {
     InvalidOrUnsupportedForm,
 }
 
-/// Resolve raw Ed25519 public-key bytes into a typed [`ed25519_dalek::VerifyingKey`].
-///
-/// Mirrors the spec's "key resolution" stage — the byte-slice → typed-key step
-/// that produces [`InvocationError::KeyResolutionFailure`] when the caller-supplied
-/// material cannot be used. Rejected cases:
-///
-/// - any input whose length is not 32 octets;
-/// - non-canonical encodings (delegated to `ed25519_dalek::VerifyingKey::from_bytes`);
-/// - small-order points (delegated to `ed25519_dalek::VerifyingKey::is_weak`).
-///
-/// See `source-spec/conformance/alg-ed25519/configured-key-small-order.txt`.
-pub fn resolve_ed25519_verifying_key(
-    bytes: &[u8],
-) -> Result<ed25519_dalek::VerifyingKey, InvocationError> {
-    let arr: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| InvocationError::KeyResolutionFailure)?;
-    let vk = ed25519_dalek::VerifyingKey::from_bytes(&arr)
-        .map_err(|_| InvocationError::KeyResolutionFailure)?;
-    if vk.is_weak() {
-        return Err(InvocationError::KeyResolutionFailure);
-    }
-    Ok(vk)
-}
-
-/// Resolve raw P-256 public-key bytes encoded per *Standards for Efficient
-/// Cryptography 1 (SEC 1)* into a typed [`p256::ecdsa::VerifyingKey`].
-///
-/// Mirrors the spec's "key resolution" stage. Rejected cases:
-///
-/// - the SEC 1 §2.3.3 single-byte `0x00` identity encoding (the point at infinity);
-/// - the all-zero 65-octet "uncompressed identity" some callers emit;
-/// - any input that `p256::ecdsa::VerifyingKey::from_sec1_bytes` rejects
-///   (off-curve, wrong length, wrong curve, etc.).
-///
-/// The SEC 1 encoding rule is third-party standards material, not material
-/// relicensed under this file's Apache-2.0 declaration. See the repository
-/// `THIRD_PARTY_NOTICES.md` for the source notice and patent/IP caveat.
-///
-/// See `source-spec/conformance/alg-ecdsa/bad-key-*.txt`.
-pub fn resolve_p256_verifying_key(
-    bytes: &[u8],
-) -> Result<p256::ecdsa::VerifyingKey, InvocationError> {
-    if bytes == [0u8].as_slice() {
-        return Err(InvocationError::KeyResolutionFailure);
-    }
-    if bytes.len() == 65 && bytes.iter().all(|&b| b == 0) {
-        return Err(InvocationError::KeyResolutionFailure);
-    }
-    p256::ecdsa::VerifyingKey::from_sec1_bytes(bytes)
-        .map_err(|_| InvocationError::KeyResolutionFailure)
-}
-
 /// Caller-supplied verification keys, indexed by algorithm.
 ///
 /// Implementations own deployment-specific key selection and trust-policy behavior. An artifact's
 /// unsigned `keyid` is only a lookup hint.
-#[derive(Debug, Clone, Copy)]
-pub struct PublicKeys<'a> {
-    pub ed25519: Option<&'a ed25519_dalek::VerifyingKey>,
-    pub p256: Option<&'a p256::ecdsa::VerifyingKey>,
+#[derive(Debug)]
+pub struct PublicKeys<'a, Ed25519: ?Sized, P256: ?Sized> {
+    pub ed25519: Option<&'a Ed25519>,
+    pub p256: Option<&'a P256>,
 }
+
+impl<Ed25519: ?Sized, P256: ?Sized> Clone for PublicKeys<'_, Ed25519, P256> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<Ed25519: ?Sized, P256: ?Sized> Copy for PublicKeys<'_, Ed25519, P256> {}
 
 /// Optional knobs for algorithm support (defaults implement both wire algorithms).
 #[derive(Debug, Clone)]
@@ -299,6 +253,11 @@ impl TryFrom<i32> for ArtifactForm {
 /// narrowings belong in the implementation crate's README, not in this trait's
 /// contract.
 pub trait Verifier {
+    /// Concrete Ed25519 verifying-key type accepted by this implementation.
+    type Ed25519VerifyingKey: ?Sized;
+    /// Concrete ECDSA P-256 verifying-key type accepted by this implementation.
+    type P256VerifyingKey: ?Sized;
+
     /// Capability surface this verifier advertises.
     fn capabilities(&self) -> VerifierCapabilities;
     /// Structural + metadata pre-verify (IDL `PreVerify`).
@@ -320,7 +279,7 @@ pub trait Verifier {
         &self,
         input_bytes: &[u8],
         form: ArtifactForm,
-        keys: &PublicKeys<'_>,
+        keys: &PublicKeys<'_, Self::Ed25519VerifyingKey, Self::P256VerifyingKey>,
         options: VerifierOptions,
     ) -> Result<VerifierState, InvocationError>;
     /// Verify with optional parser observations.
@@ -328,7 +287,7 @@ pub trait Verifier {
         &self,
         input_bytes: &[u8],
         form: ArtifactForm,
-        keys: &PublicKeys<'_>,
+        keys: &PublicKeys<'_, Self::Ed25519VerifyingKey, Self::P256VerifyingKey>,
         options: VerifierOptions,
         include_parser_observations: bool,
     ) -> Result<VerifyResult, InvocationError>;
@@ -339,33 +298,9 @@ pub trait Verifier {
     fn verify_from_pre_verify(
         &self,
         pre: &PreVerifyResponse,
-        keys: &PublicKeys<'_>,
+        keys: &PublicKeys<'_, Self::Ed25519VerifyingKey, Self::P256VerifyingKey>,
         options: VerifierOptions,
     ) -> Result<VerifierState, InvocationError>;
-    /// Resolve raw Ed25519 public-key bytes into a typed key (key-resolution stage).
-    ///
-    /// Default impl delegates to the free function
-    /// [`resolve_ed25519_verifying_key`]. Downstream implementations MAY narrow
-    /// the contract (e.g. consult their own trust store and refuse arbitrary
-    /// caller-supplied bytes); record such narrowings in the implementation's
-    /// README and in `docs/conformance-validation.md` if they affect fixtures.
-    fn resolve_ed25519_verifying_key(
-        &self,
-        bytes: &[u8],
-    ) -> Result<ed25519_dalek::VerifyingKey, InvocationError> {
-        resolve_ed25519_verifying_key(bytes)
-    }
-    /// Resolve raw P-256 SEC 1 public-key bytes into a typed key (key-resolution stage).
-    ///
-    /// Default impl delegates to the free function
-    /// [`resolve_p256_verifying_key`]. Downstream implementations MAY narrow
-    /// the contract; see the Ed25519 doc above.
-    fn resolve_p256_verifying_key(
-        &self,
-        bytes: &[u8],
-    ) -> Result<p256::ecdsa::VerifyingKey, InvocationError> {
-        resolve_p256_verifying_key(bytes)
-    }
 }
 
 /// Async sibling of [`Verifier`]. Same method semantics; the verify and
@@ -376,11 +311,12 @@ pub trait Verifier {
 /// forward-compatible choice (no `async-trait` heap allocation) at the cost of
 /// not being object-safe — use generic bounds (`<V: AsyncVerifier>`), not
 /// `&dyn AsyncVerifier`. See this repository's `AGENTS.md`.
-///
-/// The `resolve_*_verifying_key` methods have default impls that wrap the
-/// synchronous resolvers in an `async` block; downstream verifiers that own
-/// async key-resolution paths can override them.
 pub trait AsyncVerifier: Send + Sync {
+    /// Concrete Ed25519 verifying-key type accepted by this implementation.
+    type Ed25519VerifyingKey: Sync + ?Sized;
+    /// Concrete ECDSA P-256 verifying-key type accepted by this implementation.
+    type P256VerifyingKey: Sync + ?Sized;
+
     /// Capability surface this verifier advertises.
     fn capabilities(&self) -> VerifierCapabilities;
     /// Structural + metadata pre-verify (IDL `PreVerify`).
@@ -402,7 +338,7 @@ pub trait AsyncVerifier: Send + Sync {
         &'a self,
         input_bytes: &'a [u8],
         form: ArtifactForm,
-        keys: &'a PublicKeys<'_>,
+        keys: &'a PublicKeys<'_, Self::Ed25519VerifyingKey, Self::P256VerifyingKey>,
         options: VerifierOptions,
     ) -> impl core::future::Future<Output = Result<VerifierState, InvocationError>> + Send + 'a;
     /// Verify with optional parser observations.
@@ -410,7 +346,7 @@ pub trait AsyncVerifier: Send + Sync {
         &'a self,
         input_bytes: &'a [u8],
         form: ArtifactForm,
-        keys: &'a PublicKeys<'_>,
+        keys: &'a PublicKeys<'_, Self::Ed25519VerifyingKey, Self::P256VerifyingKey>,
         options: VerifierOptions,
         include_parser_observations: bool,
     ) -> impl core::future::Future<Output = Result<VerifyResult, InvocationError>> + Send + 'a;
@@ -421,32 +357,7 @@ pub trait AsyncVerifier: Send + Sync {
     fn verify_from_pre_verify<'a>(
         &'a self,
         pre: &'a PreVerifyResponse,
-        keys: &'a PublicKeys<'_>,
+        keys: &'a PublicKeys<'_, Self::Ed25519VerifyingKey, Self::P256VerifyingKey>,
         options: VerifierOptions,
     ) -> impl core::future::Future<Output = Result<VerifierState, InvocationError>> + Send + 'a;
-    /// Resolve raw Ed25519 public-key bytes into a typed key.
-    ///
-    /// Default impl delegates to the synchronous free function
-    /// [`resolve_ed25519_verifying_key`]; downstream verifiers that own async
-    /// key-resolution paths MAY override.
-    fn resolve_ed25519_verifying_key<'a>(
-        &'a self,
-        bytes: &'a [u8],
-    ) -> impl core::future::Future<Output = Result<ed25519_dalek::VerifyingKey, InvocationError>>
-    + Send
-    + 'a {
-        async move { resolve_ed25519_verifying_key(bytes) }
-    }
-    /// Resolve raw P-256 SEC 1 public-key bytes into a typed key.
-    ///
-    /// Default impl delegates to the synchronous free function
-    /// [`resolve_p256_verifying_key`]; downstream verifiers that own async
-    /// key-resolution paths MAY override.
-    fn resolve_p256_verifying_key<'a>(
-        &'a self,
-        bytes: &'a [u8],
-    ) -> impl core::future::Future<Output = Result<p256::ecdsa::VerifyingKey, InvocationError>> + Send + 'a
-    {
-        async move { resolve_p256_verifying_key(bytes) }
-    }
 }

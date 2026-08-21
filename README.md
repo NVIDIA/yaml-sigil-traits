@@ -42,8 +42,8 @@ The modules group the contract by concern:
 - `transcription` defines compose and decompose request, response, error,
   capability, artifact, and form DTOs.
 - `verification` defines verification request support DTOs, verifier states,
-  pre-verification DTOs, invocation errors, public-key DTOs, options, and key
-  resolution helpers.
+  pre-verification DTOs, invocation errors, generic public-key DTOs, and
+  options.
 
 The crate does not provide default signing, transcription, or verification
 implementations. Implementation crates own free-function APIs such as `sign`,
@@ -57,7 +57,10 @@ Use the synchronous traits through generic bounds or trait objects.
 ```rust
 use yaml_sigil_traits::signing::{SignOutcome, SignRequest, Signer};
 
-pub fn sign_with<S: Signer>(signer: &S, request: &SignRequest<'_>) -> SignOutcome {
+pub fn sign_with<S: Signer>(
+    signer: &S,
+    request: &SignRequest<'_, S::Ed25519SigningKey, S::P256SigningKey>,
+) -> SignOutcome {
     signer.sign(request)
 }
 ```
@@ -76,7 +79,7 @@ pub async fn verify_with<V: AsyncVerifier>(
     verifier: &V,
     artifact: &[u8],
     form: ArtifactForm,
-    keys: &PublicKeys<'_>,
+    keys: &PublicKeys<'_, V::Ed25519VerifyingKey, V::P256VerifyingKey>,
 ) -> Result<VerifierState, InvocationError> {
     verifier
         .verify(artifact, form, keys, VerifierOptions::default())
@@ -86,8 +89,9 @@ pub async fn verify_with<V: AsyncVerifier>(
 
 `PublicKeys` carries caller-supplied verification keys indexed by algorithm.
 The artifact's unsigned `keyid` remains a deployment-specific lookup hint.
-Downstream implementations may narrow behavior, such as requiring a configured
-trust store. Document those narrowings in the implementation crate.
+Concrete implementation crates own key parsing and may narrow behavior, such
+as requiring a configured trust store. Document those narrowings in the
+implementation crate.
 
 ## Specification source
 
@@ -136,11 +140,10 @@ The manifest limits publication to the crates.io registry.
 ## Dependency boundary
 
 `yaml-sigil-traits` stays independent from the rest of the `yaml-sigil` Rust
-implementation. It may depend on crates needed to type public DTOs, including
-[`ed25519-dalek`](https://crates.io/crates/ed25519-dalek),
-[`p256`](https://crates.io/crates/p256), and
-[`thiserror`](https://crates.io/crates/thiserror), but we do seek to reduce
-those over time.
+implementation and from concrete cryptographic libraries. Signer and verifier
+implementations bind their key types through associated types. The generic
+`SigningKey`, `SignRequest`, and `PublicKeys` DTOs carry references to those
+implementation-selected types.
 
 ## Third-party material
 
