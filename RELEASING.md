@@ -180,9 +180,9 @@ differs from the tagged RC.
 ## Publish a tested pull-request snapshot
 
 A repository writer can publish the exact head of an open pull request that
-targets `main` after that head has a successful completed `CI` workflow run.
-Use the manual workflow form with `validate-pr` or `publish-pr` and the pull
-request number:
+targets `main` after its current `pull-request/<number>` copied branch matches
+that head and has a successful completed `push` run of `ci.yml`. Use the manual
+workflow form with `validate-pr` or `publish-pr` and the pull request number:
 
 ```shell
 gh workflow run publish.yml --ref main \
@@ -191,8 +191,10 @@ gh workflow run publish.yml --ref main \
   -f operation=publish-pr -f pr_number=123
 ```
 
-The workflow rechecks the caller's repository permission, pull-request state,
-exact head SHA, and exact-head CI immediately before publication. Trusted
+The workflow does not accept an older `pull_request` run or a
+`workflow_dispatch` run as copied-head evidence. It rechecks the caller's
+repository permission, pull-request state, exact head SHA, current copied
+branch, and copied-head `push` CI immediately before publication. Trusted
 tooling from `main` applies this ephemeral version:
 
 ```text

@@ -55,17 +55,9 @@ if [[ "${state}" != "open" || "${base}" != "main" ]]; then
   exit 1
 fi
 
-runs="$(
-  gh api \
-    "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${sha}&event=pull_request&status=completed&per_page=100"
-)"
-# Bind authorization to a successful completed run for the immutable head SHA.
-if ! jq --exit-status --arg sha "${sha}" \
-  'any(.workflow_runs[]; .head_sha == $sha and .conclusion == "success")' \
-  <<<"${runs}" >/dev/null; then
-  echo "PR ${PR_NUMBER} head ${sha} has no successful completed CI run." >&2
-  exit 1
-fi
+# Bind authorization to the current copied ref and its successful push CI.
+script_dir="$(dirname -- "${BASH_SOURCE[0]}")"
+PR_SHA="${sha}" bash "${script_dir}/require-tested-copied-head.sh"
 
 echo "number=${PR_NUMBER}" >>"${GITHUB_OUTPUT}"
 echo "sha=${sha}" >>"${GITHUB_OUTPUT}"

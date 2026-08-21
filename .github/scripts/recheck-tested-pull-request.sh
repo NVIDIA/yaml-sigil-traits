@@ -43,10 +43,6 @@ if [[ "$(jq --raw-output .state <<<"${pr}")" != "open" \
   exit 1
 fi
 
-runs="$(
-  gh api \
-    "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${PR_SHA}&event=pull_request&status=completed&per_page=100"
-)"
-jq --exit-status --arg sha "${PR_SHA}" \
-  'any(.workflow_runs[]; .head_sha == $sha and .conclusion == "success")' \
-  <<<"${runs}" >/dev/null
+# Repeat the copied-ref and push-CI proof immediately before publication.
+script_dir="$(dirname -- "${BASH_SOURCE[0]}")"
+bash "${script_dir}/require-tested-copied-head.sh"

@@ -305,6 +305,8 @@ jobs:
             "${RUNNER_TEMP}/check-release-packages.sh"
           cp .github/scripts/recheck-tested-pull-request.sh \
             "${RUNNER_TEMP}/recheck-tested-pull-request.sh"
+          cp .github/scripts/require-tested-copied-head.sh \
+            "${RUNNER_TEMP}/require-tested-copied-head.sh"
           cp .github/scripts/verify-crates-io-packages.sh \
             "${RUNNER_TEMP}/verify-crates-io-packages.sh"
 
