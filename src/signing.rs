@@ -23,7 +23,7 @@ pub enum OutputForm {
     Protobuf,
 }
 
-/// Typed capability surface (IDL `SignerCapabilitiesResponse`), in-process only.
+/// Typed capability surface corresponding to the IDL `SignerCapabilitiesResponse`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignerCapabilities {
     pub protobuf_wire_decode: ProtobufWireDecodeAdvertisement,
