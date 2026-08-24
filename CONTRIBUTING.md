@@ -1,8 +1,8 @@
 # Contributing to yaml-sigil-traits
 
 `yaml-sigil-traits` is developed agent-first. Use agents to explore the trait
-and DTO contract, compare it to the pinned specification, and draft changes,
-then review the result as the responsible author before submitting it.
+and DTO contract, compare it to the pinned specification, and draft focused
+changes, then review the result as the responsible author before submitting it.
 
 ## The Critical Rule
 
