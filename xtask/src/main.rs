@@ -6,6 +6,7 @@
 
 mod ci;
 mod package_content;
+mod release;
 mod release_version;
 
 use std::env;
@@ -45,6 +46,13 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        "release" => match release::run(&workspace_root(), &remaining) {
+            Ok(outcome) => ExitCode::from(release_exit_code(outcome)),
+            Err(error) => {
+                eprintln!("release failed: {error}");
+                ExitCode::FAILURE
+            }
+        },
         "" | "help" | "--help" | "-h" => {
             print_usage();
             ExitCode::SUCCESS
@@ -63,6 +71,13 @@ fn main() -> ExitCode {
             print_usage();
             ExitCode::FAILURE
         }
+    }
+}
+
+fn release_exit_code(outcome: release::Outcome) -> u8 {
+    match outcome {
+        release::Outcome::Success => 0,
+        release::Outcome::RegistryUnavailable => 3,
     }
 }
 
@@ -104,10 +119,11 @@ fn is_help_request(args: &[String]) -> bool {
 fn print_usage() {
     eprintln!(
         "usage:\n  cargo xtask ci [--candidate-root PATH]\n  cargo xtask package-content\n  \
-         cargo xtask release-version <COMMAND>\n\n\
+         cargo xtask release <COMMAND>\n  cargo xtask release-version <COMMAND>\n\n\
          commands:\n  ci               Run the complete non-release validation sequence.\n  \
                             --candidate-root validates another checkout.\n  \
          package-content  Compare Cargo's source list with the committed inventory.\n  \
+         release          Run provider-neutral release preparation and verification.\n  \
          release-version  Manage provider-neutral release version transactions."
     );
 }
@@ -125,5 +141,11 @@ mod tests {
         );
         assert!(parse_ci_root(&["--candidate-root".to_string()]).is_err());
         assert!(parse_ci_root(&["--unknown".to_string(), "value".to_string()]).is_err());
+    }
+
+    #[test]
+    fn registry_unavailable_retains_the_ordered_wait_status() {
+        assert_eq!(release_exit_code(release::Outcome::Success), 0);
+        assert_eq!(release_exit_code(release::Outcome::RegistryUnavailable), 3);
     }
 }

@@ -15,6 +15,7 @@ import unittest
 
 
 MODULE_PATH = pathlib.Path(__file__).with_name("protected_pr_ci.py")
+POLICY_PATH = MODULE_PATH.parent.parent / "protected-pr-ci.json"
 SPEC = importlib.util.spec_from_file_location("protected_pr_ci", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None
 controller = importlib.util.module_from_spec(SPEC)
@@ -27,7 +28,13 @@ MAIN_SHA = "a" * 40
 HEAD_SHA = "b" * 40
 OLD_SHA = "c" * 40
 BOT = "nvidia-yamlsigil-release-pr[bot]"
+BOT_ID = 318780254
+BOT_EMAIL = "318780254+nvidia-yamlsigil-release-pr[bot]@users.noreply.github.com"
 APP_SLUG = "nvidia-yamlsigil-release-pr"
+WEB_FLOW = "web-flow"
+WEB_FLOW_ID = 19864447
+GITHUB_COMMITTER_NAME = "GitHub"
+GITHUB_COMMITTER_EMAIL = "noreply@github.com"
 MAINTAINER = "maintainer"
 
 
@@ -40,8 +47,15 @@ def policy() -> dict:
         "release_app": {
             "enabled": True,
             "login": BOT,
+            "bot_user_id": BOT_ID,
             "slug": APP_SLUG,
             "head_ref": "release-plz-next",
+            "commit_author_name": BOT,
+            "commit_author_email": BOT_EMAIL,
+            "commit_committer_login": WEB_FLOW,
+            "commit_committer_user_id": WEB_FLOW_ID,
+            "commit_committer_name": GITHUB_COMMITTER_NAME,
+            "commit_committer_email": GITHUB_COMMITTER_EMAIL,
             "allowed_paths": ["Cargo.toml", "CHANGELOG.md"],
         },
         "expected_jobs": ["commit_policy", "workflow_lint"],
@@ -100,6 +114,8 @@ def git_commit(
     parent: str = MAIN_SHA,
     author_login: str = MAINTAINER,
     committer_login: str = MAINTAINER,
+    author_id: int = 1,
+    committer_id: int = 1,
     author_name: str = "Maintainer",
     author_email: str = "maintainer@example.invalid",
     committer_name: str = "Maintainer",
@@ -119,8 +135,8 @@ def git_commit(
     return {
         "sha": sha,
         "parents": [{"sha": parent}],
-        "author": {"login": author_login},
-        "committer": {"login": committer_login},
+        "author": {"login": author_login, "id": author_id},
+        "committer": {"login": committer_login, "id": committer_id},
         "commit": {
             "author": {"name": author_name, "email": author_email},
             "committer": {"name": committer_name, "email": committer_email},
@@ -196,6 +212,9 @@ class FakeAuthorizationApi:
 
 
 class AuthorizationTests(unittest.TestCase):
+    def test_repository_policy_configuration_is_valid(self) -> None:
+        controller.load_config(str(POLICY_PATH))
+
     def test_writer_permissions_are_accepted(self) -> None:
         for permission in ("write", "push", "maintain", "admin"):
             with self.subTest(permission=permission):
@@ -323,20 +342,22 @@ class AuthorizationTests(unittest.TestCase):
     def test_exact_release_app_author_and_committer_are_accepted(self) -> None:
         api = FakeAuthorizationApi()
         api.files = [{"filename": "Cargo.toml", "status": "modified"}]
-        api.pull["user"]["login"] = BOT
+        api.pull["user"] = {"login": BOT, "id": BOT_ID}
         api.pull["head"]["repo"]["full_name"] = REPOSITORY
         api.pull["head"]["ref"] = "release-plz-next"
         api.details[HEAD_SHA] = git_commit(
             author_login=BOT,
-            committer_login=BOT,
+            author_id=BOT_ID,
+            committer_login=WEB_FLOW,
+            committer_id=WEB_FLOW_ID,
             author_name=BOT,
-            author_email="318780254+nvidia-yamlsigil-release-pr[bot]@users.noreply.github.com",
-            committer_name=BOT,
-            committer_email="318780254+nvidia-yamlsigil-release-pr[bot]@users.noreply.github.com",
+            author_email=BOT_EMAIL,
+            committer_name=GITHUB_COMMITTER_NAME,
+            committer_email=GITHUB_COMMITTER_EMAIL,
             message=(
                 "chore(release): prepare candidate\n\n"
                 "Signed-off-by: nvidia-yamlsigil-release-pr[bot] "
-                "<318780254+nvidia-yamlsigil-release-pr[bot]@users.noreply.github.com>\n"
+                f"<{BOT_EMAIL}>\n"
             ),
         )
         result = controller.authorize(event(), policy(), api, environment())
@@ -346,41 +367,123 @@ class AuthorizationTests(unittest.TestCase):
         with self.assertRaisesRegex(controller.PolicyError, "only modify existing"):
             controller.authorize(event(), policy(), api, environment())
 
-    def test_release_app_commit_rejects_non_app_committer(self) -> None:
-        for committer_login in ("web-flow", MAINTAINER):
-            with self.subTest(committer_login=committer_login):
-                api = FakeAuthorizationApi()
-                api.files = [{"filename": "Cargo.toml", "status": "modified"}]
-                api.pull["user"]["login"] = BOT
-                api.pull["head"]["repo"]["full_name"] = REPOSITORY
-                api.pull["head"]["ref"] = "release-plz-next"
-                api.details[HEAD_SHA] = git_commit(
-                    author_login=BOT,
-                    committer_login=committer_login,
-                    author_name=BOT,
-                    author_email="318780254+nvidia-yamlsigil-release-pr[bot]@users.noreply.github.com",
-                )
-                with self.assertRaisesRegex(controller.PolicyError, "committer is unexpected"):
+    def release_app_api(self) -> FakeAuthorizationApi:
+        api = FakeAuthorizationApi()
+        api.files = [{"filename": "Cargo.toml", "status": "modified"}]
+        api.pull["user"] = {"login": BOT, "id": BOT_ID}
+        api.pull["head"]["repo"]["full_name"] = REPOSITORY
+        api.pull["head"]["ref"] = "release-plz-next"
+        api.details[HEAD_SHA] = git_commit(
+            author_login=BOT,
+            author_id=BOT_ID,
+            committer_login=WEB_FLOW,
+            committer_id=WEB_FLOW_ID,
+            author_name=BOT,
+            author_email=BOT_EMAIL,
+            committer_name=GITHUB_COMMITTER_NAME,
+            committer_email=GITHUB_COMMITTER_EMAIL,
+            message=(
+                "chore(release): prepare candidate\n\n"
+                "Signed-off-by: nvidia-yamlsigil-release-pr[bot] "
+                f"<{BOT_EMAIL}>\n"
+            ),
+        )
+        return api
+
+    def test_release_app_rejects_wrong_bot_id_and_raw_author(self) -> None:
+        api = self.release_app_api()
+        api.pull["user"]["id"] += 1
+        with self.assertRaisesRegex(controller.PolicyError, "pull request author ID"):
+            controller.authorize(event(), policy(), api, environment())
+
+        api = self.release_app_api()
+        api.details[HEAD_SHA]["author"]["id"] += 1
+        with self.assertRaisesRegex(controller.PolicyError, "author ID"):
+            controller.authorize(event(), policy(), api, environment())
+
+        for field in ("name", "email"):
+            with self.subTest(field=field):
+                api = self.release_app_api()
+                api.details[HEAD_SHA]["commit"]["author"][field] = "lookalike"
+                with self.assertRaisesRegex(controller.PolicyError, f"author {field}"):
                     controller.authorize(event(), policy(), api, environment())
+
+    def test_release_app_rejects_bot_raw_committer(self) -> None:
+        api = self.release_app_api()
+        api.details[HEAD_SHA]["commit"]["committer"] = {
+            "name": BOT,
+            "email": BOT_EMAIL,
+        }
+        with self.assertRaisesRegex(controller.PolicyError, "raw commit committer name"):
+            controller.authorize(event(), policy(), api, environment())
+
+    def test_release_app_rejects_human_rest_committer(self) -> None:
+        api = self.release_app_api()
+        api.details[HEAD_SHA]["committer"]["login"] = MAINTAINER
+        with self.assertRaisesRegex(controller.PolicyError, "committer is unexpected"):
+            controller.authorize(event(), policy(), api, environment())
+
+    def test_release_app_rejects_wrong_web_flow_user_id(self) -> None:
+        api = self.release_app_api()
+        api.details[HEAD_SHA]["committer"]["id"] += 1
+        with self.assertRaisesRegex(controller.PolicyError, "committer ID"):
+            controller.authorize(event(), policy(), api, environment())
+
+    def test_release_app_rejects_wrong_web_flow_and_raw_github_identity(self) -> None:
+        api = self.release_app_api()
+        api.details[HEAD_SHA]["committer"]["login"] = "web-flow-lookalike"
+        with self.assertRaisesRegex(controller.PolicyError, "committer is unexpected"):
+            controller.authorize(event(), policy(), api, environment())
+
+        for field in ("name", "email"):
+            with self.subTest(field=field):
+                api = self.release_app_api()
+                api.details[HEAD_SHA]["commit"]["committer"][field] = "lookalike"
+                with self.assertRaisesRegex(controller.PolicyError, f"committer {field}"):
+                    controller.authorize(event(), policy(), api, environment())
+
+    def test_release_app_rejects_invalid_signature(self) -> None:
+        api = self.release_app_api()
+        api.details[HEAD_SHA]["commit"]["verification"] = {
+            "verified": False,
+            "reason": "invalid",
+        }
+        with self.assertRaisesRegex(controller.PolicyError, "not GitHub Verified"):
+            controller.authorize(event(), policy(), api, environment())
+
+    def test_release_app_requires_one_parent_and_author_dco(self) -> None:
+        api = self.release_app_api()
+        api.details[HEAD_SHA]["parents"].append({"sha": OLD_SHA})
+        with self.assertRaisesRegex(controller.PolicyError, "exactly one parent"):
+            controller.authorize(event(), policy(), api, environment())
+
+        api = self.release_app_api()
+        api.details[HEAD_SHA]["commit"]["message"] = (
+            "chore(release): prepare candidate\n"
+        )
+        with self.assertRaisesRegex(controller.PolicyError, "author's DCO sign-off"):
+            controller.authorize(event(), policy(), api, environment())
 
     def test_release_app_identity_parent_and_allowlist_are_exact(self) -> None:
         base_api = FakeAuthorizationApi()
         base_api.files = [{"filename": "Cargo.toml", "status": "modified"}]
-        base_api.pull["user"]["login"] = BOT
+        base_api.pull["user"] = {"login": BOT, "id": BOT_ID}
         base_api.pull["head"]["repo"]["full_name"] = REPOSITORY
         base_api.pull["head"]["ref"] = "release-plz-next"
         base_api.details[HEAD_SHA] = git_commit(
             parent=OLD_SHA,
             author_login=BOT,
-            committer_login=BOT,
+            author_id=BOT_ID,
+            committer_login=WEB_FLOW,
+            committer_id=WEB_FLOW_ID,
             author_name=BOT,
-            author_email="318780254+nvidia-yamlsigil-release-pr[bot]@users.noreply.github.com",
-            committer_name=BOT,
-            committer_email="318780254+nvidia-yamlsigil-release-pr[bot]@users.noreply.github.com",
+            author_email=BOT_EMAIL,
+            committer_name=GITHUB_COMMITTER_NAME,
+            committer_email=GITHUB_COMMITTER_EMAIL,
             message=(
                 "chore(release): prepare candidate\n\n"
                 "Signed-off-by: nvidia-yamlsigil-release-pr[bot] "
-                "<318780254+nvidia-yamlsigil-release-pr[bot]@users.noreply.github.com>\n"
+                f"<{BOT_EMAIL}>\n"
             ),
         )
         with self.assertRaisesRegex(controller.PolicyError, "current main"):
