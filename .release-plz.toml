@@ -10,6 +10,8 @@ git_release_type = "auto"
 publish_allow_dirty = false
 publish_no_verify = false
 publish_timeout = "5m"
+# The workflow runs the exact analyzer directly and fails on every error.
+semver_check = false
 
 [[package]]
 name = "yaml-sigil-traits"
@@ -20,5 +22,8 @@ publish = true
 changelog_update = true
 changelog_path = "CHANGELOG.md"
 git_tag_enable = true
+git_tag_name = "v{{ version }}"
 git_release_enable = true
+git_release_name = "v{{ version }}"
+git_release_body = "{{ changelog }}"
 git_release_type = "auto"

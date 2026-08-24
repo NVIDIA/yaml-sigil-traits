@@ -20,10 +20,9 @@ on:
       bump:
         description: Override an otherwise non-discoverable version-line change.
         required: true
-        default: auto
+        default: patch
         type: choice
         options:
-          - auto
           - patch
           - minor
           - major
@@ -52,6 +51,7 @@ jobs:
     if: ${{ vars.YAML_SIGIL_RELEASE_PR_APP_CLIENT_ID != '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    environment: protected-automation
     permissions:
       contents: read
       pull-requests: read
@@ -78,14 +78,15 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           cache: false
+          toolchain: 1.95.0
 
-      # This section would benefit by a change to the action allowlist
-      - name: Install release-plz
-        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2.83.2
+      - name: Install exact cargo-binstall
+        uses: cargo-bins/cargo-binstall@732870f031d2fb36309d0deaf36abcc704a7be65 # v1.20.1
         with:
-          checksum: true
-          fallback: cargo-binstall
-          tool: release-plz@0.3.160
+          version: 1.20.1
+
+      - name: Install and verify release analyzers
+        run: cargo xtask release install-tools
 
       - name: Require the expected repository and current main
         run: |
@@ -124,7 +125,7 @@ jobs:
           echo "version=${version}" >>"${GITHUB_OUTPUT}"
           # Exit 3 means the integrated version is awaiting publication. That
           # is an ordered wait state, while any other error must fail the run.
-          if bash .github/scripts/verify-crates-io-packages.sh \
+          if cargo xtask release verify-registry \
             --check-version "${version}" yaml-sigil-traits; then
             echo "available=true" >>"${GITHUB_OUTPUT}"
           else
@@ -137,28 +138,61 @@ jobs:
             echo "${version} is not yet published; no later proposal is created."
           fi
 
-      # A manually selected override is retained in the release PR body. Push
-      # and post-publication events preserve it; a manual `auto` clears it.
+      # The concrete reviewed intent is retained in every next-candidate PR.
       - name: Resolve release mode and bump intent
         id: intent
         if: ${{ steps.published.outputs.available == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           MANUAL_DISPATCH: ${{ github.event_name == 'workflow_dispatch' }}
-          REQUESTED_BUMP: ${{ inputs.bump || 'auto' }}
+          REQUESTED_BUMP: ${{ inputs.bump || 'patch' }}
           REQUESTED_MODE: ${{ inputs.mode || 'next-candidate' }}
         run: bash .github/scripts/resolve-release-intent.sh
+
+      - name: Prepare the official tagged baseline
+        id: baseline
+        if: ${{ steps.published.outputs.available == 'true' }}
+        env:
+          GIT_CONFIG_COUNT: 1
+          GIT_CONFIG_KEY_0: remote.origin.pushurl
+          GIT_CONFIG_VALUE_0: disabled://yaml-sigil-release-proposal
+        run: |
+          python3 .github/scripts/prepare_release_baseline.py \
+            --repository "${GITHUB_REPOSITORY}" \
+            --version "${{ steps.published.outputs.version }}" \
+            --head "${GITHUB_SHA}" \
+            --output "${RUNNER_TEMP}/official-release-baseline" \
+            --expected-fetch-url "https://github.com/${GITHUB_REPOSITORY}"
 
       - name: Generate and validate release transaction
         id: generate
         if: ${{ steps.published.outputs.available == 'true' }}
         env:
           EFFECTIVE_BUMP: ${{ steps.intent.outputs.bump }}
-          GITHUB_TOKEN: ${{ github.token }}
+          GIT_TOKEN: ${{ github.token }}
           MODE: ${{ steps.intent.outputs.mode }}
           PUBLISHED_VERSION: ${{ steps.published.outputs.version }}
+          REGISTRY_MANIFEST_PATH: ${{ steps.baseline.outputs.manifest }}
           RELEASE_MARKER: ${{ steps.intent.outputs.marker }}
+          GIT_CONFIG_COUNT: 1
+          GIT_CONFIG_KEY_0: remote.origin.pushurl
+          GIT_CONFIG_VALUE_0: disabled://yaml-sigil-release-proposal
         run: bash .github/scripts/generate-release-proposal.sh
+
+      # Proposal analysis cannot authorize a later tag or main state. Recheck
+      # the complete persisted authority immediately before the App writes.
+      - name: Recheck official tags and current main before mutation
+        if: ${{ steps.published.outputs.available == 'true' }}
+        env:
+          GIT_CONFIG_COUNT: 1
+          GIT_CONFIG_KEY_0: remote.origin.pushurl
+          GIT_CONFIG_VALUE_0: disabled://yaml-sigil-release-proposal
+        run: |
+          python3 .github/scripts/prepare_release_baseline.py \
+            --repository "${GITHUB_REPOSITORY}" \
+            --head "${GITHUB_SHA}" \
+            --verify-inventory "${{ steps.baseline.outputs.inventory }}" \
+            --expected-fetch-url "https://github.com/${GITHUB_REPOSITORY}"
 
       # GitHub signs Git Database commits created with the App installation
       # token. The helper derives the bot's DCO identity, rejects foreign

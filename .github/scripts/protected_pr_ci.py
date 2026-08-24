@@ -139,12 +139,51 @@ def load_config(path: str) -> Mapping[str, Any]:
     require(config["required_check"] == CHECK_NAME, f"required_check must be {CHECK_NAME!r}")
 
     release_app = require_mapping(config["release_app"], "release_app")
-    app_keys = {"enabled", "login", "slug", "head_ref", "allowed_paths"}
+    app_keys = {
+        "enabled",
+        "login",
+        "bot_user_id",
+        "slug",
+        "head_ref",
+        "commit_author_name",
+        "commit_author_email",
+        "commit_committer_login",
+        "commit_committer_user_id",
+        "commit_committer_name",
+        "commit_committer_email",
+        "allowed_paths",
+    }
     require(set(release_app) == app_keys, "release_app keys are incomplete or ambiguous")
     require(isinstance(release_app["enabled"], bool), "release_app.enabled must be boolean")
     validate_login(release_app["login"], "release_app.login")
+    require(
+        require_integer(release_app["bot_user_id"], "release_app.bot_user_id") > 0,
+        "release_app.bot_user_id must be positive",
+    )
     validate_login(release_app["slug"], "release_app.slug")
     require_string(release_app["head_ref"], "release_app.head_ref")
+    require_string(release_app["commit_author_name"], "release_app.commit_author_name")
+    require_string(release_app["commit_author_email"], "release_app.commit_author_email")
+    validate_login(
+        release_app["commit_committer_login"],
+        "release_app.commit_committer_login",
+    )
+    require(
+        require_integer(
+            release_app["commit_committer_user_id"],
+            "release_app.commit_committer_user_id",
+        )
+        > 0,
+        "release_app.commit_committer_user_id must be positive",
+    )
+    require_string(
+        release_app["commit_committer_name"],
+        "release_app.commit_committer_name",
+    )
+    require_string(
+        release_app["commit_committer_email"],
+        "release_app.commit_committer_email",
+    )
     allowed_paths = require_sequence(release_app["allowed_paths"], "release_app.allowed_paths")
     require(
         len(set(allowed_paths)) == len(allowed_paths),
@@ -423,6 +462,10 @@ def require_release_app_change(
     require(release_app.get("enabled") is True, "release App exception is disabled")
     user = require_mapping(pull.get("user"), "pull request author")
     require(user.get("login") == release_app.get("login"), "pull request is not owned by the release App")
+    require(
+        user.get("id") == release_app.get("bot_user_id"),
+        "pull request author ID does not match the release App",
+    )
     head = require_mapping(pull.get("head"), "pull request head")
     head_repo = require_mapping(head.get("repo"), "pull request head repository")
     require(head_repo.get("full_name") == repository, "release App head must be in this repository")
@@ -443,10 +486,39 @@ def require_release_app_change(
     require(parent.get("sha") == main_sha, "release App commit parent is not current main")
     author = require_mapping(commit.get("author"), "release App commit author")
     require(author.get("login") == release_app.get("login"), "release App commit author is unexpected")
+    require(
+        author.get("id") == release_app.get("bot_user_id"),
+        "release App commit author ID is unexpected",
+    )
     committer = require_mapping(commit.get("committer"), "release App commit committer")
     require(
-        committer.get("login") == release_app.get("login"),
+        committer.get("login") == release_app.get("commit_committer_login"),
         "release App commit committer is unexpected",
+    )
+    require(
+        committer.get("id") == release_app.get("commit_committer_user_id"),
+        "release App commit committer ID is unexpected",
+    )
+    details = require_mapping(commit.get("commit"), "release App commit details")
+    raw_author = require_mapping(details.get("author"), "release App raw commit author")
+    require(
+        raw_author.get("name") == release_app.get("commit_author_name"),
+        "release App raw commit author name is unexpected",
+    )
+    require(
+        raw_author.get("email") == release_app.get("commit_author_email"),
+        "release App raw commit author email is unexpected",
+    )
+    raw_committer = require_mapping(
+        details.get("committer"), "release App raw commit committer"
+    )
+    require(
+        raw_committer.get("name") == release_app.get("commit_committer_name"),
+        "release App raw commit committer name is unexpected",
+    )
+    require(
+        raw_committer.get("email") == release_app.get("commit_committer_email"),
+        "release App raw commit committer email is unexpected",
     )
     require_verified(commit, "release App commit")
     require_dco(commit, require_committer=False, label="release App commit")

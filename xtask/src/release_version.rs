@@ -3,10 +3,15 @@
 
 //! Provider-neutral release version transactions.
 
+use std::env;
+use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use semver::{Prerelease, Version};
+
+use crate::release::{SEMVER_CHECKS_VERSION, exact_output_line};
 
 const CHANGELOG: &str = "CHANGELOG.md";
 
@@ -25,18 +30,43 @@ pub fn run(root: &Path, args: &[String]) -> Result<(), String> {
             eprintln!("release-version: manifest version is {version}");
             Ok(())
         }
-        "snapshot" => {
-            let pr = required_value(args, "--pr")?
-                .parse::<u64>()
-                .map_err(|_| "--pr must be a positive pull-request number".to_string())?;
-            if pr == 0 {
-                return Err("--pr must be a positive pull-request number".to_string());
-            }
-            let sha = required_value(args, "--sha")?;
-            ensure_only_flags(args, &["--pr", "--sha"])?;
-            let version = snapshot_version(&read_version(root)?, pr, sha)?;
-            write_version(root, &version)?;
-            println!("{version}");
+        "check-compatibility" => {
+            let baseline_manifest = PathBuf::from(required_value(args, "--baseline-manifest")?);
+            let current_manifest = PathBuf::from(required_value(args, "--current-manifest")?);
+            let package = required_value(args, "--package")?;
+            let expected_baseline =
+                Version::parse(required_value(args, "--expected-baseline-version")?)
+                    .map_err(|error| format!("invalid --expected-baseline-version: {error}"))?;
+            let expected_current =
+                Version::parse(required_value(args, "--expected-current-version")?)
+                    .map_err(|error| format!("invalid --expected-current-version: {error}"))?;
+            let expected_intent = required_value(args, "--intent")?;
+            ensure_only_flags(
+                args,
+                &[
+                    "--baseline-manifest",
+                    "--current-manifest",
+                    "--package",
+                    "--expected-baseline-version",
+                    "--expected-current-version",
+                    "--intent",
+                ],
+            )?;
+            check_api_compatibility(
+                root,
+                &baseline_manifest,
+                &current_manifest,
+                package,
+                &expected_baseline,
+                &expected_current,
+                expected_intent,
+            )
+        }
+        "intent" => {
+            let published = Version::parse(required_value(args, "--published")?)
+                .map_err(|error| format!("invalid --published version: {error}"))?;
+            ensure_only_flags(args, &["--published"])?;
+            println!("{}", release_intent(&published, &read_version(root)?)?);
             Ok(())
         }
         "candidate" => {
@@ -86,17 +116,27 @@ pub(crate) fn check(root: &Path) -> Result<(), String> {
 
 fn usage() -> String {
     "usage: cargo xtask release-version \
-     <show|check|snapshot --pr N --sha SHA|candidate --published VERSION \
-     --bump auto|patch|minor|major --date YYYY-MM-DD [--release-notes]|\
+     <show|check|check-compatibility --baseline-manifest PATH \
+     --current-manifest PATH --package NAME --expected-baseline-version VERSION \
+     --expected-current-version VERSION --intent patch|minor|major|\
+     intent --published VERSION|candidate --published VERSION \
+     --bump patch|minor|major --date YYYY-MM-DD [--release-notes]|\
      promote-stable --date YYYY-MM-DD>"
         .to_string()
 }
 
 fn required_value<'a>(args: &'a [String], flag: &str) -> Result<&'a str, String> {
-    let index = args
+    let indexes: Vec<_> = args
         .iter()
-        .position(|arg| arg == flag)
-        .ok_or_else(|| format!("missing {flag}"))?;
+        .enumerate()
+        .filter(|(_, arg)| arg.as_str() == flag)
+        .map(|(index, _)| index)
+        .collect();
+    let index = match indexes.as_slice() {
+        [] => return Err(format!("missing {flag}")),
+        [index] => *index,
+        _ => return Err(format!("duplicate {flag}")),
+    };
     args.get(index + 1)
         .map(String::as_str)
         .filter(|value| !value.starts_with("--"))
@@ -104,12 +144,17 @@ fn required_value<'a>(args: &'a [String], flag: &str) -> Result<&'a str, String>
 }
 
 fn ensure_only_flags(args: &[String], flags: &[&str]) -> Result<(), String> {
+    let mut seen = Vec::new();
     let mut index = 1;
     while index < args.len() {
         let arg = args[index].as_str();
         if !flags.contains(&arg) {
             return Err(format!("unexpected argument: {arg}"));
         }
+        if seen.contains(&arg) {
+            return Err(format!("duplicate {arg}"));
+        }
+        seen.push(arg);
         index += 1;
         if arg != "--release-notes" {
             if index >= args.len() || args[index].starts_with("--") {
@@ -142,7 +187,333 @@ fn read_version(root: &Path) -> Result<Version, String> {
         .map_err(|error| format!("read Cargo.toml: {error}"))?;
     let value = section_version(&manifest, "[package]")?
         .ok_or_else(|| "missing [package] version in Cargo.toml".to_string())?;
-    Version::parse(&value).map_err(|error| format!("invalid package version {value}: {error}"))
+    let version = Version::parse(&value)
+        .map_err(|error| format!("invalid package version {value}: {error}"))?;
+    release_rc(&version)?;
+    Ok(version)
+}
+
+fn cargo_program() -> OsString {
+    env::var_os("CARGO").unwrap_or_else(|| "cargo".into())
+}
+
+fn output_detail(output: &CargoOutput) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !stderr.is_empty() {
+        return stderr;
+    }
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+#[derive(Debug)]
+struct ManifestPath {
+    argument: PathBuf,
+    identity: PathBuf,
+}
+
+fn resolve_manifest(root: &Path, path: &Path, label: &str) -> Result<ManifestPath, String> {
+    let argument = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+    let identity = argument
+        .canonicalize()
+        .map_err(|error| format!("resolve {label} manifest {}: {error}", argument.display()))?;
+    if !identity.is_file()
+        || identity.file_name().and_then(|name| name.to_str()) != Some("Cargo.toml")
+    {
+        return Err(format!(
+            "{label} manifest is not an exact Cargo.toml file: {}",
+            identity.display()
+        ));
+    }
+    Ok(ManifestPath { argument, identity })
+}
+
+#[derive(Debug)]
+struct CargoOutput {
+    success: bool,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct CargoStatus {
+    success: bool,
+    code: Option<i32>,
+}
+
+trait CargoRunner {
+    fn output(
+        &mut self,
+        root: &Path,
+        program: &OsStr,
+        args: &[OsString],
+    ) -> Result<CargoOutput, String>;
+    fn status(
+        &mut self,
+        root: &Path,
+        program: &OsStr,
+        args: &[OsString],
+    ) -> Result<CargoStatus, String>;
+}
+
+struct SystemCargoRunner;
+
+impl CargoRunner for SystemCargoRunner {
+    fn output(
+        &mut self,
+        root: &Path,
+        program: &OsStr,
+        args: &[OsString],
+    ) -> Result<CargoOutput, String> {
+        let output = Command::new(program)
+            .current_dir(root)
+            .args(args)
+            .output()
+            .map_err(|error| format!("run {}: {error}", program.to_string_lossy()))?;
+        Ok(CargoOutput {
+            success: output.status.success(),
+            stdout: output.stdout,
+            stderr: output.stderr,
+        })
+    }
+
+    fn status(
+        &mut self,
+        root: &Path,
+        program: &OsStr,
+        args: &[OsString],
+    ) -> Result<CargoStatus, String> {
+        let status = Command::new(program)
+            .current_dir(root)
+            .args(args)
+            .status()
+            .map_err(|error| format!("run {}: {error}", program.to_string_lossy()))?;
+        Ok(CargoStatus {
+            success: status.success(),
+            code: status.code(),
+        })
+    }
+}
+
+fn metadata_version(
+    root: &Path,
+    manifest: &ManifestPath,
+    package: &str,
+    runner: &mut impl CargoRunner,
+) -> Result<Version, String> {
+    let mut args: Vec<OsString> = [
+        "metadata",
+        "--no-deps",
+        "--format-version",
+        "1",
+        "--manifest-path",
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .collect();
+    args.push(manifest.argument.as_os_str().to_owned());
+    let output = runner
+        .output(root, &cargo_program(), &args)
+        .map_err(|error| {
+            format!(
+                "run Cargo metadata for {}: {error}",
+                manifest.argument.display()
+            )
+        })?;
+    if !output.success {
+        return Err(format!(
+            "Cargo metadata failed for {}: {}",
+            manifest.argument.display(),
+            output_detail(&output)
+        ));
+    }
+    metadata_version_from_json(&output.stdout, &manifest.identity, package)
+}
+
+fn metadata_version_from_json(
+    output: &[u8],
+    manifest: &Path,
+    package: &str,
+) -> Result<Version, String> {
+    let metadata: serde_json::Value = serde_json::from_slice(output)
+        .map_err(|error| format!("Cargo returned invalid metadata: {error}"))?;
+    let packages = metadata
+        .get("packages")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "Cargo returned invalid package metadata".to_string())?;
+    let mut matches = Vec::new();
+    for item in packages {
+        if item.get("name").and_then(serde_json::Value::as_str) != Some(package) {
+            continue;
+        }
+        let path = item
+            .get("manifest_path")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("metadata did not contain a manifest path for {package}"))?;
+        let identity = Path::new(path)
+            .canonicalize()
+            .map_err(|error| format!("resolve Cargo metadata manifest {path}: {error}"))?;
+        if identity == manifest {
+            matches.push(item);
+        }
+    }
+    if matches.len() != 1 {
+        return Err(format!(
+            "metadata did not contain exactly one {package} package at {}",
+            manifest.display()
+        ));
+    }
+    let value = matches[0]
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("metadata did not contain a version for {package}"))?;
+    let version = Version::parse(value)
+        .map_err(|error| format!("metadata returned invalid version {value}: {error}"))?;
+    release_rc(&version)?;
+    Ok(version)
+}
+
+fn checker_release_type(intent: &str, current: &Version) -> Result<&'static str, String> {
+    match intent {
+        "major" => Ok("major"),
+        "minor" if current.major == 0 => Ok("major"),
+        "minor" => Ok("minor"),
+        "patch" if current.major != 0 => Ok("patch"),
+        "patch" if current.minor == 0 => Ok("major"),
+        "patch" => Ok("minor"),
+        _ => Err("--intent must be patch, minor, or major".to_string()),
+    }
+}
+
+fn require_semver_checks_version(value: &[u8]) -> Result<(), String> {
+    let expected = format!("cargo-semver-checks {SEMVER_CHECKS_VERSION}");
+    let actual = exact_output_line(value, "cargo-semver-checks version")?;
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(format!("expected {expected}; found {actual}"))
+    }
+}
+
+fn check_api_compatibility(
+    root: &Path,
+    baseline_manifest: &Path,
+    current_manifest: &Path,
+    package: &str,
+    expected_baseline: &Version,
+    expected_current: &Version,
+    expected_intent: &str,
+) -> Result<(), String> {
+    let mut runner = SystemCargoRunner;
+    check_api_compatibility_with_runner(
+        root,
+        baseline_manifest,
+        current_manifest,
+        package,
+        expected_baseline,
+        expected_current,
+        expected_intent,
+        &mut runner,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_api_compatibility_with_runner(
+    root: &Path,
+    baseline_manifest: &Path,
+    current_manifest: &Path,
+    package: &str,
+    expected_baseline: &Version,
+    expected_current: &Version,
+    expected_intent: &str,
+    runner: &mut impl CargoRunner,
+) -> Result<(), String> {
+    if package.is_empty() || package.starts_with('-') {
+        return Err("--package must be a nonempty Cargo package name".to_string());
+    }
+    release_rc(expected_baseline)?;
+    release_rc(expected_current)?;
+
+    // Address the installed analyzer directly so Cargo aliases cannot replace it.
+    let tool = runner
+        .output(
+            root,
+            OsStr::new("cargo-semver-checks"),
+            &[OsString::from("semver-checks"), OsString::from("--version")],
+        )
+        .map_err(|error| format!("cargo-semver-checks is unavailable: {error}"))?;
+    if !tool.success {
+        return Err(format!(
+            "cargo-semver-checks is unavailable: {}",
+            output_detail(&tool)
+        ));
+    }
+    require_semver_checks_version(&tool.stdout)?;
+
+    let baseline_manifest = resolve_manifest(root, baseline_manifest, "baseline")?;
+    let current_manifest = resolve_manifest(root, current_manifest, "current")?;
+    let repository_manifest = resolve_manifest(root, &root.join("Cargo.toml"), "repository")?;
+    if current_manifest.identity != repository_manifest.identity {
+        return Err("the current manifest is not the repository root Cargo.toml".to_string());
+    }
+    let baseline = metadata_version(root, &baseline_manifest, package, runner)?;
+    let current = metadata_version(root, &current_manifest, package, runner)?;
+    if baseline != *expected_baseline {
+        return Err(format!(
+            "baseline manifest version {baseline} does not match {expected_baseline}"
+        ));
+    }
+    if current != *expected_current {
+        return Err(format!(
+            "candidate manifest version {current} does not match {expected_current}"
+        ));
+    }
+    let intent = release_intent(&baseline, &current)?;
+    if intent != expected_intent {
+        return Err(format!(
+            "candidate represents a {intent} bump, not requested {expected_intent}"
+        ));
+    }
+    let release_type = checker_release_type(intent, &current)?;
+    let baseline_root = baseline_manifest
+        .argument
+        .parent()
+        .ok_or_else(|| "the baseline manifest has no parent directory".to_string())?;
+    let args = [
+        OsString::from("semver-checks"),
+        OsString::from("check-release"),
+        OsString::from("--manifest-path"),
+        current_manifest.argument.as_os_str().to_owned(),
+        OsString::from("--package"),
+        OsString::from(package),
+        OsString::from("--baseline-root"),
+        baseline_root.as_os_str().to_owned(),
+        OsString::from("--release-type"),
+        OsString::from(release_type),
+        OsString::from("--all-features"),
+        OsString::from("--color"),
+        OsString::from("never"),
+    ];
+    // Keep analysis on the same alias-resistant executable verified above.
+    let status = runner
+        .status(root, OsStr::new("cargo-semver-checks"), &args)
+        .map_err(|error| format!("run cargo-semver-checks: {error}"))?;
+    if !status.success {
+        return Err(format!(
+            "cargo-semver-checks failed with status {}",
+            status
+                .code
+                .map_or_else(|| "signal".to_string(), |code| code.to_string())
+        ));
+    }
+    eprintln!(
+        "release-version: API compatibility passed with {intent} intent \
+         ({release_type} Cargo release type)"
+    );
+    Ok(())
 }
 
 fn write_version(root: &Path, version: &Version) -> Result<(), String> {
@@ -222,45 +593,94 @@ fn replace_section_version(manifest: &str, section: &str, version: &str) -> Resu
     Ok(output)
 }
 
-fn snapshot_version(current: &Version, pr: u64, sha: &str) -> Result<Version, String> {
-    if sha.len() < 12 || !sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err("--sha must contain at least 12 hexadecimal characters".to_string());
-    }
-    let short_sha = sha[..12].to_ascii_lowercase();
-    Version::parse(&format!(
-        "{}.{}.{}-0.pr.{pr}.commit.sha{short_sha}",
-        current.major, current.minor, current.patch
-    ))
-    .map_err(|error| format!("construct snapshot version: {error}"))
-}
-
 fn candidate_version(
     published: &Version,
-    current: &Version,
+    _current: &Version,
     bump: &str,
 ) -> Result<Version, String> {
+    let published_rc = release_rc(published)?;
     let mut target = match bump {
-        "auto" if current != published => {
-            if current.pre.is_empty() {
-                with_rc(current, 1)?
-            } else {
-                require_rc(current)?;
-                current.clone()
-            }
-        }
-        "auto" => {
-            if published.pre.is_empty() {
-                bumped_core(published, "patch")?
-            } else {
-                let rc = require_rc(published)?;
-                with_rc(published, rc.checked_add(1).ok_or("rc number overflow")?)?
-            }
-        }
-        "patch" | "minor" | "major" => bumped_core(published, bump)?,
-        _ => return Err("--bump must be auto, patch, minor, or major".to_string()),
+        "patch" => match published_rc {
+            None => bumped_core(published, "patch")?,
+            Some(rc) => with_rc(published, rc.checked_add(1).ok_or("rc number overflow")?)?,
+        },
+        "minor" | "major" => bumped_core(published, bump)?,
+        _ => return Err("--bump must be patch, minor, or major".to_string()),
     };
     target.build = semver::BuildMetadata::EMPTY;
     Ok(target)
+}
+
+fn release_intent(published: &Version, current: &Version) -> Result<&'static str, String> {
+    let published_rc = release_rc(published)?;
+    let current_rc = release_rc(current)?;
+    let same_core = current.major == published.major
+        && current.minor == published.minor
+        && current.patch == published.patch;
+    if same_core {
+        return match (published_rc, current_rc) {
+            (Some(_), None) => Ok("patch"),
+            (Some(published), Some(current)) if Some(current) == published.checked_add(1) => {
+                Ok("patch")
+            }
+            _ => Err(
+                "the release version does not exactly advance or promote the current RC"
+                    .to_string(),
+            ),
+        };
+    }
+
+    let intent = if current.major != published.major {
+        if current.major
+            == published
+                .major
+                .checked_add(1)
+                .ok_or("major version overflow")?
+            && current.minor == 0
+            && current.patch == 0
+        {
+            "major"
+        } else {
+            return Err(
+                "the release version does not represent one patch, minor, or major line"
+                    .to_string(),
+            );
+        }
+    } else if current.minor != published.minor {
+        if current.minor
+            == published
+                .minor
+                .checked_add(1)
+                .ok_or("minor version overflow")?
+            && current.patch == 0
+        {
+            "minor"
+        } else {
+            return Err(
+                "the release version does not represent one patch, minor, or major line"
+                    .to_string(),
+            );
+        }
+    } else if current.patch
+        == published
+            .patch
+            .checked_add(1)
+            .ok_or("patch version overflow")?
+    {
+        if published_rc.is_some() {
+            return Err("a patch intent must advance the current RC core".to_string());
+        }
+        "patch"
+    } else {
+        return Err(
+            "the release version does not represent one patch, minor, or major line".to_string(),
+        );
+    };
+
+    if current_rc != Some(1) {
+        return Err("a new release version line must start at rc.1".to_string());
+    }
+    Ok(intent)
 }
 
 fn bumped_core(version: &Version, bump: &str) -> Result<Version, String> {
@@ -299,9 +719,26 @@ fn require_rc(version: &Version) -> Result<u64, String> {
     let number = value
         .strip_prefix("rc.")
         .ok_or_else(|| format!("expected an rc.N prerelease, found {version}"))?;
-    number
+    let rc = number
         .parse::<u64>()
-        .map_err(|_| format!("expected an rc.N prerelease, found {version}"))
+        .map_err(|_| format!("expected an rc.N prerelease, found {version}"))?;
+    if rc == 0 {
+        return Err(format!("expected rc.N with N at least 1, found {version}"));
+    }
+    Ok(rc)
+}
+
+fn release_rc(version: &Version) -> Result<Option<u64>, String> {
+    if !version.build.is_empty() {
+        return Err(format!(
+            "release versions cannot contain build metadata: {version}"
+        ));
+    }
+    if version.pre.is_empty() {
+        Ok(None)
+    } else {
+        require_rc(version).map(Some)
+    }
 }
 
 fn with_rc(version: &Version, rc: u64) -> Result<Version, String> {
@@ -312,7 +749,7 @@ fn with_rc(version: &Version, rc: u64) -> Result<Version, String> {
 }
 
 fn stable_version(version: &Version) -> Result<Version, String> {
-    require_rc(version)?;
+    release_rc(version)?.ok_or_else(|| format!("expected an rc.N prerelease, found {version}"))?;
     Ok(Version::new(version.major, version.minor, version.patch))
 }
 
@@ -405,31 +842,156 @@ fn insert_after_unreleased(body: &str, section: &str) -> Result<String, String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    #[test]
-    fn snapshot_uses_core_and_twelve_hex_characters() {
-        let current = Version::parse("0.4.0-rc.3").unwrap();
-        assert_eq!(
-            snapshot_version(&current, 17, "ABCDEF0123456789").unwrap(),
-            Version::parse("0.4.0-0.pr.17.commit.shaabcdef012345").unwrap()
-        );
+    #[derive(Debug, Eq, PartialEq)]
+    enum Invocation {
+        Output(OsString, Vec<OsString>),
+        Status(OsString, Vec<OsString>),
+    }
+
+    #[derive(Default)]
+    struct FakeCargoRunner {
+        outputs: VecDeque<Result<CargoOutput, String>>,
+        statuses: VecDeque<Result<CargoStatus, String>>,
+        invocations: Vec<Invocation>,
+    }
+
+    impl CargoRunner for FakeCargoRunner {
+        fn output(
+            &mut self,
+            _root: &Path,
+            program: &OsStr,
+            args: &[OsString],
+        ) -> Result<CargoOutput, String> {
+            self.invocations
+                .push(Invocation::Output(program.to_owned(), args.to_vec()));
+            self.outputs
+                .pop_front()
+                .expect("unexpected fake Cargo output command")
+        }
+
+        fn status(
+            &mut self,
+            _root: &Path,
+            program: &OsStr,
+            args: &[OsString],
+        ) -> Result<CargoStatus, String> {
+            self.invocations
+                .push(Invocation::Status(program.to_owned(), args.to_vec()));
+            self.statuses
+                .pop_front()
+                .expect("unexpected fake Cargo status command")
+        }
+    }
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new(label: &str) -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
+            let path = env::temp_dir().join(format!(
+                "yaml-sigil-release-version-{label}-{}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn cargo_output(stdout: impl Into<Vec<u8>>) -> Result<CargoOutput, String> {
+        Ok(CargoOutput {
+            success: true,
+            stdout: stdout.into(),
+            stderr: Vec::new(),
+        })
+    }
+
+    fn metadata_output(
+        package: &str,
+        manifest: &Path,
+        version: &str,
+    ) -> Result<CargoOutput, String> {
+        cargo_output(
+            serde_json::to_vec(&serde_json::json!({
+                "packages": [{
+                    "name": package,
+                    "manifest_path": manifest,
+                    "version": version
+                }]
+            }))
+            .unwrap(),
+        )
+    }
+
+    fn compatibility_fixture(
+        status: Result<CargoStatus, String>,
+    ) -> (TestDirectory, PathBuf, PathBuf, FakeCargoRunner) {
+        let temporary = TestDirectory::new("compatibility");
+        let baseline_root = temporary.0.join("baseline");
+        let repository_root = temporary.0.join("repository");
+        fs::create_dir(&baseline_root).unwrap();
+        fs::create_dir(&repository_root).unwrap();
+        let baseline = baseline_root.join("Cargo.toml");
+        fs::write(
+            &baseline,
+            "[package]\nname = \"yaml-sigil-traits\"\nversion = \"0.3.0-rc.1\"\n",
+        )
+        .unwrap();
+        let baseline = baseline.canonicalize().unwrap();
+        let current = repository_root.join("Cargo.toml");
+        fs::write(
+            &current,
+            "[package]\nname = \"yaml-sigil-traits\"\nversion = \"0.4.0-rc.1\"\n",
+        )
+        .unwrap();
+        let current = current.canonicalize().unwrap();
+        let runner = FakeCargoRunner {
+            outputs: [
+                cargo_output(b"cargo-semver-checks 0.50.0\n".to_vec()),
+                metadata_output("yaml-sigil-traits", &baseline, "0.3.0-rc.1"),
+                metadata_output("yaml-sigil-traits", &current, "0.4.0-rc.1"),
+            ]
+            .into(),
+            statuses: [status].into(),
+            invocations: Vec::new(),
+        };
+        (temporary, baseline, current, runner)
     }
 
     #[test]
-    fn auto_advances_rc() {
+    fn patch_advances_rc_on_the_same_core() {
         let current = Version::parse("0.4.0-rc.3").unwrap();
         assert_eq!(
-            candidate_version(&current, &current, "auto").unwrap(),
+            candidate_version(&current, &current, "patch").unwrap(),
             Version::parse("0.4.0-rc.4").unwrap()
         );
     }
 
     #[test]
-    fn auto_starts_next_patch_rc_after_stable() {
+    fn patch_starts_next_patch_rc_after_stable() {
         let current = Version::parse("0.4.0").unwrap();
         assert_eq!(
-            candidate_version(&current, &current, "auto").unwrap(),
+            candidate_version(&current, &current, "patch").unwrap(),
             Version::parse("0.4.1-rc.1").unwrap()
+        );
+    }
+
+    #[test]
+    fn patch_ignores_analyzer_core_drift_and_advances_the_published_rc() {
+        let published = Version::parse("0.4.0-rc.3").unwrap();
+        let generated = Version::parse("0.4.1-rc.1").unwrap();
+        assert_eq!(
+            candidate_version(&published, &generated, "patch").unwrap(),
+            Version::parse("0.4.0-rc.4").unwrap()
         );
     }
 
@@ -440,6 +1002,361 @@ mod tests {
             candidate_version(&published, &published, "minor").unwrap(),
             Version::parse("0.5.0-rc.1").unwrap()
         );
+    }
+
+    #[test]
+    fn explicit_major_starts_new_rc_train() {
+        let published = Version::parse("0.4.0-rc.3").unwrap();
+        assert_eq!(
+            candidate_version(&published, &published, "major").unwrap(),
+            Version::parse("1.0.0-rc.1").unwrap()
+        );
+    }
+
+    #[test]
+    fn automatic_bump_is_rejected() {
+        let published = Version::parse("0.4.0-rc.3").unwrap();
+        assert!(candidate_version(&published, &published, "auto").is_err());
+    }
+
+    #[test]
+    fn concrete_intent_is_derived_for_merged_release_validation() {
+        let baseline = Version::parse("0.4.0-rc.1").unwrap();
+        assert_eq!(
+            release_intent(&baseline, &Version::parse("0.4.0-rc.2").unwrap()).unwrap(),
+            "patch"
+        );
+        assert_eq!(
+            release_intent(&baseline, &Version::parse("0.5.0-rc.1").unwrap()).unwrap(),
+            "minor"
+        );
+        assert_eq!(
+            release_intent(&baseline, &Version::parse("1.0.0-rc.1").unwrap()).unwrap(),
+            "major"
+        );
+        assert_eq!(
+            release_intent(&baseline, &Version::parse("0.4.0").unwrap()).unwrap(),
+            "patch"
+        );
+        assert_eq!(
+            release_intent(
+                &Version::parse("0.4.0").unwrap(),
+                &Version::parse("0.4.1-rc.1").unwrap(),
+            )
+            .unwrap(),
+            "patch"
+        );
+    }
+
+    #[test]
+    fn release_intent_rejects_non_monotonic_or_non_rc_transitions() {
+        for (published, current) in [
+            ("0.4.0-rc.2", "0.4.0-rc.1"),
+            ("0.4.0-rc.1", "0.4.0-rc.1"),
+            ("0.4.0-rc.1", "0.4.0-rc.3"),
+            ("0.4.0-rc.1", "0.4.1-rc.1"),
+            ("0.4.0", "0.4.1"),
+            ("0.4.0-rc.1", "0.5.0"),
+            ("0.4.0", "0.5.0"),
+            ("0.4.0-beta.1", "0.4.0-rc.1"),
+            ("0.4.0-rc.1", "0.4.0-beta.2"),
+            ("0.4.0-rc.0", "0.4.0-rc.1"),
+            ("0.4.0+build.1", "0.4.1-rc.1"),
+        ] {
+            assert!(
+                release_intent(
+                    &Version::parse(published).unwrap(),
+                    &Version::parse(current).unwrap(),
+                )
+                .is_err(),
+                "accepted {published} -> {current}",
+            );
+        }
+    }
+
+    #[test]
+    fn compatibility_uses_cargo_pre_one_release_types() {
+        for (intent, current, expected) in [
+            ("major", "0.5.0-rc.1", "major"),
+            ("minor", "0.5.0-rc.1", "major"),
+            ("patch", "0.5.0-rc.2", "minor"),
+            ("patch", "0.0.1-rc.1", "major"),
+            ("minor", "1.1.0-rc.1", "minor"),
+            ("patch", "1.0.1-rc.1", "patch"),
+        ] {
+            assert_eq!(
+                checker_release_type(intent, &Version::parse(current).unwrap()).unwrap(),
+                expected
+            );
+        }
+        assert!(checker_release_type("auto", &Version::parse("0.5.0-rc.1").unwrap()).is_err());
+    }
+
+    #[test]
+    fn compatibility_metadata_binds_exact_package_manifest_and_version() {
+        let temporary = TestDirectory::new("metadata-paths");
+        let release = temporary.0.join("release");
+        let other = temporary.0.join("other");
+        fs::create_dir(&release).unwrap();
+        fs::create_dir(&other).unwrap();
+        fs::write(release.join("Cargo.toml"), "[package]\n").unwrap();
+        fs::write(other.join("Cargo.toml"), "[package]\n").unwrap();
+        let manifest = release.join("Cargo.toml").canonicalize().unwrap();
+        let equivalent_spelling = release.join("..").join("release").join("Cargo.toml");
+        let exact = serde_json::json!({
+            "packages": [{
+                "name": "yaml-sigil-traits",
+                "version": "0.4.0-rc.1",
+                "manifest_path": equivalent_spelling
+            }]
+        });
+        assert_eq!(
+            metadata_version_from_json(
+                &serde_json::to_vec(&exact).unwrap(),
+                &manifest,
+                "yaml-sigil-traits"
+            )
+            .unwrap(),
+            Version::parse("0.4.0-rc.1").unwrap()
+        );
+
+        let wrong_manifest = other.join("Cargo.toml").canonicalize().unwrap();
+        assert!(
+            metadata_version_from_json(
+                &serde_json::to_vec(&exact).unwrap(),
+                &wrong_manifest,
+                "yaml-sigil-traits"
+            )
+            .is_err()
+        );
+        assert!(
+            metadata_version_from_json(br#"{"packages":[]}"#, &manifest, "yaml-sigil-traits")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn compatibility_requires_the_exact_analyzer_version() {
+        for output in [
+            b"cargo-semver-checks 0.50.0".as_slice(),
+            b"cargo-semver-checks 0.50.0\n".as_slice(),
+            b"cargo-semver-checks 0.50.0\r\n".as_slice(),
+        ] {
+            assert!(require_semver_checks_version(output).is_ok());
+        }
+        for output in [
+            b"cargo-semver-checks 0.49.0".as_slice(),
+            b" cargo-semver-checks 0.50.0\n".as_slice(),
+            b"cargo-semver-checks 0.50.0 \n".as_slice(),
+            b"cargo-semver-checks 0.50.0\n\n".as_slice(),
+            b"\xff".as_slice(),
+            b"".as_slice(),
+        ] {
+            assert!(require_semver_checks_version(output).is_err());
+        }
+    }
+
+    #[test]
+    fn compatibility_rejects_duplicate_flags() {
+        let args = [
+            "check-compatibility".to_string(),
+            "--package".to_string(),
+            "yaml-sigil-traits".to_string(),
+            "--package".to_string(),
+            "lookalike".to_string(),
+        ];
+        assert!(
+            required_value(&args, "--package")
+                .unwrap_err()
+                .contains("duplicate")
+        );
+        assert!(
+            ensure_only_flags(&args, &["--package"])
+                .unwrap_err()
+                .contains("duplicate")
+        );
+    }
+
+    #[test]
+    fn compatibility_runner_binds_exact_commands_and_paths() {
+        let (_temporary, baseline, current, mut runner) = compatibility_fixture(Ok(CargoStatus {
+            success: true,
+            code: Some(0),
+        }));
+        let root = current.parent().unwrap();
+        check_api_compatibility_with_runner(
+            root,
+            &baseline,
+            &current,
+            "yaml-sigil-traits",
+            &Version::parse("0.3.0-rc.1").unwrap(),
+            &Version::parse("0.4.0-rc.1").unwrap(),
+            "minor",
+            &mut runner,
+        )
+        .unwrap();
+        assert!(runner.outputs.is_empty());
+        assert!(runner.statuses.is_empty());
+        assert_eq!(
+            runner.invocations,
+            [
+                Invocation::Output(
+                    "cargo-semver-checks".into(),
+                    vec!["semver-checks".into(), "--version".into()],
+                ),
+                Invocation::Output(
+                    cargo_program(),
+                    vec![
+                        "metadata".into(),
+                        "--no-deps".into(),
+                        "--format-version".into(),
+                        "1".into(),
+                        "--manifest-path".into(),
+                        baseline.as_os_str().to_owned(),
+                    ],
+                ),
+                Invocation::Output(
+                    cargo_program(),
+                    vec![
+                        "metadata".into(),
+                        "--no-deps".into(),
+                        "--format-version".into(),
+                        "1".into(),
+                        "--manifest-path".into(),
+                        current.as_os_str().to_owned(),
+                    ],
+                ),
+                Invocation::Status(
+                    "cargo-semver-checks".into(),
+                    vec![
+                        "semver-checks".into(),
+                        "check-release".into(),
+                        "--manifest-path".into(),
+                        current.as_os_str().to_owned(),
+                        "--package".into(),
+                        "yaml-sigil-traits".into(),
+                        "--baseline-root".into(),
+                        baseline.parent().unwrap().as_os_str().to_owned(),
+                        "--release-type".into(),
+                        "major".into(),
+                        "--all-features".into(),
+                        "--color".into(),
+                        "never".into(),
+                    ],
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn compatibility_runner_fails_closed_on_analyzer_status_or_spawn_error() {
+        for (status, expected) in [
+            (
+                Ok(CargoStatus {
+                    success: false,
+                    code: Some(101),
+                }),
+                "101",
+            ),
+            (
+                Ok(CargoStatus {
+                    success: false,
+                    code: None,
+                }),
+                "signal",
+            ),
+            (
+                Err("fixture spawn failure".to_string()),
+                "fixture spawn failure",
+            ),
+        ] {
+            let (_temporary, baseline, current, mut runner) = compatibility_fixture(status);
+            let error = check_api_compatibility_with_runner(
+                current.parent().unwrap(),
+                &baseline,
+                &current,
+                "yaml-sigil-traits",
+                &Version::parse("0.3.0-rc.1").unwrap(),
+                &Version::parse("0.4.0-rc.1").unwrap(),
+                "minor",
+                &mut runner,
+            )
+            .unwrap_err();
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn compatibility_runner_fails_before_analysis_on_tool_or_metadata_ambiguity() {
+        let (_temporary, baseline, current, mut wrong_tool) =
+            compatibility_fixture(Ok(CargoStatus {
+                success: true,
+                code: Some(0),
+            }));
+        wrong_tool.outputs[0] = cargo_output(b"cargo-semver-checks 0.49.0\n".to_vec());
+        assert!(
+            check_api_compatibility_with_runner(
+                current.parent().unwrap(),
+                &baseline,
+                &current,
+                "yaml-sigil-traits",
+                &Version::parse("0.3.0-rc.1").unwrap(),
+                &Version::parse("0.4.0-rc.1").unwrap(),
+                "minor",
+                &mut wrong_tool,
+            )
+            .is_err()
+        );
+        assert_eq!(wrong_tool.invocations.len(), 1);
+
+        let (_temporary, baseline, current, mut malformed) =
+            compatibility_fixture(Ok(CargoStatus {
+                success: true,
+                code: Some(0),
+            }));
+        malformed.outputs[1] = cargo_output(b"not-json".to_vec());
+        assert!(
+            check_api_compatibility_with_runner(
+                current.parent().unwrap(),
+                &baseline,
+                &current,
+                "yaml-sigil-traits",
+                &Version::parse("0.3.0-rc.1").unwrap(),
+                &Version::parse("0.4.0-rc.1").unwrap(),
+                "minor",
+                &mut malformed,
+            )
+            .is_err()
+        );
+        assert_eq!(malformed.invocations.len(), 2);
+
+        let (_temporary, baseline, current, mut mismatch) =
+            compatibility_fixture(Ok(CargoStatus {
+                success: true,
+                code: Some(0),
+            }));
+        assert!(
+            check_api_compatibility_with_runner(
+                current.parent().unwrap(),
+                &baseline,
+                &current,
+                "yaml-sigil-traits",
+                &Version::parse("0.3.0-rc.2").unwrap(),
+                &Version::parse("0.4.0-rc.1").unwrap(),
+                "minor",
+                &mut mismatch,
+            )
+            .is_err()
+        );
+        assert!(!mismatch.statuses.is_empty());
+    }
+
+    #[test]
+    fn candidate_rejects_unsupported_published_prereleases() {
+        for published in ["0.4.0-beta.1", "0.4.0-rc.0", "0.4.0+build.1"] {
+            let published = Version::parse(published).unwrap();
+            assert!(candidate_version(&published, &published, "minor").is_err());
+        }
     }
 
     #[test]

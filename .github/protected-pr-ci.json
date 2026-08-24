@@ -6,8 +6,15 @@
   "release_app": {
     "enabled": true,
     "login": "nvidia-yamlsigil-release-pr[bot]",
+    "bot_user_id": 318780254,
     "slug": "nvidia-yamlsigil-release-pr",
     "head_ref": "release-plz-next",
+    "commit_author_name": "nvidia-yamlsigil-release-pr[bot]",
+    "commit_author_email": "318780254+nvidia-yamlsigil-release-pr[bot]@users.noreply.github.com",
+    "commit_committer_login": "web-flow",
+    "commit_committer_user_id": 19864447,
+    "commit_committer_name": "GitHub",
+    "commit_committer_email": "noreply@github.com",
     "allowed_paths": [
       "Cargo.toml",
       "CHANGELOG.md"
