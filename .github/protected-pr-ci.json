@@ -1,0 +1,62 @@
+{
+  "version": 1,
+  "default_branch": "main",
+  "workflow_file": ".github/workflows/pr-ci.yml",
+  "required_check": "Required CI",
+  "release_app": {
+    "enabled": true,
+    "login": "nvidia-yamlsigil-release-pr[bot]",
+    "slug": "nvidia-yamlsigil-release-pr",
+    "head_ref": "release-plz-next",
+    "allowed_paths": [
+      "Cargo.toml",
+      "CHANGELOG.md"
+    ]
+  },
+  "expected_jobs": [
+    "commit_policy",
+    "workflow_lint",
+    "static_checks",
+    "rust"
+  ],
+  "sensitive_paths": [
+    "CODEOWNERS",
+    "**/CODEOWNERS",
+    ".github/**",
+    ".cargo/**",
+    "rust-toolchain",
+    "rust-toolchain.toml",
+    "**/rust-toolchain",
+    "**/rust-toolchain.toml",
+    "rustfmt.toml",
+    ".rustfmt.toml",
+    "**/rustfmt.toml",
+    "**/.rustfmt.toml",
+    "clippy.toml",
+    ".clippy.toml",
+    "**/clippy.toml",
+    "**/.clippy.toml",
+    ".rumdl.toml",
+    "rumdl.toml",
+    ".markdownlint.json",
+    ".markdownlint.yaml",
+    "Cargo.toml",
+    "Cargo.lock",
+    "**/Cargo.toml",
+    "**/Cargo.lock",
+    "AGENTS.md",
+    "**/AGENTS.md",
+    ".agents/**",
+    "**/.agents/**",
+    "README.md",
+    "RELEASING.md",
+    "THIRD_PARTY_NOTICES.md",
+    ".release-plz.toml",
+    "release-plz.toml",
+    ".gitmodules",
+    "source-spec",
+    "src/algorithm.rs",
+    "src/verification.rs",
+    "xtask/**"
+  ]
+}

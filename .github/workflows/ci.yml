@@ -108,6 +108,14 @@ jobs:
           scandir: .github/scripts
           version: v0.11.0
 
+      - name: Compile and test protected controller
+        run: |
+          python3 -m py_compile \
+            .github/scripts/protected_pr_ci.py \
+            .github/scripts/test_protected_pr_ci.py
+          python3 -m unittest discover \
+            -s .github/scripts -p 'test_protected_pr_ci.py'
+
   static_checks:
     name: Documentation
     runs-on: linux-amd64-cpu4
@@ -159,6 +167,10 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Remove unused preinstalled Homebrew source
+        if: ${{ runner.os == 'macOS' }}
+        run: .github/scripts/remove-preinstalled-aws-tap.sh
 
       - name: Set up Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
