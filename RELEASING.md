@@ -102,7 +102,7 @@ become release-analysis baselines.
 Use this procedure when the App is unavailable or cannot safely update its
 owned proposal. A repository writer may prepare the same release transaction
 on a human-authored branch. Use Rust `1.95.0`, cargo-binstall `1.20.1`,
-release-plz `0.3.160`, and cargo-semver-checks `0.50.0`. Create a
+release-plz `0.3.160`, and cargo-semver-checks `0.49.0`. Create a
 same-repository branch named
 `release-plz-manual-<target>` from exact current `main`; do not reuse the
 workflow-owned `release-plz-next` branch.
@@ -132,17 +132,21 @@ cargo xtask release verify-registry \
 baseline_parent="$(mktemp -d)"
 baseline_root="${baseline_parent}/official-release"
 inventory_path="${baseline_parent}/official-tags.json"
+baseline_result="${baseline_parent}/baseline-result.json"
 GIT_CONFIG_COUNT=1 \
 GIT_CONFIG_KEY_0=remote.origin.pushurl \
 GIT_CONFIG_VALUE_0=disabled://yaml-sigil-release-proposal \
-  python3 .github/scripts/prepare_release_baseline.py \
-    --repository NVIDIA/yaml-sigil-traits \
+  cargo xtask release baseline prepare \
     --version "${published_version}" \
     --head "$(git rev-parse HEAD)" \
     --output "${baseline_root}" \
+    --result "${baseline_result}" \
     --inventory-output "${inventory_path}" \
     --expected-fetch-url "${fetch_url}"
-registry_manifest_path="${baseline_root}/Cargo.toml"
+registry_manifest_path="$(jq --exit-status --raw-output \
+  '.manifest' "${baseline_result}")"
+test "$(jq --exit-status --raw-output '.inventory' "${baseline_result}")" = \
+  "${inventory_path}"
 ```
 
 Stop if current main, the registry record, tag type, tag target, ancestry, or
@@ -207,10 +211,9 @@ git status --short
 GIT_CONFIG_COUNT=1 \
 GIT_CONFIG_KEY_0=remote.origin.pushurl \
 GIT_CONFIG_VALUE_0=disabled://yaml-sigil-release-proposal \
-  python3 .github/scripts/prepare_release_baseline.py \
-    --repository NVIDIA/yaml-sigil-traits \
+  cargo xtask release baseline verify \
     --head "$(git rev-parse HEAD)" \
-    --verify-inventory "${inventory_path}" \
+    --inventory "${inventory_path}" \
     --expected-fetch-url "${fetch_url}"
 ```
 

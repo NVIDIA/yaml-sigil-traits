@@ -21,7 +21,7 @@ const REGISTRY_ATTEMPTS: usize = 30;
 const REGISTRY_RETRY_SECONDS: u64 = 10;
 const CARGO_BINSTALL_VERSION: &str = "1.20.1";
 const RELEASE_PLZ_VERSION: &str = "0.3.160";
-pub(crate) const SEMVER_CHECKS_VERSION: &str = "0.50.0";
+pub(crate) const SEMVER_CHECKS_VERSION: &str = "0.49.0";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Outcome {
@@ -60,6 +60,14 @@ pub fn run(root: &Path, args: &[String]) -> Result<Outcome, String> {
             prepare_publication_config(root, &source, &output)?;
             Ok(Outcome::Success)
         }
+        "baseline" => {
+            crate::release_baseline::run(root, &args[1..])?;
+            Ok(Outcome::Success)
+        }
+        "proposal" => {
+            crate::release_proposal::run(root, &args[1..])?;
+            Ok(Outcome::Success)
+        }
         "help" | "--help" | "-h" => {
             eprintln!("{}", usage());
             Ok(Outcome::Success)
@@ -79,7 +87,11 @@ fn usage() -> String {
      require-current-main --head SHA --fetch-url URL\n\
                   Bind a release mutation to exact current remote main.\n  \
      prepare-publication-config [--source PATH] --output PATH\n\
-                  Prepare a checkout-bound release-plz publication config."
+                  Prepare a checkout-bound release-plz publication config.\n  \
+     baseline prepare|verify ...\n\
+                  Prepare or verify an archive-bound official baseline.\n  \
+     proposal generate ...\n\
+                  Generate a provider-neutral release proposal transaction."
         .to_string()
 }
 
@@ -453,23 +465,30 @@ fn check_packages_in_metadata(metadata: &Value, expected: &[String]) -> Result<(
         let publishes_to_crates_io = match package.get("publish") {
             // Cargo permits publication to its default registry when the
             // manifest omits an explicit publish allowlist.
-            Some(Value::Null) => true,
+            None | Some(Value::Null) | Some(Value::Bool(true)) => true,
+            Some(Value::Bool(false)) => false,
             Some(Value::Array(registries)) => {
-                let mut publishes = false;
-                for registry in registries {
-                    let registry = registry.as_str().ok_or_else(|| {
-                        format!("Cargo returned invalid publish registries for {name}")
-                    })?;
-                    publishes |= registry == "crates-io";
+                if registries.is_empty() {
+                    false
+                } else {
+                    let mut publishes = false;
+                    for registry in registries {
+                        let registry = registry.as_str().ok_or_else(|| {
+                            format!("Cargo returned invalid publish registries for {name}")
+                        })?;
+                        publishes |= registry == "crates-io";
+                    }
+                    if !publishes {
+                        return Err(format!("publishable package {name} excludes crates-io"));
+                    }
+                    true
                 }
-                publishes
             }
             Some(_) => {
                 return Err(format!(
                     "Cargo returned invalid publish metadata for {name}"
                 ));
             }
-            None => return Err(format!("Cargo omitted publish metadata for {name}")),
         };
         if !publishes_to_crates_io {
             continue;
@@ -933,6 +952,8 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    const FIXTURE_FETCH_URL: &str = "https://example.invalid/repository";
+
     #[derive(Debug, Eq, PartialEq)]
     enum CallMode {
         Output,
@@ -1081,7 +1102,7 @@ mod tests {
             responses: [
                 success(b"cargo-binstall 1.20.1\n".to_vec()),
                 success(b"release-plz 0.3.160\n".to_vec()),
-                success(b"cargo-semver-checks 0.50.0\n".to_vec()),
+                success(b"cargo-semver-checks 0.49.0\n".to_vec()),
             ]
             .into(),
             status_responses: [status(true, Some(0))].into(),
@@ -1103,7 +1124,7 @@ mod tests {
                 "--no-confirm",
                 "--strategies=crate-meta-data,compile",
                 "release-plz@0.3.160",
-                "cargo-semver-checks@0.50.0",
+                "cargo-semver-checks@0.49.0",
             ]
         );
         assert_eq!(runner.calls[2].program, "release-plz");
@@ -1146,7 +1167,7 @@ mod tests {
             vec![
                 success(b"cargo-binstall 1.20.1\n".to_vec()),
                 success(b"release-plz 0.3.160\n".to_vec()),
-                success(b"cargo-semver-checks 0.49.0\n".to_vec()),
+                success(b"cargo-semver-checks 0.48.0\n".to_vec()),
             ],
         ] {
             let mut runner = FakeRunner {
@@ -1205,7 +1226,7 @@ mod tests {
     #[test]
     fn current_main_gate_binds_exact_git_commands_and_state() {
         let head = "0123456789abcdef0123456789abcdef01234567";
-        let fetch_url = "https://github.com/NVIDIA/yaml-sigil-traits";
+        let fetch_url = FIXTURE_FETCH_URL;
         let mut runner = FakeRunner::with_responses(vec![
             success(format!("{head}\n").into_bytes()),
             success(format!("{fetch_url}\n").into_bytes()),
@@ -1293,7 +1314,7 @@ mod tests {
             assert!(require_current_main(Path::new("."), head, invalid).is_err());
         }
         let stale = "1123456789abcdef0123456789abcdef01234567";
-        let fetch_url = "https://github.com/NVIDIA/yaml-sigil-traits";
+        let fetch_url = FIXTURE_FETCH_URL;
         let cases = [
             vec![success(format!("{stale}\n").into_bytes())],
             vec![
@@ -1328,7 +1349,7 @@ mod tests {
     #[test]
     fn current_main_gate_fails_on_git_status_or_spawn_error() {
         let head = "0123456789abcdef0123456789abcdef01234567";
-        let fetch_url = "https://github.com/NVIDIA/yaml-sigil-traits";
+        let fetch_url = FIXTURE_FETCH_URL;
         for response in [failure("git failed"), Err("git spawn failed".to_string())] {
             let mut runner = FakeRunner::with_responses(vec![response]);
             assert!(
@@ -1368,11 +1389,6 @@ mod tests {
                     "targets": [{"kind": ["lib"]}]
                 },
                 {
-                    "name": "alternate-registry-helper",
-                    "publish": ["alternate"],
-                    "targets": [{"kind": ["lib"]}]
-                },
-                {
                     "name": "yaml-sigil-traits",
                     "publish": ["crates-io"],
                     "manifest_path": "/workspace/Cargo.toml",
@@ -1385,6 +1401,19 @@ mod tests {
         });
         assert!(check_packages_in_metadata(&metadata, &["yaml-sigil-traits".to_string()]).is_ok());
         assert!(check_packages_in_metadata(&metadata, &["wrong".to_string()]).is_err());
+
+        let mut alternate = metadata.clone();
+        alternate["packages"].as_array_mut().unwrap().insert(
+            1,
+            serde_json::json!({
+                "name": "alternate-registry-helper",
+                "publish": ["alternate"],
+                "targets": [{"kind": ["lib"]}]
+            }),
+        );
+        assert!(
+            check_packages_in_metadata(&alternate, &["yaml-sigil-traits".to_string()]).is_err()
+        );
 
         let binary = serde_json::json!({
             "workspace_root": "/workspace",
@@ -1445,6 +1474,15 @@ mod tests {
         assert!(
             check_packages_in_metadata(&default_publish, &["yaml-sigil-traits".to_string()])
                 .is_ok()
+        );
+
+        let mut absent_publish = default_publish.clone();
+        absent_publish["packages"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("publish");
+        assert!(
+            check_packages_in_metadata(&absent_publish, &["yaml-sigil-traits".to_string()]).is_ok()
         );
 
         let unexpected = serde_json::json!({

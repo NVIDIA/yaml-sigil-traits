@@ -5,8 +5,13 @@
 //! `cargo xtask <COMMAND>`.
 
 mod ci;
+mod crate_archive;
+mod github;
 mod package_content;
 mod release;
+mod release_baseline;
+mod release_policy;
+mod release_proposal;
 mod release_version;
 
 use std::env;
@@ -50,6 +55,13 @@ fn main() -> ExitCode {
             Ok(outcome) => ExitCode::from(release_exit_code(outcome)),
             Err(error) => {
                 eprintln!("release failed: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        "github" => match github::run(&workspace_root(), &remaining) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("github failed: {error}");
                 ExitCode::FAILURE
             }
         },
@@ -123,6 +135,7 @@ fn print_usage() {
          commands:\n  ci               Run the complete non-release validation sequence.\n  \
                             --candidate-root validates another checkout.\n  \
          package-content  Compare Cargo's source list with the committed inventory.\n  \
+         github          Run bounded GitHub release-automation operations.\n  \
          release          Run provider-neutral release preparation and verification.\n  \
          release-version  Manage provider-neutral release version transactions."
     );

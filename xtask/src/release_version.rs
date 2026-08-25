@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use semver::{Prerelease, Version};
+use toml_edit::DocumentMut;
 
 use crate::release::{SEMVER_CHECKS_VERSION, exact_output_line};
 
@@ -776,10 +777,11 @@ fn ensure_candidate_changelog(
     let mut updated = output.join("\n");
     updated.push('\n');
     if !updated.lines().any(|line| line.starts_with(&target_prefix)) {
+        let release_url = release_tag_url(root, target)?;
         updated = insert_after_unreleased(
             &updated,
             &format!(
-                "## [{target}](https://github.com/NVIDIA/yaml-sigil-traits/releases/tag/v{target}) - {date}\n\n### Other\n\n- No crate-specific changes."
+                "## [{target}]({release_url}) - {date}\n\n### Other\n\n- No crate-specific changes."
             ),
         )?;
         changed = true;
@@ -799,11 +801,43 @@ fn promote_changelog(
     let path = root.join(CHANGELOG);
     let body = fs::read_to_string(&path).map_err(|error| format!("read {CHANGELOG}: {error}"))?;
     let section = changelog_section(&body, rc)?;
-    let promoted = format!(
-        "## [{stable}](https://github.com/NVIDIA/yaml-sigil-traits/releases/tag/v{stable}) - {date}\n{section}"
-    );
+    let release_url = release_tag_url(root, stable)?;
+    let promoted = format!("## [{stable}]({release_url}) - {date}\n{section}");
     let updated = insert_after_unreleased(&body, &promoted)?;
     fs::write(path, updated).map_err(|error| format!("write {CHANGELOG}: {error}"))
+}
+
+fn release_tag_url(root: &Path, version: &Version) -> Result<String, String> {
+    let path = root.join("Cargo.toml");
+    let metadata = fs::symlink_metadata(&path)
+        .map_err(|error| format!("read Cargo.toml metadata: {error}"))?;
+    if !metadata.file_type().is_file() || metadata.len() > 1024 * 1024 {
+        return Err("Cargo.toml is missing, indirect, or oversized".to_string());
+    }
+    let body = fs::read_to_string(&path).map_err(|error| format!("read Cargo.toml: {error}"))?;
+    let document = body
+        .parse::<DocumentMut>()
+        .map_err(|error| format!("parse Cargo.toml: {error}"))?;
+    let repository = document
+        .get("package")
+        .and_then(|item| item.get("repository"))
+        .and_then(toml_edit::Item::as_str)
+        .or_else(|| {
+            document
+                .get("workspace")
+                .and_then(|item| item.get("package"))
+                .and_then(|item| item.get("repository"))
+                .and_then(toml_edit::Item::as_str)
+        })
+        .ok_or_else(|| "Cargo.toml has no package repository URL".to_string())?;
+    if repository.len() > 2048
+        || !repository.starts_with("https://")
+        || repository.ends_with('/')
+        || repository.contains(['\0', '\r', '\n', '?', '#'])
+    {
+        return Err("Cargo.toml has an unsupported package repository URL".to_string());
+    }
+    Ok(format!("{repository}/releases/tag/v{version}"))
 }
 
 fn changelog_section(body: &str, version: &Version) -> Result<String, String> {
@@ -844,6 +878,8 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    const FIXTURE_REPOSITORY_URL: &str = "https://example.invalid/repository";
 
     #[derive(Debug, Eq, PartialEq)]
     enum Invocation {
@@ -956,7 +992,7 @@ mod tests {
         let current = current.canonicalize().unwrap();
         let runner = FakeCargoRunner {
             outputs: [
-                cargo_output(b"cargo-semver-checks 0.50.0\n".to_vec()),
+                cargo_output(b"cargo-semver-checks 0.49.0\n".to_vec()),
                 metadata_output("yaml-sigil-traits", &baseline, "0.3.0-rc.1"),
                 metadata_output("yaml-sigil-traits", &current, "0.4.0-rc.1"),
             ]
@@ -1138,17 +1174,17 @@ mod tests {
     #[test]
     fn compatibility_requires_the_exact_analyzer_version() {
         for output in [
-            b"cargo-semver-checks 0.50.0".as_slice(),
-            b"cargo-semver-checks 0.50.0\n".as_slice(),
-            b"cargo-semver-checks 0.50.0\r\n".as_slice(),
+            b"cargo-semver-checks 0.49.0".as_slice(),
+            b"cargo-semver-checks 0.49.0\n".as_slice(),
+            b"cargo-semver-checks 0.49.0\r\n".as_slice(),
         ] {
             assert!(require_semver_checks_version(output).is_ok());
         }
         for output in [
-            b"cargo-semver-checks 0.49.0".as_slice(),
-            b" cargo-semver-checks 0.50.0\n".as_slice(),
-            b"cargo-semver-checks 0.50.0 \n".as_slice(),
-            b"cargo-semver-checks 0.50.0\n\n".as_slice(),
+            b"cargo-semver-checks 0.48.0".as_slice(),
+            b" cargo-semver-checks 0.49.0\n".as_slice(),
+            b"cargo-semver-checks 0.49.0 \n".as_slice(),
+            b"cargo-semver-checks 0.49.0\n\n".as_slice(),
             b"\xff".as_slice(),
             b"".as_slice(),
         ] {
@@ -1293,7 +1329,7 @@ mod tests {
                 success: true,
                 code: Some(0),
             }));
-        wrong_tool.outputs[0] = cargo_output(b"cargo-semver-checks 0.49.0\n".to_vec());
+        wrong_tool.outputs[0] = cargo_output(b"cargo-semver-checks 0.48.0\n".to_vec());
         assert!(
             check_api_compatibility_with_runner(
                 current.parent().unwrap(),
@@ -1367,6 +1403,31 @@ mod tests {
         assert_eq!(
             insert_after_unreleased(body, section).unwrap(),
             "# Changelog\n\n## [Unreleased]\n\n## [0.2.0](new) - 2026-08-19\n\n- New.\n\n## [0.1.0](old) - 2026-01-01\n\n- Old.\n"
+        );
+    }
+
+    #[test]
+    fn release_links_follow_reviewed_package_metadata() {
+        let temporary = TestDirectory::new("repository-url");
+        let version = Version::parse("1.2.3-rc.1").unwrap();
+        fs::write(
+            temporary.0.join("Cargo.toml"),
+            format!("[package]\nrepository = {FIXTURE_REPOSITORY_URL:?}\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            release_tag_url(&temporary.0, &version).unwrap(),
+            format!("{FIXTURE_REPOSITORY_URL}/releases/tag/v{version}")
+        );
+
+        fs::write(
+            temporary.0.join("Cargo.toml"),
+            format!("[workspace.package]\nrepository = {FIXTURE_REPOSITORY_URL:?}\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            release_tag_url(&temporary.0, &version).unwrap(),
+            format!("{FIXTURE_REPOSITORY_URL}/releases/tag/v{version}")
         );
     }
 }

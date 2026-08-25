@@ -2177,7 +2177,7 @@ jobs:
         )
         self.assertIn('const CARGO_BINSTALL_VERSION: &str = "1.20.1"', release_task)
         self.assertIn('const RELEASE_PLZ_VERSION: &str = "0.3.160"', release_task)
-        self.assertIn('const SEMVER_CHECKS_VERSION: &str = "0.50.0"', release_task)
+        self.assertIn('const SEMVER_CHECKS_VERSION: &str = "0.49.0"', release_task)
         self.assertIn("semver_check = false", config)
         expected_tags = (
             (
