@@ -20,25 +20,28 @@ use crate::github::consts::{
 use crate::github::models::{Compare, CreatedCommit, GitRef, PullRequest, RepositoryCommit, User};
 use crate::github::transport::{Transport, percent_encode};
 use crate::github::{
-    APP_EMAIL, APP_ID, APP_LOGIN, APP_SLUG, MAX_FILE_BYTES, RELEASE_BRANCH, WEB_FLOW_EMAIL,
-    WEB_FLOW_ID, WEB_FLOW_LOGIN, WEB_FLOW_NAME, append_outputs, command_output, env_bool,
-    env_required, git_line, git_output, is_positive_integer, is_sha, output_detail,
+    APP_EMAIL, APP_ID, APP_LOGIN, APP_SLUG, MAX_FILE_BYTES, RELEASE_BRANCH, ReleasePrPhase,
+    WEB_FLOW_EMAIL, WEB_FLOW_ID, WEB_FLOW_LOGIN, WEB_FLOW_NAME, append_outputs, command_output,
+    env_bool, env_required, git_line, git_output, is_positive_integer, is_sha, output_detail,
     validate_ref_component, workflow_repository,
 };
 
 const MAX_CHANGED_FILES: usize = 16;
 const MAX_TOTAL_CONTENT_BYTES: usize = 4 * 1024 * 1024;
 
-pub(super) fn apply(root: &Path, phase: &str, github: &mut impl Transport) -> Result<(), String> {
+pub(super) fn apply(
+    root: &Path,
+    phase: ReleasePrPhase,
+    github: &mut impl Transport,
+) -> Result<(), String> {
     if env::var_os("GH_TOKEN").is_none() {
         return Err("GH_TOKEN must contain the GitHub App installation token".to_string());
     }
     let context = Context::from_environment(root)?;
     let bot = require_bot(github)?;
     match phase {
-        "update" => update(root, &context, &bot, github),
-        "finalize" => finalize(root, &context, &bot, github),
-        _ => Err("release PR phase must be update or finalize".to_string()),
+        ReleasePrPhase::Update => update(root, &context, &bot, github),
+        ReleasePrPhase::Finalize => finalize(root, &context, &bot, github),
     }
 }
 

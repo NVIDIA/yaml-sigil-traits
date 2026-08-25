@@ -19,24 +19,20 @@ use crate::crate_archive::{CratesIo, Registry, require_archive, require_clean_so
 use crate::github::consts::RepositoryKind;
 use crate::github::models::{GitObject, GitRef, Signature, User};
 use crate::github::transport::{Transport, percent_encode};
-use crate::github::{
-    ensure_only_value_flags, git_line, is_sha, repository_policy_for_root, required_value,
-};
+use crate::github::{ReconcileMode, git_line, is_sha, repository_policy_for_root};
 use crate::release_policy::{PackagePolicy, ReleasePolicy, detect};
 
 const MAX_COMMAND_OUTPUT: usize = 4 * 1024 * 1024;
 
 pub(super) fn reconcile_command(
     root: &Path,
-    args: &[String],
+    mode: ReconcileMode,
+    repository: &str,
+    version: &str,
+    commit: &str,
     github: &mut impl Transport,
 ) -> Result<(), String> {
-    let mode = required_value(args, "--mode")?;
-    let repository = required_value(args, "--repository")?;
-    let version = required_value(args, "--version")?;
-    let commit = required_value(args, "--commit")?;
-    ensure_only_value_flags(args, &["--mode", "--repository", "--version", "--commit"])?;
-    if !matches!(mode, "prepublish" | "recover") || !is_sha(commit) {
+    if !is_sha(commit) {
         return Err("release object mode, repository, or commit is unsupported".to_string());
     }
     parse_version(version)?;
@@ -57,10 +53,13 @@ pub(super) fn reconcile_command(
         repository,
         &specs,
         commit,
-        mode,
+        mode.as_str(),
         &identity,
     )?;
-    eprintln!("github: release objects passed {mode} reconciliation for {version}");
+    eprintln!(
+        "github: release objects passed {} reconciliation for {version}",
+        mode.as_str()
+    );
     Ok(())
 }
 

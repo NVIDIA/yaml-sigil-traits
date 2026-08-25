@@ -3,12 +3,12 @@
 
 //! Provider-neutral release proposal generation.
 
-use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use clap::{Args, Subcommand, ValueEnum};
 use semver::Version;
 use serde::Serialize;
 
@@ -16,60 +16,80 @@ use crate::release_policy::{ReleaseFamily, ReleasePolicy, detect};
 
 const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 
-pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
-    match args {
-        [command, remaining @ ..] if command == "generate" => generate_command(root, remaining),
-        [arg] if matches!(arg.as_str(), "help" | "--help" | "-h") => {
-            eprintln!("{}", usage());
-            Ok(())
+#[derive(Args)]
+pub struct ProposalArgs {
+    #[command(subcommand)]
+    command: ProposalCommand,
+}
+
+#[derive(Subcommand)]
+enum ProposalCommand {
+    /// Generate one validated provider-neutral release transaction.
+    Generate(GenerateArgs),
+}
+
+#[derive(Args)]
+struct GenerateArgs {
+    #[arg(long, value_enum)]
+    mode: ProposalMode,
+    #[arg(long, value_enum)]
+    bump: ProposalBump,
+    #[arg(long)]
+    published_version: String,
+    #[arg(long)]
+    registry_manifest: PathBuf,
+    #[arg(long)]
+    date: String,
+    #[arg(long)]
+    result: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum ProposalMode {
+    NextCandidate,
+    PromoteStable,
+}
+
+impl ProposalMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::NextCandidate => "next-candidate",
+            Self::PromoteStable => "promote-stable",
         }
-        _ => Err(usage()),
     }
 }
 
-fn usage() -> String {
-    [
-        "usage: cargo xtask release proposal generate \\",
-        "    --mode next-candidate|promote-stable --bump patch|minor|major \\",
-        "    --published-version VERSION --registry-manifest PATH --date YYYY-MM-DD \\",
-        "    --result PATH",
-    ]
-    .join("\n")
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum ProposalBump {
+    Patch,
+    Minor,
+    Major,
 }
 
-fn generate_command(root: &Path, args: &[String]) -> Result<(), String> {
-    let values = parse_flags(
-        args,
-        &[
-            "--mode",
-            "--bump",
-            "--published-version",
-            "--registry-manifest",
-            "--date",
-            "--result",
-        ],
-    )?;
-    let required = |flag: &str| {
-        values
-            .get(flag)
-            .map(String::as_str)
-            .ok_or_else(|| format!("missing {flag}"))
-    };
-    let mode = required("--mode")?;
-    let bump = required("--bump")?;
-    let published = required("--published-version")?;
-    let registry_manifest = PathBuf::from(required("--registry-manifest")?);
-    let date = required("--date")?;
-    let result_file = PathBuf::from(required("--result")?);
-    if !matches!(mode, "next-candidate" | "promote-stable")
-        || !matches!(bump, "patch" | "minor" | "major")
-        || (mode == "promote-stable" && bump != "patch")
-    {
+impl ProposalBump {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Patch => "patch",
+            Self::Minor => "minor",
+            Self::Major => "major",
+        }
+    }
+}
+
+pub(crate) fn run(root: &Path, args: ProposalArgs) -> Result<(), String> {
+    match args.command {
+        ProposalCommand::Generate(args) => generate_command(root, args),
+    }
+}
+
+fn generate_command(root: &Path, args: GenerateArgs) -> Result<(), String> {
+    if args.mode == ProposalMode::PromoteStable && args.bump != ProposalBump::Patch {
         return Err("release proposal mode or bump is unsupported".to_string());
     }
-    parse_release_version(published)?;
-    validate_date(date)?;
-    let registry_manifest = registry_manifest
+    parse_release_version(&args.published_version)?;
+    validate_date(&args.date)?;
+    let registry_manifest = args
+        .registry_manifest
         .canonicalize()
         .map_err(|error| format!("resolve registry baseline manifest: {error}"))?;
     if !registry_manifest.is_file() {
@@ -79,13 +99,13 @@ fn generate_command(root: &Path, args: &[String]) -> Result<(), String> {
     let result = generate(
         root,
         policy,
-        mode,
-        bump,
-        published,
+        args.mode.as_str(),
+        args.bump.as_str(),
+        &args.published_version,
         &registry_manifest,
-        date,
+        &args.date,
     )?;
-    write_new_json(&result_file, &result)?;
+    write_new_json(&args.result, &result)?;
     eprintln!("release: generated validated {} proposal", result.target);
     Ok(())
 }
@@ -269,29 +289,6 @@ fn detail(output: &Output) -> String {
     }
 }
 
-fn parse_flags(args: &[String], allowed: &[&str]) -> Result<BTreeMap<String, String>, String> {
-    let mut values = BTreeMap::new();
-    let mut index = 0;
-    while index < args.len() {
-        let flag = args[index].as_str();
-        if !allowed.contains(&flag) {
-            return Err(format!("unexpected argument: {flag}"));
-        }
-        index += 1;
-        if index >= args.len() || args[index].starts_with("--") {
-            return Err(format!("missing value for {flag}"));
-        }
-        if values
-            .insert(flag.to_string(), args[index].clone())
-            .is_some()
-        {
-            return Err(format!("duplicate {flag}"));
-        }
-        index += 1;
-    }
-    Ok(values)
-}
-
 fn parse_release_version(value: &str) -> Result<Version, String> {
     let version = Version::parse(value)
         .map_err(|error| format!("invalid published version {value}: {error}"))?;
@@ -371,21 +368,61 @@ fn path_text(path: &Path) -> Result<&str, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        proposal: ProposalArgs,
+    }
 
     #[test]
     fn proposal_arguments_are_explicit_and_unique() {
-        let args = vec!["--mode".to_string(), "next-candidate".to_string()];
-        assert_eq!(
-            parse_flags(&args, &["--mode"]).unwrap()["--mode"],
-            "next-candidate"
-        );
-        let duplicate = vec![
-            "--mode".to_string(),
-            "next-candidate".to_string(),
-            "--mode".to_string(),
-            "promote-stable".to_string(),
-        ];
-        assert!(parse_flags(&duplicate, &["--mode"]).is_err());
+        let valid = TestCli::try_parse_from([
+            "test",
+            "generate",
+            "--mode",
+            "next-candidate",
+            "--bump",
+            "minor",
+            "--published-version",
+            "0.3.0",
+            "--registry-manifest",
+            "Cargo.toml",
+            "--date",
+            "2026-08-25",
+            "--result",
+            "result.json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            valid.proposal.command,
+            ProposalCommand::Generate(GenerateArgs {
+                mode: ProposalMode::NextCandidate,
+                bump: ProposalBump::Minor,
+                ..
+            })
+        ));
+
+        let duplicate = TestCli::try_parse_from([
+            "test",
+            "generate",
+            "--mode",
+            "next-candidate",
+            "--mode",
+            "promote-stable",
+            "--bump",
+            "patch",
+            "--published-version",
+            "0.3.0",
+            "--registry-manifest",
+            "Cargo.toml",
+            "--date",
+            "2026-08-25",
+            "--result",
+            "result.json",
+        ]);
+        assert!(duplicate.is_err());
     }
 
     #[test]

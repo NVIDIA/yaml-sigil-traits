@@ -428,49 +428,22 @@ mod tests {
 
     #[test]
     fn archive_requires_exact_vcs_commit_and_path() {
+        let package = &crate::release_policy::TRAITS_POLICY.packages[0];
         let commit = "a".repeat(40);
         let vcs = format!("{{\"git\":{{\"sha1\":\"{commit}\"}},\"path_in_vcs\":\"\"}}");
-        let bytes = archive(
-            "yaml-sigil-traits-0.4.0/.cargo_vcs_info.json",
-            vcs.as_bytes(),
-        );
-        let files = inspect_archive(
-            &bytes,
-            &crate::release_policy::TRAITS_POLICY.packages[0],
-            "0.4.0",
-            &commit,
-        )
-        .unwrap();
+        let root = format!("{}-0.4.0", package.package);
+        let bytes = archive(&format!("{root}/.cargo_vcs_info.json"), vcs.as_bytes());
+        let files = inspect_archive(&bytes, package, "0.4.0", &commit).unwrap();
         assert!(files.contains_key(".cargo_vcs_info.json"));
-        assert!(
-            inspect_archive(
-                &bytes,
-                &crate::release_policy::TRAITS_POLICY.packages[0],
-                "0.4.0",
-                &"b".repeat(40),
-            )
-            .is_err()
-        );
+        assert!(inspect_archive(&bytes, package, "0.4.0", &"b".repeat(40),).is_err());
     }
 
     #[test]
     fn archive_path_policy_rejects_traversal_and_wrong_roots() {
-        assert!(
-            validate_archive_path(
-                "yaml-sigil-traits-0.4.0/../escape",
-                "yaml-sigil-traits-0.4.0",
-                "yaml-sigil-traits",
-            )
-            .is_err()
-        );
-        assert!(
-            validate_archive_path(
-                "other-0.4.0/Cargo.toml",
-                "yaml-sigil-traits-0.4.0",
-                "yaml-sigil-traits",
-            )
-            .is_err()
-        );
+        let package = crate::release_policy::TRAITS_POLICY.packages[0].package;
+        let root = format!("{package}-0.4.0");
+        assert!(validate_archive_path(&format!("{root}/../escape"), &root, package).is_err());
+        assert!(validate_archive_path("other-0.4.0/Cargo.toml", &root, package).is_err());
     }
 
     #[test]

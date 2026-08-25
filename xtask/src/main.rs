@@ -14,18 +14,41 @@ mod release_policy;
 mod release_proposal;
 mod release_version;
 
-use std::env;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-fn main() -> ExitCode {
-    let mut args = env::args().skip(1);
-    let command = args.next().unwrap_or_default();
-    let remaining: Vec<_> = args.collect();
+use clap::{Parser, Subcommand};
 
-    match command.as_str() {
-        "ci" if !is_help_request(&remaining) => {
-            match parse_ci_root(&remaining)
+#[derive(Parser)]
+#[command(name = "cargo xtask", bin_name = "cargo xtask")]
+#[command(about = "Repository maintenance tasks")]
+struct Cli {
+    #[command(subcommand)]
+    command: Task,
+}
+
+#[derive(Subcommand)]
+enum Task {
+    /// Run the complete provider-neutral validation sequence.
+    Ci {
+        /// Validate another checkout instead of this repository root.
+        #[arg(long)]
+        candidate_root: Option<PathBuf>,
+    },
+    /// Compare Cargo's source list with the committed inventory.
+    PackageContent,
+    /// Manage provider-neutral release version transactions.
+    ReleaseVersion(release_version::ReleaseVersionArgs),
+    /// Run provider-neutral release preparation and verification.
+    Release(release::ReleaseArgs),
+    /// Run bounded GitHub release-automation operations.
+    Github(github::GithubArgs),
+}
+
+fn main() -> ExitCode {
+    match Cli::parse().command {
+        Task::Ci { candidate_root } => {
+            match resolve_ci_root(candidate_root)
                 .and_then(|root| ci::run(&root).map_err(|error| error.to_string()))
             {
                 Ok(()) => ExitCode::SUCCESS,
@@ -35,54 +58,34 @@ fn main() -> ExitCode {
                 }
             }
         }
-        "package-content" if remaining.is_empty() => {
-            match package_content::run(&workspace_root()) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(error) => {
-                    eprintln!("package-content failed: {error}");
-                    ExitCode::FAILURE
-                }
+        Task::PackageContent => match package_content::run(&workspace_root()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("package-content failed: {error}");
+                ExitCode::FAILURE
             }
-        }
-        "release-version" => match release_version::run(&workspace_root(), &remaining) {
+        },
+        Task::ReleaseVersion(args) => match release_version::run(&workspace_root(), args) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("release-version failed: {error}");
                 ExitCode::FAILURE
             }
         },
-        "release" => match release::run(&workspace_root(), &remaining) {
+        Task::Release(args) => match release::run(&workspace_root(), args) {
             Ok(outcome) => ExitCode::from(release_exit_code(outcome)),
             Err(error) => {
                 eprintln!("release failed: {error}");
                 ExitCode::FAILURE
             }
         },
-        "github" => match github::run(&workspace_root(), &remaining) {
+        Task::Github(args) => match github::run(&workspace_root(), args) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("github failed: {error}");
                 ExitCode::FAILURE
             }
         },
-        "" | "help" | "--help" | "-h" => {
-            print_usage();
-            ExitCode::SUCCESS
-        }
-        "ci" | "package-content" if is_help_request(&remaining) => {
-            print_usage();
-            ExitCode::SUCCESS
-        }
-        "package-content" => {
-            eprintln!("{command} does not accept arguments");
-            print_usage();
-            ExitCode::FAILURE
-        }
-        other => {
-            eprintln!("unknown subcommand: {other}");
-            print_usage();
-            ExitCode::FAILURE
-        }
     }
 }
 
@@ -100,15 +103,8 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn parse_ci_root(args: &[String]) -> Result<PathBuf, String> {
-    let candidate = match args {
-        [] => workspace_root(),
-        [flag, value] if flag == "--candidate-root" && !value.is_empty() => PathBuf::from(value),
-        [flag, _] if flag == "--candidate-root" => {
-            return Err("--candidate-root needs a nonempty path".to_string());
-        }
-        _ => return Err("ci accepts only --candidate-root PATH".to_string()),
-    };
+fn resolve_ci_root(candidate_root: Option<PathBuf>) -> Result<PathBuf, String> {
+    let candidate = candidate_root.unwrap_or_else(workspace_root);
     let candidate = candidate.canonicalize().map_err(|error| {
         format!(
             "cannot resolve candidate root {}: {error}",
@@ -124,23 +120,6 @@ fn parse_ci_root(args: &[String]) -> Result<PathBuf, String> {
     Ok(candidate)
 }
 
-fn is_help_request(args: &[String]) -> bool {
-    matches!(args, [arg] if matches!(arg.as_str(), "help" | "--help" | "-h"))
-}
-
-fn print_usage() {
-    eprintln!(
-        "usage:\n  cargo xtask ci [--candidate-root PATH]\n  cargo xtask package-content\n  \
-         cargo xtask release <COMMAND>\n  cargo xtask release-version <COMMAND>\n\n\
-         commands:\n  ci               Run the complete non-release validation sequence.\n  \
-                            --candidate-root validates another checkout.\n  \
-         package-content  Compare Cargo's source list with the committed inventory.\n  \
-         github          Run bounded GitHub release-automation operations.\n  \
-         release          Run provider-neutral release preparation and verification.\n  \
-         release-version  Manage provider-neutral release version transactions."
-    );
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,11 +128,11 @@ mod tests {
     fn ci_candidate_root_is_repository_scoped() {
         let root = workspace_root();
         assert_eq!(
-            parse_ci_root(&["--candidate-root".to_string(), root.display().to_string(),]).unwrap(),
+            resolve_ci_root(Some(root.clone())).unwrap(),
             root.canonicalize().unwrap()
         );
-        assert!(parse_ci_root(&["--candidate-root".to_string()]).is_err());
-        assert!(parse_ci_root(&["--unknown".to_string(), "value".to_string()]).is_err());
+        assert!(Cli::try_parse_from(["xtask", "ci", "--candidate-root"]).is_err());
+        assert!(Cli::try_parse_from(["xtask", "ci", "--unknown", "value"]).is_err());
     }
 
     #[test]

@@ -9,161 +9,144 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use clap::{Args, Subcommand, ValueEnum};
 use semver::{Prerelease, Version};
 use toml_edit::DocumentMut;
 
-use crate::release::{SEMVER_CHECKS_VERSION, exact_output_line};
+use crate::release::exact_output_line;
+use crate::release_policy::TRAITS_TOOLCHAIN;
 
 const CHANGELOG: &str = "CHANGELOG.md";
 
-pub fn run(root: &Path, args: &[String]) -> Result<(), String> {
-    let Some(command) = args.first().map(String::as_str) else {
-        return Err(usage());
-    };
+#[derive(Args)]
+pub struct ReleaseVersionArgs {
+    #[command(subcommand)]
+    command: ReleaseVersionCommand,
+}
 
-    match command {
-        "show" if args.len() == 1 => {
+#[derive(Subcommand)]
+enum ReleaseVersionCommand {
+    /// Print the exact release version.
+    Show,
+    /// Validate the current release version.
+    Check,
+    /// Check one exact registry baseline against the proposed API.
+    CheckCompatibility {
+        #[arg(long)]
+        baseline_manifest: PathBuf,
+        #[arg(long)]
+        current_manifest: PathBuf,
+        #[arg(long)]
+        package: String,
+        #[arg(long)]
+        expected_baseline_version: Version,
+        #[arg(long)]
+        expected_current_version: Version,
+        #[arg(long, value_enum)]
+        intent: ReleaseBump,
+    },
+    /// Resolve the release intent from published and current versions.
+    Intent {
+        #[arg(long)]
+        published: Version,
+    },
+    /// Prepare the next release candidate version.
+    Candidate {
+        #[arg(long)]
+        published: Version,
+        #[arg(long, value_enum)]
+        bump: ReleaseBump,
+        #[arg(long)]
+        date: String,
+        #[arg(long)]
+        release_notes: bool,
+    },
+    /// Promote the current release candidate to its stable version.
+    PromoteStable {
+        #[arg(long)]
+        date: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum ReleaseBump {
+    Patch,
+    Minor,
+    Major,
+}
+
+impl ReleaseBump {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Patch => "patch",
+            Self::Minor => "minor",
+            Self::Major => "major",
+        }
+    }
+}
+
+pub fn run(root: &Path, args: ReleaseVersionArgs) -> Result<(), String> {
+    match args.command {
+        ReleaseVersionCommand::Show => {
             println!("{}", read_version(root)?);
             Ok(())
         }
-        "check" if args.len() == 1 => {
+        ReleaseVersionCommand::Check => {
             let version = read_version(root)?;
             eprintln!("release-version: manifest version is {version}");
             Ok(())
         }
-        "check-compatibility" => {
-            let baseline_manifest = PathBuf::from(required_value(args, "--baseline-manifest")?);
-            let current_manifest = PathBuf::from(required_value(args, "--current-manifest")?);
-            let package = required_value(args, "--package")?;
-            let expected_baseline =
-                Version::parse(required_value(args, "--expected-baseline-version")?)
-                    .map_err(|error| format!("invalid --expected-baseline-version: {error}"))?;
-            let expected_current =
-                Version::parse(required_value(args, "--expected-current-version")?)
-                    .map_err(|error| format!("invalid --expected-current-version: {error}"))?;
-            let expected_intent = required_value(args, "--intent")?;
-            ensure_only_flags(
-                args,
-                &[
-                    "--baseline-manifest",
-                    "--current-manifest",
-                    "--package",
-                    "--expected-baseline-version",
-                    "--expected-current-version",
-                    "--intent",
-                ],
-            )?;
-            check_api_compatibility(
-                root,
-                &baseline_manifest,
-                &current_manifest,
-                package,
-                &expected_baseline,
-                &expected_current,
-                expected_intent,
-            )
-        }
-        "intent" => {
-            let published = Version::parse(required_value(args, "--published")?)
-                .map_err(|error| format!("invalid --published version: {error}"))?;
-            ensure_only_flags(args, &["--published"])?;
+        ReleaseVersionCommand::CheckCompatibility {
+            baseline_manifest,
+            current_manifest,
+            package,
+            expected_baseline_version,
+            expected_current_version,
+            intent,
+        } => check_api_compatibility(
+            root,
+            &baseline_manifest,
+            &current_manifest,
+            &package,
+            &expected_baseline_version,
+            &expected_current_version,
+            intent.as_str(),
+        ),
+        ReleaseVersionCommand::Intent { published } => {
             println!("{}", release_intent(&published, &read_version(root)?)?);
             Ok(())
         }
-        "candidate" => {
-            let published = Version::parse(required_value(args, "--published")?)
-                .map_err(|error| format!("invalid --published version: {error}"))?;
-            let bump = required_value(args, "--bump")?;
-            let date = required_value(args, "--date")?;
-            validate_date(date)?;
-            ensure_only_flags(
-                args,
-                &["--published", "--bump", "--date", "--release-notes"],
-            )?;
-            let release_notes = args.iter().any(|arg| arg == "--release-notes");
+        ReleaseVersionCommand::Candidate {
+            published,
+            bump,
+            date,
+            release_notes,
+        } => {
+            validate_date(&date)?;
             let current = read_version(root)?;
-            let target = candidate_version(&published, &current, bump)?;
+            let target = candidate_version(&published, &current, bump.as_str())?;
             write_version(root, &target)?;
             if release_notes {
-                ensure_candidate_changelog(root, &current, &target, date)?;
+                ensure_candidate_changelog(root, &current, &target, &date)?;
             }
             println!("{target}");
             Ok(())
         }
-        "promote-stable" => {
-            let date = required_value(args, "--date")?;
-            validate_date(date)?;
-            ensure_only_flags(args, &["--date"])?;
+        ReleaseVersionCommand::PromoteStable { date } => {
+            validate_date(&date)?;
             let current = read_version(root)?;
             let stable = stable_version(&current)?;
-            promote_changelog(root, &current, &stable, date)?;
+            promote_changelog(root, &current, &stable, &date)?;
             write_version(root, &stable)?;
             println!("{stable}");
             Ok(())
         }
-        "help" | "--help" | "-h" => {
-            eprintln!("{}", usage());
-            Ok(())
-        }
-        _ => Err(usage()),
     }
 }
 
 pub(crate) fn check(root: &Path) -> Result<(), String> {
     let version = read_version(root)?;
     eprintln!("release-version: manifest version is {version}");
-    Ok(())
-}
-
-fn usage() -> String {
-    "usage: cargo xtask release-version \
-     <show|check|check-compatibility --baseline-manifest PATH \
-     --current-manifest PATH --package NAME --expected-baseline-version VERSION \
-     --expected-current-version VERSION --intent patch|minor|major|\
-     intent --published VERSION|candidate --published VERSION \
-     --bump patch|minor|major --date YYYY-MM-DD [--release-notes]|\
-     promote-stable --date YYYY-MM-DD>"
-        .to_string()
-}
-
-fn required_value<'a>(args: &'a [String], flag: &str) -> Result<&'a str, String> {
-    let indexes: Vec<_> = args
-        .iter()
-        .enumerate()
-        .filter(|(_, arg)| arg.as_str() == flag)
-        .map(|(index, _)| index)
-        .collect();
-    let index = match indexes.as_slice() {
-        [] => return Err(format!("missing {flag}")),
-        [index] => *index,
-        _ => return Err(format!("duplicate {flag}")),
-    };
-    args.get(index + 1)
-        .map(String::as_str)
-        .filter(|value| !value.starts_with("--"))
-        .ok_or_else(|| format!("missing value for {flag}"))
-}
-
-fn ensure_only_flags(args: &[String], flags: &[&str]) -> Result<(), String> {
-    let mut seen = Vec::new();
-    let mut index = 1;
-    while index < args.len() {
-        let arg = args[index].as_str();
-        if !flags.contains(&arg) {
-            return Err(format!("unexpected argument: {arg}"));
-        }
-        if seen.contains(&arg) {
-            return Err(format!("duplicate {arg}"));
-        }
-        seen.push(arg);
-        index += 1;
-        if arg != "--release-notes" {
-            if index >= args.len() || args[index].starts_with("--") {
-                return Err(format!("missing value for {arg}"));
-            }
-            index += 1;
-        }
-    }
     Ok(())
 }
 
@@ -390,7 +373,10 @@ fn checker_release_type(intent: &str, current: &Version) -> Result<&'static str,
 }
 
 fn require_semver_checks_version(value: &[u8]) -> Result<(), String> {
-    let expected = format!("cargo-semver-checks {SEMVER_CHECKS_VERSION}");
+    let expected = format!(
+        "cargo-semver-checks {}",
+        TRAITS_TOOLCHAIN.cargo_semver_checks_version
+    );
     let actual = exact_output_line(value, "cargo-semver-checks version")?;
     if actual == expected {
         Ok(())
@@ -876,8 +862,19 @@ fn insert_after_unreleased(body: &str, section: &str) -> Result<String, String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    use crate::release_policy::TRAITS_POLICY;
+
+    const TRAITS_PACKAGE: &str = TRAITS_POLICY.packages[0].package;
+
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        release_version: ReleaseVersionArgs,
+    }
 
     const FIXTURE_REPOSITORY_URL: &str = "https://example.invalid/repository";
 
@@ -979,22 +976,28 @@ mod tests {
         let baseline = baseline_root.join("Cargo.toml");
         fs::write(
             &baseline,
-            "[package]\nname = \"yaml-sigil-traits\"\nversion = \"0.3.0-rc.1\"\n",
+            format!("[package]\nname = \"{TRAITS_PACKAGE}\"\nversion = \"0.3.0-rc.1\"\n"),
         )
         .unwrap();
         let baseline = baseline.canonicalize().unwrap();
         let current = repository_root.join("Cargo.toml");
         fs::write(
             &current,
-            "[package]\nname = \"yaml-sigil-traits\"\nversion = \"0.4.0-rc.1\"\n",
+            format!("[package]\nname = \"{TRAITS_PACKAGE}\"\nversion = \"0.4.0-rc.1\"\n"),
         )
         .unwrap();
         let current = current.canonicalize().unwrap();
         let runner = FakeCargoRunner {
             outputs: [
-                cargo_output(b"cargo-semver-checks 0.49.0\n".to_vec()),
-                metadata_output("yaml-sigil-traits", &baseline, "0.3.0-rc.1"),
-                metadata_output("yaml-sigil-traits", &current, "0.4.0-rc.1"),
+                cargo_output(
+                    format!(
+                        "cargo-semver-checks {}\n",
+                        TRAITS_TOOLCHAIN.cargo_semver_checks_version
+                    )
+                    .into_bytes(),
+                ),
+                metadata_output(TRAITS_PACKAGE, &baseline, "0.3.0-rc.1"),
+                metadata_output(TRAITS_PACKAGE, &current, "0.4.0-rc.1"),
             ]
             .into(),
             statuses: [status].into(),
@@ -1141,7 +1144,7 @@ mod tests {
         let equivalent_spelling = release.join("..").join("release").join("Cargo.toml");
         let exact = serde_json::json!({
             "packages": [{
-                "name": "yaml-sigil-traits",
+                "name": TRAITS_PACKAGE,
                 "version": "0.4.0-rc.1",
                 "manifest_path": equivalent_spelling
             }]
@@ -1150,7 +1153,7 @@ mod tests {
             metadata_version_from_json(
                 &serde_json::to_vec(&exact).unwrap(),
                 &manifest,
-                "yaml-sigil-traits"
+                TRAITS_PACKAGE
             )
             .unwrap(),
             Version::parse("0.4.0-rc.1").unwrap()
@@ -1161,56 +1164,60 @@ mod tests {
             metadata_version_from_json(
                 &serde_json::to_vec(&exact).unwrap(),
                 &wrong_manifest,
-                "yaml-sigil-traits"
+                TRAITS_PACKAGE
             )
             .is_err()
         );
         assert!(
-            metadata_version_from_json(br#"{"packages":[]}"#, &manifest, "yaml-sigil-traits")
-                .is_err()
+            metadata_version_from_json(br#"{"packages":[]}"#, &manifest, TRAITS_PACKAGE).is_err()
         );
     }
 
     #[test]
     fn compatibility_requires_the_exact_analyzer_version() {
-        for output in [
-            b"cargo-semver-checks 0.49.0".as_slice(),
-            b"cargo-semver-checks 0.49.0\n".as_slice(),
-            b"cargo-semver-checks 0.49.0\r\n".as_slice(),
-        ] {
-            assert!(require_semver_checks_version(output).is_ok());
+        let expected = format!(
+            "cargo-semver-checks {}",
+            TRAITS_TOOLCHAIN.cargo_semver_checks_version
+        );
+        for suffix in ["", "\n", "\r\n"] {
+            assert!(
+                require_semver_checks_version(format!("{expected}{suffix}").as_bytes()).is_ok()
+            );
         }
         for output in [
-            b"cargo-semver-checks 0.48.0".as_slice(),
-            b" cargo-semver-checks 0.49.0\n".as_slice(),
-            b"cargo-semver-checks 0.49.0 \n".as_slice(),
-            b"cargo-semver-checks 0.49.0\n\n".as_slice(),
-            b"\xff".as_slice(),
-            b"".as_slice(),
+            b"cargo-semver-checks 0.48.0".to_vec(),
+            format!(" {expected}\n").into_bytes(),
+            format!("{expected} \n").into_bytes(),
+            format!("{expected}\n\n").into_bytes(),
+            vec![0xff],
+            Vec::new(),
         ] {
-            assert!(require_semver_checks_version(output).is_err());
+            assert!(require_semver_checks_version(&output).is_err());
         }
     }
 
     #[test]
     fn compatibility_rejects_duplicate_flags() {
-        let args = [
-            "check-compatibility".to_string(),
-            "--package".to_string(),
-            "yaml-sigil-traits".to_string(),
-            "--package".to_string(),
-            "lookalike".to_string(),
-        ];
-        assert!(
-            required_value(&args, "--package")
-                .unwrap_err()
-                .contains("duplicate")
-        );
-        assert!(
-            ensure_only_flags(&args, &["--package"])
-                .unwrap_err()
-                .contains("duplicate")
-        );
+        let package = TRAITS_PACKAGE;
+        let parsed = TestCli::try_parse_from([
+            "test",
+            "check-compatibility",
+            "--baseline-manifest",
+            "baseline/Cargo.toml",
+            "--current-manifest",
+            "Cargo.toml",
+            "--package",
+            package,
+            "--package",
+            "lookalike",
+            "--expected-baseline-version",
+            "0.3.0-rc.1",
+            "--expected-current-version",
+            "0.4.0-rc.1",
+            "--intent",
+            "minor",
+        ]);
+        assert!(parsed.is_err());
     }
 
     #[test]
@@ -1224,7 +1231,7 @@ mod tests {
             root,
             &baseline,
             &current,
-            "yaml-sigil-traits",
+            TRAITS_PACKAGE,
             &Version::parse("0.3.0-rc.1").unwrap(),
             &Version::parse("0.4.0-rc.1").unwrap(),
             "minor",
@@ -1270,7 +1277,7 @@ mod tests {
                         "--manifest-path".into(),
                         current.as_os_str().to_owned(),
                         "--package".into(),
-                        "yaml-sigil-traits".into(),
+                        TRAITS_PACKAGE.into(),
                         "--baseline-root".into(),
                         baseline.parent().unwrap().as_os_str().to_owned(),
                         "--release-type".into(),
@@ -1311,7 +1318,7 @@ mod tests {
                 current.parent().unwrap(),
                 &baseline,
                 &current,
-                "yaml-sigil-traits",
+                TRAITS_PACKAGE,
                 &Version::parse("0.3.0-rc.1").unwrap(),
                 &Version::parse("0.4.0-rc.1").unwrap(),
                 "minor",
@@ -1335,7 +1342,7 @@ mod tests {
                 current.parent().unwrap(),
                 &baseline,
                 &current,
-                "yaml-sigil-traits",
+                TRAITS_PACKAGE,
                 &Version::parse("0.3.0-rc.1").unwrap(),
                 &Version::parse("0.4.0-rc.1").unwrap(),
                 "minor",
@@ -1356,7 +1363,7 @@ mod tests {
                 current.parent().unwrap(),
                 &baseline,
                 &current,
-                "yaml-sigil-traits",
+                TRAITS_PACKAGE,
                 &Version::parse("0.3.0-rc.1").unwrap(),
                 &Version::parse("0.4.0-rc.1").unwrap(),
                 "minor",
@@ -1376,7 +1383,7 @@ mod tests {
                 current.parent().unwrap(),
                 &baseline,
                 &current,
-                "yaml-sigil-traits",
+                TRAITS_PACKAGE,
                 &Version::parse("0.3.0-rc.2").unwrap(),
                 &Version::parse("0.4.0-rc.1").unwrap(),
                 "minor",

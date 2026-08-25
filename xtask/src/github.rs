@@ -18,6 +18,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use clap::{Args, Subcommand, ValueEnum};
 use transport::GhCli;
 
 use consts::RepositoryPolicy;
@@ -26,63 +27,165 @@ pub(crate) use consts::{
     WEB_FLOW_ID, WEB_FLOW_LOGIN, WEB_FLOW_NAME,
 };
 
-pub fn run(root: &Path, args: &[String]) -> Result<(), String> {
-    if matches!(args, [arg] if matches!(arg.as_str(), "help" | "--help" | "-h")) {
-        eprintln!("{}", usage());
-        return Ok(());
-    }
-    require_token()?;
-    let mut github = GhCli::new()?;
-    match args {
-        [namespace, command, rest @ ..]
-            if namespace == "git-identity" && command == "configure" =>
-        {
-            identity::configure_command(root, rest, &mut github)
+#[derive(Args)]
+pub struct GithubArgs {
+    #[command(subcommand)]
+    command: GithubCommand,
+}
+
+#[derive(Subcommand)]
+enum GithubCommand {
+    /// Configure a token-derived repository-local Git identity.
+    GitIdentity(GitIdentityArgs),
+    /// Resolve, create, update, or finalize the release pull request.
+    ReleasePr(ReleasePrArgs),
+    /// Authorize one exact integrated release proposal.
+    ReleaseSource(ReleaseSourceArgs),
+    /// Verify or recover source-only official release objects.
+    ReleaseObjects(ReleaseObjectsArgs),
+}
+
+#[derive(Args)]
+struct GitIdentityArgs {
+    #[command(subcommand)]
+    command: GitIdentityCommand,
+}
+
+#[derive(Subcommand)]
+enum GitIdentityCommand {
+    /// Configure token-derived identity; local use requires a repository.
+    Configure {
+        /// Explicit local repository identity; forbidden in GitHub Actions.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repository: Option<String>,
+    },
+}
+
+#[derive(Args)]
+struct ReleasePrArgs {
+    #[command(subcommand)]
+    command: ReleasePrCommand,
+}
+
+#[derive(Subcommand)]
+enum ReleasePrCommand {
+    /// Resolve one bounded App-owned release proposal.
+    ResolveIntent,
+    /// Create or finalize an exact App-signed release proposal.
+    Apply {
+        /// Mutation phase authorized by the surrounding workflow.
+        #[arg(long, value_enum)]
+        phase: ReleasePrPhase,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(super) enum ReleasePrPhase {
+    Update,
+    Finalize,
+}
+
+#[derive(Args)]
+struct ReleaseSourceArgs {
+    #[command(subcommand)]
+    command: ReleaseSourceCommand,
+}
+
+#[derive(Subcommand)]
+enum ReleaseSourceCommand {
+    /// Authorize one exact integrated release proposal.
+    Authorize {
+        #[arg(long, value_name = "OWNER/REPO")]
+        repository: String,
+        #[arg(long, value_name = "SHA")]
+        commit: String,
+        #[arg(long)]
+        baseline_version: String,
+        #[arg(long, value_name = "SHA")]
+        baseline_commit: String,
+    },
+}
+
+#[derive(Args)]
+struct ReleaseObjectsArgs {
+    #[command(subcommand)]
+    command: ReleaseObjectsCommand,
+}
+
+#[derive(Subcommand)]
+enum ReleaseObjectsCommand {
+    /// Reconcile source-only release objects before or after publication.
+    Reconcile {
+        #[arg(long, value_enum)]
+        mode: ReconcileMode,
+        #[arg(long, value_name = "OWNER/REPO")]
+        repository: String,
+        #[arg(long)]
+        version: String,
+        #[arg(long, value_name = "SHA")]
+        commit: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(super) enum ReconcileMode {
+    Prepublish,
+    Recover,
+}
+
+impl ReconcileMode {
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Prepublish => "prepublish",
+            Self::Recover => "recover",
         }
-        [namespace, command] if namespace == "release-pr" && command == "resolve-intent" => {
-            intent::resolve(root, &mut github)
-        }
-        [namespace, command, phase_flag, phase]
-            if namespace == "release-pr"
-                && command == "apply"
-                && phase_flag == "--phase"
-                && matches!(phase.as_str(), "update" | "finalize") =>
-        {
-            release_pr::apply(root, phase, &mut github)
-        }
-        [namespace, command, rest @ ..]
-            if namespace == "release-source" && command == "authorize" =>
-        {
-            source::authorize_command(root, rest, &mut github)
-        }
-        [namespace, command, rest @ ..]
-            if namespace == "release-objects" && command == "reconcile" =>
-        {
-            release_objects::reconcile_command(root, rest, &mut github)
-        }
-        _ => Err(usage()),
     }
 }
 
-fn usage() -> String {
-    [
-        "usage: cargo xtask github <COMMAND>",
-        "",
-        "commands:",
-        "  git-identity configure [--repository OWNER/REPO]",
-        "      Configure token-derived identity; local use requires a repository.",
-        "  release-pr resolve-intent",
-        "      Resolve one bounded App-owned release proposal.",
-        "  release-pr apply --phase update|finalize",
-        "      Create or finalize an exact App-signed release proposal.",
-        "  release-source authorize --repository OWNER/REPO --commit SHA \\",
-        "      --baseline-version VERSION --baseline-commit SHA",
-        "      Authorize one exact integrated release proposal.",
-        "  release-objects reconcile --mode prepublish|recover \\",
-        "      --repository OWNER/REPO --version VERSION --commit SHA",
-        "      Reconcile source-only official release objects.",
-    ]
-    .join("\n")
+pub fn run(root: &Path, args: GithubArgs) -> Result<(), String> {
+    require_token()?;
+    let mut github = GhCli::new()?;
+    match args.command {
+        GithubCommand::GitIdentity(args) => match args.command {
+            GitIdentityCommand::Configure { repository } => {
+                identity::configure_command(root, repository.as_deref(), &mut github)
+            }
+        },
+        GithubCommand::ReleasePr(args) => match args.command {
+            ReleasePrCommand::ResolveIntent => intent::resolve(root, &mut github),
+            ReleasePrCommand::Apply { phase } => release_pr::apply(root, phase, &mut github),
+        },
+        GithubCommand::ReleaseSource(args) => match args.command {
+            ReleaseSourceCommand::Authorize {
+                repository,
+                commit,
+                baseline_version,
+                baseline_commit,
+            } => source::authorize_command(
+                root,
+                &repository,
+                &commit,
+                &baseline_version,
+                &baseline_commit,
+                &mut github,
+            ),
+        },
+        GithubCommand::ReleaseObjects(args) => match args.command {
+            ReleaseObjectsCommand::Reconcile {
+                mode,
+                repository,
+                version,
+                commit,
+            } => release_objects::reconcile_command(
+                root,
+                mode,
+                &repository,
+                &version,
+                &commit,
+                &mut github,
+            ),
+        },
+    }
 }
 
 fn require_token() -> Result<(), String> {
@@ -141,41 +244,6 @@ pub(super) fn is_sha(value: &str) -> bool {
 
 pub(super) fn is_positive_integer(value: &str) -> bool {
     !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) && !value.starts_with('0')
-}
-
-pub(super) fn required_value<'a>(args: &'a [String], flag: &str) -> Result<&'a str, String> {
-    let values: Vec<_> = args
-        .windows(2)
-        .filter(|pair| pair[0] == flag)
-        .map(|pair| pair[1].as_str())
-        .collect();
-    match values.as_slice() {
-        [] => Err(format!("missing {flag}")),
-        [value] if !value.starts_with("--") => Ok(value),
-        [_] => Err(format!("missing value for {flag}")),
-        _ => Err(format!("duplicate {flag}")),
-    }
-}
-
-pub(super) fn ensure_only_value_flags(args: &[String], flags: &[&str]) -> Result<(), String> {
-    let mut seen = Vec::new();
-    let mut index = 0;
-    while index < args.len() {
-        let flag = args[index].as_str();
-        if !flags.contains(&flag) {
-            return Err(format!("unexpected argument: {flag}"));
-        }
-        if seen.contains(&flag) {
-            return Err(format!("duplicate {flag}"));
-        }
-        seen.push(flag);
-        index += 1;
-        if index >= args.len() || args[index].starts_with("--") {
-            return Err(format!("missing value for {flag}"));
-        }
-        index += 1;
-    }
-    Ok(())
 }
 
 pub(super) fn append_outputs(values: &[(&str, &str)]) -> Result<(), String> {

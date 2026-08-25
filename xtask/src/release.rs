@@ -12,16 +12,17 @@ use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
+use clap::{Args, Subcommand};
 use semver::Version;
 use serde_json::Value;
 use toml_edit::DocumentMut;
 
+use crate::release_policy::TRAITS_POLICY;
+
 const REGISTRY_USER_AGENT: &str = "yaml-sigil-release-workflow/1.0";
 const REGISTRY_ATTEMPTS: usize = 30;
 const REGISTRY_RETRY_SECONDS: u64 = 10;
-const CARGO_BINSTALL_VERSION: &str = "1.20.1";
-const RELEASE_PLZ_VERSION: &str = "0.3.160";
-pub(crate) const SEMVER_CHECKS_VERSION: &str = "0.49.0";
+const TRAITS_PACKAGE: &str = TRAITS_POLICY.packages[0].package;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Outcome {
@@ -29,88 +30,96 @@ pub enum Outcome {
     RegistryUnavailable,
 }
 
-pub fn run(root: &Path, args: &[String]) -> Result<Outcome, String> {
-    let Some(command) = args.first().map(String::as_str) else {
-        return Err(usage());
-    };
+#[derive(Args)]
+pub struct ReleaseArgs {
+    #[command(subcommand)]
+    command: ReleaseCommand,
+}
 
-    match command {
-        "install-tools" if args.len() == 1 => {
+#[derive(Subcommand)]
+enum ReleaseCommand {
+    /// Install and verify the exact release analyzers.
+    InstallTools,
+    /// Require the exact library-only crates.io package order.
+    CheckPackages {
+        #[arg(required = true, num_args = 1..)]
+        packages: Vec<String>,
+    },
+    /// Verify exact non-yanked crates.io versions.
+    VerifyRegistry {
+        #[arg(long)]
+        check_version: Option<Version>,
+        #[arg(required = true, num_args = 1..)]
+        packages: Vec<String>,
+    },
+    /// Bind a release mutation to exact current remote main.
+    RequireCurrentMain {
+        #[arg(long)]
+        head: String,
+        #[arg(long)]
+        fetch_url: String,
+    },
+    /// Prepare a checkout-bound release-plz publication config.
+    PreparePublicationConfig {
+        #[arg(long)]
+        source: Option<PathBuf>,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Prepare or verify an archive-bound official baseline.
+    Baseline(crate::release_baseline::BaselineArgs),
+    /// Generate a provider-neutral release proposal transaction.
+    Proposal(crate::release_proposal::ProposalArgs),
+}
+
+pub fn run(root: &Path, args: ReleaseArgs) -> Result<Outcome, String> {
+    match args.command {
+        ReleaseCommand::InstallTools => {
             install_tools(root)?;
             Ok(Outcome::Success)
         }
-        "check-packages" => {
-            let packages = positional_packages(&args[1..])?;
+        ReleaseCommand::CheckPackages { packages } => {
+            validate_package_arguments(&packages)?;
             check_packages(root, &packages)?;
             Ok(Outcome::Success)
         }
-        "verify-registry" => verify_registry_command(root, &args[1..]),
-        "require-current-main" => {
-            let head = required_value(&args[1..], "--head")?;
-            let fetch_url = required_value(&args[1..], "--fetch-url")?;
-            ensure_only_value_flags(&args[1..], &["--head", "--fetch-url"])?;
-            require_current_main(root, head, fetch_url)?;
+        ReleaseCommand::VerifyRegistry {
+            check_version,
+            packages,
+        } => {
+            validate_package_arguments(&packages)?;
+            verify_registry(root, check_version.as_ref(), &packages)
+        }
+        ReleaseCommand::RequireCurrentMain { head, fetch_url } => {
+            require_current_main(root, &head, &fetch_url)?;
             Ok(Outcome::Success)
         }
-        "prepare-publication-config" => {
-            let source = optional_value(&args[1..], "--source")?
-                .map_or_else(|| root.join(".release-plz.toml"), PathBuf::from);
-            let output = PathBuf::from(required_value(&args[1..], "--output")?);
-            ensure_only_value_flags(&args[1..], &["--source", "--output"])?;
+        ReleaseCommand::PreparePublicationConfig { source, output } => {
+            let source = source.unwrap_or_else(|| root.join(".release-plz.toml"));
             prepare_publication_config(root, &source, &output)?;
             Ok(Outcome::Success)
         }
-        "baseline" => {
-            crate::release_baseline::run(root, &args[1..])?;
+        ReleaseCommand::Baseline(args) => {
+            crate::release_baseline::run(root, args)?;
             Ok(Outcome::Success)
         }
-        "proposal" => {
-            crate::release_proposal::run(root, &args[1..])?;
+        ReleaseCommand::Proposal(args) => {
+            crate::release_proposal::run(root, args)?;
             Ok(Outcome::Success)
         }
-        "help" | "--help" | "-h" => {
-            eprintln!("{}", usage());
-            Ok(Outcome::Success)
-        }
-        _ => Err(usage()),
     }
 }
 
-fn usage() -> String {
-    "usage: cargo xtask release <COMMAND>\n\n\
-     commands:\n  install-tools\n\
-                  Install and verify the exact release analyzers.\n  \
-     check-packages CRATE [CRATE ...]\n\
-                  Require the exact library-only crates.io package order.\n  \
-     verify-registry [--check-version VERSION] CRATE [CRATE ...]\n\
-                  Verify exact non-yanked crates.io versions.\n  \
-     require-current-main --head SHA --fetch-url URL\n\
-                  Bind a release mutation to exact current remote main.\n  \
-     prepare-publication-config [--source PATH] --output PATH\n\
-                  Prepare a checkout-bound release-plz publication config.\n  \
-     baseline prepare|verify ...\n\
-                  Prepare or verify an archive-bound official baseline.\n  \
-     proposal generate ...\n\
-                  Generate a provider-neutral release proposal transaction."
-        .to_string()
-}
-
-fn positional_packages(args: &[String]) -> Result<Vec<String>, String> {
-    if args.is_empty() {
-        return Err("at least one crate name is required".to_string());
-    }
-    let mut packages = Vec::with_capacity(args.len());
-    for package in args {
-        if package.starts_with('-') {
-            return Err(format!("unexpected argument: {package}"));
-        }
+fn validate_package_arguments(packages: &[String]) -> Result<(), String> {
+    for package in packages {
         validate_crate_name(package)?;
-        if packages.contains(package) {
+    }
+    for (index, package) in packages.iter().enumerate() {
+        if packages[..index].contains(package) {
             return Err(format!("duplicate crate name: {package}"));
         }
-        packages.push(package.clone());
     }
-    Ok(packages)
+    Ok(())
 }
 
 fn validate_crate_name(package: &str) -> Result<(), String> {
@@ -126,50 +135,6 @@ fn validate_crate_name(package: &str) -> Result<(), String> {
     } else {
         Err(format!("invalid crate name: {package}"))
     }
-}
-
-fn required_value<'a>(args: &'a [String], flag: &str) -> Result<&'a str, String> {
-    let values: Vec<_> = args
-        .windows(2)
-        .filter(|pair| pair[0] == flag)
-        .map(|pair| pair[1].as_str())
-        .collect();
-    match values.as_slice() {
-        [] => Err(format!("missing {flag}")),
-        [value] if !value.starts_with("--") => Ok(value),
-        [_] => Err(format!("missing value for {flag}")),
-        _ => Err(format!("duplicate {flag}")),
-    }
-}
-
-fn optional_value<'a>(args: &'a [String], flag: &str) -> Result<Option<&'a str>, String> {
-    let count = args.iter().filter(|arg| arg.as_str() == flag).count();
-    match count {
-        0 => Ok(None),
-        1 => required_value(args, flag).map(Some),
-        _ => Err(format!("duplicate {flag}")),
-    }
-}
-
-fn ensure_only_value_flags(args: &[String], flags: &[&str]) -> Result<(), String> {
-    let mut seen = Vec::new();
-    let mut index = 0;
-    while index < args.len() {
-        let flag = args[index].as_str();
-        if !flags.contains(&flag) {
-            return Err(format!("unexpected argument: {flag}"));
-        }
-        if seen.contains(&flag) {
-            return Err(format!("duplicate {flag}"));
-        }
-        seen.push(flag);
-        index += 1;
-        if index >= args.len() || args[index].starts_with("--") {
-            return Err(format!("missing value for {flag}"));
-        }
-        index += 1;
-    }
-    Ok(())
 }
 
 fn cargo_program() -> OsString {
@@ -267,25 +232,33 @@ fn process_output_detail(output: &std::process::Output) -> String {
 }
 
 fn install_tools(root: &Path) -> Result<(), String> {
+    let toolchain = crate::release_policy::detect(root)?.toolchain;
     let mut runner = SystemRunner;
-    install_tools_with(root, &mut runner)
+    install_tools_with(root, toolchain, &mut runner)
 }
 
-fn install_tools_with(root: &Path, runner: &mut impl Runner) -> Result<(), String> {
+fn install_tools_with(
+    root: &Path,
+    toolchain: crate::release_policy::ReleaseToolchain,
+    runner: &mut impl Runner,
+) -> Result<(), String> {
     require_command_version(
         root,
         runner,
         OsStr::new("cargo-binstall"),
         &[OsString::from("--version")],
-        &format!("cargo-binstall {CARGO_BINSTALL_VERSION}"),
+        &format!("cargo-binstall {}", toolchain.cargo_binstall_version),
     )?;
     let install_args = [
         OsString::from("--force"),
         OsString::from("--locked"),
         OsString::from("--no-confirm"),
         OsString::from("--strategies=crate-meta-data,compile"),
-        OsString::from(format!("release-plz@{RELEASE_PLZ_VERSION}")),
-        OsString::from(format!("cargo-semver-checks@{SEMVER_CHECKS_VERSION}")),
+        OsString::from(format!("release-plz@{}", toolchain.release_plz_version)),
+        OsString::from(format!(
+            "cargo-semver-checks@{}",
+            toolchain.cargo_semver_checks_version
+        )),
     ];
     // Invoke the verified binary directly so a Cargo alias cannot replace it.
     let status = runner.status(OsStr::new("cargo-binstall"), &install_args, root)?;
@@ -303,14 +276,17 @@ fn install_tools_with(root: &Path, runner: &mut impl Runner) -> Result<(), Strin
         runner,
         OsStr::new("release-plz"),
         &[OsString::from("--version")],
-        &format!("release-plz {RELEASE_PLZ_VERSION}"),
+        &format!("release-plz {}", toolchain.release_plz_version),
     )?;
     require_command_version(
         root,
         runner,
         OsStr::new("cargo-semver-checks"),
         &[OsString::from("semver-checks"), OsString::from("--version")],
-        &format!("cargo-semver-checks {SEMVER_CHECKS_VERSION}"),
+        &format!(
+            "cargo-semver-checks {}",
+            toolchain.cargo_semver_checks_version
+        ),
     )?;
     eprintln!("release: installed and verified the exact release analyzers");
     Ok(())
@@ -539,7 +515,7 @@ fn validate_publishable_package_identity(
     package: &Value,
     targets: &[Value],
 ) -> Result<(), String> {
-    if package_name != "yaml-sigil-traits" {
+    if package_name != TRAITS_PACKAGE {
         return Err(format!(
             "crates.io package {package_name} has no approved workspace identity"
         ));
@@ -586,22 +562,6 @@ fn validate_publishable_package_identity(
         ));
     }
     Ok(())
-}
-
-fn verify_registry_command(root: &Path, args: &[String]) -> Result<Outcome, String> {
-    let (requested_version, package_args) =
-        if args.first().map(String::as_str) == Some("--check-version") {
-            if args.len() < 3 {
-                return Err("--check-version requires VERSION and at least one crate".to_string());
-            }
-            let version = Version::parse(&args[1])
-                .map_err(|error| format!("invalid package version {}: {error}", args[1]))?;
-            (Some(version), &args[2..])
-        } else {
-            (None, args)
-        };
-    let packages = positional_packages(package_args)?;
-    verify_registry(root, requested_version.as_ref(), &packages)
 }
 
 fn verify_registry(
@@ -949,10 +909,18 @@ fn prepare_publication_config(root: &Path, source: &Path, output: &Path) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::release_policy::{TRAITS_POLICY, TRAITS_TOOLCHAIN};
+    use clap::Parser;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     const FIXTURE_FETCH_URL: &str = "https://example.invalid/repository";
+
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        release: ReleaseArgs,
+    }
 
     #[derive(Debug, Eq, PartialEq)]
     enum CallMode {
@@ -1100,15 +1068,29 @@ mod tests {
     fn tool_installation_binds_exact_versions_and_argv() {
         let mut runner = FakeRunner {
             responses: [
-                success(b"cargo-binstall 1.20.1\n".to_vec()),
-                success(b"release-plz 0.3.160\n".to_vec()),
-                success(b"cargo-semver-checks 0.49.0\n".to_vec()),
+                success(
+                    format!(
+                        "cargo-binstall {}\n",
+                        TRAITS_TOOLCHAIN.cargo_binstall_version
+                    )
+                    .into_bytes(),
+                ),
+                success(
+                    format!("release-plz {}\n", TRAITS_TOOLCHAIN.release_plz_version).into_bytes(),
+                ),
+                success(
+                    format!(
+                        "cargo-semver-checks {}\n",
+                        TRAITS_TOOLCHAIN.cargo_semver_checks_version
+                    )
+                    .into_bytes(),
+                ),
             ]
             .into(),
             status_responses: [status(true, Some(0))].into(),
             ..FakeRunner::default()
         };
-        install_tools_with(Path::new("."), &mut runner).unwrap();
+        install_tools_with(Path::new("."), TRAITS_TOOLCHAIN, &mut runner).unwrap();
         runner.assert_consumed();
         assert_eq!(runner.calls.len(), 4);
         assert_eq!(runner.calls[0].mode, CallMode::Output);
@@ -1118,13 +1100,16 @@ mod tests {
         assert_eq!(runner.calls[1].program, "cargo-binstall");
         assert_eq!(
             runner.calls[1].args,
-            [
-                "--force",
-                "--locked",
-                "--no-confirm",
-                "--strategies=crate-meta-data,compile",
-                "release-plz@0.3.160",
-                "cargo-semver-checks@0.49.0",
+            vec![
+                "--force".to_string(),
+                "--locked".to_string(),
+                "--no-confirm".to_string(),
+                "--strategies=crate-meta-data,compile".to_string(),
+                format!("release-plz@{}", TRAITS_TOOLCHAIN.release_plz_version),
+                format!(
+                    "cargo-semver-checks@{}",
+                    TRAITS_TOOLCHAIN.cargo_semver_checks_version
+                ),
             ]
         );
         assert_eq!(runner.calls[2].program, "release-plz");
@@ -1137,7 +1122,9 @@ mod tests {
     fn tool_installation_fails_closed_on_versions_status_and_spawn() {
         let mut wrong_bootstrap =
             FakeRunner::with_responses(vec![success(b"cargo-binstall 1.20.0\n".to_vec())]);
-        assert!(install_tools_with(Path::new("."), &mut wrong_bootstrap).is_err());
+        assert!(
+            install_tools_with(Path::new("."), TRAITS_TOOLCHAIN, &mut wrong_bootstrap).is_err()
+        );
         wrong_bootstrap.assert_consumed();
         assert_eq!(wrong_bootstrap.calls.len(), 1);
 
@@ -1150,23 +1137,45 @@ mod tests {
             ),
         ] {
             let mut runner = FakeRunner {
-                responses: [success(b"cargo-binstall 1.20.1\n".to_vec())].into(),
+                responses: [success(
+                    format!(
+                        "cargo-binstall {}\n",
+                        TRAITS_TOOLCHAIN.cargo_binstall_version
+                    )
+                    .into_bytes(),
+                )]
+                .into(),
                 status_responses: [install_status].into(),
                 ..FakeRunner::default()
             };
-            let error = install_tools_with(Path::new("."), &mut runner).unwrap_err();
+            let error =
+                install_tools_with(Path::new("."), TRAITS_TOOLCHAIN, &mut runner).unwrap_err();
             assert!(error.contains(expected), "{error}");
             runner.assert_consumed();
         }
 
         for responses in [
             vec![
-                success(b"cargo-binstall 1.20.1\n".to_vec()),
+                success(
+                    format!(
+                        "cargo-binstall {}\n",
+                        TRAITS_TOOLCHAIN.cargo_binstall_version
+                    )
+                    .into_bytes(),
+                ),
                 success(b"release-plz 0.3.159\n".to_vec()),
             ],
             vec![
-                success(b"cargo-binstall 1.20.1\n".to_vec()),
-                success(b"release-plz 0.3.160\n".to_vec()),
+                success(
+                    format!(
+                        "cargo-binstall {}\n",
+                        TRAITS_TOOLCHAIN.cargo_binstall_version
+                    )
+                    .into_bytes(),
+                ),
+                success(
+                    format!("release-plz {}\n", TRAITS_TOOLCHAIN.release_plz_version).into_bytes(),
+                ),
                 success(b"cargo-semver-checks 0.48.0\n".to_vec()),
             ],
         ] {
@@ -1175,48 +1184,47 @@ mod tests {
                 status_responses: [status(true, Some(0))].into(),
                 ..FakeRunner::default()
             };
-            assert!(install_tools_with(Path::new("."), &mut runner).is_err());
+            assert!(install_tools_with(Path::new("."), TRAITS_TOOLCHAIN, &mut runner).is_err());
             runner.assert_consumed();
         }
     }
 
     #[test]
     fn tool_versions_require_one_exact_line() {
+        let expected = format!("cargo-binstall {}", TRAITS_TOOLCHAIN.cargo_binstall_version);
         for output in [
-            b" cargo-binstall 1.20.1\n".as_slice(),
-            b"cargo-binstall 1.20.1 \n".as_slice(),
-            b"\ncargo-binstall 1.20.1\n".as_slice(),
-            b"cargo-binstall 1.20.1\n\n".as_slice(),
-            b"cargo-binstall 1.20.1\nother\n".as_slice(),
-            b"cargo-binstall 1.20.1\r".as_slice(),
-            b"\xff".as_slice(),
+            format!(" {expected}\n").into_bytes(),
+            format!("{expected} \n").into_bytes(),
+            format!("\n{expected}\n").into_bytes(),
+            format!("{expected}\n\n").into_bytes(),
+            format!("{expected}\nother\n").into_bytes(),
+            format!("{expected}\r").into_bytes(),
+            vec![0xff],
         ] {
-            let mut runner = FakeRunner::with_responses(vec![success(output.to_vec())]);
+            let mut runner = FakeRunner::with_responses(vec![success(output)]);
             assert!(
                 require_command_version(
                     Path::new("."),
                     &mut runner,
                     OsStr::new("cargo-binstall"),
                     &[OsString::from("--version")],
-                    "cargo-binstall 1.20.1",
+                    &expected,
                 )
                 .is_err()
             );
             runner.assert_consumed();
         }
 
-        for output in [
-            b"cargo-binstall 1.20.1".as_slice(),
-            b"cargo-binstall 1.20.1\n".as_slice(),
-            b"cargo-binstall 1.20.1\r\n".as_slice(),
-        ] {
-            let mut runner = FakeRunner::with_responses(vec![success(output.to_vec())]);
+        for suffix in ["", "\n", "\r\n"] {
+            let mut runner = FakeRunner::with_responses(vec![success(
+                format!("{expected}{suffix}").into_bytes(),
+            )]);
             require_command_version(
                 Path::new("."),
                 &mut runner,
                 OsStr::new("cargo-binstall"),
                 &[OsString::from("--version")],
-                "cargo-binstall 1.20.1",
+                &expected,
             )
             .unwrap();
             runner.assert_consumed();
@@ -1371,11 +1379,13 @@ mod tests {
 
     #[test]
     fn crate_names_and_duplicates_are_rejected() {
-        assert!(positional_packages(&["yaml-sigil-traits".to_string()]).is_ok());
+        assert!(
+            validate_package_arguments(&[TRAITS_POLICY.packages[0].package.to_string()]).is_ok()
+        );
         for invalid in ["", "Yaml", "-yaml", "yaml.sig"] {
-            assert!(positional_packages(&[invalid.to_string()]).is_err());
+            assert!(validate_package_arguments(&[invalid.to_string()]).is_err());
         }
-        assert!(positional_packages(&["yaml".to_string(), "yaml".to_string()]).is_err());
+        assert!(validate_package_arguments(&["yaml".to_string(), "yaml".to_string()]).is_err());
     }
 
     #[test]
@@ -1389,7 +1399,7 @@ mod tests {
                     "targets": [{"kind": ["lib"]}]
                 },
                 {
-                    "name": "yaml-sigil-traits",
+                    "name": TRAITS_PACKAGE,
                     "publish": ["crates-io"],
                     "manifest_path": "/workspace/Cargo.toml",
                     "targets": [{
@@ -1399,7 +1409,7 @@ mod tests {
                 }
             ]
         });
-        assert!(check_packages_in_metadata(&metadata, &["yaml-sigil-traits".to_string()]).is_ok());
+        assert!(check_packages_in_metadata(&metadata, &[TRAITS_PACKAGE.to_string()]).is_ok());
         assert!(check_packages_in_metadata(&metadata, &["wrong".to_string()]).is_err());
 
         let mut alternate = metadata.clone();
@@ -1411,14 +1421,12 @@ mod tests {
                 "targets": [{"kind": ["lib"]}]
             }),
         );
-        assert!(
-            check_packages_in_metadata(&alternate, &["yaml-sigil-traits".to_string()]).is_err()
-        );
+        assert!(check_packages_in_metadata(&alternate, &[TRAITS_PACKAGE.to_string()]).is_err());
 
         let binary = serde_json::json!({
             "workspace_root": "/workspace",
             "packages": [{
-                "name": "yaml-sigil-traits",
+                "name": TRAITS_PACKAGE,
                 "publish": ["crates-io"],
                 "manifest_path": "/workspace/Cargo.toml",
                 "targets": [
@@ -1427,11 +1435,11 @@ mod tests {
                 ]
             }]
         });
-        assert!(check_packages_in_metadata(&binary, &["yaml-sigil-traits".to_string()]).is_err());
+        assert!(check_packages_in_metadata(&binary, &[TRAITS_PACKAGE.to_string()]).is_err());
         let build_script = serde_json::json!({
             "workspace_root": "/workspace",
             "packages": [{
-                "name": "yaml-sigil-traits",
+                "name": TRAITS_PACKAGE,
                 "publish": ["crates-io"],
                 "manifest_path": "/workspace/Cargo.toml",
                 "targets": [
@@ -1440,21 +1448,17 @@ mod tests {
                 ]
             }]
         });
-        assert!(
-            check_packages_in_metadata(&build_script, &["yaml-sigil-traits".to_string()]).is_err()
-        );
+        assert!(check_packages_in_metadata(&build_script, &[TRAITS_PACKAGE.to_string()]).is_err());
         let malformed = serde_json::json!({
             "workspace_root": "/workspace",
             "packages": [{
-                "name": "yaml-sigil-traits",
+                "name": TRAITS_PACKAGE,
                 "publish": ["crates-io"],
                 "manifest_path": "/workspace/Cargo.toml",
                 "targets": [{}]
             }]
         });
-        assert!(
-            check_packages_in_metadata(&malformed, &["yaml-sigil-traits".to_string()]).is_err()
-        );
+        assert!(check_packages_in_metadata(&malformed, &[TRAITS_PACKAGE.to_string()]).is_err());
     }
 
     #[test]
@@ -1462,7 +1466,7 @@ mod tests {
         let default_publish = serde_json::json!({
             "workspace_root": "/workspace",
             "packages": [{
-                "name": "yaml-sigil-traits",
+                "name": TRAITS_PACKAGE,
                 "publish": null,
                 "manifest_path": "/workspace/Cargo.toml",
                 "targets": [{
@@ -1472,8 +1476,7 @@ mod tests {
             }]
         });
         assert!(
-            check_packages_in_metadata(&default_publish, &["yaml-sigil-traits".to_string()])
-                .is_ok()
+            check_packages_in_metadata(&default_publish, &[TRAITS_PACKAGE.to_string()]).is_ok()
         );
 
         let mut absent_publish = default_publish.clone();
@@ -1481,15 +1484,13 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("publish");
-        assert!(
-            check_packages_in_metadata(&absent_publish, &["yaml-sigil-traits".to_string()]).is_ok()
-        );
+        assert!(check_packages_in_metadata(&absent_publish, &[TRAITS_PACKAGE.to_string()]).is_ok());
 
         let unexpected = serde_json::json!({
             "workspace_root": "/workspace",
             "packages": [
                 {
-                    "name": "yaml-sigil-traits",
+                    "name": TRAITS_PACKAGE,
                     "publish": ["crates-io"],
                     "manifest_path": "/workspace/Cargo.toml",
                     "targets": [{
@@ -1508,14 +1509,12 @@ mod tests {
                 }
             ]
         });
-        assert!(
-            check_packages_in_metadata(&unexpected, &["yaml-sigil-traits".to_string()]).is_err()
-        );
+        assert!(check_packages_in_metadata(&unexpected, &[TRAITS_PACKAGE.to_string()]).is_err());
 
         let default_binary = serde_json::json!({
             "workspace_root": "/workspace",
             "packages": [{
-                "name": "yaml-sigil-traits",
+                "name": TRAITS_PACKAGE,
                 "publish": null,
                 "manifest_path": "/workspace/Cargo.toml",
                 "targets": [
@@ -1525,18 +1524,17 @@ mod tests {
             }]
         });
         assert!(
-            check_packages_in_metadata(&default_binary, &["yaml-sigil-traits".to_string()])
-                .is_err()
+            check_packages_in_metadata(&default_binary, &[TRAITS_PACKAGE.to_string()]).is_err()
         );
     }
 
     #[test]
     fn package_policy_binds_the_root_manifest_and_primary_library() {
-        let expected = ["yaml-sigil-traits".to_string()];
+        let expected = [TRAITS_PACKAGE.to_string()];
         let valid = serde_json::json!({
             "workspace_root": "/workspace",
             "packages": [{
-                "name": "yaml-sigil-traits",
+                "name": TRAITS_PACKAGE,
                 "publish": ["crates-io"],
                 "manifest_path": "/workspace/Cargo.toml",
                 "targets": [{
@@ -1575,23 +1573,21 @@ mod tests {
         for publish in [serde_json::json!(true), serde_json::json!(["crates-io", 1])] {
             let metadata = serde_json::json!({
                 "packages": [{
-                    "name": "yaml-sigil-traits",
+                    "name": TRAITS_PACKAGE,
                     "publish": publish,
                     "targets": [{"kind": ["lib"]}]
                 }]
             });
-            assert!(
-                check_packages_in_metadata(&metadata, &["yaml-sigil-traits".to_string()]).is_err()
-            );
+            assert!(check_packages_in_metadata(&metadata, &[TRAITS_PACKAGE.to_string()]).is_err());
         }
 
         let missing = serde_json::json!({
             "packages": [{
-                "name": "yaml-sigil-traits",
+                "name": TRAITS_PACKAGE,
                 "targets": [{"kind": ["lib"]}]
             }]
         });
-        assert!(check_packages_in_metadata(&missing, &["yaml-sigil-traits".to_string()]).is_err());
+        assert!(check_packages_in_metadata(&missing, &[TRAITS_PACKAGE.to_string()]).is_err());
     }
 
     #[test]
@@ -1600,11 +1596,11 @@ mod tests {
         let available = br#"{"version":{"num":"0.4.0-rc.1","yanked":false}}
 200"#;
         assert_eq!(
-            parse_registry_response("yaml-sigil-traits", &version, available).unwrap(),
+            parse_registry_response(TRAITS_PACKAGE, &version, available).unwrap(),
             RegistryState::Available
         );
         assert_eq!(
-            parse_registry_response("yaml-sigil-traits", &version, b"missing\n404").unwrap(),
+            parse_registry_response(TRAITS_PACKAGE, &version, b"missing\n404").unwrap(),
             RegistryState::Missing
         );
         for invalid in [
@@ -1617,7 +1613,7 @@ mod tests {
             b"error\n500".as_slice(),
             b"no-status".as_slice(),
         ] {
-            assert!(parse_registry_response("yaml-sigil-traits", &version, invalid).is_err());
+            assert!(parse_registry_response(TRAITS_PACKAGE, &version, invalid).is_err());
         }
     }
 
@@ -1675,7 +1671,7 @@ mod tests {
     #[test]
     fn publication_verification_uses_metadata_polling_and_named_registry() {
         let metadata = serde_json::to_vec(&serde_json::json!({
-            "packages": [{"name": "yaml-sigil-traits", "version": "0.4.0-rc.1"}]
+            "packages": [{"name": TRAITS_PACKAGE, "version": "0.4.0-rc.1"}]
         }))
         .unwrap();
         let mut runner = FakeRunner::with_responses(vec![
@@ -1687,7 +1683,7 @@ mod tests {
         let result = verify_registry_with(
             Path::new("."),
             None,
-            &["yaml-sigil-traits".to_string()],
+            &[TRAITS_PACKAGE.to_string()],
             &mut runner,
         );
         assert_eq!(result.unwrap(), Outcome::Success);
@@ -1712,12 +1708,12 @@ mod tests {
         );
         assert_eq!(
             runner.calls[3].args,
-            [
-                "info",
-                "--quiet",
-                "--registry",
-                "crates-io",
-                "yaml-sigil-traits@0.4.0-rc.1"
+            vec![
+                "info".to_string(),
+                "--quiet".to_string(),
+                "--registry".to_string(),
+                "crates-io".to_string(),
+                format!("{TRAITS_PACKAGE}@0.4.0-rc.1"),
             ]
         );
     }
@@ -1734,7 +1730,7 @@ mod tests {
                 verify_registry_with(
                     Path::new("."),
                     None,
-                    &["yaml-sigil-traits".to_string()],
+                    &[TRAITS_PACKAGE.to_string()],
                     &mut runner,
                 )
                 .is_err()
@@ -1747,7 +1743,7 @@ mod tests {
     #[test]
     fn publication_verification_fails_on_resolution_or_bounded_absence() {
         let metadata = serde_json::to_vec(&serde_json::json!({
-            "packages": [{"name": "yaml-sigil-traits", "version": "0.4.0-rc.1"}]
+            "packages": [{"name": TRAITS_PACKAGE, "version": "0.4.0-rc.1"}]
         }))
         .unwrap();
         let available = b"{\"version\":{\"num\":\"0.4.0-rc.1\",\"yanked\":false}}\n200";
@@ -1759,7 +1755,7 @@ mod tests {
         let error = verify_registry_with(
             Path::new("."),
             None,
-            &["yaml-sigil-traits".to_string()],
+            &[TRAITS_PACKAGE.to_string()],
             &mut resolution_failure,
         )
         .unwrap_err();
@@ -1771,7 +1767,7 @@ mod tests {
         let error = verify_registry_with(
             Path::new("."),
             None,
-            &["yaml-sigil-traits".to_string()],
+            &[TRAITS_PACKAGE.to_string()],
             &mut bounded,
         )
         .unwrap_err();
@@ -1783,41 +1779,40 @@ mod tests {
     #[test]
     fn metadata_version_requires_one_exact_workspace_package() {
         let metadata = serde_json::json!({
-            "packages": [{"name": "yaml-sigil-traits", "version": "0.4.0-rc.1"}]
+            "packages": [{"name": TRAITS_PACKAGE, "version": "0.4.0-rc.1"}]
         });
         assert_eq!(
-            metadata_package_version(&metadata, "yaml-sigil-traits").unwrap(),
+            metadata_package_version(&metadata, TRAITS_PACKAGE).unwrap(),
             Version::parse("0.4.0-rc.1").unwrap()
         );
         assert!(metadata_package_version(&metadata, "missing").is_err());
         let duplicate = serde_json::json!({
             "packages": [
-                {"name": "yaml-sigil-traits", "version": "0.4.0-rc.1"},
-                {"name": "yaml-sigil-traits", "version": "0.4.0-rc.1"}
+                {"name": TRAITS_PACKAGE, "version": "0.4.0-rc.1"},
+                {"name": TRAITS_PACKAGE, "version": "0.4.0-rc.1"}
             ]
         });
-        assert!(metadata_package_version(&duplicate, "yaml-sigil-traits").is_err());
+        assert!(metadata_package_version(&duplicate, TRAITS_PACKAGE).is_err());
     }
 
     #[test]
     fn value_flags_reject_duplicates_and_stray_arguments() {
         assert!(
-            ensure_only_value_flags(&["--output".to_string(), "file".to_string()], &["--output"])
+            TestCli::try_parse_from(["test", "prepare-publication-config", "--output", "file"])
                 .is_ok()
         );
         assert!(
-            ensure_only_value_flags(
-                &[
-                    "--output".to_string(),
-                    "one".to_string(),
-                    "--output".to_string(),
-                    "two".to_string()
-                ],
-                &["--output"]
-            )
+            TestCli::try_parse_from([
+                "test",
+                "prepare-publication-config",
+                "--output",
+                "one",
+                "--output",
+                "two",
+            ])
             .is_err()
         );
-        assert!(ensure_only_value_flags(&["stray".to_string()], &["--output"]).is_err());
+        assert!(TestCli::try_parse_from(["test", "prepare-publication-config", "stray"]).is_err());
     }
 
     #[test]

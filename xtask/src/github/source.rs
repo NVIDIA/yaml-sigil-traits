@@ -18,8 +18,7 @@ use crate::github::release_pr::require_repository_app_commit;
 use crate::github::transport::{Transport, percent_encode};
 use crate::github::{
     APP_EMAIL, APP_ID, APP_LOGIN, RELEASE_BRANCH, WEB_FLOW_EMAIL, WEB_FLOW_ID, WEB_FLOW_LOGIN,
-    WEB_FLOW_NAME, ensure_only_value_flags, git_line, is_sha, repository_policy_for_root,
-    required_value,
+    WEB_FLOW_NAME, git_line, is_sha, repository_policy_for_root,
 };
 
 const MAX_MANUAL_COMMITS: usize = 100;
@@ -27,22 +26,12 @@ const WRITER_PERMISSIONS: &[&str] = &["admin", "maintain", "write"];
 
 pub(super) fn authorize_command(
     root: &Path,
-    args: &[String],
+    repository: &str,
+    commit: &str,
+    baseline_version: &str,
+    baseline_commit: &str,
     github: &mut impl Transport,
 ) -> Result<(), String> {
-    let repository = required_value(args, "--repository")?;
-    let commit = required_value(args, "--commit")?;
-    let baseline_version = required_value(args, "--baseline-version")?;
-    let baseline_commit = required_value(args, "--baseline-commit")?;
-    ensure_only_value_flags(
-        args,
-        &[
-            "--repository",
-            "--commit",
-            "--baseline-version",
-            "--baseline-commit",
-        ],
-    )?;
     let number = authorize_source(
         github,
         repository,

@@ -11,6 +11,7 @@ use std::process::{Command, Output};
 use std::thread;
 use std::time::Duration;
 
+use clap::{Args, Subcommand};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -24,48 +25,86 @@ const READ_ONLY_PUSH_URL: &str = "disabled://yaml-sigil-release-proposal";
 const REMOTE_ATTEMPTS: usize = 3;
 const MAX_GIT_OUTPUT: usize = 4 * 1024 * 1024;
 
-pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
-    let Some(command) = args.first().map(String::as_str) else {
-        return Err(usage());
+#[derive(Args)]
+pub struct BaselineArgs {
+    #[command(subcommand)]
+    command: BaselineCommand,
+}
+
+#[derive(Subcommand)]
+enum BaselineCommand {
+    /// Prepare an archive-bound official release baseline.
+    Prepare(BaselinePrepareArgs),
+    /// Verify a previously persisted official-tag inventory.
+    Verify(BaselineVerifyArgs),
+}
+
+#[derive(Args)]
+struct BaselinePrepareArgs {
+    /// Exact protected-main commit being analyzed.
+    #[arg(long, value_name = "SHA")]
+    head: String,
+    /// New detached baseline directory.
+    #[arg(long)]
+    output: PathBuf,
+    /// New JSON result file consumed by the workflow.
+    #[arg(long)]
+    result: PathBuf,
+    /// Exact read-only repository fetch URL.
+    #[arg(long)]
+    expected_fetch_url: String,
+    /// Require this exact official baseline version.
+    #[arg(long, conflicts_with = "exclude_version")]
+    version: Option<String>,
+    /// Exclude the current release version while selecting its predecessor.
+    #[arg(long, conflicts_with = "version")]
+    exclude_version: Option<String>,
+    /// New persisted official-tag inventory; derived from `--output` by default.
+    #[arg(long)]
+    inventory_output: Option<PathBuf>,
+    /// Exact non-mutating push URL configured for baseline preparation.
+    #[arg(long, default_value = READ_ONLY_PUSH_URL)]
+    expected_push_url: String,
+}
+
+#[derive(Args)]
+struct BaselineVerifyArgs {
+    /// Exact protected-main commit being revalidated.
+    #[arg(long, value_name = "SHA")]
+    head: String,
+    /// Persisted official-tag inventory to revalidate.
+    #[arg(long)]
+    inventory: PathBuf,
+    /// Exact read-only repository fetch URL.
+    #[arg(long)]
+    expected_fetch_url: String,
+    /// Exact non-mutating push URL configured for verification.
+    #[arg(long, default_value = READ_ONLY_PUSH_URL)]
+    expected_push_url: String,
+}
+
+pub(crate) fn run(root: &Path, args: BaselineArgs) -> Result<(), String> {
+    match args.command {
+        BaselineCommand::Prepare(args) => prepare_command(root, args),
+        BaselineCommand::Verify(args) => verify_command(root, args),
+    }
+}
+
+fn prepare_command(root: &Path, args: BaselinePrepareArgs) -> Result<(), String> {
+    let parsed = ParsedArgs {
+        head: args.head,
+        expected_fetch_url: args.expected_fetch_url,
+        expected_push_url: args.expected_push_url,
+        version: args.version,
+        exclude_version: args.exclude_version,
+        output: Some(args.output),
+        result: Some(args.result),
+        inventory_output: args.inventory_output,
+        inventory: None,
     };
-    match command {
-        "prepare" => prepare_command(root, &args[1..]),
-        "verify" => verify_command(root, &args[1..]),
-        "help" | "--help" | "-h" if args.len() == 1 => {
-            eprintln!("{}", usage());
-            Ok(())
-        }
-        _ => Err(usage()),
-    }
-}
-
-fn usage() -> String {
-    [
-        "usage: cargo xtask release baseline <COMMAND>",
-        "",
-        "commands:",
-        "  prepare --head SHA --output PATH --result PATH \\",
-        "      --expected-fetch-url URL [--version VERSION | --exclude-version VERSION] \\",
-        "      [--inventory-output PATH] [--expected-push-url URL]",
-        "  verify --head SHA --inventory PATH --expected-fetch-url URL \\",
-        "      [--expected-push-url URL]",
-    ]
-    .join("\n")
-}
-
-fn prepare_command(root: &Path, args: &[String]) -> Result<(), String> {
-    let parsed = ParsedArgs::parse(args, true)?;
-    let output = parsed
-        .output
-        .as_ref()
-        .ok_or_else(|| "baseline prepare requires --output".to_string())?;
-    let result_path = parsed
-        .result
-        .as_ref()
-        .ok_or_else(|| "baseline prepare requires --result".to_string())?;
-    if parsed.inventory.is_some() {
-        return Err("baseline prepare does not accept --inventory".to_string());
-    }
+    parsed.validate()?;
+    let output = parsed.output.as_ref().expect("prepare output is typed");
+    let result_path = parsed.result.as_ref().expect("prepare result is typed");
     let inventory_output = parsed.inventory_output.clone().unwrap_or_else(|| {
         output
             .parent()
@@ -96,20 +135,23 @@ fn prepare_command(root: &Path, args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn verify_command(root: &Path, args: &[String]) -> Result<(), String> {
-    let parsed = ParsedArgs::parse(args, false)?;
+fn verify_command(root: &Path, args: BaselineVerifyArgs) -> Result<(), String> {
+    let parsed = ParsedArgs {
+        head: args.head,
+        expected_fetch_url: args.expected_fetch_url,
+        expected_push_url: args.expected_push_url,
+        version: None,
+        exclude_version: None,
+        output: None,
+        result: None,
+        inventory_output: None,
+        inventory: Some(args.inventory),
+    };
+    parsed.validate()?;
     let inventory = parsed
         .inventory
         .as_ref()
-        .ok_or_else(|| "baseline verify requires --inventory".to_string())?;
-    if parsed.output.is_some()
-        || parsed.result.is_some()
-        || parsed.inventory_output.is_some()
-        || parsed.version.is_some()
-        || parsed.exclude_version.is_some()
-    {
-        return Err("baseline verify accepts only authority and inventory inputs".to_string());
-    }
+        .expect("verify inventory is typed");
     let policy = detect(root)?;
     let mut registry = CratesIo::new();
     verify_snapshot(root, policy, &parsed, inventory, &mut registry)?;
@@ -131,87 +173,20 @@ struct ParsedArgs {
 }
 
 impl ParsedArgs {
-    fn parse(args: &[String], prepare: bool) -> Result<Self, String> {
-        let allowed = if prepare {
-            &[
-                "--head",
-                "--expected-fetch-url",
-                "--expected-push-url",
-                "--version",
-                "--exclude-version",
-                "--output",
-                "--result",
-                "--inventory-output",
-            ][..]
-        } else {
-            &[
-                "--head",
-                "--expected-fetch-url",
-                "--expected-push-url",
-                "--inventory",
-            ][..]
-        };
-        let values = parse_flags(args, allowed)?;
-        let required = |flag: &str| {
-            values
-                .get(flag)
-                .cloned()
-                .ok_or_else(|| format!("missing {flag}"))
-        };
-        let head = required("--head")?;
-        if !is_sha(&head) {
+    fn validate(&self) -> Result<(), String> {
+        if !is_sha(&self.head) {
             return Err("--head must be a lowercase full SHA".to_string());
         }
-        let expected_fetch_url = required("--expected-fetch-url")?;
-        validate_url(&expected_fetch_url, "--expected-fetch-url")?;
-        let expected_push_url = values
-            .get("--expected-push-url")
-            .cloned()
-            .unwrap_or_else(|| READ_ONLY_PUSH_URL.to_string());
-        validate_url(&expected_push_url, "--expected-push-url")?;
-        let version = values.get("--version").cloned();
-        let exclude_version = values.get("--exclude-version").cloned();
-        if version.is_some() && exclude_version.is_some() {
+        validate_url(&self.expected_fetch_url, "--expected-fetch-url")?;
+        validate_url(&self.expected_push_url, "--expected-push-url")?;
+        if self.version.is_some() && self.exclude_version.is_some() {
             return Err("--version and --exclude-version are mutually exclusive".to_string());
         }
-        if let Some(value) = version.as_deref().or(exclude_version.as_deref()) {
+        if let Some(value) = self.version.as_deref().or(self.exclude_version.as_deref()) {
             parse_version(value)?;
         }
-        Ok(Self {
-            head,
-            expected_fetch_url,
-            expected_push_url,
-            version,
-            exclude_version,
-            output: values.get("--output").map(PathBuf::from),
-            result: values.get("--result").map(PathBuf::from),
-            inventory_output: values.get("--inventory-output").map(PathBuf::from),
-            inventory: values.get("--inventory").map(PathBuf::from),
-        })
+        Ok(())
     }
-}
-
-fn parse_flags(args: &[String], allowed: &[&str]) -> Result<BTreeMap<String, String>, String> {
-    let mut values = BTreeMap::new();
-    let mut index = 0;
-    while index < args.len() {
-        let flag = args[index].as_str();
-        if !allowed.contains(&flag) {
-            return Err(format!("unexpected argument: {flag}"));
-        }
-        index += 1;
-        if index >= args.len() || args[index].starts_with("--") {
-            return Err(format!("missing value for {flag}"));
-        }
-        if values
-            .insert(flag.to_string(), args[index].clone())
-            .is_some()
-        {
-            return Err(format!("duplicate {flag}"));
-        }
-        index += 1;
-    }
-    Ok(values)
 }
 
 fn validate_url(value: &str, flag: &str) -> Result<(), String> {
@@ -958,7 +933,7 @@ mod tests {
         let policy = &crate::release_policy::TRAITS_POLICY;
         assert_eq!(
             classify_tag(policy, "v0.4.0"),
-            Some(("0.4.0".to_string(), "yaml-sigil-traits"))
+            Some(("0.4.0".to_string(), policy.packages[0].package))
         );
         assert_eq!(classify_tag(policy, "snapshot-v99.0.0"), None);
         assert_eq!(classify_tag(policy, "v99.0.0-snapshot.1"), None);
@@ -966,17 +941,18 @@ mod tests {
 
     #[test]
     fn baseline_flags_reject_collisions_and_ambiguous_modes() {
-        let args = vec![
-            "--head".to_string(),
-            "a".repeat(40),
-            "--expected-fetch-url".to_string(),
-            FIXTURE_FETCH_URL.to_string(),
-            "--version".to_string(),
-            "0.4.0".to_string(),
-            "--exclude-version".to_string(),
-            "0.5.0".to_string(),
-        ];
-        assert!(ParsedArgs::parse(&args, true).is_err());
+        let parsed = ParsedArgs {
+            head: "a".repeat(40),
+            expected_fetch_url: FIXTURE_FETCH_URL.to_string(),
+            expected_push_url: READ_ONLY_PUSH_URL.to_string(),
+            version: Some("0.4.0".to_string()),
+            exclude_version: Some("0.5.0".to_string()),
+            output: None,
+            result: None,
+            inventory_output: None,
+            inventory: None,
+        };
+        assert!(parsed.validate().is_err());
     }
 
     #[test]

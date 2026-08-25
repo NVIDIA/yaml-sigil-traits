@@ -10,23 +10,20 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::github::transport::Transport;
-use crate::github::{
-    ensure_only_value_flags, git_line, git_output, repository_policy_for_root, required_value,
-    workflow_repository,
-};
+use crate::github::{git_line, git_output, repository_policy_for_root, workflow_repository};
 
 pub(super) fn configure_command(
     root: &Path,
-    args: &[String],
+    repository: Option<&str>,
     github: &mut impl Transport,
 ) -> Result<(), String> {
     match env::var_os("GITHUB_ACTIONS") {
         None => {
-            let repository = local_repository_argument(args)?;
+            let repository = local_repository_argument(repository)?;
             repository_policy_for_root(root, repository)?;
         }
         Some(value) if value == "true" => {
-            if !args.is_empty() {
+            if repository.is_some() {
                 return Err(
                     "hosted git-identity configure does not accept repository arguments"
                         .to_string(),
@@ -39,9 +36,10 @@ pub(super) fn configure_command(
     configure(root, github)
 }
 
-fn local_repository_argument(args: &[String]) -> Result<&str, String> {
-    ensure_only_value_flags(args, &["--repository"])?;
-    required_value(args, "--repository")
+fn local_repository_argument(repository: Option<&str>) -> Result<&str, String> {
+    repository
+        .filter(|repository| !repository.is_empty())
+        .ok_or_else(|| "local git-identity configure requires --repository".to_string())
 }
 
 fn configure(root: &Path, github: &mut impl Transport) -> Result<(), String> {
@@ -128,23 +126,16 @@ mod tests {
 
     #[test]
     fn local_identity_requires_one_explicit_repository() {
-        assert!(local_repository_argument(&[]).is_err());
+        assert!(local_repository_argument(None).is_err());
         assert_eq!(
-            local_repository_argument(
-                &["--repository".to_string(), TRAITS_REPOSITORY.to_string(),]
-            )
-            .unwrap(),
+            local_repository_argument(Some(TRAITS_REPOSITORY)).unwrap(),
             TRAITS_REPOSITORY
         );
-        assert!(
-            local_repository_argument(&[
-                "--repository".to_string(),
-                TRAITS_REPOSITORY.to_string(),
-                "--repository".to_string(),
-                RUST_REPOSITORY.to_string(),
-            ])
-            .is_err()
+        assert_eq!(
+            local_repository_argument(Some(RUST_REPOSITORY)).unwrap(),
+            RUST_REPOSITORY
         );
+        assert!(local_repository_argument(Some("")).is_err());
     }
 
     #[test]

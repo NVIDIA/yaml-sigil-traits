@@ -23,6 +23,22 @@ pub(crate) struct PackagePolicy {
     pub(crate) path_in_vcs: &'static str,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ReleaseToolchain {
+    pub(crate) cargo_binstall_version: &'static str,
+    pub(crate) release_plz_version: &'static str,
+    pub(crate) cargo_semver_checks_version: &'static str,
+}
+
+const REVIEWED_RELEASE_TOOLCHAIN: ReleaseToolchain = ReleaseToolchain {
+    cargo_binstall_version: "1.20.1",
+    release_plz_version: "0.3.160",
+    cargo_semver_checks_version: "0.49.0",
+};
+
+pub(crate) const TRAITS_TOOLCHAIN: ReleaseToolchain = REVIEWED_RELEASE_TOOLCHAIN;
+pub(crate) const RUST_TOOLCHAIN: ReleaseToolchain = REVIEWED_RELEASE_TOOLCHAIN;
+
 impl PackagePolicy {
     pub(crate) fn tag(&self, version: &str) -> String {
         format!("{}{version}", self.tag_prefix)
@@ -33,6 +49,7 @@ impl PackagePolicy {
 pub(crate) struct ReleasePolicy {
     pub(crate) family: ReleaseFamily,
     pub(crate) packages: &'static [PackagePolicy],
+    pub(crate) toolchain: ReleaseToolchain,
 }
 
 const TRAITS_PACKAGES: &[PackagePolicy] = &[PackagePolicy {
@@ -72,11 +89,13 @@ const RUST_PACKAGES: &[PackagePolicy] = &[
 pub(crate) const TRAITS_POLICY: ReleasePolicy = ReleasePolicy {
     family: ReleaseFamily::Traits,
     packages: TRAITS_PACKAGES,
+    toolchain: TRAITS_TOOLCHAIN,
 };
 
 pub(crate) const RUST_POLICY: ReleasePolicy = ReleasePolicy {
     family: ReleaseFamily::RustWorkspace,
     packages: RUST_PACKAGES,
+    toolchain: RUST_TOOLCHAIN,
 };
 
 pub(crate) fn detect(root: &Path) -> Result<&'static ReleasePolicy, String> {
@@ -198,5 +217,7 @@ mod tests {
     fn package_policy_is_central_and_ordered() {
         assert_eq!(TRAITS_POLICY.packages[0].tag("0.4.0"), "v0.4.0");
         assert_eq!(RUST_POLICY.packages.len(), 4);
+        assert_eq!(TRAITS_POLICY.toolchain, TRAITS_TOOLCHAIN);
+        assert_eq!(RUST_POLICY.toolchain, RUST_TOOLCHAIN);
     }
 }
