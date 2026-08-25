@@ -160,6 +160,10 @@ jobs:
       - name: Audit Rust dependencies
         run: cargo audit
 
+      # The developer-only xtask has its own committed dependency lockfile.
+      - name: Audit xtask dependencies
+        run: cargo audit --file xtask/Cargo.lock
+
   required_ci:
     name: Required CI
     if: ${{ always() }}

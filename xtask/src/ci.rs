@@ -102,6 +102,11 @@ const POST_PACKAGE_STEPS: &[Step] = &[
         program: "cargo",
         args: &["audit"],
     },
+    Step {
+        label: "xtask dependency audit",
+        program: "cargo",
+        args: &["audit", "--file", "xtask/Cargo.lock"],
+    },
 ];
 
 pub(crate) fn run(root: &Path) -> io::Result<()> {
@@ -166,7 +171,7 @@ fn require_cargo_machete() -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::CARGO_MACHETE_INSTALL_COMMAND;
+    use super::{CARGO_MACHETE_INSTALL_COMMAND, POST_PACKAGE_STEPS};
 
     const AGENT_GUIDANCE: &str = include_str!("../../AGENTS.md");
     const GITMODULES: &str = include_str!("../../.gitmodules");
@@ -193,5 +198,21 @@ mod tests {
         );
         assert!(AGENT_GUIDANCE.contains(CARGO_MACHETE_INSTALL_COMMAND));
         assert!(AGENT_GUIDANCE.contains("cargo-machete --with-metadata"));
+    }
+
+    #[test]
+    fn dependency_audits_cover_root_and_xtask_locks() {
+        let commands = POST_PACKAGE_STEPS
+            .iter()
+            .map(|step| step.command_line())
+            .collect::<Vec<_>>();
+
+        assert!(commands.iter().any(|command| command == "cargo audit"));
+        assert!(
+            commands
+                .iter()
+                .any(|command| command == "cargo audit --file xtask/Cargo.lock")
+        );
+        assert!(AGENT_GUIDANCE.contains("cargo audit --file xtask/Cargo.lock"));
     }
 }

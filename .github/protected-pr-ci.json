@@ -63,7 +63,7 @@
     ".release-plz.toml",
     "release-plz.toml",
     ".gitmodules",
-    "source-spec",
+    "source-spec/**",
     "src/**",
     "tests/**",
     "xtask/**"

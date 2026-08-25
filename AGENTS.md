@@ -207,6 +207,7 @@ cargo test --all-features
 cargo test --locked --manifest-path xtask/Cargo.toml
 cargo-machete --with-metadata
 cargo audit
+cargo audit --file xtask/Cargo.lock
 ```
 
 Install `rumdl`, `cargo-audit`, and `cargo-machete` with Cargo before running

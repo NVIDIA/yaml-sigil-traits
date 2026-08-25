@@ -75,6 +75,7 @@ def policy() -> dict:
             "**/build.rs",
             "AGENTS.md",
             ".agents/**",
+            "source-spec/**",
         ],
     }
 
@@ -317,6 +318,25 @@ class AuthorizationTests(unittest.TestCase):
     def test_repository_policy_configuration_is_valid(self) -> None:
         controller.load_config(str(POLICY_PATH))
 
+    def test_repository_directory_patterns_match_roots_and_descendants(self) -> None:
+        repository_policy = controller.load_config(str(POLICY_PATH))
+        declarations = [
+            pattern
+            for pattern in repository_policy["sensitive_paths"]
+            if pattern.endswith("/**")
+        ]
+        self.assertTrue(declarations)
+
+        for declaration in declarations:
+            root = declaration[:-3]
+            if root.startswith("**/"):
+                root = f"nested/{root[3:]}"
+            with self.subTest(declaration=declaration, root=root):
+                self.assertTrue(controller.is_sensitive(root, [declaration]))
+                self.assertTrue(
+                    controller.is_sensitive(f"{root}/representative-file", [declaration])
+                )
+
     def test_writer_permissions_are_accepted(self) -> None:
         for permission in ("write", "push", "maintain", "admin"):
             with self.subTest(permission=permission):
@@ -425,6 +445,50 @@ class AuthorizationTests(unittest.TestCase):
                 api = FakeAuthorizationApi()
                 api.set_change(path)
                 with self.assertRaisesRegex(controller.PolicyError, "same-repository branch"):
+                    controller.authorize(event(), policy(), api, environment())
+
+    def test_directory_patterns_cover_roots_descendants_and_normalized_forms(self) -> None:
+        patterns = [".cargo/**", "source-spec/**"]
+        for path in (
+            ".cargo",
+            ".CARGO/config.toml",
+            ".ＣＡＲＧＯ",
+            "source-spec",
+            "SOURCE-SPEC/proto/schema.proto",
+            "ＳＯＵＲＣＥ－ＳＰＥＣ/README.md",
+        ):
+            with self.subTest(path=path):
+                self.assertTrue(controller.is_sensitive(path, patterns))
+
+        for path in (
+            ".carg",
+            ".cargo-cache/config.toml",
+            ".cargo.toml",
+            "nested/.cargo/config.toml",
+            "nested/source-spec/README.md",
+            "source-specification/README.md",
+        ):
+            with self.subTest(near_miss=path):
+                self.assertFalse(controller.is_sensitive(path, patterns))
+
+        self.assertTrue(controller.is_sensitive("SOURCE-SPEC", ["source-spec"]))
+        self.assertFalse(
+            controller.is_sensitive("source-spec/README.md", ["source-spec"])
+        )
+
+    def test_sensitive_directory_entries_require_writer_adoption(self) -> None:
+        for path, leaf in (
+            (".cargo", ("blob", "120000", HEAD_BLOB_SHA)),
+            (".ＣＡＲＧＯ", ("blob", "120000", HEAD_BLOB_SHA)),
+            ("source-spec", ("commit", "160000", HEAD_BLOB_SHA)),
+            ("source-spec/README.md", ("blob", "100644", HEAD_BLOB_SHA)),
+        ):
+            with self.subTest(path=path, entry_type=leaf[0]):
+                api = FakeAuthorizationApi()
+                api.set_tree_files({}, {path: leaf})
+                with self.assertRaisesRegex(
+                    controller.PolicyError, "same-repository branch"
+                ):
                     controller.authorize(event(), policy(), api, environment())
 
     def test_root_and_nested_build_scripts_are_sensitive(self) -> None:
@@ -736,6 +800,27 @@ class ImmutableTreeTests(unittest.TestCase):
                 ("old-name.txt", "removed"),
                 ("removed.txt", "removed"),
             ],
+        )
+
+    def test_gitlink_replacement_retains_sensitive_root_identity(self) -> None:
+        base = self.snapshot(
+            {"source-spec": ("commit", "160000", BASE_BLOB_SHA)}
+        )
+        head = self.snapshot(
+            {"source-spec/README.md": ("blob", "100644", HEAD_BLOB_SHA)}
+        )
+
+        paths, statuses = controller.changed_tree_paths(base, head)
+
+        self.assertEqual(
+            list(zip(paths, statuses, strict=True)),
+            [
+                ("source-spec", "removed"),
+                ("source-spec/README.md", "added"),
+            ],
+        )
+        self.assertTrue(
+            all(controller.is_sensitive(path, ["source-spec/**"]) for path in paths)
         )
 
     def test_commit_and_tree_responses_are_bound_to_exact_requested_objects(self) -> None:

@@ -342,11 +342,17 @@ def normalized_casefold(value: str) -> str:
 
 
 def is_sensitive(path: str, patterns: Sequence[str]) -> bool:
+    """Match declarations, treating a trailing ``/**`` as including its root."""
     identity = normalized_casefold(path)
-    return any(
-        fnmatch.fnmatchcase(identity, normalized_casefold(pattern))
-        for pattern in patterns
-    )
+    for pattern in patterns:
+        declaration = normalized_casefold(pattern)
+        if fnmatch.fnmatchcase(identity, declaration):
+            return True
+        if declaration.endswith("/**") and fnmatch.fnmatchcase(
+            identity, declaration[:-3]
+        ):
+            return True
+    return False
 
 
 def commit_identities(commit: Mapping[str, Any]) -> tuple[str, str]:
