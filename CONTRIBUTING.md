@@ -47,17 +47,18 @@ do not edit versions on their change branches.
 
 ## Pull-request CI
 
-Pull-request CI runs from a repository-owned `pull-request/<number>` branch at
-the exact latest pull-request head. Do not push to these branches. Signed
-commits from trusted organization members are copied automatically after the
-pull request is ready for review; draft pull requests do not auto-sync.
+Pull-request CI is orchestrated only by workflow and policy loaded from current
+protected `main`. A repository writer must review the exact latest pull-request
+head and comment `/ok to test <head-sha>`. Only that exact lowercase,
+40-character SHA command starts candidate validation; every new head requires
+a new review and command.
 
-If the copy bot requests validation, a maintainer must review the exact latest
-head and comment `/ok to test <head-sha>`. Automated App-authored commits and
-other untrusted heads require this SHA-bound approval. Every new untrusted head
-requires a new review and comment. The copied branch reports checks to the
-matching pull-request head and is removed when the pull request closes or
-merges.
+Candidate jobs check out the exact authorized head on GitHub-hosted workers
+without repository credentials, secrets, OIDC, write permissions, cache saves,
+or retained artifacts. Externally authored changes to published crate source
+and tests, workflow and release policy, Cargo execution surfaces, or repository
+agent guidance additionally require adoption on a same-repository branch by a
+verified, DCO-compliant repository writer.
 
 #### Signing Off Your Work
 

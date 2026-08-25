@@ -27,6 +27,11 @@ exclude = [
 # wording in editorial review passes instead.
 disable = ["MD059"]
 
+[per-file-ignores]
+# The sole relative link in this notice targets the pinned source-spec
+# submodule, which is deliberately excluded from rumdl's workspace index.
+"THIRD_PARTY_NOTICES.md" = ["MD057"]
+
 # --------------------------------------------------------------------
 # Rule overrides
 # --------------------------------------------------------------------
