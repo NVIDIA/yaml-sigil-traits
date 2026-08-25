@@ -25,7 +25,7 @@ name = "xtask"
 path = "src/main.rs"
 
 [dependencies]
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.6", features = ["derive"] }
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 semver = "1.0"
 serde = { version = "1.0", features = ["derive"] }
