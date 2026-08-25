@@ -7,6 +7,8 @@ edition = "2024"
 # Keep this package library-only. An executable target requires an explicit
 # manifest change and is also rejected by the release workflow.
 autobins = false
+# This crate has no build script; keep automatic discovery disabled.
+build = false
 # TODO: We seek to reduce this, we just need to do the testing.
 rust-version = "1.95.0"
 license = "Apache-2.0"

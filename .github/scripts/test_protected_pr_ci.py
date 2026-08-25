@@ -12,6 +12,7 @@ import importlib.util
 import pathlib
 import sys
 import unittest
+from unittest import mock
 
 
 MODULE_PATH = pathlib.Path(__file__).with_name("protected_pr_ci.py")
@@ -27,6 +28,11 @@ REPOSITORY = "NVIDIA/yaml-sigil-example"
 MAIN_SHA = "a" * 40
 HEAD_SHA = "b" * 40
 OLD_SHA = "c" * 40
+BASE_TREE_SHA = "d" * 40
+HEAD_TREE_SHA = "e" * 40
+BASE_BLOB_SHA = "1" * 40
+HEAD_BLOB_SHA = "2" * 40
+DIRECTORY_TREE_SHA = "f" * 40
 BOT = "nvidia-yamlsigil-release-pr[bot]"
 BOT_ID = 318780254
 BOT_EMAIL = "318780254+nvidia-yamlsigil-release-pr[bot]@users.noreply.github.com"
@@ -65,6 +71,8 @@ def policy() -> dict:
             ".cargo/**",
             "Cargo.toml",
             "**/Cargo.toml",
+            "build.rs",
+            "**/build.rs",
             "AGENTS.md",
             ".agents/**",
         ],
@@ -149,17 +157,57 @@ def git_commit(
     }
 
 
+def recursive_tree(tree_sha: str, leaves: dict[str, tuple[str, str, str]]) -> dict:
+    directories = {
+        "/".join(path.split("/")[:length])
+        for path in leaves
+        for length in range(1, len(path.split("/")))
+    }
+    entries = [
+        {
+            "path": path,
+            "mode": "040000",
+            "type": "tree",
+            "sha": DIRECTORY_TREE_SHA,
+        }
+        for path in sorted(directories)
+    ]
+    entries.extend(
+        {
+            "path": path,
+            "type": leaf[0],
+            "mode": leaf[1],
+            "sha": leaf[2],
+        }
+        for path, leaf in sorted(leaves.items())
+    )
+    return {"sha": tree_sha, "truncated": False, "tree": entries}
+
+
 class FakeAuthorizationApi:
     def __init__(self) -> None:
         self.api_url = "https://api.github.com"
         self.main_sha = MAIN_SHA
+        self.final_main_sha = None
         self.permissions = {MAINTAINER: "write"}
-        self.files = [{"filename": "README.md", "status": "modified"}]
         self.commits = [{"sha": HEAD_SHA, "parents": [{"sha": MAIN_SHA}]}]
         self.details = {HEAD_SHA: git_commit()}
+        self.git_commits = {
+            MAIN_SHA: {"sha": MAIN_SHA, "tree": {"sha": BASE_TREE_SHA}},
+            HEAD_SHA: {"sha": HEAD_SHA, "tree": {"sha": HEAD_TREE_SHA}},
+        }
+        self.trees = {}
+        self.set_tree_files(
+            {"README.md": ("blob", "100644", BASE_BLOB_SHA)},
+            {"README.md": ("blob", "100644", HEAD_BLOB_SHA)},
+        )
         self.comment = copy.deepcopy(event()["comment"])
         self.comment_issue_number = 7
         self.posts = []
+        self.get_paths = []
+        self.main_reads = 0
+        self.pull_reads = 0
+        self.final_pull = None
         self.pull = {
             "number": 7,
             "state": "open",
@@ -178,14 +226,52 @@ class FakeAuthorizationApi:
             "commits": 1,
         }
 
+    def set_tree_files(
+        self,
+        base: dict[str, tuple[str, str, str]],
+        head: dict[str, tuple[str, str, str]],
+    ) -> None:
+        self.trees[BASE_TREE_SHA] = recursive_tree(BASE_TREE_SHA, base)
+        self.trees[HEAD_TREE_SHA] = recursive_tree(HEAD_TREE_SHA, head)
+
+    def set_change(
+        self, path: str, status: str = "modified", previous_filename: str | None = None
+    ) -> None:
+        base: dict[str, tuple[str, str, str]] = {}
+        head: dict[str, tuple[str, str, str]] = {}
+        if status == "modified":
+            base[path] = ("blob", "100644", BASE_BLOB_SHA)
+            head[path] = ("blob", "100644", HEAD_BLOB_SHA)
+        elif status == "added":
+            head[path] = ("blob", "100644", HEAD_BLOB_SHA)
+        elif status == "removed":
+            base[path] = ("blob", "100644", BASE_BLOB_SHA)
+        elif status == "renamed":
+            if previous_filename is None:
+                raise AssertionError("a renamed fixture needs previous_filename")
+            base[previous_filename] = ("blob", "100644", BASE_BLOB_SHA)
+            head[path] = ("blob", "100644", BASE_BLOB_SHA)
+        else:
+            raise AssertionError(f"unsupported fixture status {status}")
+        self.set_tree_files(base, head)
+
     def get(self, path: str):
+        self.get_paths.append(path)
         if "/collaborators/" in path and path.endswith("/permission"):
             login = path.split("/collaborators/", 1)[1].rsplit("/permission", 1)[0]
             return {"permission": self.permissions.get(login, "none")}
         if path.endswith("/git/ref/heads/main"):
-            return {"object": {"type": "commit", "sha": self.main_sha}}
+            self.main_reads += 1
+            sha = (
+                self.final_main_sha
+                if self.main_reads > 1 and self.final_main_sha is not None
+                else self.main_sha
+            )
+            return {"object": {"type": "commit", "sha": sha}}
         if path.endswith("/pulls/7"):
-            return self.pull
+            self.pull_reads += 1
+            value = self.final_pull if self.pull_reads > 1 and self.final_pull else self.pull
+            return copy.deepcopy(value)
         if path.endswith("/issues/comments/19"):
             value = copy.deepcopy(self.comment)
             value["issue_url"] = (
@@ -193,17 +279,21 @@ class FakeAuthorizationApi:
                 f"{self.comment_issue_number}"
             )
             return value
+        if "/git/commits/" in path:
+            sha = path.split("/git/commits/", 1)[1].split("?", 1)[0]
+            return copy.deepcopy(self.git_commits[sha])
+        if "/git/trees/" in path:
+            sha = path.split("/git/trees/", 1)[1].split("?", 1)[0]
+            return copy.deepcopy(self.trees[sha])
         if "/commits/" in path:
             sha = path.rsplit("/", 1)[1]
-            return self.details[sha]
+            return copy.deepcopy(self.details[sha])
         raise AssertionError(f"unexpected GET {path}")
 
     def paginate(self, path: str, *, max_items: int, label: str):
         del path, max_items
-        if label == "pull request files":
-            return self.files
         if label == "pull request commits":
-            return self.commits
+            return copy.deepcopy(self.commits)
         raise AssertionError(f"unexpected pagination label {label}")
 
     def post(self, path: str, payload: dict):
@@ -267,38 +357,75 @@ class AuthorizationTests(unittest.TestCase):
         with self.assertRaisesRegex(controller.PolicyError, "linear descendant"):
             controller.authorize(event(), policy(), api, environment())
 
-    def test_pagination_count_mismatch_is_rejected(self) -> None:
+    def test_live_main_and_pull_state_are_rechecked_before_authorization(self) -> None:
         api = FakeAuthorizationApi()
-        api.pull["changed_files"] = 2
+        api.final_main_sha = OLD_SHA
+        with self.assertRaisesRegex(controller.PolicyError, "main changed during"):
+            controller.authorize(event(), policy(), api, environment())
+
+        api = FakeAuthorizationApi()
+        api.final_pull = copy.deepcopy(api.pull)
+        api.final_pull["head"]["sha"] = OLD_SHA
+        with self.assertRaisesRegex(controller.PolicyError, "head changed during"):
+            controller.authorize(event(), policy(), api, environment())
+
+        api = FakeAuthorizationApi()
+        api.final_pull = copy.deepcopy(api.pull)
+        api.final_pull["base"]["sha"] = OLD_SHA
+        with self.assertRaisesRegex(controller.PolicyError, "base changed during"):
+            controller.authorize(event(), policy(), api, environment())
+
+    def test_commit_pagination_count_mismatch_is_rejected(self) -> None:
+        api = FakeAuthorizationApi()
+        api.pull["commits"] = 2
         with self.assertRaisesRegex(controller.PolicyError, "pagination"):
             controller.authorize(event(), policy(), api, environment())
 
-    def test_renamed_sensitive_source_and_unknown_status_fail_closed(self) -> None:
+    def test_renamed_sensitive_source_is_remove_plus_add(self) -> None:
         api = FakeAuthorizationApi()
-        api.files = [
-            {
-                "filename": "docs/retired-workflow.md",
-                "previous_filename": ".github/workflows/ci.yml",
-                "status": "renamed",
-            }
-        ]
+        api.set_change(
+            "docs/retired-workflow.md",
+            "renamed",
+            previous_filename=".github/workflows/ci.yml",
+        )
         with self.assertRaisesRegex(controller.PolicyError, "same-repository branch"):
             controller.authorize(event(), policy(), api, environment())
 
+    def test_mutable_pull_file_view_is_never_authoritative(self) -> None:
         api = FakeAuthorizationApi()
-        api.files[0]["status"] = "mystery"
-        with self.assertRaisesRegex(controller.PolicyError, "unknown status"):
-            controller.authorize(event(), policy(), api, environment())
+        api.pull["changed_files"] = 999_999
+        result = controller.authorize(event(), policy(), api, environment())
+        self.assertEqual(result.head_sha, HEAD_SHA)
+        self.assertFalse(any("/pulls/7/files" in path for path in api.get_paths))
 
     def test_sensitive_fork_change_runs_no_candidate_policy(self) -> None:
         api = FakeAuthorizationApi()
-        api.files = [{"filename": ".github/workflows/ci.yml", "status": "modified"}]
+        api.set_change(".github/workflows/ci.yml")
         with self.assertRaisesRegex(controller.PolicyError, "same-repository branch"):
             controller.authorize(event(), policy(), api, environment())
 
+    def test_sensitive_matching_uses_unicode_normalized_casefold_paths(self) -> None:
+        for path in (
+            ".GitHub/Workflows/ci.yml",
+            ".ＧitHub/workflows/ci.yml",
+        ):
+            with self.subTest(path=path):
+                api = FakeAuthorizationApi()
+                api.set_change(path)
+                with self.assertRaisesRegex(controller.PolicyError, "same-repository branch"):
+                    controller.authorize(event(), policy(), api, environment())
+
+    def test_root_and_nested_build_scripts_are_sensitive(self) -> None:
+        for path in ("build.rs", "nested/BUILD.RS"):
+            with self.subTest(path=path):
+                api = FakeAuthorizationApi()
+                api.set_change(path)
+                with self.assertRaisesRegex(controller.PolicyError, "same-repository branch"):
+                    controller.authorize(event(), policy(), api, environment())
+
     def test_verified_writer_adoption_requires_both_dco_identities(self) -> None:
         api = FakeAuthorizationApi()
-        api.files = [{"filename": "Cargo.toml", "status": "modified"}]
+        api.set_change("Cargo.toml")
         api.pull["head"]["repo"]["full_name"] = REPOSITORY
         api.permissions[MAINTAINER] = "maintain"
         api.details[HEAD_SHA] = git_commit(
@@ -320,7 +447,7 @@ class AuthorizationTests(unittest.TestCase):
 
     def test_sensitive_adoption_requires_verified_writer_commit(self) -> None:
         api = FakeAuthorizationApi()
-        api.files = [{"filename": "AGENTS.md", "status": "modified"}]
+        api.set_change("AGENTS.md")
         api.pull["head"]["repo"]["full_name"] = REPOSITORY
         api.details[HEAD_SHA] = git_commit(verified=False)
         with self.assertRaisesRegex(controller.PolicyError, "not GitHub Verified"):
@@ -333,7 +460,7 @@ class AuthorizationTests(unittest.TestCase):
 
     def test_full_commit_response_must_match_requested_sha(self) -> None:
         api = FakeAuthorizationApi()
-        api.files = [{"filename": "Cargo.toml", "status": "modified"}]
+        api.set_change("Cargo.toml")
         api.pull["head"]["repo"]["full_name"] = REPOSITORY
         api.details[HEAD_SHA]["sha"] = OLD_SHA
         with self.assertRaisesRegex(controller.PolicyError, "requested SHA"):
@@ -341,7 +468,7 @@ class AuthorizationTests(unittest.TestCase):
 
     def test_exact_release_app_author_and_committer_are_accepted(self) -> None:
         api = FakeAuthorizationApi()
-        api.files = [{"filename": "Cargo.toml", "status": "modified"}]
+        api.set_change("Cargo.toml")
         api.pull["user"] = {"login": BOT, "id": BOT_ID}
         api.pull["head"]["repo"]["full_name"] = REPOSITORY
         api.pull["head"]["ref"] = "release-plz-next"
@@ -363,13 +490,13 @@ class AuthorizationTests(unittest.TestCase):
         result = controller.authorize(event(), policy(), api, environment())
         self.assertEqual(result.head_sha, HEAD_SHA)
 
-        api.files[0]["status"] = "removed"
+        api.set_change("Cargo.toml", "removed")
         with self.assertRaisesRegex(controller.PolicyError, "only modify existing"):
             controller.authorize(event(), policy(), api, environment())
 
     def release_app_api(self) -> FakeAuthorizationApi:
         api = FakeAuthorizationApi()
-        api.files = [{"filename": "Cargo.toml", "status": "modified"}]
+        api.set_change("Cargo.toml")
         api.pull["user"] = {"login": BOT, "id": BOT_ID}
         api.pull["head"]["repo"]["full_name"] = REPOSITORY
         api.pull["head"]["ref"] = "release-plz-next"
@@ -466,7 +593,7 @@ class AuthorizationTests(unittest.TestCase):
 
     def test_release_app_identity_parent_and_allowlist_are_exact(self) -> None:
         base_api = FakeAuthorizationApi()
-        base_api.files = [{"filename": "Cargo.toml", "status": "modified"}]
+        base_api.set_change("Cargo.toml")
         base_api.pull["user"] = {"login": BOT, "id": BOT_ID}
         base_api.pull["head"]["repo"]["full_name"] = REPOSITORY
         base_api.pull["head"]["ref"] = "release-plz-next"
@@ -491,7 +618,7 @@ class AuthorizationTests(unittest.TestCase):
 
         api = copy.deepcopy(base_api)
         api.details[HEAD_SHA]["parents"] = [{"sha": MAIN_SHA}]
-        api.files = [{"filename": ".github/workflows/ci.yml", "status": "modified"}]
+        api.set_change(".github/workflows/ci.yml")
         with self.assertRaisesRegex(controller.PolicyError, "allowlist"):
             controller.authorize(event(), policy(), api, environment())
 
@@ -561,6 +688,163 @@ class AuthorizationTests(unittest.TestCase):
             controller.authorize_dispatch(workflow_dispatch_event(), policy(), api, env)
 
 
+class ImmutableTreeTests(unittest.TestCase):
+    @staticmethod
+    def snapshot(leaves: dict[str, tuple[str, str, str]]) -> controller.GitTree:
+        return controller.GitTree(paths=frozenset(leaves), leaves=leaves)
+
+    def test_additions_removals_modifications_and_renames_are_derived(self) -> None:
+        unchanged = ("blob", "100644", "3" * 40)
+        renamed = ("blob", "100644", "4" * 40)
+        base = self.snapshot(
+            {
+                "modified.txt": ("blob", "100644", "5" * 40),
+                "old-name.txt": renamed,
+                "removed.txt": ("blob", "100644", "6" * 40),
+                "unchanged.txt": unchanged,
+            }
+        )
+        head = self.snapshot(
+            {
+                "added.txt": ("blob", "100644", "7" * 40),
+                "modified.txt": ("blob", "100755", "5" * 40),
+                "new-name.txt": renamed,
+                "unchanged.txt": unchanged,
+            }
+        )
+
+        paths, statuses = controller.changed_tree_paths(base, head)
+
+        self.assertEqual(
+            list(zip(paths, statuses, strict=True)),
+            [
+                ("added.txt", "added"),
+                ("modified.txt", "modified"),
+                ("new-name.txt", "added"),
+                ("old-name.txt", "removed"),
+                ("removed.txt", "removed"),
+            ],
+        )
+
+    def test_commit_and_tree_responses_are_bound_to_exact_requested_objects(self) -> None:
+        for sha, label in ((MAIN_SHA, "base"), (HEAD_SHA, "head")):
+            with self.subTest(object=label):
+                api = FakeAuthorizationApi()
+                api.git_commits[sha]["sha"] = OLD_SHA
+                with self.assertRaisesRegex(controller.PolicyError, "requested SHA"):
+                    controller.authorize(event(), policy(), api, environment())
+
+        api = FakeAuthorizationApi()
+        api.trees[HEAD_TREE_SHA]["sha"] = OLD_SHA
+        with self.assertRaisesRegex(controller.PolicyError, "does not match its commit"):
+            controller.authorize(event(), policy(), api, environment())
+
+    def test_external_head_git_objects_use_the_installed_base_repository(self) -> None:
+        api = FakeAuthorizationApi()
+        result = controller.authorize(event(), policy(), api, environment())
+        self.assertNotEqual(result.head_repository, REPOSITORY)
+        git_object_paths = [path for path in api.get_paths if "/git/" in path]
+        self.assertIn(
+            controller.repo_api_path(REPOSITORY, f"/git/commits/{HEAD_SHA}"),
+            git_object_paths,
+        )
+        self.assertTrue(
+            all(path.startswith(f"/repos/{REPOSITORY}/git/") for path in git_object_paths)
+        )
+
+    def test_truncated_and_over_limit_trees_fail_closed(self) -> None:
+        api = FakeAuthorizationApi()
+        api.trees[HEAD_TREE_SHA]["truncated"] = True
+        with self.assertRaisesRegex(controller.PolicyError, "truncated"):
+            controller.authorize(event(), policy(), api, environment())
+
+        with mock.patch.object(controller, "MAX_TREE_ENTRIES", 0):
+            with self.assertRaisesRegex(controller.PolicyError, "tree exceeds"):
+                controller.authorize(
+                    event(), policy(), FakeAuthorizationApi(), environment()
+                )
+
+        with mock.patch.object(controller, "MAX_CHANGED_PATHS", 0):
+            with self.assertRaisesRegex(controller.PolicyError, "tree diff exceeds"):
+                controller.authorize(
+                    event(), policy(), FakeAuthorizationApi(), environment()
+                )
+
+    def test_malformed_recursive_trees_fail_closed(self) -> None:
+        api = FakeAuthorizationApi()
+        api.trees[HEAD_TREE_SHA]["tree"] = {}
+        with self.assertRaisesRegex(controller.PolicyError, "must be an array"):
+            controller.authorize(event(), policy(), api, environment())
+
+        api = FakeAuthorizationApi()
+        api.trees[HEAD_TREE_SHA]["tree"].append(
+            copy.deepcopy(api.trees[HEAD_TREE_SHA]["tree"][0])
+        )
+        with self.assertRaisesRegex(controller.PolicyError, "duplicate paths"):
+            controller.authorize(event(), policy(), api, environment())
+
+        api = FakeAuthorizationApi()
+        api.trees[HEAD_TREE_SHA]["tree"][0]["mode"] = "100600"
+        with self.assertRaisesRegex(controller.PolicyError, "invalid mode"):
+            controller.authorize(event(), policy(), api, environment())
+
+        api = FakeAuthorizationApi()
+        api.trees[HEAD_TREE_SHA] = {
+            "sha": HEAD_TREE_SHA,
+            "truncated": False,
+            "tree": [
+                {
+                    "path": "missing-parent/file.txt",
+                    "mode": "100644",
+                    "type": "blob",
+                    "sha": HEAD_BLOB_SHA,
+                }
+            ],
+        }
+        with self.assertRaisesRegex(controller.PolicyError, "omits a parent"):
+            controller.authorize(event(), policy(), api, environment())
+
+    def test_candidate_collision_with_unchanged_base_path_is_rejected(self) -> None:
+        api = FakeAuthorizationApi()
+        unchanged = ("blob", "100644", BASE_BLOB_SHA)
+        api.set_tree_files(
+            {"Cargo.toml": unchanged},
+            {
+                "Cargo.toml": unchanged,
+                "cargo.TOML": ("blob", "100644", HEAD_BLOB_SHA),
+            },
+        )
+        with self.assertRaisesRegex(controller.PolicyError, "casefold path collisions"):
+            controller.authorize(event(), policy(), api, environment())
+
+    def test_candidate_unicode_and_directory_collisions_are_rejected(self) -> None:
+        for head in (
+            {
+                "docs/caf\N{LATIN SMALL LETTER E WITH ACUTE}.md": (
+                    "blob",
+                    "100644",
+                    BASE_BLOB_SHA,
+                ),
+                "docs/cafe\N{COMBINING ACUTE ACCENT}.md": (
+                    "blob",
+                    "100644",
+                    HEAD_BLOB_SHA,
+                ),
+            },
+            {
+                "Src/a.txt": ("blob", "100644", BASE_BLOB_SHA),
+                "src/b.txt": ("blob", "100644", HEAD_BLOB_SHA),
+            },
+        ):
+            with self.subTest(paths=sorted(head)):
+                api = FakeAuthorizationApi()
+                api.set_tree_files({}, head)
+                with self.assertRaisesRegex(
+                    controller.PolicyError, "casefold path collisions"
+                ):
+                    controller.authorize(event(), policy(), api, environment())
+
+
 class PaginationApi(controller.GitHubApi):
     def __init__(self, responses):
         self.responses = list(responses)
@@ -592,6 +876,20 @@ class PaginationTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(controller.PolicyError, "total changed"):
             api.paginate_key("/items", "items", max_items=200, label="items")
+
+    def test_pagination_limits_and_completion_fail_closed(self) -> None:
+        api = PaginationApi([[{} for _ in range(100)]])
+        with self.assertRaisesRegex(controller.PolicyError, "supported limit"):
+            api.paginate("/items", max_items=99, label="items")
+
+        api = PaginationApi([{"total_count": 2, "items": [{}]}])
+        with self.assertRaisesRegex(controller.PolicyError, "incomplete"):
+            api.paginate_key("/items", "items", max_items=2, label="items")
+
+        api = PaginationApi([[{} for _ in range(100)] for _ in range(2)])
+        with mock.patch.object(controller, "MAX_PAGES", 2):
+            with self.assertRaisesRegex(controller.PolicyError, "did not terminate"):
+                api.paginate("/items", max_items=200, label="items")
 
 
 class FakeCheckApi:

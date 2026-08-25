@@ -25,6 +25,7 @@ import json
 import os
 import re
 import sys
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -41,8 +42,9 @@ WRITER_PERMISSIONS = frozenset({"write", "push", "maintain", "admin"})
 GITHUB_ACTIONS_LOGIN = "github-actions[bot]"
 TERMINAL_CHECK_STATUSES = frozenset({"completed"})
 CHECK_NAME = "Required CI"
-MAX_PULL_FILES = 3_000
+MAX_CHANGED_PATHS = 3_000
 MAX_PULL_COMMITS = 250
+MAX_TREE_ENTRIES = 100_000
 MAX_PAGES = 100
 
 
@@ -332,8 +334,19 @@ def exact_command(body: Any) -> str:
     return requested_sha
 
 
+def normalized_casefold(value: str) -> str:
+    """Return the compatibility-normalized, case-insensitive identity."""
+
+    normalized = unicodedata.normalize("NFKC", value)
+    return unicodedata.normalize("NFKC", normalized.casefold())
+
+
 def is_sensitive(path: str, patterns: Sequence[str]) -> bool:
-    return any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns)
+    identity = normalized_casefold(path)
+    return any(
+        fnmatch.fnmatchcase(identity, normalized_casefold(pattern))
+        for pattern in patterns
+    )
 
 
 def commit_identities(commit: Mapping[str, Any]) -> tuple[str, str]:
@@ -378,31 +391,121 @@ def current_main(api: GitHubApi, repository: str, branch: str) -> str:
     return validate_sha(obj.get("sha"), "current main SHA")
 
 
-def pull_files(
-    api: GitHubApi, repository: str, number: int, expected: int
-) -> tuple[list[str], list[str]]:
-    require(0 <= expected <= MAX_PULL_FILES, "pull request file count exceeds GitHub's reviewable limit")
-    values = api.paginate(
-        repo_api_path(repository, f"/pulls/{number}/files"),
-        max_items=MAX_PULL_FILES,
-        label="pull request files",
+TreeLeaf = tuple[str, str, str]
+
+
+@dataclass(frozen=True)
+class GitTree:
+    paths: frozenset[str]
+    leaves: Mapping[str, TreeLeaf]
+
+
+def git_tree_for_commit(
+    api: GitHubApi, repository: str, commit_sha: str, label: str
+) -> GitTree:
+    """Load one complete recursive tree bound to an exact Git commit object."""
+
+    commit = require_mapping(
+        api.get(repo_api_path(repository, f"/git/commits/{commit_sha}")),
+        f"{label} Git commit",
     )
-    require(len(values) == expected, "pull request file pagination did not match changed_files")
-    paths = []
+    require(
+        validate_sha(commit.get("sha"), f"{label} Git commit response SHA")
+        == commit_sha,
+        f"{label} Git commit response does not match the requested SHA",
+    )
+    tree = require_mapping(commit.get("tree"), f"{label} Git commit tree")
+    tree_sha = validate_sha(tree.get("sha"), f"{label} Git commit tree SHA")
+    response = require_mapping(
+        api.get(repo_api_path(repository, f"/git/trees/{tree_sha}?recursive=1")),
+        f"{label} recursive Git tree",
+    )
+    require(
+        validate_sha(response.get("sha"), f"{label} recursive Git tree SHA")
+        == tree_sha,
+        f"{label} recursive Git tree does not match its commit",
+    )
+    require(
+        response.get("truncated") is False,
+        f"{label} recursive Git tree is truncated or ambiguous",
+    )
+    entries = require_sequence(response.get("tree"), f"{label} recursive Git tree entries")
+    require(
+        len(entries) <= MAX_TREE_ENTRIES,
+        f"{label} recursive Git tree exceeds the supported limit of {MAX_TREE_ENTRIES}",
+    )
+
+    paths: set[str] = set()
+    entry_types: dict[str, str] = {}
+    leaves: dict[str, TreeLeaf] = {}
+    valid_modes = {
+        "blob": frozenset({"100644", "100755", "120000"}),
+        "tree": frozenset({"040000"}),
+        "commit": frozenset({"160000"}),
+    }
+    for index, value in enumerate(entries):
+        entry = require_mapping(value, f"{label} Git tree entry {index}")
+        path = validate_path(entry.get("path"), f"{label} Git tree entry {index} path")
+        require(path not in paths, f"{label} recursive Git tree contains duplicate paths")
+        entry_type = require_string(
+            entry.get("type"), f"{label} Git tree entry {index} type"
+        )
+        require(
+            entry_type in valid_modes,
+            f"{label} Git tree entry {index} has an unsupported type",
+        )
+        mode = require_string(entry.get("mode"), f"{label} Git tree entry {index} mode")
+        require(
+            mode in valid_modes[entry_type],
+            f"{label} Git tree entry {index} has an invalid mode",
+        )
+        sha = validate_sha(entry.get("sha"), f"{label} Git tree entry {index} SHA")
+        paths.add(path)
+        entry_types[path] = entry_type
+        if entry_type != "tree":
+            leaves[path] = (entry_type, mode, sha)
+
+    for path in paths:
+        parts = path.split("/")
+        for length in range(1, len(parts)):
+            parent = "/".join(parts[:length])
+            require(
+                entry_types.get(parent) == "tree",
+                f"{label} recursive Git tree omits a parent tree entry",
+            )
+    return GitTree(paths=frozenset(paths), leaves=leaves)
+
+
+def require_no_path_collisions(paths: Iterable[str]) -> None:
+    """Reject checkout-ambiguous candidate paths before candidate execution."""
+
+    identities: dict[str, str] = {}
+    for path in sorted(paths):
+        identity = normalized_casefold(path)
+        previous = identities.setdefault(identity, path)
+        require(
+            previous == path,
+            "candidate tree contains Unicode-normalized casefold path collisions",
+        )
+
+
+def changed_tree_paths(base: GitTree, head: GitTree) -> tuple[list[str], list[str]]:
+    """Derive leaf changes from immutable trees; a rename is remove plus add."""
+
+    paths = sorted(set(base.leaves) | set(head.leaves))
+    paths = [path for path in paths if base.leaves.get(path) != head.leaves.get(path)]
+    require(
+        len(paths) <= MAX_CHANGED_PATHS,
+        f"tree diff exceeds the supported limit of {MAX_CHANGED_PATHS}",
+    )
     statuses = []
-    known_statuses = {"added", "removed", "modified", "renamed", "copied", "changed", "unchanged"}
-    for index, value in enumerate(values):
-        item = require_mapping(value, f"pull request file {index}")
-        status = require_string(item.get("status"), f"pull request file {index} status")
-        require(status in known_statuses, f"pull request file {index} has unknown status {status!r}")
-        statuses.append(status)
-        paths.append(validate_path(item.get("filename"), f"pull request file {index} name"))
-        previous = item.get("previous_filename")
-        if status == "renamed":
-            paths.append(validate_path(previous, f"pull request file {index} previous name"))
+    for path in paths:
+        if path not in base.leaves:
+            statuses.append("added")
+        elif path not in head.leaves:
+            statuses.append("removed")
         else:
-            require(previous is None, f"pull request file {index} has an ambiguous previous name")
-    require(len(set(paths)) == len(paths), "pull request files contain duplicate names")
+            statuses.append("modified")
     return paths, statuses
 
 
@@ -418,6 +521,54 @@ def pull_commits(api: GitHubApi, repository: str, number: int, expected: int) ->
     shas = [validate_sha(commit.get("sha"), f"pull request commit {index} SHA") for index, commit in enumerate(commits)]
     require(len(set(shas)) == len(shas), "pull request commits contain duplicate SHAs")
     return commits
+
+
+def require_live_authorization_state(
+    api: GitHubApi,
+    repository: str,
+    branch: str,
+    pull_number: int,
+    main_sha: str,
+    head_sha: str,
+    head_repository: str,
+    head_ref: str,
+) -> None:
+    """Re-read mutable PR and main refs immediately before authorization."""
+
+    require(
+        current_main(api, repository, branch) == main_sha,
+        "main changed during pull request authorization",
+    )
+    pull = require_mapping(
+        api.get(repo_api_path(repository, f"/pulls/{pull_number}")),
+        "rechecked pull request",
+    )
+    require(pull.get("state") == "open", "pull request closed during authorization")
+    require(pull.get("number") == pull_number, "pull request number changed during authorization")
+    base = require_mapping(pull.get("base"), "rechecked pull request base")
+    base_repo = require_mapping(base.get("repo"), "rechecked pull request base repository")
+    require(
+        base_repo.get("full_name") == repository
+        and base.get("ref") == branch
+        and validate_sha(base.get("sha"), "rechecked pull request base SHA") == main_sha,
+        "pull request base changed during authorization",
+    )
+    head = require_mapping(pull.get("head"), "rechecked pull request head")
+    head_repo = require_mapping(head.get("repo"), "rechecked pull request head repository")
+    require(
+        validate_sha(head.get("sha"), "rechecked pull request head SHA") == head_sha
+        and validate_repository(
+            head_repo.get("full_name"), "rechecked pull request head repository"
+        )
+        == head_repository
+        and require_string(head.get("ref"), "rechecked pull request head ref")
+        == head_ref,
+        "pull request head changed during authorization",
+    )
+    require(
+        current_main(api, repository, branch) == main_sha,
+        "main changed during pull request authorization",
+    )
 
 
 def require_commit_chain(
@@ -613,10 +764,15 @@ def authorize(
     require(head_sha == requested_sha, "comment SHA is not the exact current pull request head")
     head_repo = require_mapping(head.get("repo"), "pull request head repository")
     head_repository = validate_repository(head_repo.get("full_name"), "pull request head repository")
+    head_ref = require_string(head.get("ref"), "pull request head ref")
 
-    changed_files = require_integer(pull.get("changed_files"), "pull request changed_files")
+    base_tree = git_tree_for_commit(api, repository, base_sha, "base")
+    # GitHub retains the exact PR head object in the base repository. Keep both
+    # immutable-tree reads inside the installation token's repository scope.
+    head_tree = git_tree_for_commit(api, repository, head_sha, "head")
+    require_no_path_collisions(head_tree.paths)
+    paths, statuses = changed_tree_paths(base_tree, head_tree)
     commit_count = require_integer(pull.get("commits"), "pull request commits")
-    paths, statuses = pull_files(api, repository, pull_number, changed_files)
     commits = pull_commits(api, repository, pull_number, commit_count)
     require(validate_sha(commits[-1].get("sha"), "last pull request commit SHA") == head_sha, "commit list does not end at pull request head")
     require_commit_chain(commits, base_sha, head_sha)
@@ -632,6 +788,17 @@ def authorize(
             )
         else:
             require_adopted_change(api, repository, pull, commits)
+
+    require_live_authorization_state(
+        api,
+        repository,
+        branch,
+        pull_number,
+        main_sha,
+        head_sha,
+        head_repository,
+        head_ref,
+    )
 
     return Authorization(
         repository=repository,

@@ -446,24 +446,41 @@ fn check_packages(root: &Path, expected: &[String]) -> Result<(), String> {
 fn check_packages_in_metadata(metadata: &Value, expected: &[String]) -> Result<(), String> {
     let mut actual = Vec::new();
     for package in metadata_packages(metadata)? {
-        let publish = package.get("publish").and_then(Value::as_array);
-        let publishes_to_crates_io = publish.is_some_and(|registries| {
-            registries
-                .iter()
-                .any(|registry| registry.as_str() == Some("crates-io"))
-        });
-        if !publishes_to_crates_io {
-            continue;
-        }
         let name = package
             .get("name")
             .and_then(Value::as_str)
-            .ok_or_else(|| "Cargo returned a publishable package without a name".to_string())?;
+            .ok_or_else(|| "Cargo returned a package without a valid name".to_string())?;
+        let publishes_to_crates_io = match package.get("publish") {
+            // Cargo permits publication to its default registry when the
+            // manifest omits an explicit publish allowlist.
+            Some(Value::Null) => true,
+            Some(Value::Array(registries)) => {
+                let mut publishes = false;
+                for registry in registries {
+                    let registry = registry.as_str().ok_or_else(|| {
+                        format!("Cargo returned invalid publish registries for {name}")
+                    })?;
+                    publishes |= registry == "crates-io";
+                }
+                publishes
+            }
+            Some(_) => {
+                return Err(format!(
+                    "Cargo returned invalid publish metadata for {name}"
+                ));
+            }
+            None => return Err(format!("Cargo omitted publish metadata for {name}")),
+        };
+        if !publishes_to_crates_io {
+            continue;
+        }
         let targets = package
             .get("targets")
             .and_then(Value::as_array)
             .ok_or_else(|| format!("Cargo returned invalid targets for {name}"))?;
+        validate_publishable_package_identity(metadata, name, package, targets)?;
         let mut has_binary = false;
+        let mut has_build_script = false;
         for target in targets {
             let kinds = target
                 .get("kind")
@@ -473,9 +490,17 @@ fn check_packages_in_metadata(metadata: &Value, expected: &[String]) -> Result<(
                 return Err(format!("Cargo returned invalid target kinds for {name}"));
             }
             has_binary |= kinds.iter().any(|kind| kind.as_str() == Some("bin"));
+            has_build_script |= kinds
+                .iter()
+                .any(|kind| kind.as_str() == Some("custom-build"));
         }
         if has_binary {
             return Err(format!("crates.io package {name} contains a binary target"));
+        }
+        if has_build_script {
+            return Err(format!(
+                "crates.io package {name} contains an unexpected build script"
+            ));
         }
         actual.push(name.to_string());
     }
@@ -484,6 +509,61 @@ fn check_packages_in_metadata(metadata: &Value, expected: &[String]) -> Result<(
             "crates.io package order differs: expected [{}], found [{}]",
             expected.join(", "),
             actual.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+fn validate_publishable_package_identity(
+    metadata: &Value,
+    package_name: &str,
+    package: &Value,
+    targets: &[Value],
+) -> Result<(), String> {
+    if package_name != "yaml-sigil-traits" {
+        return Err(format!(
+            "crates.io package {package_name} has no approved workspace identity"
+        ));
+    }
+    let workspace_root = metadata
+        .get("workspace_root")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Cargo returned no workspace root for package validation".to_string())?;
+    let expected_manifest = Path::new(workspace_root).join("Cargo.toml");
+    let manifest = package
+        .get("manifest_path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("Cargo returned no manifest path for {package_name}"))?;
+    if Path::new(manifest) != expected_manifest {
+        return Err(format!(
+            "crates.io package {package_name} manifest differs from {}",
+            expected_manifest.display()
+        ));
+    }
+
+    let expected_library = Path::new(workspace_root).join("src/lib.rs");
+    let libraries: Vec<_> = targets
+        .iter()
+        .filter(|target| {
+            target
+                .get("kind")
+                .and_then(Value::as_array)
+                .is_some_and(|kinds| kinds.len() == 1 && kinds[0].as_str() == Some("lib"))
+        })
+        .collect();
+    if libraries.len() != 1 {
+        return Err(format!(
+            "crates.io package {package_name} must contain one exact primary library target"
+        ));
+    }
+    let source = libraries[0]
+        .get("src_path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("Cargo returned no library source path for {package_name}"))?;
+    if Path::new(source) != expected_library {
+        return Err(format!(
+            "crates.io package {package_name} library differs from {}",
+            expected_library.display()
         ));
     }
     Ok(())
@@ -1280,6 +1360,7 @@ mod tests {
     #[test]
     fn package_policy_requires_exact_order_and_no_binary_targets() {
         let metadata = serde_json::json!({
+            "workspace_root": "/workspace",
             "packages": [
                 {
                     "name": "private-helper",
@@ -1287,9 +1368,18 @@ mod tests {
                     "targets": [{"kind": ["lib"]}]
                 },
                 {
+                    "name": "alternate-registry-helper",
+                    "publish": ["alternate"],
+                    "targets": [{"kind": ["lib"]}]
+                },
+                {
                     "name": "yaml-sigil-traits",
                     "publish": ["crates-io"],
-                    "targets": [{"kind": ["lib"]}]
+                    "manifest_path": "/workspace/Cargo.toml",
+                    "targets": [{
+                        "kind": ["lib"],
+                        "src_path": "/workspace/src/lib.rs"
+                    }]
                 }
             ]
         });
@@ -1297,23 +1387,173 @@ mod tests {
         assert!(check_packages_in_metadata(&metadata, &["wrong".to_string()]).is_err());
 
         let binary = serde_json::json!({
+            "workspace_root": "/workspace",
             "packages": [{
                 "name": "yaml-sigil-traits",
                 "publish": ["crates-io"],
-                "targets": [{"kind": ["lib", "bin"]}]
+                "manifest_path": "/workspace/Cargo.toml",
+                "targets": [
+                    {"kind": ["lib"], "src_path": "/workspace/src/lib.rs"},
+                    {"kind": ["bin"]}
+                ]
             }]
         });
         assert!(check_packages_in_metadata(&binary, &["yaml-sigil-traits".to_string()]).is_err());
-        let malformed = serde_json::json!({
+        let build_script = serde_json::json!({
+            "workspace_root": "/workspace",
             "packages": [{
                 "name": "yaml-sigil-traits",
                 "publish": ["crates-io"],
+                "manifest_path": "/workspace/Cargo.toml",
+                "targets": [
+                    {"kind": ["lib"], "src_path": "/workspace/src/lib.rs"},
+                    {"kind": ["custom-build"]}
+                ]
+            }]
+        });
+        assert!(
+            check_packages_in_metadata(&build_script, &["yaml-sigil-traits".to_string()]).is_err()
+        );
+        let malformed = serde_json::json!({
+            "workspace_root": "/workspace",
+            "packages": [{
+                "name": "yaml-sigil-traits",
+                "publish": ["crates-io"],
+                "manifest_path": "/workspace/Cargo.toml",
                 "targets": [{}]
             }]
         });
         assert!(
             check_packages_in_metadata(&malformed, &["yaml-sigil-traits".to_string()]).is_err()
         );
+    }
+
+    #[test]
+    fn package_policy_includes_cargo_default_publication() {
+        let default_publish = serde_json::json!({
+            "workspace_root": "/workspace",
+            "packages": [{
+                "name": "yaml-sigil-traits",
+                "publish": null,
+                "manifest_path": "/workspace/Cargo.toml",
+                "targets": [{
+                    "kind": ["lib"],
+                    "src_path": "/workspace/src/lib.rs"
+                }]
+            }]
+        });
+        assert!(
+            check_packages_in_metadata(&default_publish, &["yaml-sigil-traits".to_string()])
+                .is_ok()
+        );
+
+        let unexpected = serde_json::json!({
+            "workspace_root": "/workspace",
+            "packages": [
+                {
+                    "name": "yaml-sigil-traits",
+                    "publish": ["crates-io"],
+                    "manifest_path": "/workspace/Cargo.toml",
+                    "targets": [{
+                        "kind": ["lib"],
+                        "src_path": "/workspace/src/lib.rs"
+                    }]
+                },
+                {
+                    "name": "unexpected-default-package",
+                    "publish": null,
+                    "manifest_path": "/workspace/unexpected/Cargo.toml",
+                    "targets": [{
+                        "kind": ["lib"],
+                        "src_path": "/workspace/unexpected/src/lib.rs"
+                    }]
+                }
+            ]
+        });
+        assert!(
+            check_packages_in_metadata(&unexpected, &["yaml-sigil-traits".to_string()]).is_err()
+        );
+
+        let default_binary = serde_json::json!({
+            "workspace_root": "/workspace",
+            "packages": [{
+                "name": "yaml-sigil-traits",
+                "publish": null,
+                "manifest_path": "/workspace/Cargo.toml",
+                "targets": [
+                    {"kind": ["lib"], "src_path": "/workspace/src/lib.rs"},
+                    {"kind": ["bin"]}
+                ]
+            }]
+        });
+        assert!(
+            check_packages_in_metadata(&default_binary, &["yaml-sigil-traits".to_string()])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn package_policy_binds_the_root_manifest_and_primary_library() {
+        let expected = ["yaml-sigil-traits".to_string()];
+        let valid = serde_json::json!({
+            "workspace_root": "/workspace",
+            "packages": [{
+                "name": "yaml-sigil-traits",
+                "publish": ["crates-io"],
+                "manifest_path": "/workspace/Cargo.toml",
+                "targets": [{
+                    "kind": ["lib"],
+                    "src_path": "/workspace/src/lib.rs"
+                }]
+            }]
+        });
+        assert!(check_packages_in_metadata(&valid, &expected).is_ok());
+
+        let mut relocated_manifest = valid.clone();
+        relocated_manifest["packages"][0]["manifest_path"] =
+            Value::String("/workspace/relocated/Cargo.toml".to_string());
+        assert!(check_packages_in_metadata(&relocated_manifest, &expected).is_err());
+
+        let mut relocated_library = valid.clone();
+        relocated_library["packages"][0]["targets"][0]["src_path"] =
+            Value::String("/workspace/src/other.rs".to_string());
+        assert!(check_packages_in_metadata(&relocated_library, &expected).is_err());
+
+        let mut missing_library = valid.clone();
+        missing_library["packages"][0]["targets"] =
+            serde_json::json!([{"kind": ["test"], "src_path": "/workspace/tests/api.rs"}]);
+        assert!(check_packages_in_metadata(&missing_library, &expected).is_err());
+
+        let mut duplicate_library = valid;
+        duplicate_library["packages"][0]["targets"] = serde_json::json!([
+            {"kind": ["lib"], "src_path": "/workspace/src/lib.rs"},
+            {"kind": ["lib"], "src_path": "/workspace/src/lib.rs"}
+        ]);
+        assert!(check_packages_in_metadata(&duplicate_library, &expected).is_err());
+    }
+
+    #[test]
+    fn package_policy_rejects_ambiguous_publish_metadata() {
+        for publish in [serde_json::json!(true), serde_json::json!(["crates-io", 1])] {
+            let metadata = serde_json::json!({
+                "packages": [{
+                    "name": "yaml-sigil-traits",
+                    "publish": publish,
+                    "targets": [{"kind": ["lib"]}]
+                }]
+            });
+            assert!(
+                check_packages_in_metadata(&metadata, &["yaml-sigil-traits".to_string()]).is_err()
+            );
+        }
+
+        let missing = serde_json::json!({
+            "packages": [{
+                "name": "yaml-sigil-traits",
+                "targets": [{"kind": ["lib"]}]
+            }]
+        });
+        assert!(check_packages_in_metadata(&missing, &["yaml-sigil-traits".to_string()]).is_err());
     }
 
     #[test]

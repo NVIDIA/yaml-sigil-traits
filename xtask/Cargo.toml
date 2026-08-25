@@ -8,6 +8,8 @@ name = "xtask"
 version = "0.0.0"
 edition = "2024"
 publish = false
+# This developer tool has no build script.
+build = false
 license = "Apache-2.0"
 description = "Developer-only tasks for yaml-sigil-traits."
 
