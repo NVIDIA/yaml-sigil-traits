@@ -532,26 +532,28 @@ def require_live_authorization_state(
     head_sha: str,
     head_repository: str,
     head_ref: str,
+    *,
+    phase: str = "pull request authorization",
 ) -> None:
-    """Re-read mutable PR and main refs immediately before authorization."""
+    """Re-read mutable PR and main refs at a reporting security boundary."""
 
     require(
         current_main(api, repository, branch) == main_sha,
-        "main changed during pull request authorization",
+        f"main changed during {phase}",
     )
     pull = require_mapping(
         api.get(repo_api_path(repository, f"/pulls/{pull_number}")),
         "rechecked pull request",
     )
-    require(pull.get("state") == "open", "pull request closed during authorization")
-    require(pull.get("number") == pull_number, "pull request number changed during authorization")
+    require(pull.get("state") == "open", f"pull request closed during {phase}")
+    require(pull.get("number") == pull_number, f"pull request number changed during {phase}")
     base = require_mapping(pull.get("base"), "rechecked pull request base")
     base_repo = require_mapping(base.get("repo"), "rechecked pull request base repository")
     require(
         base_repo.get("full_name") == repository
         and base.get("ref") == branch
         and validate_sha(base.get("sha"), "rechecked pull request base SHA") == main_sha,
-        "pull request base changed during authorization",
+        f"pull request base changed during {phase}",
     )
     head = require_mapping(pull.get("head"), "rechecked pull request head")
     head_repo = require_mapping(head.get("repo"), "rechecked pull request head repository")
@@ -563,11 +565,11 @@ def require_live_authorization_state(
         == head_repository
         and require_string(head.get("ref"), "rechecked pull request head ref")
         == head_ref,
-        "pull request head changed during authorization",
+        f"pull request head changed during {phase}",
     )
     require(
         current_main(api, repository, branch) == main_sha,
-        "main changed during pull request authorization",
+        f"main changed during {phase}",
     )
 
 
@@ -704,6 +706,7 @@ class Authorization:
     head_sha: str
     base_sha: str
     head_repository: str
+    head_ref: str
     policy_sha: str
     comment_id: int
 
@@ -806,6 +809,7 @@ def authorize(
         head_sha=head_sha,
         base_sha=base_sha,
         head_repository=head_repository,
+        head_ref=head_ref,
         policy_sha=policy_sha,
         comment_id=comment_id,
     )
@@ -1022,17 +1026,24 @@ def complete_check(
     conclusion: str,
     title: str,
     summary: str,
-) -> None:
+) -> Mapping[str, Any]:
     require(conclusion in {"success", "failure", "cancelled"}, "unsupported check conclusion")
-    api.patch(
-        repo_api_path(repository, f"/check-runs/{check_id}"),
-        {
-            "status": "completed",
-            "conclusion": conclusion,
-            "completed_at": utc_now(),
-            "output": {"title": title[:255], "summary": summary[:65_535]},
-        },
+    updated = require_mapping(
+        api.patch(
+            repo_api_path(repository, f"/check-runs/{check_id}"),
+            {
+                "status": "completed",
+                "conclusion": conclusion,
+                "completed_at": utc_now(),
+                "output": {"title": title[:255], "summary": summary[:65_535]},
+            },
+        ),
+        "updated check run",
     )
+    require(updated.get("id") == check_id, "updated check run ID is ambiguous")
+    require(updated.get("status") == "completed", "updated check run is not completed")
+    require(updated.get("conclusion") == conclusion, "updated check run conclusion is unexpected")
+    return updated
 
 
 def start_check(
@@ -1099,8 +1110,8 @@ def parse_results(values: Iterable[str], expected_jobs: Sequence[str]) -> Mappin
     return results
 
 
-def validate_check(
-    api: GitHubApi,
+def validate_check_value(
+    check: Mapping[str, Any],
     config: Mapping[str, Any],
     external: ExternalId,
     check_id: int,
@@ -1109,13 +1120,28 @@ def validate_check(
     release_app = require_mapping(config.get("release_app"), "release_app")
     app_slug = validate_login(release_app.get("slug"), "release App slug")
     require_app_slug(observed_app_slug, app_slug)
-    check = require_mapping(api.get(repo_api_path(external.repository, f"/check-runs/{check_id}")), "check run")
     require(check.get("id") == check_id, "check run ID is ambiguous")
     require(check.get("name") == config.get("required_check"), "check run name is unexpected")
     require(check.get("head_sha") == external.head_sha, "check run head is unexpected")
     require(check.get("external_id") == external.encode(), "check run binding is unexpected")
     require(check_is_from_app(check, app_slug), "check run is not owned by the configured App")
     return check
+
+
+def validate_check(
+    api: GitHubApi,
+    config: Mapping[str, Any],
+    external: ExternalId,
+    check_id: int,
+    observed_app_slug: str,
+) -> Mapping[str, Any]:
+    check = require_mapping(
+        api.get(repo_api_path(external.repository, f"/check-runs/{check_id}")),
+        "check run",
+    )
+    return validate_check_value(
+        check, config, external, check_id, observed_app_slug
+    )
 
 
 def finish_check(
@@ -1149,22 +1175,59 @@ def finish_check(
         error = caught
 
     if error is None:
-        complete_check(
-            app_api,
-            external.repository,
-            check_id,
-            "success",
-            "Protected-main validation succeeded",
-            f"All protected jobs succeeded for pull request #{external.pull_number} at {external.head_sha}.",
-        )
+        try:
+            updated = complete_check(
+                app_api,
+                external.repository,
+                check_id,
+                "success",
+                "Protected-main validation succeeded",
+                f"All protected jobs succeeded for pull request #{external.pull_number} at {external.head_sha}.",
+            )
+            validate_check_value(
+                updated, config, external, check_id, observed_app_slug
+            )
+
+            # GitHub cannot atomically update a check and compare the mutable
+            # branch and pull-request refs. Narrow that unavoidable window by
+            # checking the exact state again after success is visible. Strict
+            # up-to-date branch protection remains the merge-time backstop.
+            branch = require_string(config.get("default_branch"), "default_branch")
+            require_live_authorization_state(
+                auth_api,
+                external.repository,
+                branch,
+                external.pull_number,
+                external.base_sha,
+                external.head_sha,
+                current.head_repository,
+                current.head_ref,
+                phase="final check reconciliation",
+            )
+        except PolicyError as reconciliation_error:
+            failed = complete_check(
+                app_api,
+                external.repository,
+                check_id,
+                "failure",
+                "Protected-main validation became stale",
+                str(reconciliation_error),
+            )
+            validate_check_value(
+                failed, config, external, check_id, observed_app_slug
+            )
+            raise reconciliation_error
     else:
-        complete_check(
+        failed = complete_check(
             app_api,
             external.repository,
             check_id,
             "failure",
             "Protected-main validation failed",
             str(error),
+        )
+        validate_check_value(
+            failed, config, external, check_id, observed_app_slug
         )
         raise error
 
