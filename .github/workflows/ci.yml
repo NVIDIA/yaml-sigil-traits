@@ -40,10 +40,8 @@ jobs:
       - name: Compile and test automation controllers
         run: |
           python3 -m py_compile \
-            .github/scripts/prepare_release_baseline.py \
             .github/scripts/protected_pr_ci.py \
-            .github/scripts/test_protected_pr_ci.py \
-            .github/scripts/test_release_automation.py
+            .github/scripts/test_protected_pr_ci.py
           python3 -m unittest discover \
             -s .github/scripts -p 'test_*.py'
 

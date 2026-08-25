@@ -43,15 +43,8 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Validate invocation
-        env:
-          EXPECTED_REPOSITORY: NVIDIA/yaml-sigil-traits
+      - name: Validate exact main invocation
         run: |
-          # Prevent a copied workflow from operating in another repository.
-          if [[ "${GITHUB_REPOSITORY}" != "${EXPECTED_REPOSITORY}" ]]; then
-            echo "This workflow runs only in ${EXPECTED_REPOSITORY}." >&2
-            exit 1
-          fi
           # Official release authority belongs only to exact protected main.
           if [[ "${GITHUB_REF}" != "refs/heads/main" \
             || "$(git rev-parse HEAD)" != "${GITHUB_SHA}" ]]; then
@@ -76,7 +69,7 @@ jobs:
       - name: Configure read-only release forge identity
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: bash .github/scripts/configure-release-git-user.sh
+        run: cargo xtask github git-identity configure
 
       - name: Require a committed release version
         run: |
@@ -91,12 +84,20 @@ jobs:
           GIT_CONFIG_VALUE_0: disabled://yaml-sigil-release-proposal
         run: |
           current_version="$(cargo xtask release-version show)"
-          python3 .github/scripts/prepare_release_baseline.py \
-            --repository "${GITHUB_REPOSITORY}" \
+          result="${RUNNER_TEMP}/baseline-result.json"
+          cargo xtask release baseline prepare \
             --head "${GITHUB_SHA}" \
             --exclude-version "${current_version}" \
             --output "${RUNNER_TEMP}/official-release-baseline" \
+            --result "${result}" \
             --expected-fetch-url "https://github.com/${GITHUB_REPOSITORY}"
+          jq --raw-output \
+            '"commit=\(.commit)",
+             "manifest=\(.manifest)",
+             "version=\(.version)",
+             "inventory=\(.inventory)",
+             "tags=\(.tags | @json)"' \
+            "${result}" >>"${GITHUB_OUTPUT}"
 
       - name: Require the tagged baseline on crates.io
         run: >-
@@ -129,7 +130,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          python3 .github/scripts/verify_release_publication_source.py \
+          cargo xtask github release-source authorize \
             --repository "${GITHUB_REPOSITORY}" \
             --commit "${GITHUB_SHA}" \
             --baseline-version "${{ steps.baseline.outputs.version }}" \
@@ -194,7 +195,7 @@ jobs:
       - name: Configure protected publication forge identity
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: bash .github/scripts/configure-release-git-user.sh
+        run: cargo xtask github git-identity configure
 
       - name: Recheck the committed release version
         run: |
@@ -209,12 +210,20 @@ jobs:
           GIT_CONFIG_VALUE_0: disabled://yaml-sigil-release-proposal
         run: |
           current_version="$(cargo xtask release-version show)"
-          python3 .github/scripts/prepare_release_baseline.py \
-            --repository "${GITHUB_REPOSITORY}" \
+          result="${RUNNER_TEMP}/baseline-result.json"
+          cargo xtask release baseline prepare \
             --head "${GITHUB_SHA}" \
             --exclude-version "${current_version}" \
             --output "${RUNNER_TEMP}/official-release-baseline" \
+            --result "${result}" \
             --expected-fetch-url "https://github.com/${GITHUB_REPOSITORY}"
+          jq --raw-output \
+            '"commit=\(.commit)",
+             "manifest=\(.manifest)",
+             "version=\(.version)",
+             "inventory=\(.inventory)",
+             "tags=\(.tags | @json)"' \
+            "${result}" >>"${GITHUB_OUTPUT}"
 
       - name: Require the tagged baseline on crates.io
         run: >-
@@ -253,7 +262,7 @@ jobs:
             --check-version "${version}" yaml-sigil-traits
           registry_status="$?"
           set -e
-          python3 .github/scripts/verify_release_publication_source.py \
+          cargo xtask github release-source authorize \
             --repository "${GITHUB_REPOSITORY}" \
             --commit "${GITHUB_SHA}" \
             --baseline-version "${{ steps.baseline.outputs.version }}" \
@@ -261,10 +270,9 @@ jobs:
           GIT_CONFIG_COUNT=1 \
             GIT_CONFIG_KEY_0=remote.origin.pushurl \
             GIT_CONFIG_VALUE_0=disabled://yaml-sigil-release-proposal \
-            python3 .github/scripts/prepare_release_baseline.py \
-            --repository "${GITHUB_REPOSITORY}" \
+            cargo xtask release baseline verify \
             --head "${GITHUB_SHA}" \
-            --verify-inventory "${{ steps.baseline.outputs.inventory }}" \
+            --inventory "${{ steps.baseline.outputs.inventory }}" \
             --expected-fetch-url "https://github.com/${GITHUB_REPOSITORY}"
           cargo xtask release require-current-main \
             --head "${GITHUB_SHA}" \
@@ -274,19 +282,19 @@ jobs:
           # permits a fresh or fail-closed resumed Trusted Publishing attempt.
           case "${registry_status}" in
             0)
-              python3 .github/scripts/reconcile_release_objects.py \
+              cargo xtask github release-objects reconcile \
+                --mode recover \
                 --repository "${GITHUB_REPOSITORY}" \
                 --version "${version}" \
-                --commit "${GITHUB_SHA}" \
-                --mode preflight
+                --commit "${GITHUB_SHA}"
               echo "The exact crate is already published; skipping registry mutation."
               ;;
             3)
-              python3 .github/scripts/reconcile_release_objects.py \
+              cargo xtask github release-objects reconcile \
+                --mode prepublish \
                 --repository "${GITHUB_REPOSITORY}" \
                 --version "${version}" \
-                --commit "${GITHUB_SHA}" \
-                --mode prepublish
+                --commit "${GITHUB_SHA}"
               cargo xtask release require-current-main \
                 --head "${GITHUB_SHA}" \
                 --fetch-url "https://github.com/${GITHUB_REPOSITORY}"
@@ -319,11 +327,11 @@ jobs:
           test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
           # Recovery can create only missing annotated tags and Releases after
           # it independently rechecks the exact non-yanked registry version.
-          python3 .github/scripts/reconcile_release_objects.py \
+          cargo xtask github release-objects reconcile \
+            --mode recover \
             --repository "${GITHUB_REPOSITORY}" \
             --version "${version}" \
-            --commit "${GITHUB_SHA}" \
-            --mode recover
+            --commit "${GITHUB_SHA}"
 
       - name: Request the next release proposal
         env:

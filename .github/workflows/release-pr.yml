@@ -80,6 +80,11 @@ jobs:
           cache: false
           toolchain: 1.95.0
 
+      - name: Bind repository and workflow identity
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: cargo xtask github git-identity configure
+
       - name: Install exact cargo-binstall
         uses: cargo-bins/cargo-binstall@732870f031d2fb36309d0deaf36abcc704a7be65 # v1.20.1
         with:
@@ -88,13 +93,8 @@ jobs:
       - name: Install and verify release analyzers
         run: cargo xtask release install-tools
 
-      - name: Require the expected repository and current main
+      - name: Require current main
         run: |
-          # Prevent a copied workflow from operating in another repository.
-          if [[ "${GITHUB_REPOSITORY}" != "NVIDIA/yaml-sigil-traits" ]]; then
-            echo "This workflow runs only in NVIDIA/yaml-sigil-traits." >&2
-            exit 1
-          fi
           # Manual proposals must use the protected default branch as source.
           if [[ "${GITHUB_REF}" != "refs/heads/main" ]]; then
             echo "Release proposals must be dispatched from main." >&2
@@ -148,7 +148,7 @@ jobs:
           MANUAL_DISPATCH: ${{ github.event_name == 'workflow_dispatch' }}
           REQUESTED_BUMP: ${{ inputs.bump || 'patch' }}
           REQUESTED_MODE: ${{ inputs.mode || 'next-candidate' }}
-        run: bash .github/scripts/resolve-release-intent.sh
+        run: cargo xtask github release-pr resolve-intent
 
       - name: Prepare the official tagged baseline
         id: baseline
@@ -160,12 +160,20 @@ jobs:
           GIT_CONFIG_KEY_0: remote.origin.pushurl
           GIT_CONFIG_VALUE_0: disabled://yaml-sigil-release-proposal
         run: |
-          python3 .github/scripts/prepare_release_baseline.py \
-            --repository "${GITHUB_REPOSITORY}" \
+          result="${RUNNER_TEMP}/baseline-result.json"
+          cargo xtask release baseline prepare \
             --version "${{ steps.published.outputs.version }}" \
             --head "${GITHUB_SHA}" \
             --output "${RUNNER_TEMP}/official-release-baseline" \
+            --result "${result}" \
             --expected-fetch-url "https://github.com/${GITHUB_REPOSITORY}"
+          jq --raw-output \
+            '"commit=\(.commit)",
+             "manifest=\(.manifest)",
+             "version=\(.version)",
+             "inventory=\(.inventory)",
+             "tags=\(.tags | @json)"' \
+            "${result}" >>"${GITHUB_OUTPUT}"
 
       - name: Generate and validate release transaction
         id: generate
@@ -173,15 +181,22 @@ jobs:
           ${{ steps.published.outputs.available == 'true' &&
               steps.intent.outputs.proceed == 'true' }}
         env:
-          EFFECTIVE_BUMP: ${{ steps.intent.outputs.bump }}
           GIT_TOKEN: ${{ github.token }}
-          MODE: ${{ steps.intent.outputs.mode }}
-          PUBLISHED_VERSION: ${{ steps.published.outputs.version }}
-          REGISTRY_MANIFEST_PATH: ${{ steps.baseline.outputs.manifest }}
           GIT_CONFIG_COUNT: 1
           GIT_CONFIG_KEY_0: remote.origin.pushurl
           GIT_CONFIG_VALUE_0: disabled://yaml-sigil-release-proposal
-        run: bash .github/scripts/generate-release-proposal.sh
+        run: |
+          result="${RUNNER_TEMP}/proposal-result.json"
+          cargo xtask release proposal generate \
+            --mode "${{ steps.intent.outputs.mode }}" \
+            --bump "${{ steps.intent.outputs.bump }}" \
+            --published-version "${{ steps.published.outputs.version }}" \
+            --registry-manifest "${{ steps.baseline.outputs.manifest }}" \
+            --date "$(date -u +%F)" \
+            --result "${result}"
+          jq --raw-output \
+            '"target=\(.target)", "substantive=\(.substantive)"' \
+            "${result}" >>"${GITHUB_OUTPUT}"
 
       # Proposal analysis cannot authorize a later tag or main state. Recheck
       # the complete persisted authority immediately before the App writes.
@@ -194,10 +209,9 @@ jobs:
           GIT_CONFIG_KEY_0: remote.origin.pushurl
           GIT_CONFIG_VALUE_0: disabled://yaml-sigil-release-proposal
         run: |
-          python3 .github/scripts/prepare_release_baseline.py \
-            --repository "${GITHUB_REPOSITORY}" \
+          cargo xtask release baseline verify \
             --head "${GITHUB_SHA}" \
-            --verify-inventory "${{ steps.baseline.outputs.inventory }}" \
+            --inventory "${{ steps.baseline.outputs.inventory }}" \
             --expected-fetch-url "https://github.com/${GITHUB_REPOSITORY}"
 
       # GitHub signs Git Database commits created with the App installation
@@ -211,13 +225,11 @@ jobs:
         env:
           APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          RELEASE_BODY_FILE: ${{ runner.temp }}/release-pr-body.md
           RELEASE_BRANCH: release-plz-next
-          RELEASE_DRAFT: ${{ steps.generate.outputs.draft }}
           RELEASE_HOLD_DRAFT: "true"
-          RELEASE_OPERATION: update
-          RELEASE_TITLE: ${{ steps.generate.outputs.title }}
-        run: bash .github/scripts/update-release-pull-request.sh
+          RELEASE_SUBSTANTIVE: ${{ steps.generate.outputs.substantive }}
+          RELEASE_TARGET: ${{ steps.generate.outputs.target }}
+        run: cargo xtask github release-pr apply --phase update
 
       - name: Check out generated Verified commit
         if: >-
@@ -274,12 +286,10 @@ jobs:
         env:
           APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          RELEASE_BODY_FILE: ${{ runner.temp }}/release-pr-body.md
           RELEASE_BRANCH: release-plz-next
           RELEASE_COMMIT: ${{ steps.release-pr.outputs.commit_sha }}
-          RELEASE_DRAFT: ${{ steps.generate.outputs.draft }}
           RELEASE_HOLD_DRAFT: "true"
-          RELEASE_OPERATION: finalize
           RELEASE_PR_NUMBER: ${{ steps.release-pr.outputs.pr_number }}
-          RELEASE_TITLE: ${{ steps.generate.outputs.title }}
-        run: bash .github/scripts/update-release-pull-request.sh
+          RELEASE_SUBSTANTIVE: ${{ steps.generate.outputs.substantive }}
+          RELEASE_TARGET: ${{ steps.generate.outputs.target }}
+        run: cargo xtask github release-pr apply --phase finalize
