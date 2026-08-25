@@ -2,9 +2,8 @@
 # SPDX-FileCopyrightText: Copyright 2026 NVIDIA CORPORATION & AFFILIATES
 # SPDX-License-Identifier: Apache-2.0
 
-# Resolve the release mode and version bump. Manual choices replace the prior
-# override, while push and post-publication events preserve the hidden marker
-# already reviewed in an open release PR. Every candidate records its intent.
+# Resolve whether this event may create or update the App-owned release
+# proposal and select its explicit release mode and version-line intent.
 
 set -euo pipefail
 
@@ -15,6 +14,14 @@ set -euo pipefail
 : "${REQUESTED_BUMP:?REQUESTED_BUMP is required}"
 : "${REQUESTED_MODE:?REQUESTED_MODE is required}"
 
+# Accept only the event-authority states supplied by the workflow.
+case "${MANUAL_DISPATCH}" in
+  true | false) ;;
+  *)
+    echo "Unsupported manual-dispatch state: ${MANUAL_DISPATCH}." >&2
+    exit 2
+    ;;
+esac
 # Accept only the two documented release paths.
 case "${REQUESTED_MODE}" in
   next-candidate | promote-stable) ;;
@@ -38,7 +45,7 @@ existing_prs="$(
   gh api --method GET "repos/${GITHUB_REPOSITORY}/pulls" \
     -f state=open -f "head=${GITHUB_REPOSITORY%%/*}:release-plz-next"
 )"
-# Preserve intent only from at most one exact App-owned same-repository PR.
+# Accept only an absent proposal or one exact App-owned same-repository PR.
 if ! jq -e \
   --arg repository "${GITHUB_REPOSITORY}" \
   --arg login "${release_app_login}" \
@@ -49,60 +56,37 @@ if ! jq -e \
      .user.login == $login and .user.id == $user_id and
      .head.ref == "release-plz-next" and
      .head.repo.full_name == $repository and
-     .base.ref == "main" and .base.repo.full_name == $repository and
-     (.body == null or (.body | type == "string"))))' \
+     .base.ref == "main" and .base.repo.full_name == $repository))' \
   >/dev/null <<<"${existing_prs}"; then
   echo "The existing release proposal lookup is ambiguous or unauthorized." >&2
   exit 1
 fi
-existing_body="$(
-  jq -r 'if length == 0 then "" else (.[0].body // "") end' \
-    <<<"${existing_prs}"
-)"
-marker_like_count="$(
-  jq -nr --arg body "${existing_body}" \
-    '$body | [match("yaml-sigil-release-bump:"; "g")] | length'
-)"
-exact_markers="$(
-  jq -cn --arg body "${existing_body}" \
-    '$body | split("\n") |
-     map(select(test("^<!-- yaml-sigil-release-bump: (patch|minor|major) -->$")))'
-)"
-exact_marker_count="$(jq -r 'length' <<<"${exact_markers}")"
-# Reject duplicate markers and every embedded or malformed marker-like value.
-if [[ "${marker_like_count}" != "${exact_marker_count}" \
-  || "${exact_marker_count}" -gt 1 ]]; then
-  echo "The existing release proposal has ambiguous release intent." >&2
-  exit 1
-fi
-retained_bump="$(
-  jq -r \
-    'if length == 0 then "" else
-       (.[0] | capture("yaml-sigil-release-bump: (?<bump>patch|minor|major)").bump)
-     end' \
-    <<<"${exact_markers}"
-)"
+existing_count="$(jq -r 'length' <<<"${existing_prs}")"
 
 mode="${REQUESTED_MODE}"
-# Stable promotion keeps a deterministic patch intent for compatibility checks.
-if [[ "${mode}" == "promote-stable" ]]; then
-  bump="patch"
-  marker=""
-# A manual dispatch deliberately replaces the retained release intent.
-elif [[ "${MANUAL_DISPATCH}" == "true" ]]; then
-  bump="${REQUESTED_BUMP}"
-  marker="<!-- yaml-sigil-release-bump: ${bump} -->"
-# Background updates retain the last reviewed explicit bump selection.
-elif [[ -n "${retained_bump}" ]]; then
-  bump="${retained_bump}"
-  marker="<!-- yaml-sigil-release-bump: ${bump} -->"
+proceed=true
+bump="${REQUESTED_BUMP}"
+# Background events may seed one patch proposal but cannot revise one.
+if [[ "${MANUAL_DISPATCH}" == "false" ]]; then
+  # Background inputs must remain the deterministic next-patch defaults.
+  if [[ "${mode}" != "next-candidate" || "${bump}" != "patch" ]]; then
+    echo "Background release proposals must use next-candidate patch mode." >&2
+    exit 2
+  fi
+  # Leave an existing exact proposal untouched until a manual dispatch.
+  if [[ "${existing_count}" == "1" ]]; then
+    proceed=false
+    echo "An App-owned release proposal already exists; no background update is needed."
+  fi
 else
-  bump="patch"
-  marker="<!-- yaml-sigil-release-bump: patch -->"
+  # Stable promotion always uses patch compatibility intent for the same core.
+  if [[ "${mode}" == "promote-stable" ]]; then
+    bump="patch"
+  fi
 fi
 
 {
+  echo "proceed=${proceed}"
   echo "mode=${mode}"
   echo "bump=${bump}"
-  echo "marker=${marker}"
 } >>"${GITHUB_OUTPUT}"

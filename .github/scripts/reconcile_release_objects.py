@@ -606,9 +606,11 @@ def require_prepublish_state(
     if len(specs) != len(states):
         raise ReleaseObjectError("release object inventory is incomplete")
     published: list[ReleaseSpec] = []
+    missing_seen = False
     for spec, state in zip(specs, states, strict=True):
         record = registry.exact_version(spec.package, spec.version)
         if record is None:
+            missing_seen = True
             # An official object would make release-plz skip a crate whose
             # immutable registry source is still absent.
             if state.tag_exists or state.release_exists:
@@ -616,6 +618,10 @@ def require_prepublish_state(
                     f"unpublished crate {spec.package} already has release objects"
                 )
             continue
+        if missing_seen:
+            raise ReleaseObjectError(
+                "published crates do not form the exact dependency-order prefix"
+            )
         published.append(spec)
 
     # A prior attempt can publish an earlier workspace crate and create either,

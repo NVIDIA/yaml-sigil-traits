@@ -22,11 +22,17 @@ from unittest import mock
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+REPOSITORY_ROOT = SCRIPT_DIR.parent.parent
+IS_RS_REPOSITORY = (REPOSITORY_ROOT / "crates" / "yaml-sigil-core").is_dir()
+EXPECTED_REPOSITORY = (
+    "NVIDIA/yaml-sigil-rs" if IS_RS_REPOSITORY else "NVIDIA/yaml-sigil-traits"
+)
 BASELINE_PATH = SCRIPT_DIR / "prepare_release_baseline.py"
 UPDATE_PR_PATH = SCRIPT_DIR / "update-release-pull-request.sh"
 RECONCILE_PATH = SCRIPT_DIR / "reconcile_release_objects.py"
 CONFIGURE_GIT_PATH = SCRIPT_DIR / "configure-release-git-user.sh"
 RESOLVE_INTENT_PATH = SCRIPT_DIR / "resolve-release-intent.sh"
+GENERATE_PROPOSAL_PATH = SCRIPT_DIR / "generate-release-proposal.sh"
 SOURCE_AUTHORIZATION_PATH = SCRIPT_DIR / "verify_release_publication_source.py"
 VERIFY_TRAITS_PATH = SCRIPT_DIR / "verify-release-traits.sh"
 SPEC = importlib.util.spec_from_file_location("prepare_release_baseline", BASELINE_PATH)
@@ -131,19 +137,34 @@ def workflow_oidc_locations(bodies: dict[str, str]) -> list[tuple[str, str | Non
     for name, body in bodies.items():
         lines = body.splitlines()
         jobs = workflow_direct_keys(lines, ("jobs",))
+        job_blocks = [
+            (job, *workflow_block(lines, ("jobs", job))) for job in jobs
+        ]
         for index, line in enumerate(lines):
-            if re.search(
+            id_token_write = re.search(
                 r'''(?:^|[ {])(?:id-token|[']id-token[']|"id-token"):\s*'''
                 r'''(?:write|[']write[']|"write")(?:$|[ },])''',
                 line,
-            ) is None:
-                continue
+            ) is not None
             owner = None
-            for job in jobs:
-                start, end, _ = workflow_block(lines, ("jobs", job))
+            owner_indent = None
+            for job, start, end, indent in job_blocks:
                 if start <= index < end:
                     owner = job
+                    owner_indent = indent
                     break
+            entry = workflow_mapping_entry(line)
+            write_all = False
+            if entry is not None and entry[1] == "permissions":
+                value = entry[2][1:].strip()
+                value = value.split("#", 1)[0].rstrip()
+                write_all = value in {"write-all", "'write-all'", '"write-all"'}
+                write_all = write_all and (
+                    (owner is None and entry[0] == 0)
+                    or (owner is not None and entry[0] == owner_indent)
+                )
+            if not id_token_write and not write_all:
+                continue
             locations.append((name, owner))
     return locations
 
@@ -487,7 +508,7 @@ class ReleaseBaselineTests(unittest.TestCase):
                 candidate_version,
             )
 
-    def test_workspace_retry_exclusion_rejects_an_incomplete_current_tag_set(self) -> None:
+    def test_workspace_retry_exclusion_allows_an_exact_current_tag_subset(self) -> None:
         candidate_version = "0.4.1-rc.1"
         fixture = GitFixture(
             "NVIDIA/yaml-sigil-rs", current_version=candidate_version
@@ -500,7 +521,33 @@ class ReleaseBaselineTests(unittest.TestCase):
         )
         command("git", "push", "origin", tag, cwd=fixture.source)
         command("git", "fetch", "origin", "--tags", cwd=fixture.checkout)
-        with self.assertRaisesRegex(BASELINE.BaselineError, "incomplete official tag set"):
+        commit, _, tags = BASELINE.prepare_baseline(
+            fixture.checkout,
+            fixture.repository,
+            fixture.version,
+            fixture.head,
+            fixture.output,
+            str(fixture.remote),
+            BASELINE.READ_ONLY_PUSH_URL,
+            candidate_version,
+        )
+        self.assertEqual(commit, fixture.baseline)
+        self.assertEqual(len(tags), 4)
+
+    def test_workspace_retry_exclusion_rejects_a_partial_tag_away_from_main(self) -> None:
+        candidate_version = "0.4.1-rc.1"
+        fixture = GitFixture(
+            "NVIDIA/yaml-sigil-rs", current_version=candidate_version
+        )
+        self.addCleanup(fixture.close)
+        tag = f"yaml-sigil-core-v{candidate_version}"
+        command(
+            "git", "tag", "-a", tag, "-m", f"Release {tag}", fixture.baseline,
+            cwd=fixture.source,
+        )
+        command("git", "push", "origin", tag, cwd=fixture.source)
+        command("git", "fetch", "origin", "--tags", cwd=fixture.checkout)
+        with self.assertRaisesRegex(BASELINE.BaselineError, "exact current main"):
             BASELINE.prepare_baseline(
                 fixture.checkout,
                 fixture.repository,
@@ -602,6 +649,70 @@ class ReleaseBaselineTests(unittest.TestCase):
         with self.assertRaisesRegex(BASELINE.BaselineError, "different commits"):
             fixture.prepare()
 
+    def test_workspace_accepts_only_strictly_superseded_legacy_split_tags(self) -> None:
+        fixture = GitFixture("NVIDIA/yaml-sigil-rs")
+        self.addCleanup(fixture.close)
+        prefixes = ("core", "transcription", "signing", "verification")
+        for index, prefix in enumerate(prefixes):
+            target = fixture.baseline if index < 2 else fixture.head
+            tag = f"yaml-sigil-{prefix}-v0.3.0-rc.1"
+            command(
+                "git", "tag", "-a", tag, "-m", f"Release {tag}", target,
+                cwd=fixture.source,
+            )
+        fixture.write_commit('version = "0.5.0-rc.1"\n', "later synchronized release")
+        later = command("git", "rev-parse", "HEAD", cwd=fixture.source).stdout.strip()
+        for prefix in prefixes:
+            tag = f"yaml-sigil-{prefix}-v0.5.0-rc.1"
+            command("git", "tag", "-a", tag, "-m", f"Release {tag}", cwd=fixture.source)
+        command("git", "push", "origin", "main", "--tags", cwd=fixture.source)
+        command("git", "fetch", "origin", "main", "--tags", cwd=fixture.checkout)
+        command("git", "checkout", "--detach", later, cwd=fixture.checkout)
+        self.assertEqual(
+            BASELINE.last_official_version(
+                fixture.checkout, fixture.repository, later
+            ),
+            ("0.5.0-rc.1", later),
+        )
+
+    def test_workspace_rejects_newer_split_tags_even_when_ancestry_matches(self) -> None:
+        older = "1" * 40
+        newer = "2" * 40
+        valid = "3" * 40
+        with mock.patch.object(BASELINE, "is_ancestor", return_value=True):
+            with self.assertRaisesRegex(BASELINE.BaselineError, "different commits"):
+                BASELINE.require_selected_baseline_supersedes_split_tags(
+                    Path("."), {"0.5.0-rc.1": {older, newer}}, "0.4.0-rc.1", valid
+                )
+
+    def test_workspace_split_tolerance_binds_the_selected_nearest_baseline(self) -> None:
+        versions = {
+            "0.6.0-rc.1": "3" * 40,
+            "0.4.0-rc.1": "4" * 40,
+        }
+        mismatched = {"0.5.0-rc.1": {"1" * 40, "2" * 40}}
+
+        def rev_list(
+            root: Path, *args: str, check: bool = True
+        ) -> subprocess.CompletedProcess[str]:
+            self.assertEqual(args[:2], ("rev-list", "--count"))
+            distance = "10" if args[2].startswith("3" * 40) else "1"
+            return subprocess.CompletedProcess(args, 0, distance, "")
+
+        with (
+            mock.patch.object(
+                BASELINE,
+                "classified_official_tag_versions",
+                return_value=(versions, mismatched),
+            ),
+            mock.patch.object(BASELINE, "git", rev_list),
+            mock.patch.object(BASELINE, "is_ancestor", return_value=True),
+            self.assertRaisesRegex(BASELINE.BaselineError, "different commits"),
+        ):
+            BASELINE.last_official_version(
+                Path("."), "NVIDIA/yaml-sigil-rs", "f" * 40, inventory={}
+            )
+
     def test_workspace_rejects_a_partial_official_tag_group(self) -> None:
         fixture = GitFixture("NVIDIA/yaml-sigil-rs")
         self.addCleanup(fixture.close)
@@ -683,7 +794,6 @@ class ReleaseIntentResolverTests(unittest.TestCase):
         manual: str,
         bump: str,
         mode: str = "next-candidate",
-        existing_body: str = "",
         existing_prs: object | None = None,
     ) -> tuple[subprocess.CompletedProcess[str], dict[str, str]]:
         with tempfile.TemporaryDirectory(prefix="release-intent-") as temporary:
@@ -697,32 +807,13 @@ class ReleaseIntentResolverTests(unittest.TestCase):
             output = root / "output"
             if existing_prs is None:
                 existing_prs = []
-                if existing_body:
-                    existing_prs = [
-                        {
-                            "state": "open",
-                            "user": {
-                                "login": SOURCE_AUTHORIZATION.BOT_LOGIN,
-                                "id": SOURCE_AUTHORIZATION.BOT_ID,
-                            },
-                            "head": {
-                                "ref": "release-plz-next",
-                                "repo": {"full_name": "NVIDIA/yaml-sigil-traits"},
-                            },
-                            "base": {
-                                "ref": "main",
-                                "repo": {"full_name": "NVIDIA/yaml-sigil-traits"},
-                            },
-                            "body": existing_body,
-                        }
-                    ]
             environment = os.environ.copy()
             environment.update(
                 {
                     "FAKE_EXISTING_PRS": json.dumps(existing_prs),
                     "GH_TOKEN": "fixture",
                     "GITHUB_OUTPUT": str(output),
-                    "GITHUB_REPOSITORY": "NVIDIA/yaml-sigil-traits",
+                    "GITHUB_REPOSITORY": EXPECTED_REPOSITORY,
                     "MANUAL_DISPATCH": manual,
                     "PATH": f"{root}:{environment['PATH']}",
                     "REQUESTED_BUMP": bump,
@@ -745,47 +836,9 @@ class ReleaseIntentResolverTests(unittest.TestCase):
                 )
             return result, values
 
-    def test_manual_and_background_candidate_intents_are_explicit(self) -> None:
-        result, values = self.resolve(manual="true", bump="minor")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(values["bump"], "minor")
-        self.assertEqual(
-            values["marker"], "<!-- yaml-sigil-release-bump: minor -->"
-        )
-
-        result, values = self.resolve(manual="false", bump="patch")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(values["bump"], "patch")
-        self.assertEqual(
-            values["marker"], "<!-- yaml-sigil-release-bump: patch -->"
-        )
-
-    def test_background_update_retains_reviewed_intent(self) -> None:
-        result, values = self.resolve(
-            manual="false",
-            bump="patch",
-            existing_body="<!-- yaml-sigil-release-bump: major -->",
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(values["bump"], "major")
-        self.assertEqual(
-            values["marker"], "<!-- yaml-sigil-release-bump: major -->"
-        )
-
-    def test_stable_promotion_uses_patch_and_no_candidate_marker(self) -> None:
-        result, values = self.resolve(
-            manual="true", bump="major", mode="promote-stable"
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(values, {"mode": "promote-stable", "bump": "patch", "marker": ""})
-
-    def test_automatic_bump_is_rejected(self) -> None:
-        result, values = self.resolve(manual="true", bump="auto")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(values, {})
-
-    def test_retained_intent_rejects_ambiguous_or_foreign_proposals(self) -> None:
-        valid = {
+    @staticmethod
+    def exact_proposal(*, body: object = None) -> dict[str, object]:
+        return {
             "state": "open",
             "user": {
                 "login": SOURCE_AUTHORIZATION.BOT_LOGIN,
@@ -793,14 +846,87 @@ class ReleaseIntentResolverTests(unittest.TestCase):
             },
             "head": {
                 "ref": "release-plz-next",
-                "repo": {"full_name": "NVIDIA/yaml-sigil-traits"},
+                "repo": {"full_name": EXPECTED_REPOSITORY},
             },
             "base": {
                 "ref": "main",
-                "repo": {"full_name": "NVIDIA/yaml-sigil-traits"},
+                "repo": {"full_name": EXPECTED_REPOSITORY},
             },
-            "body": "<!-- yaml-sigil-release-bump: minor -->",
+            "body": body,
         }
+
+    def test_manual_candidate_uses_explicit_intent(self) -> None:
+        result, values = self.resolve(manual="true", bump="minor")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            values,
+            {"proceed": "true", "mode": "next-candidate", "bump": "minor"},
+        )
+
+    def test_background_seeds_default_patch_without_a_proposal(self) -> None:
+        result, values = self.resolve(manual="false", bump="patch")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            values,
+            {"proceed": "true", "mode": "next-candidate", "bump": "patch"},
+        )
+
+    def test_background_leaves_an_existing_exact_proposal_untouched(self) -> None:
+        result, values = self.resolve(
+            manual="false",
+            bump="patch",
+            existing_prs=[
+                self.exact_proposal(body="This proposal discusses major changes.")
+            ],
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            values,
+            {"proceed": "false", "mode": "next-candidate", "bump": "patch"},
+        )
+        self.assertIn("no background update is needed", result.stdout)
+
+    def test_manual_dispatch_may_update_an_existing_exact_proposal(self) -> None:
+        result, values = self.resolve(
+            manual="true",
+            bump="major",
+            existing_prs=[
+                self.exact_proposal(body="Body text is not release authority.")
+            ],
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            values,
+            {"proceed": "true", "mode": "next-candidate", "bump": "major"},
+        )
+
+    def test_manual_stable_promotion_uses_deterministic_patch_intent(self) -> None:
+        result, values = self.resolve(
+            manual="true", bump="major", mode="promote-stable"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            values,
+            {"proceed": "true", "mode": "promote-stable", "bump": "patch"},
+        )
+
+    def test_background_events_reject_nondefault_intent(self) -> None:
+        for bump, mode in (
+            ("minor", "next-candidate"),
+            ("patch", "promote-stable"),
+        ):
+            with self.subTest(bump=bump, mode=mode):
+                result, values = self.resolve(manual="false", bump=bump, mode=mode)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(values, {})
+
+    def test_automatic_bump_is_rejected(self) -> None:
+        result, values = self.resolve(manual="true", bump="auto")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(values, {})
+
+    def test_proposal_lookup_rejects_ambiguous_or_foreign_state(self) -> None:
+        valid = self.exact_proposal()
         for payload in (
             [valid, valid],
             [{**valid, "user": {"login": "writer", "id": 55}}],
@@ -821,19 +947,138 @@ class ReleaseIntentResolverTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(values, {})
 
-    def test_retained_intent_rejects_duplicate_or_embedded_markers(self) -> None:
-        for body in (
-            "<!-- yaml-sigil-release-bump: minor -->\n"
-            "<!-- yaml-sigil-release-bump: major -->",
-            "prefix <!-- yaml-sigil-release-bump: minor --> suffix",
-            "<!-- yaml-sigil-release-bump: auto -->",
-        ):
-            with self.subTest(body=body):
-                result, values = self.resolve(
-                    manual="false", bump="patch", existing_body=body
-                )
-                self.assertNotEqual(result.returncode, 0)
-                self.assertEqual(values, {})
+    def test_manual_dispatch_state_must_be_exact(self) -> None:
+        result, values = self.resolve(manual="yes", bump="patch")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(values, {})
+
+
+class ReleaseProposalGeneratorTests(unittest.TestCase):
+    FAKE_COMMAND = r'''#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+import sys
+
+program = Path(sys.argv[0]).name
+with Path(os.environ["FAKE_COMMAND_LOG"]).open("a", encoding="utf-8") as stream:
+    stream.write(json.dumps([program, *sys.argv[1:]]) + "\n")
+if program == "date":
+    print("2026-08-24")
+elif program == "cargo" and sys.argv[1:4] == ["xtask", "release-version", "candidate"]:
+    print(os.environ["FAKE_TARGET"])
+elif program == "git" and sys.argv[1:3] == ["diff", "--quiet"]:
+    raise SystemExit(int(os.environ["FAKE_CHANGELOG_STATUS"]))
+'''
+
+    def generate(
+        self, repository: str
+    ) -> tuple[subprocess.CompletedProcess[str], list[list[str]], dict[str, str], str]:
+        with tempfile.TemporaryDirectory(prefix="release-generator-") as temporary:
+            root = Path(temporary)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            for program in ("cargo", "date", "git", "release-plz"):
+                executable = fake_bin / program
+                executable.write_text(self.FAKE_COMMAND, encoding="utf-8")
+                executable.chmod(0o755)
+
+            baseline = root / "official-baseline" / "Cargo.toml"
+            baseline.parent.mkdir()
+            baseline.write_text("[workspace]\n", encoding="utf-8")
+            output = root / "output"
+            log = root / "commands.jsonl"
+            published, target = (
+                ("0.4.0-rc.1", "0.4.0-rc.2")
+                if repository == "NVIDIA/yaml-sigil-traits"
+                else ("0.5.0-rc.1", "0.5.0-rc.2")
+            )
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "EFFECTIVE_BUMP": "patch",
+                    "FAKE_CHANGELOG_STATUS": "1",
+                    "FAKE_COMMAND_LOG": str(log),
+                    "FAKE_TARGET": target,
+                    "GITHUB_OUTPUT": str(output),
+                    "GITHUB_REPOSITORY": repository,
+                    "GITHUB_SHA": "a" * 40,
+                    "MODE": "next-candidate",
+                    "PATH": f"{fake_bin}:{environment['PATH']}",
+                    "PUBLISHED_VERSION": published,
+                    "REGISTRY_MANIFEST_PATH": str(baseline),
+                    "RUNNER_TEMP": str(root),
+                }
+            )
+            result = subprocess.run(
+                ["bash", str(GENERATE_PROPOSAL_PATH)],
+                cwd=root,
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=environment,
+            )
+            calls = [
+                json.loads(line)
+                for line in log.read_text(encoding="utf-8").splitlines()
+            ]
+            values = dict(
+                line.split("=", 1)
+                for line in output.read_text(encoding="utf-8").splitlines()
+            )
+            body = (root / "release-pr-body.md").read_text(encoding="utf-8")
+            return result, calls, values, body
+
+    @staticmethod
+    def cargo_calls(calls: list[list[str]], command: list[str]) -> list[list[str]]:
+        return [
+            call
+            for call in calls
+            if call[0] == "cargo" and call[1 : 1 + len(command)] == command
+        ]
+
+    def test_traits_generator_scopes_compatibility_and_changelog(self) -> None:
+        result, calls, values, body = self.generate("NVIDIA/yaml-sigil-traits")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        compatibility = self.cargo_calls(
+            calls, ["xtask", "release-version", "check-compatibility"]
+        )
+        self.assertEqual(len(compatibility), 1)
+        self.assertIn("--package", compatibility[0])
+        package = compatibility[0].index("--package")
+        self.assertEqual(compatibility[0][package + 1], "yaml-sigil-traits")
+        self.assertEqual(
+            self.cargo_calls(calls, ["xtask", "sync-workspace-versions"]), []
+        )
+        self.assertIn(["git", "diff", "--quiet", "--", "CHANGELOG.md"], calls)
+        self.assertEqual(values["target"], "0.4.0-rc.2")
+        self.assertEqual(values["draft"], "false")
+        self.assertIn("prepares yaml-sigil-traits", body)
+        self.assertIn("GitHub Release is source-only", body)
+
+    def test_rs_generator_uses_workspace_mode_without_a_package_argument(self) -> None:
+        result, calls, values, body = self.generate("NVIDIA/yaml-sigil-rs")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        compatibility = self.cargo_calls(
+            calls, ["xtask", "release-version", "check-compatibility"]
+        )
+        self.assertEqual(len(compatibility), 1)
+        self.assertNotIn("--package", compatibility[0])
+        self.assertEqual(
+            self.cargo_calls(calls, ["xtask", "sync-workspace-versions"]),
+            [
+                ["cargo", "xtask", "sync-workspace-versions"],
+                ["cargo", "xtask", "sync-workspace-versions", "--check"],
+            ],
+        )
+        self.assertIn(
+            ["git", "diff", "--quiet", "--", "crates/*/CHANGELOG.md"], calls
+        )
+        self.assertEqual(values["target"], "0.5.0-rc.2")
+        self.assertEqual(values["draft"], "false")
+        self.assertIn("prepares all four YamlSigil Rust crates", body)
+        self.assertIn("GitHub Releases are source-only", body)
 
 
 def crate_archive(
@@ -1227,6 +1472,35 @@ class ReleaseObjectReconciliationTests(unittest.TestCase):
                 self.commit,
             )
 
+    def test_prepublish_rejects_a_nonprefix_registry_subset(self) -> None:
+        later = RECONCILE.ReleaseSpec(
+            package="yaml-sigil-signing",
+            tag="yaml-sigil-signing-v0.4.1-rc.1",
+            changelog=self.spec.changelog,
+            path_in_vcs="crates/yaml-sigil-signing",
+            body=self.spec.body,
+            prerelease=True,
+        )
+        archives = {
+            self.spec.package: self.archive,
+            later.package: crate_archive(later, self.commit),
+        }
+        with self.assertRaisesRegex(
+            RECONCILE.ReleaseObjectError, "exact dependency-order prefix"
+        ):
+            RECONCILE.require_prepublish_state(
+                FakeMultiReleaseRegistry(
+                    archives, missing={self.spec.package}
+                ),
+                FakeMultiSourcePackager(archives),
+                (self.spec, later),
+                (
+                    RECONCILE.ObjectState(tag_exists=False, release_exists=False),
+                    RECONCILE.ObjectState(tag_exists=True, release_exists=True),
+                ),
+                self.commit,
+            )
+
     def test_prepublish_rejects_a_partial_registry_source_mismatch(self) -> None:
         later = RECONCILE.ReleaseSpec(
             package="yaml-sigil-signing",
@@ -1566,7 +1840,6 @@ class WorkflowBoundaryTests(unittest.TestCase):
         for forbidden in (
             "validate-pr",
             "publish-pr",
-            "pr_number",
             "crates-io-pr",
             "release-plz-snapshot",
             "verify-crates-io-packages.sh",
@@ -1588,6 +1861,12 @@ class WorkflowBoundaryTests(unittest.TestCase):
             if line.startswith(" " * operation_indent + "- ")
         ]
         self.assertEqual(operations, ["validate", "publish"])
+        self.assertNotIn(
+            "pr_number",
+            workflow_direct_keys(
+                publish_lines, ("on", "workflow_dispatch", "inputs")
+            ),
+        )
         self.assertEqual(
             workflow_direct_keys(publish_lines, ("jobs",)),
             ["validation", "publication"],
@@ -1640,6 +1919,25 @@ jobs:
         self.assertEqual(
             workflow_oidc_locations(fixture),
             [("quoted.yml", "preview"), ("quoted.yml", "inline-preview")],
+        )
+
+    def test_write_all_permissions_are_treated_as_oidc_capable(self) -> None:
+        fixture = {
+            "workflow.yml": '''permissions: write-all
+jobs:
+  explicit:
+    permissions: "write-all" # grants id-token write
+    runs-on: ubuntu-latest
+  read-only:
+    permissions:
+      contents: read
+    steps:
+      - run: echo "permissions: write-all"
+'''
+        }
+        self.assertEqual(
+            workflow_oidc_locations(fixture),
+            [("workflow.yml", None), ("workflow.yml", "explicit")],
         )
 
     def test_publication_rechecks_main_and_reconciles_source_objects(self) -> None:
@@ -1708,6 +2006,75 @@ jobs:
         self.assertLess(analysis, recheck)
         self.assertLess(recheck, mutation)
 
+    def test_proposal_holds_draft_until_association_validation(self) -> None:
+        proposal = (SCRIPT_DIR.parent / "workflows" / "release-pr.yml").read_text(
+            encoding="utf-8"
+        )
+        mutation = proposal.index("update-release-pull-request.sh")
+        checkout = proposal.index("Check out generated Verified commit", mutation)
+        validation = proposal.index("Recheck clean generated release source", checkout)
+        finalization = proposal.index("update-release-pull-request.sh", validation)
+        update = proposal[mutation - 600 : checkout]
+        post_association = proposal[validation:finalization]
+        finalized = proposal[finalization - 600 :]
+        self.assertIn('RELEASE_HOLD_DRAFT: "true"', update)
+        self.assertIn("RELEASE_OPERATION: update", update)
+        self.assertIn("release-plz release", post_association)
+        self.assertIn("--dry-run", post_association)
+        self.assertIn('RELEASE_HOLD_DRAFT: "true"', finalized)
+        self.assertIn("RELEASE_OPERATION: finalize", finalized)
+
+    def test_rs_proposal_holds_draft_until_repeated_source_validation(self) -> None:
+        if not IS_RS_REPOSITORY:
+            self.skipTest("the four-crate proposal transaction belongs to yaml-sigil-rs")
+        proposal = (SCRIPT_DIR.parent / "workflows" / "release-pr.yml").read_text(
+            encoding="utf-8"
+        )
+        generated = proposal.index("Validate generated release source before mutation")
+        mutation = proposal.index("update-release-pull-request.sh", generated)
+        pre_mutation = proposal[generated:mutation]
+        checkout = proposal.index("Check out generated Verified commit", mutation)
+        repeated = proposal.index("Recheck clean generated release source", checkout)
+        finalization = proposal.rindex("update-release-pull-request.sh", repeated)
+        post_association = proposal[repeated:finalization]
+        required = (
+            "cargo xtask sync-workspace-versions --check",
+            "cargo xtask release-version check",
+            "cargo xtask release verify-traits",
+            "cargo xtask release check-packages",
+            "cargo xtask release-version check-compatibility",
+            "cargo metadata --no-deps --format-version 1",
+            "cargo package --package yaml-sigil-core --all-features",
+            "cargo package --package yaml-sigil-transcription",
+            "cargo package --package yaml-sigil-signing --all-features",
+            "cargo package --package yaml-sigil-verification --all-features",
+        )
+        for command_text in required:
+            self.assertIn(command_text, pre_mutation)
+            self.assertIn(command_text, post_association)
+        self.assertIn('RELEASE_HOLD_DRAFT: "true"', proposal[mutation - 500 : checkout])
+        dry_run = post_association.index("release-plz release")
+        self.assertLess(dry_run, len(post_association))
+        self.assertIn("RELEASE_OPERATION: finalize", proposal[repeated:])
+
+    def test_oidc_publication_uses_an_unpatched_cargo_home(self) -> None:
+        if not IS_RS_REPOSITORY:
+            self.skipTest("workspace dependency publication belongs to yaml-sigil-rs")
+        publish_lines = (
+            SCRIPT_DIR.parent / "workflows" / "publish.yml"
+        ).read_text(encoding="utf-8").splitlines()
+        validation_start, validation_end, _ = workflow_block(
+            publish_lines, ("jobs", "validation")
+        )
+        publication_start, publication_end, _ = workflow_block(
+            publish_lines, ("jobs", "publication")
+        )
+        validation = "\n".join(publish_lines[validation_start:validation_end])
+        publication = "\n".join(publish_lines[publication_start:publication_end])
+        self.assertIn("prepare-validation-cargo-home", validation)
+        self.assertIn("prepare-publication-cargo-home", publication)
+        self.assertNotIn("prepare-validation-cargo-home", publication)
+
     def test_release_workflows_pin_the_exact_analyzer_bootstrap(self) -> None:
         action = (
             "cargo-bins/cargo-binstall@"
@@ -1725,8 +2092,13 @@ jobs:
         generator = (SCRIPT_DIR / "generate-release-proposal.sh").read_text(encoding="utf-8")
         self.assertIn("--registry-manifest-path", generator)
         self.assertIn("cargo xtask release-version check-compatibility", generator)
+        self.assertIn(
+            "compatibility_package_args=(--package yaml-sigil-traits)", generator
+        )
+        self.assertIn("compatibility_package_args=()", generator)
+        self.assertIn('"${compatibility_package_args[@]}"', generator)
 
-    def test_release_intent_is_always_concrete(self) -> None:
+    def test_release_intent_is_explicit_and_not_stored_in_the_pr_body(self) -> None:
         proposal = (SCRIPT_DIR.parent / "workflows" / "release-pr.yml").read_text(
             encoding="utf-8"
         )
@@ -1734,6 +2106,9 @@ jobs:
             encoding="utf-8"
         )
         resolver = (SCRIPT_DIR / "resolve-release-intent.sh").read_text(
+            encoding="utf-8"
+        )
+        generator = (SCRIPT_DIR / "generate-release-proposal.sh").read_text(
             encoding="utf-8"
         )
         releasing = (SCRIPT_DIR.parent.parent / "RELEASING.md").read_text(
@@ -1744,14 +2119,24 @@ jobs:
         self.assertNotIn("--intent auto", publish)
         self.assertNotIn("auto | patch", resolver)
         self.assertNotIn('bump="auto"', releasing)
+        self.assertIn('echo "proceed=${proceed}"', resolver)
+        self.assertEqual(
+            proposal.count("steps.intent.outputs.proceed == 'true'"),
+            9 if IS_RS_REPOSITORY else 8,
+        )
+        hidden_body_field = "yaml-sigil-release-" + "bump"
+        retired_environment = "RELEASE_" + "MARKER"
+        for body in (proposal, resolver, generator, releasing):
+            self.assertNotIn(hidden_body_field, body)
+            self.assertNotIn(retired_environment, body)
         self.assertIn("RUSTUP_TOOLCHAIN=1.95.0", releasing)
         self.assertIn("omits release-plz's `--dry-run` CLI", releasing)
 
     def test_manual_fallback_pins_the_official_fetch_url(self) -> None:
-        releasing = (SCRIPT_DIR.parent.parent / "RELEASING.md").read_text(
+        releasing = (REPOSITORY_ROOT / "RELEASING.md").read_text(
             encoding="utf-8"
         )
-        expected = 'fetch_url="https://github.com/NVIDIA/yaml-sigil-traits"'
+        expected = f'fetch_url="https://github.com/{EXPECTED_REPOSITORY}"'
         self.assertIn(expected, releasing)
         self.assertIn(
             'test "$(git remote get-url origin)" = "${fetch_url}"', releasing
@@ -1784,7 +2169,8 @@ jobs:
             publish.count("cargo xtask release prepare-publication-config"), 2
         )
         self.assertEqual(
-            publish.count("cargo xtask release check-packages"), 1
+            publish.count("cargo xtask release check-packages"),
+            2 if IS_RS_REPOSITORY else 1,
         )
         self.assertEqual(
             proposal.count("cargo xtask release verify-registry"), 1
@@ -1793,21 +2179,41 @@ jobs:
         self.assertIn('const RELEASE_PLZ_VERSION: &str = "0.3.160"', release_task)
         self.assertIn('const SEMVER_CHECKS_VERSION: &str = "0.50.0"', release_task)
         self.assertIn("semver_check = false", config)
-        self.assertIn('git_tag_name = "v{{ version }}"', config)
-        self.assertIn('git_release_name = "v{{ version }}"', config)
-        self.assertIn('git_release_body = "{{ changelog }}"', config)
+        expected_tags = (
+            (
+                "yaml-sigil-core",
+                "yaml-sigil-transcription",
+                "yaml-sigil-signing",
+                "yaml-sigil-verification",
+            )
+            if IS_RS_REPOSITORY
+            else ("v",)
+        )
+        for prefix in expected_tags:
+            separator = "-v" if IS_RS_REPOSITORY else ""
+            tag = f'{prefix}{separator}{{{{ version }}}}'
+            self.assertIn(f'git_tag_name = "{tag}"', config)
+            self.assertIn(f'git_release_name = "{tag}"', config)
+        self.assertEqual(
+            config.count('git_release_body = "{{ changelog }}"'),
+            len(expected_tags),
+        )
 
     def test_rs_release_paths_require_exact_traits_identity(self) -> None:
-        if not VERIFY_TRAITS_PATH.exists():
-            self.skipTest("single-crate repository has no traits dependency")
         publish = (SCRIPT_DIR.parent / "workflows" / "publish.yml").read_text(
             encoding="utf-8"
         )
         proposal = (SCRIPT_DIR.parent / "workflows" / "release-pr.yml").read_text(
             encoding="utf-8"
         )
-        self.assertEqual(publish.count("verify-release-traits.sh"), 2)
-        self.assertEqual(proposal.count("verify-release-traits.sh"), 2)
+        expected = 2 if IS_RS_REPOSITORY else 0
+        self.assertEqual(publish.count("cargo xtask release verify-traits"), expected)
+        self.assertEqual(
+            proposal.count("cargo xtask release verify-traits"),
+            3 if IS_RS_REPOSITORY else 0,
+        )
+        self.assertNotIn("verify-release-traits.sh", publish)
+        self.assertNotIn("verify-release-traits.sh", proposal)
 
     def test_candidate_and_trusted_runner_labels_remain_separate(self) -> None:
         protected = (SCRIPT_DIR.parent / "workflows" / "pr-ci.yml").read_text(
@@ -2339,6 +2745,9 @@ import sys
 
 args = sys.argv[1:]
 log_path = Path(os.environ["GH_FIXTURE_LOG"])
+if os.environ.get("GH_FIXTURE_PHASE") == "finalize" and args == ["rev-parse", "HEAD"]:
+    print(os.environ["GH_FIXTURE_COMMIT"])
+    raise SystemExit(0)
 if "push" in args:
     with log_path.open("a", encoding="utf-8") as log:
         log.write(json.dumps({"method": "GIT", "endpoint": "push", "args": args}) + "\n")
@@ -2442,6 +2851,8 @@ elif endpoint == matching_endpoint:
         "invalid-existing-raw-committer",
         "wrong-pr-base",
         "existing-success",
+        "existing-ready-success",
+        "existing-ready-transition-failure",
         "lease-race",
     ):
         print(json.dumps([{
@@ -2544,33 +2955,81 @@ elif endpoint == f"repos/{repo}/pulls" and method == "GET":
             },
             "base": {"repo": {"full_name": repo}, "ref": "develop"},
         }]))
+    elif mode in ("existing-ready-success", "existing-ready-transition-failure"):
+        print(json.dumps([{
+            "number": 7,
+            "node_id": "PR_node_7",
+            "state": "open",
+            "user": {"login": bot, "id": int(bot_id)},
+            "head": {
+                "repo": {"full_name": repo},
+                "ref": os.environ["RELEASE_BRANCH"],
+                "sha": existing,
+            },
+            "base": {"repo": {"full_name": repo}, "ref": "main", "sha": head},
+            "commits": 1,
+            "draft": False,
+        }]))
     else:
         print("[]")
 elif endpoint == f"repos/{repo}/pulls" and method == "POST":
+    state["pr_draft"] = form("draft") == "true"
+    state["pr_title"] = form("title")
+    state["pr_body"] = form("body")
+    save()
     print(json.dumps({"number": 7}))
-elif endpoint == f"repos/{repo}/pulls/7" and method == "GET":
+elif endpoint == f"repos/{repo}/pulls/7" and method == "PATCH":
+    state["pr_title"] = form("title")
+    state["pr_body"] = form("body")
+    save()
     print(json.dumps({
         "number": 7,
+        "node_id": "PR_node_7",
+        "draft": state.get("pr_draft", False),
+    }))
+elif endpoint == f"repos/{repo}/pulls/7" and method == "GET":
+    pr_head = commit if state.get("target_created") else existing
+    print(json.dumps({
+        "number": 7,
+        "node_id": "PR_node_7",
         "state": "open",
         "user": {"login": bot, "id": int(bot_id)},
         "head": {
             "repo": {"full_name": repo},
             "ref": os.environ["RELEASE_BRANCH"],
-            "sha": commit,
+            "sha": pr_head,
         },
-        "base": {"repo": {"full_name": repo}, "ref": "main"},
-        "title": os.environ["RELEASE_TITLE"],
-        "body": "Release body.",
+        "base": {"repo": {"full_name": repo}, "ref": "main", "sha": head},
+        "title": state.get("pr_title", os.environ["RELEASE_TITLE"]),
+        "body": state.get("pr_body", "Release body."),
         "commits": 1,
-        "draft": os.environ["RELEASE_DRAFT"] == "true",
+        "draft": state.get("pr_draft", os.environ["RELEASE_DRAFT"] == "true"),
     }))
 elif endpoint == "graphql":
-    print(json.dumps({"data": {}}))
+    query = form("query")
+    if mode == "existing-ready-transition-failure":
+        print(json.dumps({"data": {}}))
+    elif "convertPullRequestToDraft" in query:
+        state["pr_draft"] = True
+        save()
+        print(json.dumps({"data": {"convertPullRequestToDraft": {
+            "pullRequest": {"number": 7, "isDraft": True}
+        }}}))
+    elif "markPullRequestReadyForReview" in query:
+        state["pr_draft"] = False
+        save()
+        print(json.dumps({"data": {"markPullRequestReadyForReview": {
+            "pullRequest": {"number": 7, "isDraft": False}
+        }}}))
+    else:
+        print(json.dumps({"data": {}}))
 else:
     print("{}")
 '''
 
-    def run_fixture(self, mode: str) -> tuple[subprocess.CompletedProcess[str], list[dict[str, object]]]:
+    def run_fixture(
+        self, mode: str, *, hold_draft: bool = False
+    ) -> tuple[subprocess.CompletedProcess[str], list[dict[str, object]]]:
         with tempfile.TemporaryDirectory(prefix="release-pr-api-") as temporary:
             root = Path(temporary)
             repository = root / "repository"
@@ -2621,7 +3080,7 @@ else:
                     "GH_TOKEN": "fixture-token",
                     "FAKE_REAL_GIT": command("which", "git", cwd=repository).stdout.strip(),
                     "GITHUB_OUTPUT": str(output),
-                    "GITHUB_REPOSITORY": "NVIDIA/yaml-sigil-traits",
+                    "GITHUB_REPOSITORY": EXPECTED_REPOSITORY,
                     "GITHUB_RUN_ATTEMPT": "1",
                     "GITHUB_RUN_ID": "99",
                     "GITHUB_SHA": head,
@@ -2629,6 +3088,8 @@ else:
                     "RELEASE_BODY_FILE": str(body),
                     "RELEASE_BRANCH": "release-plz-next",
                     "RELEASE_DRAFT": "false",
+                    "RELEASE_HOLD_DRAFT": "true" if hold_draft else "false",
+                    "RELEASE_OPERATION": "update",
                     "RELEASE_TITLE": "chore(release): prepare test 1.0.1",
                 }
             )
@@ -2647,12 +3108,118 @@ else:
                 self.assertIn("pr_number=7", output.read_text(encoding="utf-8"))
             return result, calls
 
+    def run_finalize_fixture(
+        self,
+        mode: str = "success",
+        *,
+        held_draft: bool = True,
+        requested_draft: bool = False,
+    ) -> tuple[subprocess.CompletedProcess[str], list[dict[str, object]]]:
+        with tempfile.TemporaryDirectory(prefix="release-pr-finalize-") as temporary:
+            root = Path(temporary)
+            repository = root / "repository"
+            repository.mkdir()
+            command("git", "init", "--initial-branch=main", cwd=repository)
+            command("git", "config", "user.name", "Release Test", cwd=repository)
+            command("git", "config", "user.email", "release-test@example.com", cwd=repository)
+            (repository / "Cargo.toml").write_text(
+                "version = \"1.0.0\"\n", encoding="utf-8"
+            )
+            command("git", "add", "Cargo.toml", cwd=repository)
+            command("git", "commit", "-m", "baseline", cwd=repository)
+            head = command("git", "rev-parse", "HEAD", cwd=repository).stdout.strip()
+            base_tree = command(
+                "git", "rev-parse", "HEAD^{tree}", cwd=repository
+            ).stdout.strip()
+
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            fake_gh = fake_bin / "gh"
+            fake_gh.write_text(self.FAKE_GH, encoding="utf-8")
+            fake_gh.chmod(0o755)
+            fake_git = fake_bin / "git"
+            fake_git.write_text(self.FAKE_GIT, encoding="utf-8")
+            fake_git.chmod(0o755)
+            body = root / "body.md"
+            body.write_text("Release body.\n", encoding="utf-8")
+            output = root / "github-output"
+            output.write_text("", encoding="utf-8")
+            log = root / "gh.log"
+            log.touch()
+            state = root / "state.json"
+            state.write_text(
+                json.dumps(
+                    {
+                        "target_created": True,
+                        "pr_draft": held_draft,
+                        "pr_title": "chore(release): prepare test 1.0.1",
+                        "pr_body": "Release body.",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "APP_SLUG": "nvidia-yamlsigil-release-pr",
+                    "GH_FIXTURE_BOT": "nvidia-yamlsigil-release-pr[bot]",
+                    "GH_FIXTURE_BOT_ID": "318780254",
+                    "GH_FIXTURE_BASE_TREE": base_tree,
+                    "GH_FIXTURE_COMMIT": "2" * 40,
+                    "GH_FIXTURE_EXISTING": "5" * 40,
+                    "GH_FIXTURE_LOG": str(log),
+                    "GH_FIXTURE_MODE": mode,
+                    "GH_FIXTURE_OTHER": "3" * 40,
+                    "GH_FIXTURE_PHASE": "finalize",
+                    "GH_FIXTURE_STATE_FILE": str(state),
+                    "GH_FIXTURE_TREE": "4" * 40,
+                    "GH_TOKEN": "fixture-token",
+                    "FAKE_REAL_GIT": command("which", "git", cwd=repository).stdout.strip(),
+                    "GITHUB_OUTPUT": str(output),
+                    "GITHUB_REPOSITORY": EXPECTED_REPOSITORY,
+                    "GITHUB_RUN_ATTEMPT": "1",
+                    "GITHUB_RUN_ID": "99",
+                    "GITHUB_SHA": head,
+                    "PATH": f"{fake_bin}:{environment['PATH']}",
+                    "RELEASE_BODY_FILE": str(body),
+                    "RELEASE_BRANCH": "release-plz-next",
+                    "RELEASE_COMMIT": "2" * 40,
+                    "RELEASE_DRAFT": "true" if requested_draft else "false",
+                    "RELEASE_HOLD_DRAFT": "true",
+                    "RELEASE_OPERATION": "finalize",
+                    "RELEASE_PR_NUMBER": "7",
+                    "RELEASE_TITLE": "chore(release): prepare test 1.0.1",
+                }
+            )
+            result = subprocess.run(
+                ["bash", str(UPDATE_PR_PATH)],
+                cwd=repository,
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=environment,
+            )
+            calls = [
+                json.loads(line)
+                for line in log.read_text(encoding="utf-8").splitlines()
+            ]
+            if result.returncode == 0:
+                self.assertIn("commit_sha=" + "2" * 40, output.read_text(encoding="utf-8"))
+                self.assertIn("pr_number=7", output.read_text(encoding="utf-8"))
+            return result, calls
+
     def test_app_git_objects_become_reachable_before_durable_ref(self) -> None:
         result, calls = self.run_fixture("success")
         self.assertEqual(result.returncode, 0, result.stderr)
         endpoints = [(call["method"], call["endpoint"]) for call in calls]
-        commit_index = endpoints.index(("POST", "repos/NVIDIA/yaml-sigil-traits/git/commits"))
-        reachability_index = endpoints.index(("GET", "repos/NVIDIA/yaml-sigil-traits/commits/" + "2" * 40))
+        commit_index = endpoints.index(
+            ("POST", f"repos/{EXPECTED_REPOSITORY}/git/commits")
+        )
+        reachability_index = endpoints.index(
+            ("GET", f"repos/{EXPECTED_REPOSITORY}/commits/" + "2" * 40)
+        )
         target_index = endpoints.index(("GIT", "push"), reachability_index)
         self.assertLess(commit_index, reachability_index)
         self.assertLess(reachability_index, target_index)
@@ -2660,7 +3227,7 @@ else:
             call
             for call in calls
             if (call["method"], call["endpoint"])
-            == ("POST", "repos/NVIDIA/yaml-sigil-traits/git/trees")
+            == ("POST", f"repos/{EXPECTED_REPOSITORY}/git/trees")
         )
         self.assertEqual(
             json.loads(tree_call["payload"])["base_tree"],
@@ -2672,6 +3239,76 @@ else:
         )
         self.assertFalse(any("fixture-token" in arg for arg in push["args"]))
 
+    def test_new_proposal_is_created_as_draft_while_validation_is_held(self) -> None:
+        result, calls = self.run_fixture("success", hold_draft=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        create = next(
+            call
+            for call in calls
+            if (call["method"], call["endpoint"])
+            == ("POST", f"repos/{EXPECTED_REPOSITORY}/pulls")
+        )
+        self.assertIn("draft=true", create["args"])
+        self.assertFalse(any(call["endpoint"] == "graphql" for call in calls))
+
+    def test_existing_ready_proposal_is_held_before_git_object_mutation(self) -> None:
+        result, calls = self.run_fixture(
+            "existing-ready-success", hold_draft=True
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        endpoints = [(call["method"], call["endpoint"]) for call in calls]
+        draft = endpoints.index(("GET", "graphql"))
+        tree = endpoints.index(("POST", f"repos/{EXPECTED_REPOSITORY}/git/trees"))
+        branch = endpoints.index(("GIT", "push"))
+        self.assertLess(draft, tree)
+        self.assertLess(draft, branch)
+
+    def test_failed_draft_hold_never_creates_or_moves_git_objects(self) -> None:
+        result, calls = self.run_fixture(
+            "existing-ready-transition-failure", hold_draft=True
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("did not convert", result.stderr)
+        self.assertFalse(
+            any(
+                call["method"] in {"POST", "PATCH", "GIT"}
+                and call["endpoint"] != "graphql"
+                for call in calls
+            )
+        )
+
+    def test_finalize_marks_only_the_exact_held_app_pr_ready(self) -> None:
+        result, calls = self.run_finalize_fixture()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        endpoints = [(call["method"], call["endpoint"]) for call in calls]
+        commit = endpoints.index(
+            ("GET", f"repos/{EXPECTED_REPOSITORY}/commits/" + "2" * 40)
+        )
+        transition = endpoints.index(("GET", "graphql"))
+        self.assertLess(commit, transition)
+        self.assertFalse(
+            any(
+                call["method"] in {"POST", "PATCH", "DELETE", "GIT"}
+                for call in calls
+            )
+        )
+
+    def test_finalize_rejects_a_pr_that_is_already_ready(self) -> None:
+        result, calls = self.run_finalize_fixture(held_draft=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not the exact held draft", result.stderr)
+        self.assertFalse(any(call["endpoint"] == "graphql" for call in calls))
+
+    def test_finalize_requires_an_exact_graphql_transition_response(self) -> None:
+        result, calls = self.run_finalize_fixture(
+            mode="existing-ready-transition-failure"
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("did not mark", result.stderr)
+        self.assertEqual(
+            sum(call["endpoint"] == "graphql" for call in calls), 1
+        )
+
     def test_success_removes_and_verifies_the_exact_staging_ref(self) -> None:
         result, calls = self.run_fixture("success")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -2679,11 +3316,11 @@ else:
         endpoints = [(call["method"], call["endpoint"]) for call in calls]
         delete = (
             "DELETE",
-            f"repos/NVIDIA/yaml-sigil-traits/git/refs/heads/{staging}",
+            f"repos/{EXPECTED_REPOSITORY}/git/refs/heads/{staging}",
         )
         verify = (
             "GET",
-            f"repos/NVIDIA/yaml-sigil-traits/git/matching-refs/heads/{staging}",
+            f"repos/{EXPECTED_REPOSITORY}/git/matching-refs/heads/{staging}",
         )
         self.assertIn(delete, endpoints)
         self.assertIn(verify, endpoints)
@@ -2696,7 +3333,7 @@ else:
         self.assertIn(
             (
                 "DELETE",
-                "repos/NVIDIA/yaml-sigil-traits/git/refs/heads/"
+                f"repos/{EXPECTED_REPOSITORY}/git/refs/heads/"
                 "automation/release-staging-99-1",
             ),
             [(call["method"], call["endpoint"]) for call in calls],
@@ -2718,7 +3355,7 @@ else:
         self.assertFalse(
             any(
                 call["method"] == "POST"
-                and call["endpoint"] == "repos/NVIDIA/yaml-sigil-traits/pulls"
+                and call["endpoint"] == f"repos/{EXPECTED_REPOSITORY}/pulls"
                 for call in calls
             )
         )
@@ -2733,7 +3370,7 @@ else:
         result, calls = self.run_fixture("stale")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Main advanced", result.stderr)
-        self.assertNotIn(("POST", "repos/NVIDIA/yaml-sigil-traits/pulls"), [(c["method"], c["endpoint"]) for c in calls])
+        self.assertNotIn(("POST", f"repos/{EXPECTED_REPOSITORY}/pulls"), [(c["method"], c["endpoint"]) for c in calls])
 
     def test_late_stale_main_never_moves_the_durable_ref(self) -> None:
         result, calls = self.run_fixture("late-stale")
@@ -2741,7 +3378,7 @@ else:
         self.assertIn("before the durable release branch update", result.stderr)
         self.assertFalse(any(call["method"] == "GIT" for call in calls))
         self.assertNotIn(
-            ("POST", "repos/NVIDIA/yaml-sigil-traits/pulls"),
+            ("POST", f"repos/{EXPECTED_REPOSITORY}/pulls"),
             [(call["method"], call["endpoint"]) for call in calls],
         )
 
@@ -2749,14 +3386,14 @@ else:
         result, calls = self.run_fixture("foreign")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("non-App commit", result.stderr)
-        self.assertNotIn(("POST", "repos/NVIDIA/yaml-sigil-traits/git/trees"), [(c["method"], c["endpoint"]) for c in calls])
+        self.assertNotIn(("POST", f"repos/{EXPECTED_REPOSITORY}/git/trees"), [(c["method"], c["endpoint"]) for c in calls])
 
     def test_foreign_release_branch_committer_is_preserved(self) -> None:
         result, calls = self.run_fixture("foreign-committer")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("non-App commit", result.stderr)
         self.assertNotIn(
-            ("POST", "repos/NVIDIA/yaml-sigil-traits/git/trees"),
+            ("POST", f"repos/{EXPECTED_REPOSITORY}/git/trees"),
             [(call["method"], call["endpoint"]) for call in calls],
         )
 
@@ -2765,7 +3402,7 @@ else:
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("invalid App commit", result.stderr)
         self.assertNotIn(
-            ("POST", "repos/NVIDIA/yaml-sigil-traits/git/trees"),
+            ("POST", f"repos/{EXPECTED_REPOSITORY}/git/trees"),
             [(call["method"], call["endpoint"]) for call in calls],
         )
 
@@ -2774,7 +3411,7 @@ else:
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("invalid App commit", result.stderr)
         self.assertNotIn(
-            ("POST", "repos/NVIDIA/yaml-sigil-traits/git/trees"),
+            ("POST", f"repos/{EXPECTED_REPOSITORY}/git/trees"),
             [(call["method"], call["endpoint"]) for call in calls],
         )
 
@@ -2794,7 +3431,7 @@ else:
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("unexpected ownership or refs", result.stderr)
         self.assertNotIn(
-            ("POST", "repos/NVIDIA/yaml-sigil-traits/git/trees"),
+            ("POST", f"repos/{EXPECTED_REPOSITORY}/git/trees"),
             [(call["method"], call["endpoint"]) for call in calls],
         )
 
@@ -2802,13 +3439,13 @@ else:
         result, calls = self.run_fixture("unreachable")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("did not resolve", result.stderr)
-        self.assertNotIn(("POST", "repos/NVIDIA/yaml-sigil-traits/pulls"), [(c["method"], c["endpoint"]) for c in calls])
+        self.assertNotIn(("POST", f"repos/{EXPECTED_REPOSITORY}/pulls"), [(c["method"], c["endpoint"]) for c in calls])
 
     def test_wrong_explicit_release_ref_never_opens_a_pull_request(self) -> None:
         result, calls = self.run_fixture("wrong-ref")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("does not identify", result.stderr)
-        self.assertNotIn(("POST", "repos/NVIDIA/yaml-sigil-traits/pulls"), [(c["method"], c["endpoint"]) for c in calls])
+        self.assertNotIn(("POST", f"repos/{EXPECTED_REPOSITORY}/pulls"), [(c["method"], c["endpoint"]) for c in calls])
 
 
 if __name__ == "__main__":

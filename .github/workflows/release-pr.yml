@@ -18,7 +18,7 @@ on:
           - next-candidate
           - promote-stable
       bump:
-        description: Override an otherwise non-discoverable version-line change.
+        description: Select the next-candidate line; stable promotion uses patch.
         required: true
         default: patch
         type: choice
@@ -138,7 +138,8 @@ jobs:
             echo "${version} is not yet published; no later proposal is created."
           fi
 
-      # The concrete reviewed intent is retained in every next-candidate PR.
+      # Manual dispatches may revise the App proposal with explicit intent.
+      # Background events seed one patch proposal but never revise it.
       - name: Resolve release mode and bump intent
         id: intent
         if: ${{ steps.published.outputs.available == 'true' }}
@@ -151,7 +152,9 @@ jobs:
 
       - name: Prepare the official tagged baseline
         id: baseline
-        if: ${{ steps.published.outputs.available == 'true' }}
+        if: >-
+          ${{ steps.published.outputs.available == 'true' &&
+              steps.intent.outputs.proceed == 'true' }}
         env:
           GIT_CONFIG_COUNT: 1
           GIT_CONFIG_KEY_0: remote.origin.pushurl
@@ -166,14 +169,15 @@ jobs:
 
       - name: Generate and validate release transaction
         id: generate
-        if: ${{ steps.published.outputs.available == 'true' }}
+        if: >-
+          ${{ steps.published.outputs.available == 'true' &&
+              steps.intent.outputs.proceed == 'true' }}
         env:
           EFFECTIVE_BUMP: ${{ steps.intent.outputs.bump }}
           GIT_TOKEN: ${{ github.token }}
           MODE: ${{ steps.intent.outputs.mode }}
           PUBLISHED_VERSION: ${{ steps.published.outputs.version }}
           REGISTRY_MANIFEST_PATH: ${{ steps.baseline.outputs.manifest }}
-          RELEASE_MARKER: ${{ steps.intent.outputs.marker }}
           GIT_CONFIG_COUNT: 1
           GIT_CONFIG_KEY_0: remote.origin.pushurl
           GIT_CONFIG_VALUE_0: disabled://yaml-sigil-release-proposal
@@ -182,7 +186,9 @@ jobs:
       # Proposal analysis cannot authorize a later tag or main state. Recheck
       # the complete persisted authority immediately before the App writes.
       - name: Recheck official tags and current main before mutation
-        if: ${{ steps.published.outputs.available == 'true' }}
+        if: >-
+          ${{ steps.published.outputs.available == 'true' &&
+              steps.intent.outputs.proceed == 'true' }}
         env:
           GIT_CONFIG_COUNT: 1
           GIT_CONFIG_KEY_0: remote.origin.pushurl
@@ -199,18 +205,24 @@ jobs:
       # branch commits, and keeps the generated file set narrow.
       - name: Create or update release pull request
         id: release-pr
-        if: ${{ steps.published.outputs.available == 'true' }}
+        if: >-
+          ${{ steps.published.outputs.available == 'true' &&
+              steps.intent.outputs.proceed == 'true' }}
         env:
           APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           RELEASE_BODY_FILE: ${{ runner.temp }}/release-pr-body.md
           RELEASE_BRANCH: release-plz-next
           RELEASE_DRAFT: ${{ steps.generate.outputs.draft }}
+          RELEASE_HOLD_DRAFT: "true"
+          RELEASE_OPERATION: update
           RELEASE_TITLE: ${{ steps.generate.outputs.title }}
         run: bash .github/scripts/update-release-pull-request.sh
 
       - name: Check out generated Verified commit
-        if: ${{ steps.published.outputs.available == 'true' }}
+        if: >-
+          ${{ steps.published.outputs.available == 'true' &&
+              steps.intent.outputs.proceed == 'true' }}
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
@@ -218,7 +230,9 @@ jobs:
           ref: ${{ steps.release-pr.outputs.commit_sha }}
 
       - name: Attach generated release branch
-        if: ${{ steps.published.outputs.available == 'true' }}
+        if: >-
+          ${{ steps.published.outputs.available == 'true' &&
+              steps.intent.outputs.proceed == 'true' }}
         env:
           RELEASE_BRANCH: release-plz-next
           RELEASE_COMMIT: ${{ steps.release-pr.outputs.commit_sha }}
@@ -236,7 +250,9 @@ jobs:
           fi
 
       - name: Recheck clean generated release source
-        if: ${{ steps.published.outputs.available == 'true' }}
+        if: >-
+          ${{ steps.published.outputs.available == 'true' &&
+              steps.intent.outputs.proceed == 'true' }}
         env:
           # Resolve manifests whose publish allowlist names crates-io.
           CARGO_REGISTRIES_CRATES_IO_INDEX: https://github.com/rust-lang/crates.io-index
@@ -247,3 +263,23 @@ jobs:
           cargo metadata --no-deps --format-version 1 >/dev/null
           # The read-only job token permits forge checks; dry-run cannot publish.
           release-plz release --dry-run --forge github --config .release-plz.toml
+          test -z "$(git status --porcelain --untracked-files=no)"
+
+      # Change review state only after the exact App commit passes the
+      # association-dependent release-plz dry run and every repeated source gate.
+      - name: Finalize validated release pull request
+        if: >-
+          ${{ steps.published.outputs.available == 'true' &&
+              steps.intent.outputs.proceed == 'true' }}
+        env:
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          RELEASE_BODY_FILE: ${{ runner.temp }}/release-pr-body.md
+          RELEASE_BRANCH: release-plz-next
+          RELEASE_COMMIT: ${{ steps.release-pr.outputs.commit_sha }}
+          RELEASE_DRAFT: ${{ steps.generate.outputs.draft }}
+          RELEASE_HOLD_DRAFT: "true"
+          RELEASE_OPERATION: finalize
+          RELEASE_PR_NUMBER: ${{ steps.release-pr.outputs.pr_number }}
+          RELEASE_TITLE: ${{ steps.generate.outputs.title }}
+        run: bash .github/scripts/update-release-pull-request.sh
