@@ -1,0 +1,4 @@
+# Unicode-3.0 is restricted to this exact proc-macro dependency.
+exceptions = [
+    { allow = ["Unicode-3.0"], crate = "unicode-ident@1.0.24" },
+]
