@@ -32,6 +32,13 @@ The workflow remains a successful no-op while the GitHub App configuration is
 absent. It also waits without advancing the train until the version on `main`
 is available and non-yanked on crates.io.
 
+A push or `repository_dispatch` event may create one default `patch` proposal
+when no exact App-owned proposal exists. Once that proposal exists, background
+events leave it untouched. A repository writer must dispatch `Release
+proposal` with an explicit `patch`, `minor`, or `major` selection to revise the
+proposal. The workflow uses that dispatch input directly and does not store
+release intent in pull-request text.
+
 Release proposals enter `protected-automation`, which is restricted to exact
 `main` and supplies only the App credential. Official publication enters
 `crates-io`, whose configured approval gates the OIDC-enabled publication job.
@@ -228,17 +235,18 @@ The default release progression is:
   `MAJOR.MINOR.(PATCH+1)-rc.1`;
 - a published `MAJOR.MINOR.PATCH-rc.N` advances to
   `MAJOR.MINOR.PATCH-rc.(N+1)`; and
-- release-plz updates the active proposal when later Conventional Commits add
-  release notes or imply a discoverable version-line change.
+- a background event creates a default patch proposal only when the App-owned
+  proposal does not already exist.
 
 An empty next-version seed remains a draft pull request. A proposal with
 release notes is marked ready for review.
 
 For every `major`, `minor`, or `patch` advance, a repository writer can
 dispatch `Release proposal` with mode `next-candidate` and the intended bump.
-The workflow records that concrete intent in the pull-request body and retains
-it across later background updates. In the absence of an earlier marker, a
-background update deterministically selects `patch`.
+That manual dispatch may create the proposal or replace its App-owned commit.
+Later pushes and post-publication notifications do not revise an existing
+proposal; another explicit writer dispatch is required to incorporate later
+changes or select a different release line.
 
 The manifest and changelog changes for an RC or stable release must be part of
 the release pull request. Official publication rejects a dirty source tree.
@@ -247,10 +255,11 @@ the release pull request. Official publication rejects a dirty source tree.
 
 Stable promotion is an explicit review operation. First publish and verify the
 RC from `main`. Its `vMAJOR.MINOR.PATCH-rc.N` tag must resolve to the exact
-current `main` commit. Then dispatch `Release proposal` with mode
-`promote-stable`. The workflow creates a pull request that removes the
-prerelease component and copies the reviewed RC changelog section to the stable
-version.
+current `main` commit. Then a repository writer must manually dispatch
+`Release proposal` with mode `promote-stable`. Background events cannot select
+stable promotion. The workflow deterministically uses patch compatibility
+intent, creates a pull request that removes the prerelease component, and
+copies the reviewed RC changelog section to the stable version.
 
 Review and merge that exact proposal before publishing the stable version. Do
 not edit a contributor branch to remove `rc.N`, and do not promote source that

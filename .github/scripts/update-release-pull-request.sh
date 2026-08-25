@@ -11,13 +11,232 @@ set -euo pipefail
 : "${GH_TOKEN:?GH_TOKEN must contain the GitHub App installation token}"
 : "${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required}"
 : "${GITHUB_SHA:?GITHUB_SHA must identify the checked-out main commit}"
-: "${GITHUB_RUN_ID:?GITHUB_RUN_ID is required}"
-: "${GITHUB_RUN_ATTEMPT:?GITHUB_RUN_ATTEMPT is required}"
 : "${APP_SLUG:?APP_SLUG is required}"
 : "${RELEASE_BRANCH:?RELEASE_BRANCH is required}"
 : "${RELEASE_TITLE:?RELEASE_TITLE is required}"
 : "${RELEASE_BODY_FILE:?RELEASE_BODY_FILE is required}"
 : "${RELEASE_DRAFT:?RELEASE_DRAFT is required}"
+RELEASE_OPERATION="${RELEASE_OPERATION:-update}"
+RELEASE_HOLD_DRAFT="${RELEASE_HOLD_DRAFT:-false}"
+
+# Limit this helper to an update phase and a post-validation review-state phase.
+case "${RELEASE_OPERATION}" in
+  update | finalize) ;;
+  *)
+    echo "RELEASE_OPERATION must be update or finalize." >&2
+    exit 1
+    ;;
+esac
+# Only the repository's dedicated release App and branch own this automation.
+if [[ "${APP_SLUG}" != "nvidia-yamlsigil-release-pr" \
+  || "${RELEASE_BRANCH}" != "release-plz-next" ]]; then
+  echo "The release proposal App or branch identity is unexpected." >&2
+  exit 1
+fi
+# Reject values that cannot be sent as a typed GitHub API boolean.
+if [[ "${RELEASE_DRAFT}" != "true" && "${RELEASE_DRAFT}" != "false" ]]; then
+  echo "RELEASE_DRAFT must be true or false." >&2
+  exit 1
+fi
+# Reject values that could silently bypass the pre-validation draft hold.
+if [[ "${RELEASE_HOLD_DRAFT}" != "true" \
+  && "${RELEASE_HOLD_DRAFT}" != "false" ]]; then
+  echo "RELEASE_HOLD_DRAFT must be true or false." >&2
+  exit 1
+fi
+# Require the generated body file rather than accepting shell-expanded prose.
+if [[ ! -f "${RELEASE_BODY_FILE}" ]]; then
+  echo "RELEASE_BODY_FILE must name the generated pull-request body." >&2
+  exit 1
+fi
+RELEASE_BODY="$(<"${RELEASE_BODY_FILE}")"
+
+bot_login="${APP_SLUG}[bot]"
+expected_bot_id=318780254
+bot="$(gh api "users/${bot_login}")"
+bot_id="$(jq --raw-output .id <<<"${bot}")"
+# The App identity endpoint must resolve the exact expected bot and numeric ID.
+if ! jq --exit-status --arg bot "${bot_login}" \
+  --argjson bot_id "${expected_bot_id}" \
+  '.login == $bot and .id == $bot_id' \
+  <<<"${bot}" >/dev/null; then
+  echo "GitHub did not return the expected release App bot identity." >&2
+  exit 1
+fi
+bot_email="${bot_id}+${bot_login}@users.noreply.github.com"
+rest_committer="web-flow"
+rest_committer_id=19864447
+raw_committer_name="GitHub"
+raw_committer_email="noreply@github.com"
+
+# Finalization changes only the review state after checkout-bound validation.
+if [[ "${RELEASE_OPERATION}" == "finalize" ]]; then
+  : "${RELEASE_COMMIT:?RELEASE_COMMIT is required for finalization}"
+  : "${RELEASE_PR_NUMBER:?RELEASE_PR_NUMBER is required for finalization}"
+  # Require exact typed identifiers before using them in API paths or filters.
+  if [[ ! "${RELEASE_COMMIT}" =~ ^[0-9a-f]{40}$ \
+    || ! "${RELEASE_PR_NUMBER}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Finalization requires an exact commit and pull-request number." >&2
+    exit 1
+  fi
+  # The post-association validator must leave the checkout on the App commit.
+  if [[ "$(git rev-parse HEAD)" != "${RELEASE_COMMIT}" ]]; then
+    echo "Finalization is not running at the validated App commit." >&2
+    exit 1
+  fi
+  remote_main="$(
+    gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha
+  )"
+  release_sha="$(
+    gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${RELEASE_BRANCH}" \
+      --jq .object.sha
+  )"
+  # Finalization cannot outlive its exact main parent or App-owned branch head.
+  if [[ "${remote_main}" != "${GITHUB_SHA}" \
+    || "${release_sha}" != "${RELEASE_COMMIT}" ]]; then
+    echo "Release proposal state changed before finalization." >&2
+    exit 1
+  fi
+  release_commit="$(
+    gh api "repos/${GITHUB_REPOSITORY}/commits/${RELEASE_COMMIT}"
+  )"
+  # Rebind finalization to the exact Verified, DCO-compliant App commit.
+  if ! jq --exit-status \
+    --arg bot "${bot_login}" \
+    --argjson bot_id "${bot_id}" \
+    --arg bot_email "${bot_email}" \
+    --arg rest_committer "${rest_committer}" \
+    --argjson rest_committer_id "${rest_committer_id}" \
+    --arg raw_committer_name "${raw_committer_name}" \
+    --arg raw_committer_email "${raw_committer_email}" \
+    --arg dco "Signed-off-by: ${bot_login} <${bot_email}>" \
+    --arg parent "${GITHUB_SHA}" \
+    '.author.login == $bot
+      and .author.id == $bot_id
+      and .committer.login == $rest_committer
+      and .committer.id == $rest_committer_id
+      and .commit.author.name == $bot
+      and .commit.author.email == $bot_email
+      and .commit.committer.name == $raw_committer_name
+      and .commit.committer.email == $raw_committer_email
+      and .commit.verification.verified == true
+      and .commit.verification.reason == "valid"
+      and ([.commit.message | split("\n")[]
+        | select(startswith("Signed-off-by: "))] == [$dco])
+      and (.parents | length == 1)
+      and .parents[0].sha == $parent' \
+    <<<"${release_commit}" >/dev/null; then
+    echo "Finalization did not resolve the exact valid App commit." >&2
+    exit 1
+  fi
+  held_pr="$(
+    gh api "repos/${GITHUB_REPOSITORY}/pulls/${RELEASE_PR_NUMBER}"
+  )"
+  # Only the exact held-draft review surface may be finalized.
+  if ! jq --exit-status \
+    --arg repository "${GITHUB_REPOSITORY}" \
+    --arg branch "${RELEASE_BRANCH}" \
+    --arg sha "${RELEASE_COMMIT}" \
+    --arg main "${GITHUB_SHA}" \
+    --arg bot "${bot_login}" \
+    --argjson bot_id "${bot_id}" \
+    --arg title "${RELEASE_TITLE}" \
+    --arg body "${RELEASE_BODY}" \
+    --argjson number "${RELEASE_PR_NUMBER}" \
+    '.number == $number
+      and .state == "open"
+      and .user.login == $bot
+      and .user.id == $bot_id
+      and .head.repo.full_name == $repository
+      and .head.ref == $branch
+      and .head.sha == $sha
+      and .base.repo.full_name == $repository
+      and .base.ref == "main"
+      and .base.sha == $main
+      and .title == $title
+      and .body == $body
+      and .commits == 1
+      and (.node_id | type == "string" and length > 0)
+      and .draft == true' \
+    <<<"${held_pr}" >/dev/null; then
+    echo "The release pull request is not the exact held draft." >&2
+    exit 1
+  fi
+  # A substantive proposal leaves draft only after every exact-commit check.
+  if [[ "${RELEASE_DRAFT}" == "false" ]]; then
+    pull_request_id="$(jq --raw-output .node_id <<<"${held_pr}")"
+    # Keep GraphQL's `$id` variable literal for the API rather than the shell.
+    # shellcheck disable=SC2016
+    transition_response="$(
+      gh api graphql \
+        -f query='mutation($id: ID!) {
+          markPullRequestReadyForReview(input: {pullRequestId: $id}) {
+            pullRequest { number isDraft }
+          }
+        }' \
+        -f "id=${pull_request_id}"
+    )"
+    # GitHub must report the exact transitioned pull request as ready.
+    if ! jq --exit-status --argjson number "${RELEASE_PR_NUMBER}" \
+      '.data.markPullRequestReadyForReview.pullRequest.number == $number
+        and .data.markPullRequestReadyForReview.pullRequest.isDraft == false' \
+      <<<"${transition_response}" >/dev/null; then
+      echo "GitHub did not mark the exact release pull request ready." >&2
+      exit 1
+    fi
+  fi
+  final_pr="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${RELEASE_PR_NUMBER}")"
+  # The final review state must retain every exact binding and requested state.
+  if ! jq --exit-status \
+    --arg repository "${GITHUB_REPOSITORY}" \
+    --arg branch "${RELEASE_BRANCH}" \
+    --arg sha "${RELEASE_COMMIT}" \
+    --arg main "${GITHUB_SHA}" \
+    --arg bot "${bot_login}" \
+    --argjson bot_id "${bot_id}" \
+    --arg title "${RELEASE_TITLE}" \
+    --arg body "${RELEASE_BODY}" \
+    --argjson number "${RELEASE_PR_NUMBER}" \
+    --argjson draft "${RELEASE_DRAFT}" \
+    '.number == $number
+      and .state == "open"
+      and .user.login == $bot
+      and .user.id == $bot_id
+      and .head.repo.full_name == $repository
+      and .head.ref == $branch
+      and .head.sha == $sha
+      and .base.repo.full_name == $repository
+      and .base.ref == "main"
+      and .base.sha == $main
+      and .title == $title
+      and .body == $body
+      and .commits == 1
+      and .draft == $draft' \
+    <<<"${final_pr}" >/dev/null; then
+    echo "GitHub returned an unexpected finalized pull-request state." >&2
+    exit 1
+  fi
+  final_main="$(
+    gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha
+  )"
+  final_release="$(
+    gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${RELEASE_BRANCH}" \
+      --jq .object.sha
+  )"
+  # A concurrent main or branch change invalidates the completed transition.
+  if [[ "${final_main}" != "${GITHUB_SHA}" \
+    || "${final_release}" != "${RELEASE_COMMIT}" ]]; then
+    echo "Release proposal state changed during finalization." >&2
+    exit 1
+  fi
+  echo "commit_sha=${RELEASE_COMMIT}" >>"${GITHUB_OUTPUT}"
+  echo "pr_number=${RELEASE_PR_NUMBER}" >>"${GITHUB_OUTPUT}"
+  echo "Finalized PR #${RELEASE_PR_NUMBER} at validated commit ${RELEASE_COMMIT}."
+  exit 0
+fi
+
+: "${GITHUB_RUN_ID:?GITHUB_RUN_ID is required for an update}"
+: "${GITHUB_RUN_ATTEMPT:?GITHUB_RUN_ATTEMPT is required for an update}"
 
 # Bind the generated diff to the exact triggering main commit.
 if [[ "$(git rev-parse HEAD)" != "${GITHUB_SHA}" ]]; then
@@ -33,23 +252,6 @@ if [[ "${remote_main}" != "${GITHUB_SHA}" ]]; then
   echo "Main advanced while the release proposal was being generated." >&2
   exit 1
 fi
-# Only the repository's dedicated release App and branch own this automation.
-if [[ "${APP_SLUG}" != "nvidia-yamlsigil-release-pr" \
-  || "${RELEASE_BRANCH}" != "release-plz-next" ]]; then
-  echo "The release proposal App or branch identity is unexpected." >&2
-  exit 1
-fi
-# Reject values that cannot be sent as a typed GitHub API boolean.
-if [[ "${RELEASE_DRAFT}" != "true" && "${RELEASE_DRAFT}" != "false" ]]; then
-  echo "RELEASE_DRAFT must be true or false." >&2
-  exit 1
-fi
-# Require the generated body file rather than accepting shell-expanded prose.
-if [[ ! -f "${RELEASE_BODY_FILE}" ]]; then
-  echo "RELEASE_BODY_FILE must name the generated pull-request body." >&2
-  exit 1
-fi
-RELEASE_BODY="$(<"${RELEASE_BODY_FILE}")"
 
 git diff --check
 # The helper consumes one unstaged generated diff and no index or untracked state.
@@ -100,24 +302,6 @@ while IFS=$'\t' read -r status path; do
     exit 1
   fi
 done < <(git diff --name-status --no-renames)
-
-bot_login="${APP_SLUG}[bot]"
-expected_bot_id=318780254
-bot="$(gh api "users/${bot_login}")"
-bot_id="$(jq --raw-output .id <<<"${bot}")"
-# The App identity endpoint must resolve the exact expected bot and numeric ID.
-if ! jq --exit-status --arg bot "${bot_login}" \
-  --argjson bot_id "${expected_bot_id}" \
-  '.login == $bot and .id == $bot_id' \
-  <<<"${bot}" >/dev/null; then
-  echo "GitHub did not return the expected release App bot identity." >&2
-  exit 1
-fi
-bot_email="${bot_id}+${bot_login}@users.noreply.github.com"
-rest_committer="web-flow"
-rest_committer_id=19864447
-raw_committer_name="GitHub"
-raw_committer_email="noreply@github.com"
 
 # Never overwrite unique commits that were not authored by this App. Commits
 # already integrated into main are not unique and do not block a new train.
@@ -203,6 +387,11 @@ pulls="$(
   gh api --method GET "repos/${GITHUB_REPOSITORY}/pulls" \
     -f state=open -f "head=${GITHUB_REPOSITORY%%/*}:${RELEASE_BRANCH}"
 )"
+effective_draft="${RELEASE_DRAFT}"
+# A held proposal remains draft until a separate exact-commit finalization.
+if [[ "${RELEASE_HOLD_DRAFT}" == "true" ]]; then
+  effective_draft=true
+fi
 # More than one open pull request for the durable branch is ambiguous.
 if [[ "$(jq 'length' <<<"${pulls}")" -gt 1 ]]; then
   echo "Multiple open release pull requests use ${RELEASE_BRANCH}." >&2
@@ -227,10 +416,62 @@ if [[ -n "${pr_number}" ]]; then
         and .[0].head.ref == $branch
         and .[0].head.sha == $sha
         and .[0].base.repo.full_name == $repository
-        and .[0].base.ref == "main"' \
+        and .[0].base.ref == "main"
+        and .[0].commits == 1
+        and (.[0].node_id | type == "string" and length > 0)
+        and (.[0].draft | type == "boolean")' \
       <<<"${pulls}" >/dev/null; then
     echo "The existing release pull request has unexpected ownership or refs." >&2
     exit 1
+  fi
+  current_draft="$(jq --raw-output '.[0].draft' <<<"${pulls}")"
+  # Reduce an existing ready PR to draft before changing any Git object or ref.
+  if [[ "${RELEASE_HOLD_DRAFT}" == "true" \
+    && "${current_draft}" == "false" ]]; then
+    pull_request_id="$(jq --raw-output '.[0].node_id' <<<"${pulls}")"
+    # Keep GraphQL's `$id` variable literal for the API rather than the shell.
+    # shellcheck disable=SC2016
+    transition_response="$(
+      gh api graphql \
+        -f query='mutation($id: ID!) {
+          convertPullRequestToDraft(input: {pullRequestId: $id}) {
+            pullRequest { number isDraft }
+          }
+        }' \
+        -f "id=${pull_request_id}"
+    )"
+    # GitHub must report the exact existing pull request as held in draft.
+    if ! jq --exit-status --argjson number "${pr_number}" \
+      '.data.convertPullRequestToDraft.pullRequest.number == $number
+        and .data.convertPullRequestToDraft.pullRequest.isDraft == true' \
+      <<<"${transition_response}" >/dev/null; then
+      echo "GitHub did not convert the exact release pull request to draft." >&2
+      exit 1
+    fi
+    held_pr="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}")"
+    # Verify the draft hold against the exact pre-update branch and PR identity.
+    if ! jq --exit-status \
+      --arg repository "${GITHUB_REPOSITORY}" \
+      --arg branch "${RELEASE_BRANCH}" \
+      --arg sha "${target_sha}" \
+      --arg bot "${bot_login}" \
+      --argjson bot_id "${bot_id}" \
+      --argjson number "${pr_number}" \
+      '.number == $number
+        and .state == "open"
+        and .user.login == $bot
+        and .user.id == $bot_id
+        and .head.repo.full_name == $repository
+        and .head.ref == $branch
+        and .head.sha == $sha
+        and .base.repo.full_name == $repository
+        and .base.ref == "main"
+        and .commits == 1
+        and .draft == true' \
+      <<<"${held_pr}" >/dev/null; then
+      echo "GitHub did not retain the exact release pull request as draft." >&2
+      exit 1
+    fi
   fi
 fi
 
@@ -461,6 +702,33 @@ if [[ "${remote_main}" != "${GITHUB_SHA}" ]]; then
   echo "Main advanced before the durable release branch update." >&2
   exit 1
 fi
+# A held existing proposal must still be draft at the last pre-ref gate.
+if [[ "${RELEASE_HOLD_DRAFT}" == "true" && -n "${pr_number}" ]]; then
+  held_pr="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}")"
+  # Reject a review-state or identity race before the App-owned ref changes.
+  if ! jq --exit-status \
+    --arg repository "${GITHUB_REPOSITORY}" \
+    --arg branch "${RELEASE_BRANCH}" \
+    --arg sha "${target_sha}" \
+    --arg bot "${bot_login}" \
+    --argjson bot_id "${bot_id}" \
+    --argjson number "${pr_number}" \
+    '.number == $number
+      and .state == "open"
+      and .user.login == $bot
+      and .user.id == $bot_id
+      and .head.repo.full_name == $repository
+      and .head.ref == $branch
+      and .head.sha == $sha
+      and .base.repo.full_name == $repository
+      and .base.ref == "main"
+      and .commits == 1
+      and .draft == true' \
+    <<<"${held_pr}" >/dev/null; then
+    echo "The release pull request did not remain draft before the branch update." >&2
+    exit 1
+  fi
+fi
 credential_helper="!f() { printf \"%s\\n\" \"username=x-access-token\" \"password=\${GH_TOKEN}\"; }; f"
 # Git receive-pack applies the expected-old-SHA lease atomically. An empty
 # expected value permits creation only while the durable ref remains absent.
@@ -492,7 +760,7 @@ if [[ -z "${pr_number}" ]]; then
       -f "head=${RELEASE_BRANCH}" \
       -f base=main \
       -f "body=${RELEASE_BODY}" \
-      -F "draft=${RELEASE_DRAFT}"
+      -F "draft=${effective_draft}"
   )"
   pr_number="$(jq --raw-output .number <<<"${pr}")"
 else
@@ -502,29 +770,49 @@ else
   )"
   current_draft="$(jq --raw-output .draft <<<"${pr}")"
   # Keep the PR's review state aligned with the generated proposal state.
-  if [[ "${current_draft}" != "${RELEASE_DRAFT}" ]]; then
+  if [[ "${current_draft}" != "${effective_draft}" ]]; then
     pull_request_id="$(jq --raw-output .node_id <<<"${pr}")"
     # Ready proposals leave draft state; empty seed proposals return to draft.
-    if [[ "${RELEASE_DRAFT}" == "false" ]]; then
+    if [[ "${effective_draft}" == "false" ]]; then
       # Keep GraphQL's `$id` variable literal for the API rather than the shell.
       # shellcheck disable=SC2016
-      gh api graphql \
-        -f query='mutation($id: ID!) {
-          markPullRequestReadyForReview(input: {pullRequestId: $id}) {
-            pullRequest { number }
-          }
-        }' \
-        -f "id=${pull_request_id}" >/dev/null
+      transition_response="$(
+        gh api graphql \
+          -f query='mutation($id: ID!) {
+            markPullRequestReadyForReview(input: {pullRequestId: $id}) {
+              pullRequest { number isDraft }
+            }
+          }' \
+          -f "id=${pull_request_id}"
+      )"
+      # Bind the ready transition to this exact pull request and state.
+      if ! jq --exit-status --argjson number "${pr_number}" \
+        '.data.markPullRequestReadyForReview.pullRequest.number == $number
+          and .data.markPullRequestReadyForReview.pullRequest.isDraft == false' \
+        <<<"${transition_response}" >/dev/null; then
+        echo "GitHub did not mark the exact release pull request ready." >&2
+        exit 1
+      fi
     else
       # Keep GraphQL's `$id` variable literal for the API rather than the shell.
       # shellcheck disable=SC2016
-      gh api graphql \
-        -f query='mutation($id: ID!) {
-          convertPullRequestToDraft(input: {pullRequestId: $id}) {
-            pullRequest { number }
-          }
-        }' \
-        -f "id=${pull_request_id}" >/dev/null
+      transition_response="$(
+        gh api graphql \
+          -f query='mutation($id: ID!) {
+            convertPullRequestToDraft(input: {pullRequestId: $id}) {
+              pullRequest { number isDraft }
+            }
+          }' \
+          -f "id=${pull_request_id}"
+      )"
+      # Bind the draft transition to this exact pull request and state.
+      if ! jq --exit-status --argjson number "${pr_number}" \
+        '.data.convertPullRequestToDraft.pullRequest.number == $number
+          and .data.convertPullRequestToDraft.pullRequest.isDraft == true' \
+        <<<"${transition_response}" >/dev/null; then
+        echo "GitHub did not convert the exact release pull request to draft." >&2
+        exit 1
+      fi
     fi
   fi
 fi
@@ -540,7 +828,7 @@ if ! jq --exit-status \
   --arg title "${RELEASE_TITLE}" \
   --arg body "${RELEASE_BODY}" \
   --argjson number "${pr_number}" \
-  --argjson draft "${RELEASE_DRAFT}" \
+  --argjson draft "${effective_draft}" \
   '.number == $number
     and .state == "open"
     and .user.login == $bot

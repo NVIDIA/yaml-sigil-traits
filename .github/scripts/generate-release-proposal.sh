@@ -16,11 +16,6 @@ set -euo pipefail
 : "${PUBLISHED_VERSION:?PUBLISHED_VERSION is required}"
 : "${REGISTRY_MANIFEST_PATH:?REGISTRY_MANIFEST_PATH is required}"
 : "${RUNNER_TEMP:?RUNNER_TEMP is required}"
-# An empty marker is meaningful because it clears an earlier override.
-if [[ ! -v RELEASE_MARKER ]]; then
-  echo "RELEASE_MARKER must be set, even when empty." >&2
-  exit 2
-fi
 # The baseline helper must provide one clean detached official manifest.
 if [[ ! -f "${REGISTRY_MANIFEST_PATH}" ]]; then
   echo "The official registry baseline manifest is missing." >&2
@@ -35,6 +30,7 @@ case "${GITHUB_REPOSITORY}" in
     changelog_paths=(CHANGELOG.md)
     published_tags=("v${PUBLISHED_VERSION}")
     release_policy="The resulting GitHub Release is source-only and receives no binary assets."
+    compatibility_package_args=(--package yaml-sigil-traits)
     sync_commands=false
     ;;
   NVIDIA/yaml-sigil-rs)
@@ -48,6 +44,7 @@ case "${GITHUB_REPOSITORY}" in
       "yaml-sigil-verification-v${PUBLISHED_VERSION}"
     )
     release_policy="The resulting GitHub Releases are source-only and receive no binary assets."
+    compatibility_package_args=()
     sync_commands=true
     ;;
   *)
@@ -117,7 +114,7 @@ cargo metadata --no-deps --format-version 1 >/dev/null
 cargo xtask release-version check-compatibility \
   --baseline-manifest "${REGISTRY_MANIFEST_PATH}" \
   --current-manifest Cargo.toml \
-  --package yaml-sigil-traits \
+  "${compatibility_package_args[@]}" \
   --expected-baseline-version "${PUBLISHED_VERSION}" \
   --expected-current-version "${target}" \
   --intent "${EFFECTIVE_BUMP}"
@@ -130,11 +127,6 @@ body_file="${RUNNER_TEMP}/release-pr-body.md"
   echo
   echo "Reviewing and merging this pull request authorizes the protected official publication workflow."
   echo "${release_policy}"
-  # Persist only an explicit version-line override in the pull-request body.
-  if [[ -n "${RELEASE_MARKER}" ]]; then
-    echo
-    echo "${RELEASE_MARKER}"
-  fi
 } >"${body_file}"
 
 {

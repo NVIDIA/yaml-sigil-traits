@@ -184,12 +184,25 @@ def synchronized_official_tag_inventory(
     return local
 
 
-def official_tag_versions(
+def official_version_key(version: str) -> tuple[int, int, int, int, int]:
+    """Return Cargo-compatible ordering for the supported release versions."""
+
+    core, separator, prerelease = version.partition("-rc.")
+    major, minor, patch = (int(component) for component in core.split("."))
+    if separator:
+        return major, minor, patch, 0, int(prerelease)
+    return major, minor, patch, 1, 0
+
+
+def classified_official_tag_versions(
     root: Path,
     repository: str,
     head: str,
     inventory: dict[str, tuple[str, str]] | None = None,
-) -> dict[str, str]:
+    allow_incomplete_version: str | None = None,
+) -> tuple[dict[str, str], dict[str, set[str]]]:
+    """Classify reachable synchronized versions and complete split tag groups."""
+
     pattern = TAG_PATTERNS[repository]
     if inventory is None:
         inventory = synchronized_official_tag_inventory(root, repository)
@@ -200,23 +213,69 @@ def official_tag_versions(
             raise BaselineError("the official tag inventory contains an invalid name")
         grouped.setdefault(match.group("version"), {})[tag] = commit
     versions: dict[str, str] = {}
+    mismatched: dict[str, set[str]] = {}
     for version, tagged_commits in grouped.items():
         expected = {
             template.format(version=version) for template in REPOSITORY_TAGS[repository]
         }
         if set(tagged_commits) != expected:
+            if version == allow_incomplete_version:
+                continue
             raise BaselineError(
                 f"official version {version} has an incomplete official tag set"
             )
         commits = set(tagged_commits.values())
         if len(commits) != 1:
-            raise BaselineError(
-                f"official version {version} tags resolve to different commits"
-            )
+            mismatched[version] = commits
+            continue
         commit = commits.pop()
         if is_ancestor(root, commit, head):
             versions[version] = commit
-    return versions
+    return versions, mismatched
+
+
+def require_selected_baseline_supersedes_split_tags(
+    root: Path,
+    mismatched: dict[str, set[str]],
+    selected_version: str,
+    selected_commit: str,
+) -> None:
+    """Permit only lower legacy split tags strictly behind the selected baseline."""
+
+    for version, commits in mismatched.items():
+        if not (
+            official_version_key(version) < official_version_key(selected_version)
+            and all(
+                commit != selected_commit
+                and is_ancestor(root, commit, selected_commit)
+                for commit in commits
+            )
+        ):
+            raise BaselineError(
+                f"official version {version} tags resolve to different commits"
+            )
+
+
+def require_excluded_current_version(
+    root: Path,
+    repository: str,
+    head: str,
+    exclude_version: str,
+    inventory: dict[str, tuple[str, str]],
+) -> None:
+    """Allow only exact-main tags for the manifest's excluded retry version."""
+
+    if manifest_version(root / "Cargo.toml", repository) != exclude_version:
+        raise BaselineError("the excluded retry version does not match current main")
+    expected = {
+        template.format(version=exclude_version)
+        for template in REPOSITORY_TAGS[repository]
+    }
+    present = expected.intersection(inventory)
+    if any(inventory[tag][1] != head for tag in present):
+        raise BaselineError(
+            "the excluded retry version does not tag exact current main"
+        )
 
 
 def last_official_version(
@@ -230,7 +289,15 @@ def last_official_version(
         raise BaselineError(f"unsupported release repository: {repository}")
     if exclude_version is not None and VERSION_RE.fullmatch(exclude_version) is None:
         raise BaselineError(f"unsupported excluded release version: {exclude_version}")
-    versions = official_tag_versions(root, repository, head, inventory)
+    if inventory is None:
+        inventory = synchronized_official_tag_inventory(root, repository)
+    if exclude_version is not None:
+        require_excluded_current_version(
+            root, repository, head, exclude_version, inventory
+        )
+    versions, mismatched = classified_official_tag_versions(
+        root, repository, head, inventory, exclude_version
+    )
     if exclude_version is not None:
         versions.pop(exclude_version, None)
     distances = {
@@ -238,6 +305,11 @@ def last_official_version(
         for candidate, commit in versions.items()
     }
     if not distances:
+        if mismatched:
+            version = sorted(mismatched, key=official_version_key)[-1]
+            raise BaselineError(
+                f"official version {version} tags resolve to different commits"
+            )
         raise BaselineError("no reachable official annotated release tag exists")
     nearest_distance = min(distances.values())
     nearest_versions = sorted(
@@ -248,6 +320,9 @@ def last_official_version(
             "the last official annotated release is not unique"
         )
     version = nearest_versions[0]
+    require_selected_baseline_supersedes_split_tags(
+        root, mismatched, version, versions[version]
+    )
     return version, versions[version]
 
 
@@ -431,27 +506,9 @@ def prepare_baseline(
     if exclude_version is not None:
         if VERSION_RE.fullmatch(exclude_version) is None:
             raise BaselineError(f"unsupported excluded release version: {exclude_version}")
-        if manifest_version(root / "Cargo.toml", repository) != exclude_version:
-            raise BaselineError(
-                "the excluded retry version does not match current main"
-            )
-        expected_excluded = {
-            template.format(version=exclude_version)
-            for template in REPOSITORY_TAGS[repository]
-        }
-        present_excluded = expected_excluded.intersection(inventory)
-        if present_excluded:
-            if present_excluded != expected_excluded:
-                raise BaselineError(
-                    "the excluded retry version has an incomplete official tag set"
-                )
-            excluded_commits = {
-                inventory[tag][1] for tag in expected_excluded
-            }
-            if excluded_commits != {head}:
-                raise BaselineError(
-                    "the excluded retry version does not tag exact current main"
-                )
+        require_excluded_current_version(
+            root, repository, head, exclude_version, inventory
+        )
 
     tags = tuple(template.format(version=version) for template in REPOSITORY_TAGS[repository])
     commits: set[str] = set()
