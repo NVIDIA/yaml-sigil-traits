@@ -206,18 +206,26 @@ cargo clippy --locked --manifest-path xtask/Cargo.toml --all-targets --all-featu
 cargo test --all-features
 cargo test --locked --manifest-path xtask/Cargo.toml
 cargo-machete --with-metadata
+cargo deny check bans licenses sources -D warnings
+cargo deny --manifest-path xtask/Cargo.toml --locked check bans licenses sources -D warnings
 cargo audit
 cargo audit --file xtask/Cargo.lock
 ```
 
-Install `rumdl`, `cargo-audit`, and `cargo-machete` with Cargo before running
-the wrapper:
+Install `rumdl`, `cargo-audit`, `cargo-deny`, and `cargo-machete` with
+Cargo before running the wrapper:
 
 ```shell
 cargo install rumdl
 cargo install cargo-audit
+cargo install --locked cargo-deny --version 0.20.2
 cargo install --locked cargo-machete --version 0.9.2
 ```
+
+Cargo Deny reads the repository-wide policy from `deny.toml` and the exact
+license exceptions for each graph from the nearest `deny.exceptions.toml`.
+The root check resolves the uncommitted crate graph, while the xtask check uses
+its committed lockfile.
 
 Keep the cargo-machete version aligned with hosted CI. The
 `--with-metadata` check resolves normal, development, and build dependency

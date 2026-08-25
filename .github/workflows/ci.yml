@@ -113,7 +113,7 @@ jobs:
         with:
           checksum: true
           fallback: none
-          tool: cargo-audit,cargo-machete@0.9.2
+          tool: cargo-audit,cargo-deny@0.20.2,cargo-machete@0.9.2
 
       - name: Cache Rust build inputs
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -152,6 +152,14 @@ jobs:
 
       - name: Check unused Rust dependencies
         run: cargo-machete --with-metadata
+
+      - name: Check Rust dependency policy
+        run: cargo deny check bans licenses sources -D warnings
+
+      - name: Check xtask dependency policy
+        run: >-
+          cargo deny --manifest-path xtask/Cargo.toml --locked
+          check bans licenses sources -D warnings
 
       # Audit after the Cargo checks have resolved this platform's dependency
       # graph and generated the intentionally untracked root Cargo.lock.

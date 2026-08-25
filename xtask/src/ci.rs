@@ -10,6 +10,7 @@ use std::process::Command;
 use crate::{package_content, release_version};
 
 const CARGO_MACHETE_INSTALL_COMMAND: &str = "cargo install --locked cargo-machete --version 0.9.2";
+const CARGO_DENY_INSTALL_COMMAND: &str = "cargo install --locked cargo-deny --version 0.20.2";
 
 #[derive(Clone, Copy, Debug)]
 struct Step {
@@ -98,6 +99,29 @@ const POST_PACKAGE_STEPS: &[Step] = &[
         args: &["--with-metadata"],
     },
     Step {
+        label: "Rust dependency policy",
+        program: "cargo",
+        args: &[
+            "deny", "check", "bans", "licenses", "sources", "-D", "warnings",
+        ],
+    },
+    Step {
+        label: "xtask dependency policy",
+        program: "cargo",
+        args: &[
+            "deny",
+            "--manifest-path",
+            "xtask/Cargo.toml",
+            "--locked",
+            "check",
+            "bans",
+            "licenses",
+            "sources",
+            "-D",
+            "warnings",
+        ],
+    },
+    Step {
         label: "Rust dependency audit",
         program: "cargo",
         args: &["audit"],
@@ -111,6 +135,7 @@ const POST_PACKAGE_STEPS: &[Step] = &[
 
 pub(crate) fn run(root: &Path) -> io::Result<()> {
     require_cargo_machete()?;
+    require_cargo_deny()?;
     for step in PRE_PACKAGE_STEPS {
         run_step(root, *step)?;
     }
@@ -139,7 +164,15 @@ fn run_step(root: &Path, step: Step) -> io::Result<()> {
 }
 
 fn require_cargo_machete() -> io::Result<()> {
-    let output = Command::new("cargo-machete")
+    require_cargo_tool("cargo-machete", CARGO_MACHETE_INSTALL_COMMAND)
+}
+
+fn require_cargo_deny() -> io::Result<()> {
+    require_cargo_tool("cargo-deny", CARGO_DENY_INSTALL_COMMAND)
+}
+
+fn require_cargo_tool(program: &str, install_command: &str) -> io::Result<()> {
+    let output = Command::new(program)
         .arg("--version")
         .output()
         .map_err(|error| {
@@ -147,22 +180,19 @@ fn require_cargo_machete() -> io::Result<()> {
                 io::Error::new(
                     io::ErrorKind::NotFound,
                     format!(
-                        "cargo-machete is required but was not found.\n\n\
-                         Install it with:\n    {CARGO_MACHETE_INSTALL_COMMAND}"
+                        "{program} is required but was not found.\n\n\
+                         Install it with:\n    {install_command}"
                     ),
                 )
             } else {
-                io::Error::new(
-                    error.kind(),
-                    format!("failed to run cargo-machete: {error}"),
-                )
+                io::Error::new(error.kind(), format!("failed to run {program}: {error}"))
             }
         })?;
 
     if !output.status.success() {
         return Err(io::Error::other(format!(
-            "cargo-machete --version failed with {}.\n\n{}",
-            output.status, CARGO_MACHETE_INSTALL_COMMAND
+            "{program} --version failed with {}.\n\n{install_command}",
+            output.status
         )));
     }
 
@@ -171,7 +201,7 @@ fn require_cargo_machete() -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CARGO_MACHETE_INSTALL_COMMAND, POST_PACKAGE_STEPS};
+    use super::{CARGO_DENY_INSTALL_COMMAND, CARGO_MACHETE_INSTALL_COMMAND, POST_PACKAGE_STEPS};
 
     const AGENT_GUIDANCE: &str = include_str!("../../AGENTS.md");
     const GITMODULES: &str = include_str!("../../.gitmodules");
@@ -198,6 +228,18 @@ mod tests {
         );
         assert!(AGENT_GUIDANCE.contains(CARGO_MACHETE_INSTALL_COMMAND));
         assert!(AGENT_GUIDANCE.contains("cargo-machete --with-metadata"));
+    }
+
+    #[test]
+    fn cargo_deny_guidance_is_aligned_and_actionable() {
+        assert_eq!(
+            CARGO_DENY_INSTALL_COMMAND,
+            "cargo install --locked cargo-deny --version 0.20.2"
+        );
+        assert!(AGENT_GUIDANCE.contains(CARGO_DENY_INSTALL_COMMAND));
+        assert!(AGENT_GUIDANCE.contains(
+            "cargo deny --manifest-path xtask/Cargo.toml --locked check bans licenses sources"
+        ));
     }
 
     #[test]
