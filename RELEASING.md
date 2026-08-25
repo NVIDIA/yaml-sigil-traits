@@ -28,6 +28,47 @@ pull request is the authorization signal for release-plz because
 `.release-plz.toml` sets `release_always = false` and the branch uses the
 `release-plz-` prefix.
 
+### Preserve reviewed commits at integration
+
+Preserve a release pull request's individual commits when review finds them
+coherent, correctly scoped, and useful to retain on `main`. Every retained
+commit must carry its own cryptographic signature and DCO sign-off and leave
+the repository in a coherent state. If the submitted sequence is noisy,
+partial, or not independently meaningful, curate or squash it on the
+contributor branch and re-sign the result before requesting final
+authorization. Do not make the integrating repository writer repair avoidable
+history problems at merge time.
+
+Do not use GitHub's **Rebase and merge** option. It rewrites reviewed commits
+on the server and cannot preserve their signatures. **Squash and merge** also
+replaces the reviewed commits. Use it when review concludes that the submitted
+commit sequence is not worth retaining as-is, not as the default for coherent
+history. This repository disables server-side rebase merging.
+
+Bring a human-owned branch up to date before final CI with
+`git rebase --gpg-sign origin/main` and the approved SSH signing key. Push
+rewritten history only with `--force-with-lease`, then request `Required CI`
+for the new exact head SHA. Do not rewrite `release-plz-next`; have the
+`Release proposal` workflow refresh that App-owned branch instead. Every
+rewritten head invalidates the earlier authorization and check.
+
+After the exact head is current, GitHub Verified, DCO-compliant, and green
+under `Required CI`, a repository writer re-fetches `origin` and integrates
+that immutable commit with a normal fast-forward push:
+
+```shell
+git fetch origin
+expected_main="$(git rev-parse origin/main)"
+expected_head="<exact-40-character-PR-head-SHA>"
+git merge-base --is-ancestor "${expected_main}" "${expected_head}"
+git push origin "${expected_head}:refs/heads/main"
+```
+
+Re-check the pull request's base, head, and `Required CI` binding immediately
+before the push. A concurrent `main` update makes the normal push fail closed;
+rebase and re-sign the human-owned branch, or refresh the App-owned proposal,
+then rerun exact-head CI. Never force-push `main`.
+
 The workflow remains a successful no-op while the GitHub App configuration is
 absent. It also waits without advancing the train until the version on `main`
 is available and non-yanked on crates.io.
