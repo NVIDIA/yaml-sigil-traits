@@ -8,6 +8,12 @@ name = "xtask"
 version = "0.0.0"
 edition = "2024"
 publish = false
+# Keep the developer tool's target inventory explicit; only the declared
+# binary below participates in validation.
+autobenches = false
+autobins = false
+autoexamples = false
+autotests = false
 # This developer tool has no build script.
 build = false
 license = "Apache-2.0"

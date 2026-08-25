@@ -69,10 +69,15 @@ def policy() -> dict:
             "CODEOWNERS",
             ".github/**",
             ".cargo/**",
+            "**/.cargo/**",
             "Cargo.toml",
             "**/Cargo.toml",
             "build.rs",
             "**/build.rs",
+            "benches/**",
+            "**/benches/**",
+            "examples/**",
+            "**/examples/**",
             "AGENTS.md",
             ".agents/**",
             "source-spec/**",
@@ -318,6 +323,19 @@ class AuthorizationTests(unittest.TestCase):
     def test_repository_policy_configuration_is_valid(self) -> None:
         controller.load_config(str(POLICY_PATH))
 
+    def test_repository_policy_covers_cargo_configuration_and_auto_targets(self) -> None:
+        repository_policy = controller.load_config(str(POLICY_PATH))
+        required = {
+            ".cargo/**",
+            "**/.cargo/**",
+            "benches/**",
+            "**/benches/**",
+            "examples/**",
+            "**/examples/**",
+        }
+
+        self.assertLessEqual(required, set(repository_policy["sensitive_paths"]))
+
     def test_repository_directory_patterns_match_roots_and_descendants(self) -> None:
         repository_policy = controller.load_config(str(POLICY_PATH))
         declarations = [
@@ -448,11 +466,29 @@ class AuthorizationTests(unittest.TestCase):
                     controller.authorize(event(), policy(), api, environment())
 
     def test_directory_patterns_cover_roots_descendants_and_normalized_forms(self) -> None:
-        patterns = [".cargo/**", "source-spec/**"]
+        patterns = [
+            ".cargo/**",
+            "**/.cargo/**",
+            "benches/**",
+            "**/benches/**",
+            "examples/**",
+            "**/examples/**",
+            "source-spec/**",
+        ]
         for path in (
             ".cargo",
             ".CARGO/config.toml",
             ".ＣＡＲＧＯ",
+            "nested/.cargo",
+            "nested/.ＣＡＲＧＯ/config.toml",
+            "benches",
+            "BENCHES/throughput.rs",
+            "nested/benches",
+            "nested/ＢＥＮＣＨＥＳ/throughput.rs",
+            "examples",
+            "EXAMPLES/verify.rs",
+            "nested/examples",
+            "nested/ＥＸＡＭＰＬＥＳ/verify.rs",
             "source-spec",
             "SOURCE-SPEC/proto/schema.proto",
             "ＳＯＵＲＣＥ－ＳＰＥＣ/README.md",
@@ -464,7 +500,9 @@ class AuthorizationTests(unittest.TestCase):
             ".carg",
             ".cargo-cache/config.toml",
             ".cargo.toml",
-            "nested/.cargo/config.toml",
+            "nested/.cargo-cache/config.toml",
+            "benchmark/throughput.rs",
+            "nested/examples-extra/verify.rs",
             "nested/source-spec/README.md",
             "source-specification/README.md",
         ):
@@ -480,6 +518,11 @@ class AuthorizationTests(unittest.TestCase):
         for path, leaf in (
             (".cargo", ("blob", "120000", HEAD_BLOB_SHA)),
             (".ＣＡＲＧＯ", ("blob", "120000", HEAD_BLOB_SHA)),
+            ("nested/.cargo", ("blob", "120000", HEAD_BLOB_SHA)),
+            ("benches", ("blob", "120000", HEAD_BLOB_SHA)),
+            ("nested/ＢＥＮＣＨＥＳ", ("blob", "120000", HEAD_BLOB_SHA)),
+            ("examples", ("blob", "120000", HEAD_BLOB_SHA)),
+            ("nested/ＥＸＡＭＰＬＥＳ", ("blob", "120000", HEAD_BLOB_SHA)),
             ("source-spec", ("commit", "160000", HEAD_BLOB_SHA)),
             ("source-spec/README.md", ("blob", "100644", HEAD_BLOB_SHA)),
         ):
@@ -490,6 +533,25 @@ class AuthorizationTests(unittest.TestCase):
                     controller.PolicyError, "same-repository branch"
                 ):
                     controller.authorize(event(), policy(), api, environment())
+
+    def test_auto_discovered_executable_targets_require_writer_adoption(self) -> None:
+        for path in (
+            "benches/throughput.rs",
+            "nested/benches/throughput.rs",
+            "examples/verify.rs",
+            "nested/examples/verify.rs",
+        ):
+            with self.subTest(path=path):
+                api = FakeAuthorizationApi()
+                api.set_change(path)
+                with self.assertRaisesRegex(
+                    controller.PolicyError, "same-repository branch"
+                ):
+                    controller.authorize(event(), policy(), api, environment())
+
+                api.pull["head"]["repo"]["full_name"] = REPOSITORY
+                result = controller.authorize(event(), policy(), api, environment())
+                self.assertEqual(result.head_sha, HEAD_SHA)
 
     def test_root_and_nested_build_scripts_are_sensitive(self) -> None:
         for path in ("build.rs", "nested/BUILD.RS"):
