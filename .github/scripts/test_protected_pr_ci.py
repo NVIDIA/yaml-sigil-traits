@@ -189,6 +189,8 @@ class FakeAuthorizationApi:
         self.api_url = "https://api.github.com"
         self.main_sha = MAIN_SHA
         self.final_main_sha = None
+        self.main_sha_sequence = None
+        self.main_error_on_read = None
         self.permissions = {MAINTAINER: "write"}
         self.commits = [{"sha": HEAD_SHA, "parents": [{"sha": MAIN_SHA}]}]
         self.details = {HEAD_SHA: git_commit()}
@@ -262,6 +264,16 @@ class FakeAuthorizationApi:
             return {"permission": self.permissions.get(login, "none")}
         if path.endswith("/git/ref/heads/main"):
             self.main_reads += 1
+            if self.main_reads == self.main_error_on_read:
+                raise controller.PolicyError("main ref reread failed")
+            if self.main_sha_sequence is not None:
+                index = min(self.main_reads - 1, len(self.main_sha_sequence) - 1)
+                return {
+                    "object": {
+                        "type": "commit",
+                        "sha": self.main_sha_sequence[index],
+                    }
+                }
             sha = (
                 self.final_main_sha
                 if self.main_reads > 1 and self.final_main_sha is not None
@@ -897,6 +909,7 @@ class FakeCheckApi:
         self.checks = list(checks or [])
         self.patches = []
         self.posts = []
+        self.patch_response_overrides = {}
 
     def get(self, path: str):
         if "/check-runs/" in path:
@@ -913,7 +926,9 @@ class FakeCheckApi:
         check_id = int(path.rsplit("/", 1)[1])
         check = next(check for check in self.checks if check["id"] == check_id)
         check.update(payload)
-        return check
+        response = copy.deepcopy(check)
+        response.update(self.patch_response_overrides.get(payload["conclusion"], {}))
+        return response
 
     def post(self, path, payload):
         self.posts.append((path, payload))
@@ -1040,6 +1055,85 @@ class CheckRunTests(unittest.TestCase):
                 APP_SLUG,
             )
         self.assertEqual(app_api.patches[-1][1]["conclusion"], "failure")
+
+    def test_success_is_overwritten_if_main_advances_during_reconciliation(self) -> None:
+        binding = external()
+        app_api = FakeCheckApi([pending_check(1, binding)])
+        auth_api = FakeAuthorizationApi()
+        auth_api.main_sha_sequence = [MAIN_SHA, MAIN_SHA, MAIN_SHA, OLD_SHA]
+
+        with self.assertRaisesRegex(
+            controller.PolicyError, "main changed during final check reconciliation"
+        ):
+            controller.finish_check(
+                app_api,
+                auth_api,
+                policy(),
+                workflow_dispatch_event(),
+                environment(),
+                binding,
+                1,
+                ["commit_policy=success", "workflow_lint=success"],
+                APP_SLUG,
+            )
+
+        self.assertEqual(
+            [payload["conclusion"] for _path, payload in app_api.patches],
+            ["success", "failure"],
+        )
+        self.assertEqual(app_api.patches[0][0], app_api.patches[1][0])
+        self.assertEqual(app_api.checks[0]["conclusion"], "failure")
+
+    def test_success_is_overwritten_if_reconciliation_read_fails(self) -> None:
+        binding = external()
+        app_api = FakeCheckApi([pending_check(1, binding)])
+        auth_api = FakeAuthorizationApi()
+        auth_api.main_error_on_read = 4
+
+        with self.assertRaisesRegex(controller.PolicyError, "main ref reread failed"):
+            controller.finish_check(
+                app_api,
+                auth_api,
+                policy(),
+                workflow_dispatch_event(),
+                environment(),
+                binding,
+                1,
+                ["commit_policy=success", "workflow_lint=success"],
+                APP_SLUG,
+            )
+
+        self.assertEqual(
+            [payload["conclusion"] for _path, payload in app_api.patches],
+            ["success", "failure"],
+        )
+        self.assertEqual(app_api.patches[0][0], app_api.patches[1][0])
+        self.assertEqual(app_api.checks[0]["conclusion"], "failure")
+
+    def test_reconciliation_validates_failure_patch_response_binding(self) -> None:
+        binding = external()
+        app_api = FakeCheckApi([pending_check(1, binding)])
+        app_api.patch_response_overrides["failure"] = {
+            "external_id": external(run_id=999).encode()
+        }
+        auth_api = FakeAuthorizationApi()
+        auth_api.main_error_on_read = 4
+
+        with self.assertRaisesRegex(controller.PolicyError, "binding is unexpected"):
+            controller.finish_check(
+                app_api,
+                auth_api,
+                policy(),
+                workflow_dispatch_event(),
+                environment(),
+                binding,
+                1,
+                ["commit_policy=success", "workflow_lint=success"],
+                APP_SLUG,
+            )
+
+        self.assertEqual(app_api.patches[-1][1]["conclusion"], "failure")
+        self.assertEqual(app_api.checks[0]["conclusion"], "failure")
 
     def test_cancelled_workflow_reconciles_only_its_app_check(self) -> None:
         binding = external()
