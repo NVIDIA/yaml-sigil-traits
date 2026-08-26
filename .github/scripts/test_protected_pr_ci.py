@@ -3,19 +3,23 @@
 # SPDX-FileCopyrightText: Copyright 2026 NVIDIA CORPORATION & AFFILIATES
 # SPDX-License-Identifier: Apache-2.0
 
-"""Regression tests for the protected-main pull-request controller."""
+"""Regression tests for protected-main pull-request policy."""
 
 from __future__ import annotations
 
 import copy
 import importlib.util
+import os
 import pathlib
+import subprocess
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
 
 MODULE_PATH = pathlib.Path(__file__).with_name("protected_pr_ci.py")
+COMMIT_POLICY_PATH = MODULE_PATH.with_name("check-pull-request-commits.sh")
 POLICY_PATH = MODULE_PATH.parent.parent / "protected-pr-ci.json"
 SPEC = importlib.util.spec_from_file_location("protected_pr_ci", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None
@@ -1053,6 +1057,111 @@ class ImmutableTreeTests(unittest.TestCase):
                     controller.PolicyError, "casefold path collisions"
                 ):
                     controller.authorize(event(), policy(), api, environment())
+
+
+class CommitPolicyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_directory.cleanup)
+        self.repository = pathlib.Path(temporary_directory.name)
+        self.run_git("init", "--quiet", "--initial-branch=main")
+        self.empty_tree = self.run_git(
+            "hash-object", "-t", "tree", "--stdin", input_text=""
+        ).stdout.strip()
+
+    def run_git(
+        self,
+        *args: str,
+        input_text: str | None = None,
+        environment: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        process_environment = os.environ.copy()
+        process_environment.update(environment or {})
+        return subprocess.run(
+            ["git", *args],
+            cwd=self.repository,
+            env=process_environment,
+            input=input_text,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+
+    def commit(
+        self,
+        message: str,
+        *,
+        parent: str | None = None,
+        author_name: str = "Base Author",
+        author_email: str = "base-author@example.invalid",
+        committer_name: str = "Base Committer",
+        committer_email: str = "base-committer@example.invalid",
+    ) -> str:
+        args = ["commit-tree", self.empty_tree]
+        if parent is not None:
+            args.extend(["-p", parent])
+        args.extend(["-m", message])
+        result = self.run_git(
+            *args,
+            environment={
+                "GIT_AUTHOR_NAME": author_name,
+                "GIT_AUTHOR_EMAIL": author_email,
+                "GIT_COMMITTER_NAME": committer_name,
+                "GIT_COMMITTER_EMAIL": committer_email,
+            },
+        )
+        return result.stdout.strip()
+
+    def run_policy(
+        self, base_sha: str, head_sha: str
+    ) -> subprocess.CompletedProcess[str]:
+        process_environment = os.environ.copy()
+        process_environment.update({"BASE_SHA": base_sha, "HEAD_SHA": head_sha})
+        return subprocess.run(
+            ["bash", str(COMMIT_POLICY_PATH)],
+            cwd=self.repository,
+            env=process_environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    def test_generic_platform_committer_signoff_does_not_satisfy_author_dco(
+        self,
+    ) -> None:
+        base = self.commit("test: base")
+        head = self.commit(
+            "test: candidate\n\nSigned-off-by: GitHub <noreply@github.com>",
+            parent=base,
+            author_name="Contributor",
+            author_email="contributor@example.invalid",
+            committer_name="GitHub",
+            committer_email="noreply@github.com",
+        )
+
+        result = self.run_policy(base, head)
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("matching its author.", result.stdout)
+
+    def test_exact_author_signoff_is_accepted_when_committer_differs(self) -> None:
+        base = self.commit("test: base")
+        head = self.commit(
+            "test: candidate\n\n"
+            "Signed-off-by: Contributor <contributor@example.invalid>",
+            parent=base,
+            author_name="Contributor",
+            author_email="contributor@example.invalid",
+            committer_name="GitHub",
+            committer_email="noreply@github.com",
+        )
+
+        result = self.run_policy(base, head)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "Validated 1 linear, signed-off pull request commit(s).", result.stdout
+        )
 
 
 class PaginationApi(controller.GitHubApi):

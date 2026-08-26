@@ -41,15 +41,14 @@ fi
 
 # Enforce the Developer Certificate of Origin on every proposed commit. Use
 # Git's trailer parser rather than a loose text match, and require at least one
-# Signed-off-by identity to match that commit's author or committer exactly.
+# Signed-off-by identity to match that commit's author exactly.
 invalid_signoffs=()
 for commit in "${commits[@]}"; do
   author="$(git show --no-patch --format='%an <%ae>' "${commit}")"
-  committer="$(git show --no-patch --format='%cn <%ce>' "${commit}")"
   valid=false
 
   while IFS= read -r signoff; do
-    if [[ "${signoff}" == "${author}" || "${signoff}" == "${committer}" ]]; then
+    if [[ "${signoff}" == "${author}" ]]; then
       valid=true
       break
     fi
@@ -64,7 +63,7 @@ for commit in "${commits[@]}"; do
 done
 
 if ((${#invalid_signoffs[@]} > 0)); then
-  echo "::error::Each commit needs a Signed-off-by trailer matching its author or committer."
+  echo "::error::Each commit needs a Signed-off-by trailer matching its author."
   git show --no-patch --format='  %H %s' "${invalid_signoffs[@]}"
   exit 1
 fi
