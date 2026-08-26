@@ -319,6 +319,57 @@ class FakeAuthorizationApi:
         return None
 
 
+class GitHubApiTests(unittest.TestCase):
+    def test_api_response_size_is_bounded(self) -> None:
+        class Response:
+            status = 200
+            limit = None
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, limit):
+                self.limit = limit
+                return b"12345"
+
+        response = Response()
+        with (
+            mock.patch.object(controller, "MAX_API_RESPONSE_BYTES", 4),
+            mock.patch.object(controller.urllib.request, "urlopen", return_value=response),
+            self.assertRaisesRegex(controller.PolicyError, "size limit"),
+        ):
+            controller.GitHubApi("token").get("/test")
+
+        self.assertEqual(response.limit, 5)
+
+    def test_api_error_response_size_is_bounded(self) -> None:
+        class ErrorBody:
+            limit = None
+
+            def read(self, limit):
+                self.limit = limit
+                return b"12345"
+
+            def close(self):
+                pass
+
+        body = ErrorBody()
+        error = controller.urllib.error.HTTPError(
+            "https://api.github.com/test", 500, "failure", {}, body
+        )
+        with (
+            mock.patch.object(controller, "MAX_API_ERROR_DETAIL_BYTES", 4),
+            mock.patch.object(controller.urllib.request, "urlopen", side_effect=error),
+            self.assertRaisesRegex(controller.PolicyError, r"HTTP 500: 1234\.\.\.$"),
+        ):
+            controller.GitHubApi("token").get("/test")
+
+        self.assertEqual(body.limit, 5)
+
+
 class AuthorizationTests(unittest.TestCase):
     def test_repository_policy_configuration_is_valid(self) -> None:
         controller.load_config(str(POLICY_PATH))

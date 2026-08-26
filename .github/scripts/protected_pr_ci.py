@@ -46,6 +46,8 @@ MAX_CHANGED_PATHS = 3_000
 MAX_PULL_COMMITS = 250
 MAX_TREE_ENTRIES = 100_000
 MAX_PAGES = 100
+MAX_API_RESPONSE_BYTES = 32 * 1024 * 1024
+MAX_API_ERROR_DETAIL_BYTES = 500
 
 
 class PolicyError(RuntimeError):
@@ -235,10 +237,18 @@ class GitHubApi:
         )
         try:
             with urllib.request.urlopen(request, timeout=30) as response:
-                raw = response.read()
+                raw = response.read(MAX_API_RESPONSE_BYTES + 1)
+                require(
+                    len(raw) <= MAX_API_RESPONSE_BYTES,
+                    "GitHub API response exceeds the supported size limit",
+                )
                 require(200 <= response.status < 300, f"GitHub API returned HTTP {response.status}")
         except urllib.error.HTTPError as error:
-            detail = error.read().decode("utf-8", "replace")[:500]
+            raw_detail = error.read(MAX_API_ERROR_DETAIL_BYTES + 1)
+            truncated = len(raw_detail) > MAX_API_ERROR_DETAIL_BYTES
+            detail = raw_detail[:MAX_API_ERROR_DETAIL_BYTES].decode("utf-8", "replace")
+            if truncated:
+                detail = f"{detail}..."
             raise PolicyError(f"GitHub API {method} {path} failed with HTTP {error.code}: {detail}") from error
         except (urllib.error.URLError, TimeoutError, OSError) as error:
             raise PolicyError(f"GitHub API {method} {path} failed: {error}") from error

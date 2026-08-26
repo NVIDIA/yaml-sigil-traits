@@ -21,6 +21,7 @@ const MAX_JSON_BYTES: usize = 2 * 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 64 * 1024;
 const MAX_CRATE_FILES: usize = 10_000;
 const MAX_CRATE_UNPACKED_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_CRATE_DECOMPRESSED_BYTES: u64 = 160 * 1024 * 1024;
 const READ_ATTEMPTS: usize = 3;
 const USER_AGENT: &str = "yaml-sigil-release-workflow/1.0";
 
@@ -232,6 +233,22 @@ pub(crate) fn inspect_archive(
     version: &str,
     commit: &str,
 ) -> Result<BTreeMap<String, Vec<u8>>, String> {
+    inspect_archive_with_limit(
+        archive,
+        policy,
+        version,
+        commit,
+        MAX_CRATE_DECOMPRESSED_BYTES,
+    )
+}
+
+fn inspect_archive_with_limit(
+    archive: &[u8],
+    policy: &PackagePolicy,
+    version: &str,
+    commit: &str,
+    decompressed_limit: u64,
+) -> Result<BTreeMap<String, Vec<u8>>, String> {
     if archive.is_empty() || archive.len() > MAX_CRATE_BYTES {
         return Err(format!(
             "{} source archive is empty or oversized",
@@ -240,84 +257,103 @@ pub(crate) fn inspect_archive(
     }
     let prefix = format!("{}-{version}", policy.package);
     let decoder = GzDecoder::new(Cursor::new(archive));
-    let mut package = tar::Archive::new(decoder);
-    let entries = package
-        .entries()
-        .map_err(|error| format!("{} source archive is invalid: {error}", policy.package))?;
-    let mut files = BTreeMap::new();
-    let mut count = 0usize;
-    let mut total = 0u64;
-    for entry in entries {
-        let mut entry = entry.map_err(|error| {
-            format!(
-                "{} source archive entry is invalid: {error}",
-                policy.package
-            )
-        })?;
-        count += 1;
-        if count > MAX_CRATE_FILES {
-            return Err(format!(
-                "{} source archive contains too many entries",
-                policy.package
-            ));
-        }
-        let size = entry.header().size().map_err(|error| {
-            format!(
-                "{} source archive has an invalid entry size: {error}",
-                policy.package
-            )
-        })?;
-        total = total
-            .checked_add(size)
-            .ok_or_else(|| format!("{} source archive size overflowed", policy.package))?;
-        if total > MAX_CRATE_UNPACKED_BYTES {
-            return Err(format!(
-                "{} source archive expands beyond its limit",
-                policy.package
-            ));
-        }
-        let raw_path = entry.path_bytes();
-        let raw_path = std::str::from_utf8(&raw_path)
-            .map_err(|_| format!("{} source archive has a non-UTF-8 path", policy.package))?
-            .to_string();
-        let directory = entry.header().entry_type().is_dir();
-        let path = raw_path.strip_suffix('/').unwrap_or(&raw_path);
-        validate_archive_path(path, &prefix, policy.package)?;
-        if directory {
-            continue;
-        }
-        if !entry.header().entry_type().is_file() {
-            return Err(format!(
-                "{} source archive contains a non-file entry",
-                policy.package
-            ));
-        }
-        let relative = path
-            .strip_prefix(&format!("{prefix}/"))
-            .ok_or_else(|| format!("{} source archive path lacks its root", policy.package))?;
-        let mut body = Vec::with_capacity(size.min(MAX_CRATE_BYTES as u64) as usize);
-        entry
-            .by_ref()
-            .take(size + 1)
-            .read_to_end(&mut body)
-            .map_err(|error| {
+    let stream_limit = decompressed_limit + 1;
+    let mut package = tar::Archive::new(decoder.take(stream_limit));
+    let inspection = (|| {
+        let entries = package
+            .entries()
+            .map_err(|error| format!("{} source archive is invalid: {error}", policy.package))?;
+        let mut files = BTreeMap::new();
+        let mut count = 0usize;
+        let mut total = 0u64;
+        for entry in entries {
+            let mut entry = entry.map_err(|error| {
                 format!(
-                    "{} source archive entry is unreadable: {error}",
+                    "{} source archive entry is invalid: {error}",
                     policy.package
                 )
             })?;
-        if body.len() as u64 != size || files.insert(relative.to_string(), body).is_some() {
-            return Err(format!(
-                "{} source archive contains a duplicate or truncated file",
-                policy.package
-            ));
+            count += 1;
+            if count > MAX_CRATE_FILES {
+                return Err(format!(
+                    "{} source archive contains too many entries",
+                    policy.package
+                ));
+            }
+            let size = entry.header().size().map_err(|error| {
+                format!(
+                    "{} source archive has an invalid entry size: {error}",
+                    policy.package
+                )
+            })?;
+            total = total
+                .checked_add(size)
+                .ok_or_else(|| format!("{} source archive size overflowed", policy.package))?;
+            if total > MAX_CRATE_UNPACKED_BYTES {
+                return Err(format!(
+                    "{} source archive expands beyond its limit",
+                    policy.package
+                ));
+            }
+            let raw_path = entry.path_bytes();
+            let raw_path = std::str::from_utf8(&raw_path)
+                .map_err(|_| format!("{} source archive has a non-UTF-8 path", policy.package))?
+                .to_string();
+            let directory = entry.header().entry_type().is_dir();
+            let path = raw_path.strip_suffix('/').unwrap_or(&raw_path);
+            validate_archive_path(path, &prefix, policy.package)?;
+            if directory {
+                continue;
+            }
+            if !entry.header().entry_type().is_file() {
+                return Err(format!(
+                    "{} source archive contains a non-file entry",
+                    policy.package
+                ));
+            }
+            let relative = path
+                .strip_prefix(&format!("{prefix}/"))
+                .ok_or_else(|| format!("{} source archive path lacks its root", policy.package))?;
+            let mut body = Vec::with_capacity(size.min(MAX_CRATE_BYTES as u64) as usize);
+            entry
+                .by_ref()
+                .take(size + 1)
+                .read_to_end(&mut body)
+                .map_err(|error| {
+                    format!(
+                        "{} source archive entry is unreadable: {error}",
+                        policy.package
+                    )
+                })?;
+            if body.len() as u64 != size || files.insert(relative.to_string(), body).is_some() {
+                return Err(format!(
+                    "{} source archive contains a duplicate or truncated file",
+                    policy.package
+                ));
+            }
         }
+        if count == 0 {
+            return Err(format!("{} source archive is empty", policy.package));
+        }
+        require_vcs_info(&files, policy, commit)?;
+        Ok(files)
+    })();
+
+    let mut stream = package.into_inner();
+    let drain = std::io::copy(&mut stream, &mut std::io::sink());
+    if stream_limit - stream.limit() > decompressed_limit {
+        return Err(format!(
+            "{} source archive expands beyond its limit",
+            policy.package
+        ));
     }
-    if count == 0 {
-        return Err(format!("{} source archive is empty", policy.package));
-    }
-    require_vcs_info(&files, policy, commit)?;
-    Ok(files)
+    drain.map_err(|error| {
+        format!(
+            "{} source archive decompressed stream is unreadable: {error}",
+            policy.package
+        )
+    })?;
+    inspection
 }
 
 fn validate_archive_path(path: &str, prefix: &str, package: &str) -> Result<(), String> {
@@ -415,15 +451,21 @@ mod tests {
     use flate2::Compression;
     use flate2::write::GzEncoder;
 
-    fn archive(path: &str, vcs: &[u8]) -> Vec<u8> {
+    fn archive_with_files(files: &[(&str, &[u8])]) -> Vec<u8> {
         let encoder = GzEncoder::new(Vec::new(), Compression::default());
         let mut builder = tar::Builder::new(encoder);
-        let mut header = tar::Header::new_gnu();
-        header.set_mode(0o644);
-        header.set_size(vcs.len() as u64);
-        header.set_cksum();
-        builder.append_data(&mut header, path, vcs).unwrap();
+        for (path, body) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_mode(0o644);
+            header.set_size(body.len() as u64);
+            header.set_cksum();
+            builder.append_data(&mut header, path, *body).unwrap();
+        }
         builder.into_inner().unwrap().finish().unwrap()
+    }
+
+    fn archive(path: &str, vcs: &[u8]) -> Vec<u8> {
+        archive_with_files(&[(path, vcs)])
     }
 
     #[test]
@@ -444,6 +486,45 @@ mod tests {
         let root = format!("{package}-0.4.0");
         assert!(validate_archive_path(&format!("{root}/../escape"), &root, package).is_err());
         assert!(validate_archive_path("other-0.4.0/Cargo.toml", &root, package).is_err());
+    }
+
+    #[test]
+    fn compressed_archive_expansion_within_stream_limit_is_accepted() {
+        let package = &crate::release_policy::TRAITS_POLICY.packages[0];
+        let commit = "a".repeat(40);
+        let vcs = format!("{{\"git\":{{\"sha1\":\"{commit}\"}},\"path_in_vcs\":\"\"}}");
+        let root = format!("{}-0.4.0", package.package);
+        let vcs_path = format!("{root}/.cargo_vcs_info.json");
+        let payload_path = format!("{root}/compressible.bin");
+        let payload = vec![b'a'; 64 * 1024];
+        let bytes = archive_with_files(&[
+            (vcs_path.as_str(), vcs.as_bytes()),
+            (payload_path.as_str(), payload.as_slice()),
+        ]);
+
+        assert!(bytes.len() < payload.len());
+        let files =
+            inspect_archive_with_limit(&bytes, package, "0.4.0", &commit, 80 * 1024).unwrap();
+        assert_eq!(files["compressible.bin"], payload);
+    }
+
+    #[test]
+    fn oversized_hidden_gnu_metadata_exceeds_stream_limit() {
+        let package = &crate::release_policy::TRAITS_POLICY.packages[0];
+        let commit = "a".repeat(40);
+        let vcs = format!("{{\"git\":{{\"sha1\":\"{commit}\"}},\"path_in_vcs\":\"\"}}");
+        let root = format!("{}-0.4.0", package.package);
+        let vcs_path = format!("{root}/.cargo_vcs_info.json");
+        let long_path = format!("{root}/{}", "a".repeat(8 * 1024));
+        let bytes = archive_with_files(&[
+            (vcs_path.as_str(), vcs.as_bytes()),
+            (long_path.as_str(), &[]),
+        ]);
+
+        assert!(bytes.len() < 2 * 1024);
+        let error =
+            inspect_archive_with_limit(&bytes, package, "0.4.0", &commit, 2 * 1024).unwrap_err();
+        assert!(error.contains("expands beyond its limit"));
     }
 
     #[test]

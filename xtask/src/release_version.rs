@@ -13,6 +13,7 @@ use clap::{Args, Subcommand, ValueEnum};
 use semver::{Prerelease, Version};
 use toml_edit::DocumentMut;
 
+use crate::bounded_process::{self, VALIDATION_OUTPUT_LIMITS};
 use crate::release::exact_output_line;
 use crate::release_policy::TRAITS_TOOLCHAIN;
 
@@ -252,10 +253,9 @@ impl CargoRunner for SystemCargoRunner {
         program: &OsStr,
         args: &[OsString],
     ) -> Result<CargoOutput, String> {
-        let output = Command::new(program)
-            .current_dir(root)
-            .args(args)
-            .output()
+        let mut command = Command::new(program);
+        command.current_dir(root).args(args);
+        let output = bounded_process::output(&mut command, VALIDATION_OUTPUT_LIMITS)
             .map_err(|error| format!("run {}: {error}", program.to_string_lossy()))?;
         Ok(CargoOutput {
             success: output.status.success(),
@@ -322,6 +322,12 @@ fn metadata_version_from_json(
     manifest: &Path,
     package: &str,
 ) -> Result<Version, String> {
+    bounded_process::require_within_limit(
+        output,
+        VALIDATION_OUTPUT_LIMITS.stdout,
+        "Cargo metadata",
+    )
+    .map_err(|error| error.to_string())?;
     let metadata: serde_json::Value = serde_json::from_slice(output)
         .map_err(|error| format!("Cargo returned invalid metadata: {error}"))?;
     let packages = metadata
@@ -938,6 +944,56 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn metadata_json_rejects_candidate_input_above_byte_ceiling() {
+        let error = metadata_version_from_json(
+            &vec![b' '; VALIDATION_OUTPUT_LIMITS.stdout + 1],
+            Path::new("Cargo.toml"),
+            TRAITS_PACKAGE,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            format!(
+                "Cargo metadata exceeded its {}-byte limit",
+                VALIDATION_OUTPUT_LIMITS.stdout
+            )
+        );
+    }
+
+    #[test]
+    fn system_cargo_runner_bounds_candidate_metadata_while_reading() {
+        let temporary = TestDirectory::new("bounded-cargo-metadata");
+        let root = &temporary.0;
+        fs::create_dir(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn value() -> u8 { 1 }\n").unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"metadata-bound-test\"\nversion = \"0.1.0\"\n\
+                 edition = \"2024\"\npublish = false\n\n[package.metadata]\npadding = \"{}\"\n",
+                "x".repeat(VALIDATION_OUTPUT_LIMITS.stdout)
+            ),
+        )
+        .unwrap();
+        let args = ["metadata", "--no-deps", "--format-version", "1"]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>();
+
+        let error = SystemCargoRunner
+            .output(root, &cargo_program(), &args)
+            .unwrap_err();
+
+        assert!(
+            error.contains(&format!(
+                "stdout exceeded its {}-byte limit",
+                VALIDATION_OUTPUT_LIMITS.stdout
+            )),
+            "unexpected bounded-output error: {error}"
+        );
     }
 
     fn cargo_output(stdout: impl Into<Vec<u8>>) -> Result<CargoOutput, String> {
