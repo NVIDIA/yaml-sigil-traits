@@ -172,6 +172,8 @@ fn require_cargo_machete() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{CARGO_MACHETE_INSTALL_COMMAND, POST_PACKAGE_STEPS};
+    #[cfg(windows)]
+    use super::{PRE_PACKAGE_STEPS, run_step};
 
     const AGENT_GUIDANCE: &str = include_str!("../../AGENTS.md");
     const GITMODULES: &str = include_str!("../../.gitmodules");
@@ -214,5 +216,83 @@ mod tests {
                 .any(|command| command == "cargo audit --file xtask/Cargo.lock")
         );
         assert!(AGENT_GUIDANCE.contains("cargo audit --file xtask/Cargo.lock"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn candidate_working_directory_does_not_shadow_cargo() {
+        let (candidate, marker) = candidate_with_cargo_decoy();
+        let cargo_step = PRE_PACKAGE_STEPS
+            .iter()
+            .copied()
+            .find(|step| step.program == "cargo")
+            .expect("protected validation must contain a Cargo step");
+
+        run_step(candidate.path(), cargo_step).unwrap();
+        assert!(
+            !marker.exists(),
+            "candidate cargo.exe shadowed the protected validation step"
+        );
+
+        let package_result = crate::package_content::check_test_package(candidate.path());
+        assert!(
+            !marker.exists(),
+            "candidate cargo.exe shadowed package-content validation"
+        );
+        assert_eq!(package_result.unwrap(), 4);
+    }
+
+    #[cfg(windows)]
+    fn candidate_with_cargo_decoy() -> (tempfile::TempDir, std::path::PathBuf) {
+        let candidate = tempfile::tempdir().unwrap();
+        let root = candidate.path();
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\n\
+             name = \"candidate-package\"\n\
+             version = \"0.1.0\"\n\
+             edition = \"2024\"\n\
+             license = \"Apache-2.0\"\n\
+             exclude = [\"cargo.exe\", \"cargo-decoy.rs\", \"shadow-marker\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn value() -> u8 {\n    1\n}\n",
+        )
+        .unwrap();
+
+        let marker = root.join("shadow-marker");
+        let decoy_build = tempfile::tempdir().unwrap();
+        let decoy_source = decoy_build.path().join("cargo-decoy.rs");
+        let decoy_executable = decoy_build.path().join("cargo.exe");
+        std::fs::write(
+            &decoy_source,
+            format!(
+                "fn main() {{ std::fs::write({:?}, b\"shadowed\").unwrap(); }}\n",
+                marker.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let output = std::process::Command::new("rustc")
+            .arg(&decoy_source)
+            .arg("--crate-name")
+            .arg("candidate_cargo_decoy")
+            .arg("-o")
+            .arg(&decoy_executable)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "failed to compile harmless cargo.exe decoy: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::fs::copy(decoy_executable, root.join("cargo.exe")).unwrap();
+        assert!(
+            !std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+                .any(|entry| entry == root)
+        );
+        (candidate, marker)
     }
 }

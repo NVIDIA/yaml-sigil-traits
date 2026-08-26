@@ -4,10 +4,12 @@
 //! Repository maintenance tasks. Invoke from the repository root with
 //! `cargo xtask <COMMAND>`.
 
+mod bounded_process;
 mod ci;
 mod crate_archive;
 mod github;
 mod package_content;
+mod package_content_policy;
 mod release;
 mod release_baseline;
 mod release_policy;
