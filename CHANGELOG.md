@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0-rc.2](https://github.com/NVIDIA/yaml-sigil-traits/compare/v0.4.0-rc.1...v0.4.0-rc.2) - 2026-08-27
+
+### Added
+
+- *(xtask)* consolidate release automation
+
+### Fixed
+
+- *(release)* verify cargo-binstall version
+- *(ci)* isolate protected fork validation
+- *(ci)* require author DCO signoff
+- *(ci)* bound protected validation resources
+- *(xtask)* require Clap 4.6
+- *(ci)* complete Cargo target policy
+- *(ci)* harden protected validation
+- *(release)* bind proposal intent and validation
+- *(ci)* reconcile protected check state ([#36](https://github.com/NVIDIA/yaml-sigil-traits/pull/36))
+- *(ci)* harden protected candidate policy ([#35](https://github.com/NVIDIA/yaml-sigil-traits/pull/35))
+- *(ci)* retire copied-head validation
+- *(ci)* disable copied pull request syncing
+
+### Other
+
+- enforce dependency policy with cargo-deny
+- validate signed fork contributions
+- *(xtask)* derive release command parsing
+- *(release)* adopt Rust automation
+- *(release)* preserve reviewed commit signatures
+- *(release)* harden official automation
+- add protected pull request validation
+- *(signing)* clarify capability surface
+
 ## [0.4.0-rc.1](https://github.com/NVIDIA/yaml-sigil-traits/compare/v0.3.0-rc.2...v0.4.0-rc.1) - 2026-08-21
 
 ### Fixed
