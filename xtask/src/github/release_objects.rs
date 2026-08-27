@@ -17,7 +17,8 @@ use toml_edit::DocumentMut;
 
 use crate::crate_archive::{CratesIo, Registry, require_archive, require_clean_source};
 use crate::github::consts::RepositoryKind;
-use crate::github::models::{GitObject, GitRef, Signature, User};
+use crate::github::identity::token_signature;
+use crate::github::models::{GitObject, GitRef, Signature};
 use crate::github::transport::{Transport, percent_encode};
 use crate::github::{ReconcileMode, git_line, is_sha, repository_policy_for_root};
 use crate::release_policy::{PackagePolicy, ReleasePolicy, detect};
@@ -69,27 +70,13 @@ struct TokenIdentity {
 }
 
 fn token_identity(root: &Path, github: &mut impl Transport) -> Result<TokenIdentity, String> {
-    let user: User = github.get("user")?;
-    if user.login.is_empty() || user.id == 0 {
-        return Err("GitHub token has no exact immutable identity".to_string());
-    }
-    let expected_name = user
-        .name
-        .as_deref()
-        .filter(|value| !value.is_empty() && !value.contains(['\0', '\r', '\n']))
-        .unwrap_or(&user.login);
-    let expected_email = format!("{}+{}@users.noreply.github.com", user.id, user.login);
-    if git_line(root, &["config", "--local", "user.name"])? != expected_name
-        || git_line(root, &["config", "--local", "user.email"])? != expected_email
+    let signature = token_signature(github)?;
+    if git_line(root, &["config", "--local", "user.name"])? != signature.name
+        || git_line(root, &["config", "--local", "user.email"])? != signature.email
     {
         return Err("local release identity is not bound to the current GitHub token".to_string());
     }
-    Ok(TokenIdentity {
-        signature: Signature {
-            name: expected_name.to_string(),
-            email: expected_email,
-        },
-    })
+    Ok(TokenIdentity { signature })
 }
 
 #[derive(Clone, Debug)]
@@ -683,7 +670,7 @@ mod tests {
 
     use super::*;
     use crate::crate_archive::RegistryVersion;
-    use crate::github::consts::TRAITS_REPOSITORY;
+    use crate::github::consts::{APP_EMAIL, APP_ID, APP_LOGIN, TRAITS_REPOSITORY};
     use crate::github::transport::fake::{Expected, FakeTransport};
 
     #[test]
@@ -703,6 +690,40 @@ mod tests {
     fn release_heading_requires_an_exact_date() {
         assert!(release_heading("## [0.4.0] - 2026-08-25", "0.4.0"));
         assert!(!release_heading("## [0.4.0] - someday", "0.4.0"));
+    }
+
+    #[test]
+    fn release_object_identity_uses_the_graphql_viewer() {
+        let root = tempfile::tempdir().unwrap();
+        crate::github::git_output(root.path(), &["init", "--quiet"]).unwrap();
+        crate::github::git_output(root.path(), &["config", "--local", "user.name", APP_LOGIN])
+            .unwrap();
+        crate::github::git_output(root.path(), &["config", "--local", "user.email", APP_EMAIL])
+            .unwrap();
+        let payload = json!({
+            "query": "query { viewer { name login databaseId } }",
+        });
+        let response = json!({
+            "data": {
+                "viewer": {
+                    "login": APP_LOGIN,
+                    "databaseId": APP_ID,
+                    "name": null,
+                }
+            }
+        });
+        let mut github = FakeTransport::new([Expected::mutation(
+            "GRAPHQL",
+            "graphql",
+            payload,
+            Ok(response),
+        )]);
+
+        let identity = token_identity(root.path(), &mut github).unwrap();
+
+        assert_eq!(identity.signature.name, APP_LOGIN);
+        assert_eq!(identity.signature.email, APP_EMAIL);
+        github.finish();
     }
 
     #[test]

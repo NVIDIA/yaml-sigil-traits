@@ -9,6 +9,7 @@ use std::path::Path;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::github::models::Signature;
 use crate::github::transport::Transport;
 use crate::github::{git_line, git_output, repository_policy_for_root, workflow_repository};
 
@@ -43,6 +44,19 @@ fn local_repository_argument(repository: Option<&str>) -> Result<&str, String> {
 }
 
 fn configure(root: &Path, github: &mut impl Transport) -> Result<(), String> {
+    let identity = token_signature(github)?;
+    git_output(root, &["config", "--local", "user.name", &identity.name])?;
+    git_output(root, &["config", "--local", "user.email", &identity.email])?;
+    if git_line(root, &["config", "--local", "user.name"])? != identity.name
+        || git_line(root, &["config", "--local", "user.email"])? != identity.email
+    {
+        return Err("the release Git identity did not persist locally".to_string());
+    }
+    eprintln!("github: configured the token-derived local Git identity");
+    Ok(())
+}
+
+pub(super) fn token_signature(github: &mut impl Transport) -> Result<Signature, String> {
     let response: ViewerResponse = github.graphql(&json!({
         "query": "query { viewer { name login databaseId } }",
     }))?;
@@ -60,17 +74,10 @@ fn configure(root: &Path, github: &mut impl Transport) -> Result<(), String> {
         .name
         .as_deref()
         .filter(|name| valid_name(name))
-        .unwrap_or(&viewer.login);
+        .unwrap_or(&viewer.login)
+        .to_string();
     let email = format!("{}+{}@users.noreply.github.com", viewer.id, viewer.login);
-    git_output(root, &["config", "--local", "user.name", name])?;
-    git_output(root, &["config", "--local", "user.email", &email])?;
-    if git_line(root, &["config", "--local", "user.name"])? != name
-        || git_line(root, &["config", "--local", "user.email"])? != email
-    {
-        return Err("the release Git identity did not persist locally".to_string());
-    }
-    eprintln!("github: configured the token-derived local Git identity");
-    Ok(())
+    Ok(Signature { name, email })
 }
 
 #[derive(Debug, Deserialize)]
