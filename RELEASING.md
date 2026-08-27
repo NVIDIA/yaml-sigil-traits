@@ -69,21 +69,54 @@ before the push. A concurrent `main` update makes the normal push fail closed;
 rebase and re-sign the human-owned branch, or refresh the App-owned proposal,
 then rerun exact-head CI. Never force-push `main`.
 
-The workflow remains a successful no-op while the GitHub App configuration is
-absent. It also waits without advancing the train until the version on `main`
-is available and non-yanked on crates.io.
+When enabled, the workflow remains a successful no-op while the GitHub App
+configuration is absent. It also waits without advancing the train until the
+version on `main` is available and non-yanked on crates.io.
 
-A push or `repository_dispatch` event may create one default `patch` proposal
-when no exact App-owned proposal exists. Once that proposal exists, background
-events leave it untouched. A repository writer must dispatch `Release
-proposal` with an explicit `patch`, `minor`, or `major` selection to revise the
-proposal. The workflow uses that dispatch input directly and does not store
-release intent in pull-request text.
+While `release-pr.yml` is enabled, a push or `repository_dispatch` event may
+create one default `patch` proposal when no exact App-owned proposal exists.
+Once that proposal exists, background events leave it untouched. A repository
+writer must dispatch `Release proposal` with an explicit `patch`, `minor`, or
+`major` selection to revise the proposal. The workflow uses that dispatch
+input directly and does not store release intent in pull-request text.
 
 Release proposals enter `protected-automation`, which is restricted to exact
 `main` and supplies only the App credential. Official publication enters
 `crates-io`, whose configured approval gates the OIDC-enabled publication job.
 Validation enters neither environment and receives no OIDC permission.
+
+### Bound workflow activation
+
+Keep `release-pr.yml` and `publish.yml` manually disabled between bounded
+release operations. Check their actual GitHub state, including disabled
+workflows, with:
+
+```shell
+gh workflow list --repo NVIDIA/yaml-sigil-traits --all
+```
+
+Enable only the workflow needed for the current operation. To create or revise
+the next RC proposal from exact current `main`, keep `publish.yml` disabled and
+run:
+
+```shell
+gh workflow enable release-pr.yml --repo NVIDIA/yaml-sigil-traits
+gh workflow run release-pr.yml --repo NVIDIA/yaml-sigil-traits \
+  --ref main -f mode=next-candidate -f bump=patch
+```
+
+Replace `patch` only with the reviewed `minor` or `major` intent. Stable
+promotion uses `mode=promote-stable` and `bump=patch`. Wait for the selected
+run to close, then disable the proposal workflow immediately:
+
+```shell
+gh workflow disable release-pr.yml --repo NVIDIA/yaml-sigil-traits
+```
+
+Do not rely on a push or repository-dispatch event that occurred while the
+workflow was disabled; use a fresh explicit dispatch after enabling it. Do not
+enable proposal and publication automation at the same time. The later
+validation and publication procedures enable only `publish.yml`.
 
 Every proposal resolves its comparison baseline from the last official
 annotated `v<version>` tag. The workflow confirms that the tag matches origin,
@@ -326,7 +359,9 @@ Before validation or publication, confirm:
 Run validation from `main`:
 
 ```shell
-gh workflow run publish.yml --ref main -f operation=validate
+gh workflow enable publish.yml --repo NVIDIA/yaml-sigil-traits
+gh workflow run publish.yml --repo NVIDIA/yaml-sigil-traits \
+  --ref main -f operation=validate
 ```
 
 Validation compares the candidate with the detached last official tagged
@@ -334,12 +369,18 @@ source using cargo-semver-checks before it runs ordinary `cargo package` and a
 release-plz dry run. It has no OIDC permission, uploads nothing, and does not
 enter the publication environment.
 
+If validation fails or publication will not begin immediately, disable
+`publish.yml` before investigating. When an authorized publication follows the
+successful validation immediately, leave it active only through that one
+publication run.
+
 ## Publish an official release
 
 Dispatch publication from `main`:
 
 ```shell
-gh workflow run publish.yml --ref main -f operation=publish
+gh workflow run publish.yml --repo NVIDIA/yaml-sigil-traits \
+  --ref main -f operation=publish
 ```
 
 The validation job runs first. The publication job starts only after
@@ -348,6 +389,12 @@ receives `id-token: write` and `contents: write`. Release-plz exchanges the job
 identity for a short-lived crates.io credential, publishes the source package,
 and creates the configured tag and source-only GitHub Release. A prerelease
 version becomes a GitHub prerelease.
+
+Approve only the pending `crates-io` deployment on the selected exact-SHA run.
+Use `gh run view <run-id> --web` to open it, confirm the validation job passed
+and the run still identifies current `main`, then record the environment
+approval. An earlier authorization or a deployment for another run is not a
+substitute for this per-run gate.
 
 Both validation and publication independently require exact current `main` to
 be the merge result of one reviewed App proposal or the documented signed
@@ -362,8 +409,19 @@ check out another commit.
 
 The publication invocation deliberately omits release-plz's `--dry-run` CLI
 flag.
+After the run closes, whether it succeeded or failed, disable publication
+immediately and confirm both release workflows are disabled:
+
+```shell
+gh workflow disable publish.yml --repo NVIDIA/yaml-sigil-traits
+gh workflow list --repo NVIDIA/yaml-sigil-traits --all
+```
+
 After a successful publication, the workflow requests the next release
-proposal.
+proposal. That notification is deliberately inert while `release-pr.yml` is
+disabled. Start the next proposal later with the bounded activation procedure
+above; do not leave proposal automation enabled merely to receive the
+notification.
 
 ## Verify and recover
 
