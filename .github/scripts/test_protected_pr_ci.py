@@ -50,7 +50,7 @@ MAINTAINER = "maintainer"
 
 def policy() -> dict:
     return {
-        "version": 1,
+        "version": 2,
         "default_branch": "main",
         "workflow_file": ".github/workflows/pr-ci.yml",
         "required_check": "Required CI",
@@ -68,23 +68,14 @@ def policy() -> dict:
             "commit_committer_email": GITHUB_COMMITTER_EMAIL,
             "allowed_paths": ["Cargo.toml", "CHANGELOG.md"],
         },
-        "expected_jobs": ["commit_policy", "workflow_lint"],
-        "sensitive_paths": [
-            "CODEOWNERS",
+        "expected_jobs": ["commit_policy", "workflow_lint", "candidate_ci"],
+        "candidate_ci_paths": [
             ".github/**",
             ".cargo/**",
             "**/.cargo/**",
-            "Cargo.toml",
-            "**/Cargo.toml",
-            "build.rs",
-            "**/build.rs",
-            "benches/**",
-            "**/benches/**",
-            "examples/**",
-            "**/examples/**",
-            "AGENTS.md",
-            ".agents/**",
-            "source-spec/**",
+            "deny.toml",
+            "deny.exceptions.toml",
+            "xtask/**",
         ],
     }
 
@@ -223,7 +214,7 @@ class FakeAuthorizationApi:
         self.pull = {
             "number": 7,
             "state": "open",
-            "user": {"login": "contributor"},
+        "user": {"login": "contributor", "id": 42},
             "base": {
                 "ref": "main",
                 "sha": MAIN_SHA,
@@ -378,24 +369,25 @@ class AuthorizationTests(unittest.TestCase):
     def test_repository_policy_configuration_is_valid(self) -> None:
         controller.load_config(str(POLICY_PATH))
 
-    def test_repository_policy_covers_cargo_configuration_and_auto_targets(self) -> None:
+    def test_repository_policy_covers_candidate_validation_surfaces(self) -> None:
         repository_policy = controller.load_config(str(POLICY_PATH))
         required = {
             ".cargo/**",
             "**/.cargo/**",
-            "benches/**",
-            "**/benches/**",
-            "examples/**",
-            "**/examples/**",
+            ".github/workflows/ci.yml",
+            ".github/workflows/pr-ci.yml",
+            "deny.toml",
+            "deny.exceptions.toml",
+            "xtask/**",
         }
 
-        self.assertLessEqual(required, set(repository_policy["sensitive_paths"]))
+        self.assertLessEqual(required, set(repository_policy["candidate_ci_paths"]))
 
     def test_repository_directory_patterns_match_roots_and_descendants(self) -> None:
         repository_policy = controller.load_config(str(POLICY_PATH))
         declarations = [
             pattern
-            for pattern in repository_policy["sensitive_paths"]
+            for pattern in repository_policy["candidate_ci_paths"]
             if pattern.endswith("/**")
         ]
         self.assertTrue(declarations)
@@ -405,9 +397,11 @@ class AuthorizationTests(unittest.TestCase):
             if root.startswith("**/"):
                 root = f"nested/{root[3:]}"
             with self.subTest(declaration=declaration, root=root):
-                self.assertTrue(controller.is_sensitive(root, [declaration]))
+                self.assertTrue(controller.matches_path_inventory(root, [declaration]))
                 self.assertTrue(
-                    controller.is_sensitive(f"{root}/representative-file", [declaration])
+                    controller.matches_path_inventory(
+                        f"{root}/representative-file", [declaration]
+                    )
                 )
 
     def test_writer_permissions_are_accepted(self) -> None:
@@ -486,15 +480,15 @@ class AuthorizationTests(unittest.TestCase):
         with self.assertRaisesRegex(controller.PolicyError, "pagination"):
             controller.authorize(event(), policy(), api, environment())
 
-    def test_renamed_sensitive_source_is_remove_plus_add(self) -> None:
+    def test_renamed_candidate_ci_source_is_remove_plus_add(self) -> None:
         api = FakeAuthorizationApi()
         api.set_change(
             "docs/retired-workflow.md",
             "renamed",
             previous_filename=".github/workflows/ci.yml",
         )
-        with self.assertRaisesRegex(controller.PolicyError, "same-repository branch"):
-            controller.authorize(event(), policy(), api, environment())
+        result = controller.authorize(event(), policy(), api, environment())
+        self.assertTrue(result.candidate_ci_required)
 
     def test_mutable_pull_file_view_is_never_authoritative(self) -> None:
         api = FakeAuthorizationApi()
@@ -503,13 +497,16 @@ class AuthorizationTests(unittest.TestCase):
         self.assertEqual(result.head_sha, HEAD_SHA)
         self.assertFalse(any("/pulls/7/files" in path for path in api.get_paths))
 
-    def test_sensitive_fork_change_runs_no_candidate_policy(self) -> None:
+    def test_candidate_ci_change_from_fork_is_authorized_and_required(self) -> None:
         api = FakeAuthorizationApi()
         api.set_change(".github/workflows/ci.yml")
-        with self.assertRaisesRegex(controller.PolicyError, "same-repository branch"):
-            controller.authorize(event(), policy(), api, environment())
+        result = controller.authorize(event(), policy(), api, environment())
+        self.assertEqual(
+            result.head_repository, "contributor/yaml-sigil-example"
+        )
+        self.assertTrue(result.candidate_ci_required)
 
-    def test_sensitive_matching_uses_unicode_normalized_casefold_paths(self) -> None:
+    def test_candidate_ci_matching_uses_unicode_normalized_casefold_paths(self) -> None:
         for path in (
             ".GitHub/Workflows/ci.yml",
             ".ＧitHub/workflows/ci.yml",
@@ -517,8 +514,8 @@ class AuthorizationTests(unittest.TestCase):
             with self.subTest(path=path):
                 api = FakeAuthorizationApi()
                 api.set_change(path)
-                with self.assertRaisesRegex(controller.PolicyError, "same-repository branch"):
-                    controller.authorize(event(), policy(), api, environment())
+                result = controller.authorize(event(), policy(), api, environment())
+                self.assertTrue(result.candidate_ci_required)
 
     def test_directory_patterns_cover_roots_descendants_and_normalized_forms(self) -> None:
         patterns = [
@@ -549,7 +546,7 @@ class AuthorizationTests(unittest.TestCase):
             "ＳＯＵＲＣＥ－ＳＰＥＣ/README.md",
         ):
             with self.subTest(path=path):
-                self.assertTrue(controller.is_sensitive(path, patterns))
+                self.assertTrue(controller.matches_path_inventory(path, patterns))
 
         for path in (
             ".carg",
@@ -562,34 +559,32 @@ class AuthorizationTests(unittest.TestCase):
             "source-specification/README.md",
         ):
             with self.subTest(near_miss=path):
-                self.assertFalse(controller.is_sensitive(path, patterns))
+                self.assertFalse(controller.matches_path_inventory(path, patterns))
 
-        self.assertTrue(controller.is_sensitive("SOURCE-SPEC", ["source-spec"]))
+        self.assertTrue(
+            controller.matches_path_inventory("SOURCE-SPEC", ["source-spec"])
+        )
         self.assertFalse(
-            controller.is_sensitive("source-spec/README.md", ["source-spec"])
+            controller.matches_path_inventory(
+                "source-spec/README.md", ["source-spec"]
+            )
         )
 
-    def test_sensitive_directory_entries_require_writer_adoption(self) -> None:
+    def test_candidate_ci_directory_entries_match_any_leaf_type(self) -> None:
         for path, leaf in (
             (".cargo", ("blob", "120000", HEAD_BLOB_SHA)),
             (".ＣＡＲＧＯ", ("blob", "120000", HEAD_BLOB_SHA)),
             ("nested/.cargo", ("blob", "120000", HEAD_BLOB_SHA)),
-            ("benches", ("blob", "120000", HEAD_BLOB_SHA)),
-            ("nested/ＢＥＮＣＨＥＳ", ("blob", "120000", HEAD_BLOB_SHA)),
-            ("examples", ("blob", "120000", HEAD_BLOB_SHA)),
-            ("nested/ＥＸＡＭＰＬＥＳ", ("blob", "120000", HEAD_BLOB_SHA)),
-            ("source-spec", ("commit", "160000", HEAD_BLOB_SHA)),
-            ("source-spec/README.md", ("blob", "100644", HEAD_BLOB_SHA)),
+            (".github", ("blob", "120000", HEAD_BLOB_SHA)),
+            (".github/workflows/ci.yml", ("blob", "100644", HEAD_BLOB_SHA)),
         ):
             with self.subTest(path=path, entry_type=leaf[0]):
                 api = FakeAuthorizationApi()
                 api.set_tree_files({}, {path: leaf})
-                with self.assertRaisesRegex(
-                    controller.PolicyError, "same-repository branch"
-                ):
-                    controller.authorize(event(), policy(), api, environment())
+                result = controller.authorize(event(), policy(), api, environment())
+                self.assertTrue(result.candidate_ci_required)
 
-    def test_auto_discovered_executable_targets_require_writer_adoption(self) -> None:
+    def test_ordinary_executable_targets_do_not_require_candidate_ci(self) -> None:
         for path in (
             "benches/throughput.rs",
             "nested/benches/throughput.rs",
@@ -599,62 +594,58 @@ class AuthorizationTests(unittest.TestCase):
             with self.subTest(path=path):
                 api = FakeAuthorizationApi()
                 api.set_change(path)
-                with self.assertRaisesRegex(
-                    controller.PolicyError, "same-repository branch"
-                ):
-                    controller.authorize(event(), policy(), api, environment())
-
-                api.pull["head"]["repo"]["full_name"] = REPOSITORY
                 result = controller.authorize(event(), policy(), api, environment())
-                self.assertEqual(result.head_sha, HEAD_SHA)
+                self.assertFalse(result.candidate_ci_required)
 
-    def test_root_and_nested_build_scripts_are_sensitive(self) -> None:
+    def test_build_scripts_do_not_require_candidate_ci(self) -> None:
         for path in ("build.rs", "nested/BUILD.RS"):
             with self.subTest(path=path):
                 api = FakeAuthorizationApi()
                 api.set_change(path)
-                with self.assertRaisesRegex(controller.PolicyError, "same-repository branch"):
-                    controller.authorize(event(), policy(), api, environment())
+                result = controller.authorize(event(), policy(), api, environment())
+                self.assertFalse(result.candidate_ci_required)
 
-    def test_verified_writer_adoption_requires_both_dco_identities(self) -> None:
+    def test_verified_human_commit_requires_only_exact_author_dco(self) -> None:
         api = FakeAuthorizationApi()
-        api.set_change("Cargo.toml")
-        api.pull["head"]["repo"]["full_name"] = REPOSITORY
-        api.permissions[MAINTAINER] = "maintain"
+        api.set_change(".github/workflows/ci.yml")
         api.details[HEAD_SHA] = git_commit(
             author_login="contributor",
             author_name="Contributor",
             author_email="contributor@example.invalid",
             committer_name="Maintainer",
             committer_email="maintainer@example.invalid",
+            message=(
+                "ci: update policy\n\n"
+                "Signed-off-by: Contributor <contributor@example.invalid>\n"
+            ),
         )
         result = controller.authorize(event(), policy(), api, environment())
-        self.assertEqual(result.head_repository, REPOSITORY)
+        self.assertEqual(
+            result.head_repository, "contributor/yaml-sigil-example"
+        )
 
         api.details[HEAD_SHA]["commit"]["message"] = (
             "ci: update policy\n\n"
-            "Signed-off-by: Contributor <contributor@example.invalid>\n"
+            "Signed-off-by: Maintainer <maintainer@example.invalid>\n"
         )
-        with self.assertRaisesRegex(controller.PolicyError, "adopting committer"):
+        with self.assertRaisesRegex(controller.PolicyError, "author's DCO sign-off"):
             controller.authorize(event(), policy(), api, environment())
 
-    def test_sensitive_adoption_requires_verified_writer_commit(self) -> None:
+    def test_every_human_commit_requires_valid_github_verification(self) -> None:
         api = FakeAuthorizationApi()
         api.set_change("AGENTS.md")
-        api.pull["head"]["repo"]["full_name"] = REPOSITORY
         api.details[HEAD_SHA] = git_commit(verified=False)
         with self.assertRaisesRegex(controller.PolicyError, "not GitHub Verified"):
             controller.authorize(event(), policy(), api, environment())
 
         api.details[HEAD_SHA] = git_commit(committer_login="outsider")
         api.permissions["outsider"] = "read"
-        with self.assertRaisesRegex(controller.PolicyError, "committer"):
-            controller.authorize(event(), policy(), api, environment())
+        result = controller.authorize(event(), policy(), api, environment())
+        self.assertEqual(result.head_sha, HEAD_SHA)
 
     def test_full_commit_response_must_match_requested_sha(self) -> None:
         api = FakeAuthorizationApi()
         api.set_change("Cargo.toml")
-        api.pull["head"]["repo"]["full_name"] = REPOSITORY
         api.details[HEAD_SHA]["sha"] = OLD_SHA
         with self.assertRaisesRegex(controller.PolicyError, "requested SHA"):
             controller.authorize(event(), policy(), api, environment())
@@ -717,6 +708,11 @@ class AuthorizationTests(unittest.TestCase):
             controller.authorize(event(), policy(), api, environment())
 
         api = self.release_app_api()
+        api.pull["user"]["login"] = "release-app-lookalike"
+        with self.assertRaisesRegex(controller.PolicyError, "not owned by the release App"):
+            controller.authorize(event(), policy(), api, environment())
+
+        api = self.release_app_api()
         api.details[HEAD_SHA]["author"]["id"] += 1
         with self.assertRaisesRegex(controller.PolicyError, "author ID"):
             controller.authorize(event(), policy(), api, environment())
@@ -727,6 +723,14 @@ class AuthorizationTests(unittest.TestCase):
                 api.details[HEAD_SHA]["commit"]["author"][field] = "lookalike"
                 with self.assertRaisesRegex(controller.PolicyError, f"author {field}"):
                     controller.authorize(event(), policy(), api, environment())
+
+    def test_release_app_identity_cannot_fall_back_when_disabled(self) -> None:
+        api = self.release_app_api()
+        disabled = policy()
+        disabled["release_app"]["enabled"] = False
+
+        with self.assertRaisesRegex(controller.PolicyError, "exception is disabled"):
+            controller.authorize(event(), disabled, api, environment())
 
     def test_release_app_rejects_bot_raw_committer(self) -> None:
         api = self.release_app_api()
@@ -919,7 +923,7 @@ class ImmutableTreeTests(unittest.TestCase):
             ],
         )
 
-    def test_gitlink_replacement_retains_sensitive_root_identity(self) -> None:
+    def test_gitlink_replacement_retains_inventory_root_identity(self) -> None:
         base = self.snapshot(
             {"source-spec": ("commit", "160000", BASE_BLOB_SHA)}
         )
@@ -937,7 +941,10 @@ class ImmutableTreeTests(unittest.TestCase):
             ],
         )
         self.assertTrue(
-            all(controller.is_sensitive(path, ["source-spec/**"]) for path in paths)
+            all(
+                controller.matches_path_inventory(path, ["source-spec/**"])
+                for path in paths
+            )
         )
 
     def test_commit_and_tree_responses_are_bound_to_exact_requested_objects(self) -> None:
@@ -1317,18 +1324,32 @@ class CheckRunTests(unittest.TestCase):
             controller.start_check(api, policy(), external(), "another-app")
         self.assertEqual(api.posts, [])
 
-    def test_expected_jobs_are_exact_and_skips_fail(self) -> None:
-        expected = ["commit_policy", "workflow_lint"]
+    def test_expected_jobs_are_exact_and_skips_remain_explicit(self) -> None:
+        expected = ["commit_policy", "workflow_lint", "candidate_ci"]
         self.assertEqual(
             controller.parse_results(
-                ["commit_policy=success", "workflow_lint=success"], expected
+                [
+                    "commit_policy=success",
+                    "workflow_lint=success",
+                    "candidate_ci=skipped",
+                ],
+                expected,
             ),
-            {"commit_policy": "success", "workflow_lint": "success"},
+            {
+                "commit_policy": "success",
+                "workflow_lint": "success",
+                "candidate_ci": "skipped",
+            },
         )
         with self.assertRaisesRegex(controller.PolicyError, "exactly match"):
             controller.parse_results(["commit_policy=success"], expected)
         results = controller.parse_results(
-            ["commit_policy=success", "workflow_lint=skipped"], expected
+            [
+                "commit_policy=success",
+                "workflow_lint=skipped",
+                "candidate_ci=skipped",
+            ],
+            expected,
         )
         self.assertNotEqual(results["workflow_lint"], "success")
 
@@ -1343,7 +1364,11 @@ class CheckRunTests(unittest.TestCase):
             environment(),
             binding,
             1,
-            ["commit_policy=success", "workflow_lint=success"],
+            [
+                "commit_policy=success",
+                "workflow_lint=success",
+                "candidate_ci=skipped",
+            ],
             APP_SLUG,
         )
         self.assertEqual(app_api.patches[-1][1]["conclusion"], "success")
@@ -1358,9 +1383,38 @@ class CheckRunTests(unittest.TestCase):
                 environment(),
                 binding,
                 1,
-                ["commit_policy=success", "workflow_lint=skipped"],
+                [
+                    "commit_policy=success",
+                    "workflow_lint=skipped",
+                    "candidate_ci=skipped",
+                ],
                 APP_SLUG,
             )
+        self.assertEqual(app_api.patches[-1][1]["conclusion"], "failure")
+
+    def test_required_candidate_ci_may_not_be_skipped(self) -> None:
+        binding = external()
+        app_api = FakeCheckApi([pending_check(1, binding)])
+        auth_api = FakeAuthorizationApi()
+        auth_api.set_change(".github/workflows/ci.yml")
+
+        with self.assertRaisesRegex(controller.PolicyError, "did not all succeed"):
+            controller.finish_check(
+                app_api,
+                auth_api,
+                policy(),
+                workflow_dispatch_event(),
+                environment(),
+                binding,
+                1,
+                [
+                    "commit_policy=success",
+                    "workflow_lint=success",
+                    "candidate_ci=skipped",
+                ],
+                APP_SLUG,
+            )
+
         self.assertEqual(app_api.patches[-1][1]["conclusion"], "failure")
 
     def test_success_is_overwritten_if_main_advances_during_reconciliation(self) -> None:
@@ -1380,7 +1434,11 @@ class CheckRunTests(unittest.TestCase):
                 environment(),
                 binding,
                 1,
-                ["commit_policy=success", "workflow_lint=success"],
+                [
+                    "commit_policy=success",
+                    "workflow_lint=success",
+                    "candidate_ci=skipped",
+                ],
                 APP_SLUG,
             )
 
@@ -1406,7 +1464,11 @@ class CheckRunTests(unittest.TestCase):
                 environment(),
                 binding,
                 1,
-                ["commit_policy=success", "workflow_lint=success"],
+                [
+                    "commit_policy=success",
+                    "workflow_lint=success",
+                    "candidate_ci=skipped",
+                ],
                 APP_SLUG,
             )
 
@@ -1435,7 +1497,11 @@ class CheckRunTests(unittest.TestCase):
                 environment(),
                 binding,
                 1,
-                ["commit_policy=success", "workflow_lint=success"],
+                [
+                    "commit_policy=success",
+                    "workflow_lint=success",
+                    "candidate_ci=skipped",
+                ],
                 APP_SLUG,
             )
 
