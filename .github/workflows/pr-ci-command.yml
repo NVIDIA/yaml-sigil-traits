@@ -1,5 +1,5 @@
 name: Protected pull request command
-run-name: PR #${{ github.event.issue.number }} test command
+run-name: "PR #${{ github.event.issue.number }} comment ${{ github.event.comment.id }}"
 
 on:
   issue_comment:
