@@ -1,7 +1,7 @@
 {
   "version": 2,
   "default_branch": "main",
-  "workflow_file": ".github/workflows/pr-ci.yml",
+  "workflow_file": ".github/workflows/pr-ci-command.yml",
   "required_check": "Required CI",
   "release_app": {
     "enabled": true,

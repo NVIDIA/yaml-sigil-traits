@@ -36,18 +36,26 @@ from typing import Any, Iterable, Mapping, Sequence
 
 API_VERSION = "2022-11-28"
 COMMAND_RE = re.compile(r"/ok to test ([0-9a-f]{40})")
-RUN_TITLE_RE = re.compile(r"PR #([1-9][0-9]*) /ok to test ([0-9a-f]{40})")
 SHA_RE = re.compile(r"[0-9a-f]{40}")
+JOB_BINDING_MARKER = "protected-ci|"
+CALLER_JOB_NAME = "Run authorized protected CI"
+JOB_BINDING_RE = re.compile(
+    rf"(?:{re.escape(CALLER_JOB_NAME)} / )?"
+    r"protected-ci\|pr=([1-9][0-9]*)"
+    r"\|head=([0-9a-f]{40})"
+    r"\|comment=([1-9][0-9]*)"
+)
+CALLER_WORKFLOW_NAME = "Protected pull request command"
 WRITER_PERMISSIONS = frozenset({"write", "push", "maintain", "admin"})
-GITHUB_ACTIONS_LOGIN = "github-actions[bot]"
 TERMINAL_CHECK_STATUSES = frozenset({"completed"})
 CHECK_NAME = "Required CI"
+MAX_API_RESPONSE_BYTES = 32 * 1024 * 1024
+MAX_API_ERROR_DETAIL_BYTES = 500
 MAX_CHANGED_PATHS = 3_000
 MAX_PULL_COMMITS = 250
 MAX_TREE_ENTRIES = 100_000
+MAX_WORKFLOW_JOBS = 1_000
 MAX_PAGES = 100
-MAX_API_RESPONSE_BYTES = 32 * 1024 * 1024
-MAX_API_ERROR_DETAIL_BYTES = 500
 
 
 class PolicyError(RuntimeError):
@@ -215,6 +223,7 @@ def load_config(path: str) -> Mapping[str, Any]:
             "\\" not in pattern and not pattern.startswith("/"),
             f"candidate_ci_paths[{index}] is invalid",
         )
+
     return config
 
 
@@ -252,10 +261,14 @@ class GitHubApi:
         except urllib.error.HTTPError as error:
             raw_detail = error.read(MAX_API_ERROR_DETAIL_BYTES + 1)
             truncated = len(raw_detail) > MAX_API_ERROR_DETAIL_BYTES
-            detail = raw_detail[:MAX_API_ERROR_DETAIL_BYTES].decode("utf-8", "replace")
+            detail = raw_detail[:MAX_API_ERROR_DETAIL_BYTES].decode(
+                "utf-8", "replace"
+            )
             if truncated:
                 detail = f"{detail}..."
-            raise PolicyError(f"GitHub API {method} {path} failed with HTTP {error.code}: {detail}") from error
+            raise PolicyError(
+                f"GitHub API {method} {path} failed with HTTP {error.code}: {detail}"
+            ) from error
         except (urllib.error.URLError, TimeoutError, OSError) as error:
             raise PolicyError(f"GitHub API {method} {path} failed: {error}") from error
         if not raw:
@@ -714,6 +727,7 @@ def require_contributor_change(
 class Authorization:
     repository: str
     pull_number: int
+    commenter: str
     head_sha: str
     base_sha: str
     head_repository: str
@@ -733,6 +747,40 @@ class Authorization:
             "comment_id": str(self.comment_id),
             "candidate_ci_required": str(self.candidate_ci_required).lower(),
         }
+
+
+@dataclass(frozen=True)
+class CallBinding:
+    pull_number: int
+    head_sha: str
+    comment_id: int
+
+    def encode_job_name(self) -> str:
+        require(
+            self.pull_number > 0 and self.comment_id > 0,
+            "call binding integers must be positive",
+        )
+        validate_sha(self.head_sha, "call binding head SHA")
+        return (
+            f"{JOB_BINDING_MARKER}pr={self.pull_number}"
+            f"|head={self.head_sha}|comment={self.comment_id}"
+        )
+
+    @staticmethod
+    def decode_job_name(value: Any) -> "CallBinding | None":
+        name = require_string(value, "workflow job name")
+        if JOB_BINDING_MARKER not in name:
+            return None
+        match = JOB_BINDING_RE.fullmatch(name)
+        require(
+            match is not None,
+            "workflow job binding is malformed or truncated",
+        )
+        return CallBinding(
+            pull_number=int(match.group(1)),
+            head_sha=match.group(2),
+            comment_id=int(match.group(3)),
+        )
 
 
 def authorize(
@@ -830,6 +878,7 @@ def authorize(
     return Authorization(
         repository=repository,
         pull_number=pull_number,
+        commenter=commenter,
         head_sha=head_sha,
         base_sha=base_sha,
         head_repository=head_repository,
@@ -838,19 +887,6 @@ def authorize(
         comment_id=comment_id,
         candidate_ci_required=candidate_ci_required,
     )
-
-
-def positive_decimal(value: Any, label: str) -> int:
-    text = require_string(value, label)
-    require(re.fullmatch(r"[1-9][0-9]*", text) is not None, f"{label} must be a positive decimal integer")
-    return int(text)
-
-
-def dispatch_inputs(event: Mapping[str, Any]) -> Mapping[str, Any]:
-    inputs = require_mapping(event.get("inputs"), "workflow dispatch inputs")
-    required = {"pull_number", "head_sha", "base_sha", "policy_sha", "comment_id"}
-    require(set(inputs) == required, "workflow dispatch input keys are incomplete or ambiguous")
-    return inputs
 
 
 def original_comment_event(
@@ -874,89 +910,159 @@ def original_comment_event(
     }
 
 
-def require_dispatch_actor(
-    api: GitHubApi,
+def require_authorization_values(
+    authorization: Authorization,
+    *,
     repository: str,
-    environment: Mapping[str, str],
+    pull_number: int,
+    head_sha: str,
+    base_sha: str,
+    policy_sha: str,
+    comment_id: int,
 ) -> None:
-    actor = validate_login(environment.get("GITHUB_ACTOR"), "GITHUB_ACTOR")
-    triggering_actor = validate_login(
-        environment.get("GITHUB_TRIGGERING_ACTOR"), "GITHUB_TRIGGERING_ACTOR"
-    )
-    run_attempt = positive_decimal(environment.get("GITHUB_RUN_ATTEMPT"), "GITHUB_RUN_ATTEMPT")
-    if actor != GITHUB_ACTIONS_LOGIN:
-        require_writer(api, repository, actor, "workflow dispatch actor")
-    if triggering_actor == GITHUB_ACTIONS_LOGIN:
-        require(run_attempt == 1, "an automated identity may not rerun protected validation")
-    else:
-        require_writer(api, repository, triggering_actor, "workflow dispatch triggering actor")
+    require(authorization.repository == repository, "authorized repository changed")
+    require(authorization.pull_number == pull_number, "authorized pull request changed")
+    require(authorization.head_sha == head_sha, "authorized head SHA changed")
+    require(authorization.base_sha == base_sha, "authorized base SHA changed")
+    require(authorization.policy_sha == policy_sha, "authorized policy SHA changed")
+    require(authorization.comment_id == comment_id, "authorized comment changed")
 
 
-def authorize_dispatch(
-    event: Mapping[str, Any],
-    config: Mapping[str, Any],
+def authorize_live_comment(
     api: GitHubApi,
-    environment: Mapping[str, str],
+    config: Mapping[str, Any],
+    repository: str,
+    pull_number: int,
+    comment_id: int,
+    policy_sha: str,
+    triggering_actor: str,
 ) -> Authorization:
-    repository = validate_repository(environment.get("GITHUB_REPOSITORY"), "GITHUB_REPOSITORY")
-    branch = require_string(config.get("default_branch"), "default_branch")
-    require(
-        environment.get("GITHUB_REF") == f"refs/heads/{branch}",
-        "protected validation must be dispatched on exact main",
-    )
-    event_repo = require_mapping(event.get("repository"), "event repository")
-    require(event_repo.get("full_name") == repository, "event repository does not match the workflow repository")
-    inputs = dispatch_inputs(event)
-    pull_number = positive_decimal(inputs.get("pull_number"), "pull_number input")
-    comment_id = positive_decimal(inputs.get("comment_id"), "comment_id input")
-    requested_head = validate_sha(inputs.get("head_sha"), "head_sha input")
-    requested_base = validate_sha(inputs.get("base_sha"), "base_sha input")
-    requested_policy = validate_sha(inputs.get("policy_sha"), "policy_sha input")
-    policy_sha = validate_sha(environment.get("POLICY_SHA"), "POLICY_SHA")
-    require(requested_policy == policy_sha, "dispatch policy SHA is not the workflow policy SHA")
-
     comment_event = original_comment_event(api, repository, pull_number, comment_id)
     original_comment = require_mapping(comment_event.get("comment"), "original comment")
     original_user = require_mapping(original_comment.get("user"), "original comment user")
     commenter = validate_login(original_user.get("login"), "original commenter")
-    synthetic_environment = dict(environment)
-    synthetic_environment["GITHUB_ACTOR"] = commenter
-    synthetic_environment["GITHUB_TRIGGERING_ACTOR"] = commenter
-    result = authorize(comment_event, config, api, synthetic_environment)
-    require(result.head_sha == requested_head, "dispatch head SHA differs from the authorized request")
-    require(result.base_sha == requested_base, "dispatch base SHA differs from the authorized request")
-    require(result.policy_sha == requested_policy, "dispatch policy SHA differs from the authorized request")
-    require(result.comment_id == comment_id, "dispatch comment ID differs from the authorized request")
-    require_dispatch_actor(api, repository, environment)
-    return result
+    synthetic_environment = {
+        "GITHUB_REPOSITORY": repository,
+        "GITHUB_ACTOR": commenter,
+        "GITHUB_TRIGGERING_ACTOR": validate_login(
+            triggering_actor, "triggering actor"
+        ),
+        "POLICY_SHA": policy_sha,
+    }
+    return authorize(comment_event, config, api, synthetic_environment)
 
 
-def dispatch_comment(
+def authorize_comment(
     event: Mapping[str, Any],
     config: Mapping[str, Any],
     api: GitHubApi,
     environment: Mapping[str, str],
-) -> bool:
+) -> Authorization | None:
+    require(
+        environment.get("GITHUB_EVENT_NAME") == "issue_comment",
+        "the command receiver must retain the issue_comment event",
+    )
     comment = event.get("comment")
     if not isinstance(comment, dict) or command_sha(comment.get("body")) is None:
-        return False
-    authorization = authorize(event, config, api, environment)
-    workflow_file = validate_path(config.get("workflow_file"), "workflow_file")
-    encoded_workflow = urllib.parse.quote(workflow_file, safe="")
-    api.post(
-        repo_api_path(authorization.repository, f"/actions/workflows/{encoded_workflow}/dispatches"),
-        {
-            "ref": require_string(config.get("default_branch"), "default_branch"),
-            "inputs": {
-                "pull_number": str(authorization.pull_number),
-                "head_sha": authorization.head_sha,
-                "base_sha": authorization.base_sha,
-                "policy_sha": authorization.policy_sha,
-                "comment_id": str(authorization.comment_id),
-            },
-        },
+        return None
+    return authorize(event, config, api, environment)
+
+
+def authorize_call(
+    event: Mapping[str, Any],
+    config: Mapping[str, Any],
+    api: GitHubApi,
+    environment: Mapping[str, str],
+    *,
+    repository: str,
+    pull_number: int,
+    head_sha: str,
+    base_sha: str,
+    policy_sha: str,
+    comment_id: int,
+    run_id: int,
+    run_attempt: int,
+) -> Authorization:
+    repository = validate_repository(repository)
+    require(
+        environment.get("GITHUB_REPOSITORY") == repository,
+        "called repository does not match GITHUB_REPOSITORY",
     )
-    return True
+    branch = require_string(config.get("default_branch"), "default_branch")
+    require(
+        environment.get("GITHUB_REF") == f"refs/heads/{branch}",
+        "protected validation must be called on exact main",
+    )
+    require(
+        environment.get("GITHUB_EVENT_NAME") == "issue_comment",
+        "protected validation must retain the issue_comment event",
+    )
+    require(
+        validate_sha(environment.get("POLICY_SHA"), "POLICY_SHA") == policy_sha,
+        "call policy SHA is not the workflow policy SHA",
+    )
+    require(pull_number > 0 and comment_id > 0, "call identifiers must be positive")
+    validate_sha(head_sha, "called head SHA")
+    validate_sha(base_sha, "called base SHA")
+    validate_sha(policy_sha, "called policy SHA")
+    require(run_id > 0 and run_attempt > 0, "workflow run identity must be positive")
+
+    event_authorization = authorize(event, config, api, environment)
+    require_authorization_values(
+        event_authorization,
+        repository=repository,
+        pull_number=pull_number,
+        head_sha=head_sha,
+        base_sha=base_sha,
+        policy_sha=policy_sha,
+        comment_id=comment_id,
+    )
+
+    run = protected_run_identity(
+        api,
+        config,
+        repository,
+        run_id,
+        run_attempt,
+        policy_sha,
+        require_binding=True,
+    )
+    assert run is not None
+    require(
+        run.binding == CallBinding(pull_number, head_sha, comment_id),
+        "reusable-call job does not match the authorized request",
+    )
+
+    triggering_actor = validate_login(
+        environment.get("GITHUB_TRIGGERING_ACTOR"), "GITHUB_TRIGGERING_ACTOR"
+    )
+    require(
+        run.actor == event_authorization.commenter,
+        "workflow run actor is not the comment author",
+    )
+    require(
+        run.triggering_actor == triggering_actor,
+        "workflow run triggering actor is ambiguous",
+    )
+    live_authorization = authorize_live_comment(
+        api,
+        config,
+        repository,
+        pull_number,
+        comment_id,
+        policy_sha,
+        triggering_actor,
+    )
+    require_authorization_values(
+        live_authorization,
+        repository=repository,
+        pull_number=pull_number,
+        head_sha=head_sha,
+        base_sha=base_sha,
+        policy_sha=policy_sha,
+        comment_id=comment_id,
+    )
+    return live_authorization
 
 
 def write_github_outputs(path: str, values: Mapping[str, str]) -> None:
@@ -1176,6 +1282,7 @@ def finish_check(
     event: Mapping[str, Any],
     environment: Mapping[str, str],
     external: ExternalId,
+    comment_id: int,
     check_id: int,
     result_values: Iterable[str],
     observed_app_slug: str,
@@ -1184,12 +1291,20 @@ def finish_check(
     require(check.get("status") not in TERMINAL_CHECK_STATUSES, "check run is already completed")
     error: PolicyError | None = None
     try:
-        current = authorize_dispatch(event, config, auth_api, environment)
-        require(current.repository == external.repository, "repository changed before reporting")
-        require(current.pull_number == external.pull_number, "pull request changed before reporting")
-        require(current.head_sha == external.head_sha, "pull request head changed before reporting")
-        require(current.base_sha == external.base_sha, "pull request base changed before reporting")
-        require(current.policy_sha == external.policy_sha, "policy commit changed before reporting")
+        current = authorize_call(
+            event,
+            config,
+            auth_api,
+            environment,
+            repository=external.repository,
+            pull_number=external.pull_number,
+            head_sha=external.head_sha,
+            base_sha=external.base_sha,
+            policy_sha=external.policy_sha,
+            comment_id=comment_id,
+            run_id=external.run_id,
+            run_attempt=external.run_attempt,
+        )
         expected = [require_string(value, "expected job") for value in require_sequence(config.get("expected_jobs"), "expected_jobs")]
         results = parse_results(result_values, expected)
         failed = [
@@ -1266,32 +1381,226 @@ def finish_check(
         raise error
 
 
-def parse_run_title(value: Any) -> tuple[int, str]:
-    title = require_string(value, "workflow run title")
-    match = RUN_TITLE_RE.fullmatch(title)
-    require(match is not None, "workflow run title is not a protected pull-request run")
-    return int(match.group(1)), match.group(2)
+@dataclass(frozen=True)
+class ProtectedRun:
+    run_id: int
+    run_attempt: int
+    policy_sha: str
+    status: str
+    conclusion: str | None
+    actor: str
+    triggering_actor: str
+    binding: CallBinding
 
 
-def protected_run_identity(
-    run: Mapping[str, Any], config: Mapping[str, Any]
-) -> tuple[int, str, int, int, str]:
-    require(run.get("name") == "Protected pull request CI", "unexpected workflow name")
-    require(run.get("event") == "workflow_dispatch", "unexpected workflow event")
-    require(
-        run.get("path") == config.get("workflow_file"),
-        "unexpected workflow path",
+def workflow_actor(run: Mapping[str, Any], field: str) -> str:
+    actor = require_mapping(run.get(field), f"workflow run {field}")
+    return validate_login(actor.get("login"), f"workflow run {field} login")
+
+
+def caller_workflow_id(
+    api: GitHubApi,
+    repository: str,
+    config: Mapping[str, Any],
+) -> int:
+    workflow_file = validate_path(config.get("workflow_file"), "workflow_file")
+    encoded = urllib.parse.quote(workflow_file, safe="")
+    workflow = require_mapping(
+        api.get(repo_api_path(repository, f"/actions/workflows/{encoded}")),
+        "caller workflow",
     )
+    workflow_id = require_integer(workflow.get("id"), "caller workflow ID")
+    require(workflow_id > 0, "caller workflow ID must be positive")
+    require(workflow.get("name") == CALLER_WORKFLOW_NAME, "caller workflow name is unexpected")
+    require(workflow.get("path") == workflow_file, "caller workflow path is unexpected")
+    require(workflow.get("state") == "active", "caller workflow is not active")
+    return workflow_id
+
+
+def validate_run_metadata(
+    run: Mapping[str, Any],
+    config: Mapping[str, Any],
+    *,
+    run_id: int,
+    run_attempt: int,
+    policy_sha: str,
+    workflow_id: int,
+) -> tuple[str, str | None, str, str]:
+    require(run.get("id") == run_id, "workflow run ID is ambiguous")
+    require(
+        run.get("run_attempt") == run_attempt,
+        "workflow run attempt is ambiguous",
+    )
+    require(run_id > 0 and run_attempt > 0, "workflow run identity must be positive")
+    require(run.get("workflow_id") == workflow_id, "unexpected workflow ID")
+    require(run.get("event") == "issue_comment", "unexpected workflow event")
+    require(run.get("path") == config.get("workflow_file"), "unexpected workflow path")
     require(
         run.get("head_branch") == config.get("default_branch"),
         "unexpected workflow branch",
     )
-    pull_number, head_sha = parse_run_title(run.get("display_title"))
-    run_id = require_integer(run.get("id"), "workflow run id")
-    run_attempt = require_integer(run.get("run_attempt"), "workflow run attempt")
-    require(run_id > 0 and run_attempt > 0, "workflow run identity must be positive")
-    policy_sha = validate_sha(run.get("head_sha"), "workflow policy SHA")
-    return pull_number, head_sha, run_id, run_attempt, policy_sha
+    require(
+        validate_sha(run.get("head_sha"), "workflow policy SHA") == policy_sha,
+        "workflow policy SHA is unexpected",
+    )
+    status = require_string(run.get("status"), "workflow run status")
+    conclusion = run.get("conclusion")
+    require(
+        conclusion is None
+        or conclusion
+        in {
+            "success",
+            "failure",
+            "cancelled",
+            "skipped",
+            "timed_out",
+            "action_required",
+            "neutral",
+            "stale",
+        },
+        "workflow run conclusion is unexpected",
+    )
+    return (
+        status,
+        conclusion,
+        workflow_actor(run, "actor"),
+        workflow_actor(run, "triggering_actor"),
+    )
+
+
+def call_binding_for_run(
+    api: GitHubApi,
+    repository: str,
+    run_id: int,
+    run_attempt: int,
+    policy_sha: str,
+    *,
+    required: bool,
+) -> CallBinding | None:
+    jobs = api.paginate_key(
+        repo_api_path(repository, f"/actions/runs/{run_id}/jobs?filter=all"),
+        "jobs",
+        max_items=MAX_WORKFLOW_JOBS,
+        label="workflow run jobs",
+    )
+    bindings: list[CallBinding] = []
+    for index, value in enumerate(jobs):
+        job = require_mapping(value, f"workflow job {index}")
+        name = require_string(job.get("name"), f"workflow job {index} name")
+        if JOB_BINDING_MARKER not in name:
+            continue
+        attempt = require_integer(
+            job.get("run_attempt"), f"workflow job {index} run attempt"
+        )
+        if attempt != run_attempt:
+            continue
+        require(job.get("run_id") == run_id, "workflow job run ID is ambiguous")
+        require(
+            validate_sha(job.get("head_sha"), "workflow job policy SHA")
+            == policy_sha,
+            "workflow job policy SHA is unexpected",
+        )
+        require(
+            require_integer(job.get("id"), "workflow job ID") > 0,
+            "workflow job ID must be positive",
+        )
+        binding = CallBinding.decode_job_name(name)
+        assert binding is not None
+        bindings.append(binding)
+    require(len(bindings) <= 1, "multiple reusable-call binding jobs were found")
+    if not bindings:
+        require(not required, "reusable-call binding job is missing")
+        return None
+    return bindings[0]
+
+
+def protected_run_identity(
+    api: GitHubApi,
+    config: Mapping[str, Any],
+    repository: str,
+    run_id: int,
+    run_attempt: int,
+    policy_sha: str,
+    *,
+    require_binding: bool,
+) -> ProtectedRun | None:
+    workflow_id = caller_workflow_id(api, repository, config)
+    run = require_mapping(
+        api.get(repo_api_path(repository, f"/actions/runs/{run_id}")),
+        "workflow run",
+    )
+    status, conclusion, actor, triggering_actor = validate_run_metadata(
+        run,
+        config,
+        run_id=run_id,
+        run_attempt=run_attempt,
+        policy_sha=policy_sha,
+        workflow_id=workflow_id,
+    )
+    binding = call_binding_for_run(
+        api,
+        repository,
+        run_id,
+        run_attempt,
+        policy_sha,
+        required=require_binding,
+    )
+    if binding is None:
+        return None
+    return ProtectedRun(
+        run_id=run_id,
+        run_attempt=run_attempt,
+        policy_sha=policy_sha,
+        status=status,
+        conclusion=conclusion,
+        actor=actor,
+        triggering_actor=triggering_actor,
+        binding=binding,
+    )
+
+
+def completed_run_from_event(
+    api: GitHubApi,
+    config: Mapping[str, Any],
+    event: Mapping[str, Any],
+    repository: str,
+) -> ProtectedRun | None:
+    require(event.get("action") == "completed", "only completed workflow runs are reconciled")
+    event_repository = require_mapping(event.get("repository"), "event repository")
+    require(
+        event_repository.get("full_name") == repository,
+        "event repository does not match the workflow repository",
+    )
+    event_run = require_mapping(event.get("workflow_run"), "workflow_run")
+    run_id = require_integer(event_run.get("id"), "workflow run id")
+    run_attempt = require_integer(event_run.get("run_attempt"), "workflow run attempt")
+    policy_sha = validate_sha(event_run.get("head_sha"), "workflow policy SHA")
+    workflow_id = caller_workflow_id(api, repository, config)
+    validate_run_metadata(
+        event_run,
+        config,
+        run_id=run_id,
+        run_attempt=run_attempt,
+        policy_sha=policy_sha,
+        workflow_id=workflow_id,
+    )
+    run = protected_run_identity(
+        api,
+        config,
+        repository,
+        run_id,
+        run_attempt,
+        policy_sha,
+        require_binding=False,
+    )
+    if run is None:
+        return None
+    require(run.status == "completed", "reconciled workflow run is not completed")
+    require(
+        run.conclusion == event_run.get("conclusion"),
+        "workflow run conclusion changed during reconciliation",
+    )
+    return run
 
 
 def pending_checks_for_run(
@@ -1324,8 +1633,77 @@ def pending_checks_for_run(
     return matches
 
 
+def close_pending_check_for_run(
+    app_api: GitHubApi,
+    auth_api: GitHubApi,
+    config: Mapping[str, Any],
+    repository: str,
+    observed_app_slug: str,
+    run: ProtectedRun,
+    title: str,
+    summary: str,
+) -> int:
+    matches = pending_checks_for_run(
+        app_api,
+        config,
+        repository,
+        run.binding.pull_number,
+        run.binding.head_sha,
+        run.run_id,
+        run.run_attempt,
+        run.policy_sha,
+    )
+    require(len(matches) <= 1, "multiple pending checks match one workflow run")
+    if not matches:
+        return 0
+    check, external = matches[0]
+    try:
+        authorization = authorize_live_comment(
+            auth_api,
+            config,
+            repository,
+            run.binding.pull_number,
+            run.binding.comment_id,
+            run.policy_sha,
+            run.triggering_actor,
+        )
+        require(
+            run.actor == authorization.commenter,
+            "workflow run actor is not the comment author",
+        )
+        require_authorization_values(
+            authorization,
+            repository=external.repository,
+            pull_number=external.pull_number,
+            head_sha=external.head_sha,
+            base_sha=external.base_sha,
+            policy_sha=external.policy_sha,
+            comment_id=run.binding.comment_id,
+        )
+    except PolicyError as error:
+        summary = f"{summary} Final state validation failed: {error}"
+    check_id = require_integer(check.get("id"), "check run id")
+    updated = complete_check(
+        app_api,
+        repository,
+        check_id,
+        "cancelled" if run.conclusion == "cancelled" else "failure",
+        title,
+        summary,
+    )
+    validate_check_value(
+        updated,
+        config,
+        external,
+        check_id,
+        observed_app_slug,
+    )
+    return 1
+
+
 def reconcile_run(
     app_api: GitHubApi,
+    auth_api: GitHubApi,
     config: Mapping[str, Any],
     event: Mapping[str, Any],
     repository: str,
@@ -1333,47 +1711,28 @@ def reconcile_run(
 ) -> int:
     release_app = require_mapping(config.get("release_app"), "release_app")
     require_app_slug(observed_app_slug, validate_login(release_app.get("slug"), "release App slug"))
-    require(event.get("action") == "completed", "only completed workflow runs are reconciled")
-    event_repository = require_mapping(event.get("repository"), "event repository")
-    require(
-        event_repository.get("full_name") == repository,
-        "event repository does not match the workflow repository",
-    )
-    run = require_mapping(event.get("workflow_run"), "workflow_run")
-    pull_number, head_sha, run_id, run_attempt, policy_sha = protected_run_identity(
-        run, config
-    )
-    matches = pending_checks_for_run(
-        app_api,
-        config,
-        repository,
-        pull_number,
-        head_sha,
-        run_id,
-        run_attempt,
-        policy_sha,
-    )
-    require(len(matches) <= 1, "multiple pending checks match one workflow run")
-    if not matches:
+    run = completed_run_from_event(auth_api, config, event, repository)
+    if run is None:
         return 0
-    check, _external = matches[0]
-    check_id = require_integer(check.get("id"), "check run id")
-    conclusion = run.get("conclusion")
-    if conclusion == "cancelled":
-        check_conclusion = "cancelled"
+    if run.conclusion == "cancelled":
         title = "Validation run was cancelled"
     else:
-        check_conclusion = "failure"
         title = "Validation run ended without a final report"
-    complete_check(
-        app_api,
-        repository,
-        check_id,
-        check_conclusion,
-        title,
-        f"Workflow run {run_id} completed with conclusion {conclusion!r} before its protected finalizer completed the check.",
+    summary = (
+        f"Workflow run {run.run_id} attempt {run.run_attempt} completed with "
+        f"conclusion {run.conclusion!r} before its protected finalizer "
+        "completed the check."
     )
-    return 1
+    return close_pending_check_for_run(
+        app_api,
+        auth_api,
+        config,
+        repository,
+        observed_app_slug,
+        run,
+        title,
+        summary,
+    )
 
 
 def sweep_runs(
@@ -1394,41 +1753,54 @@ def sweep_runs(
         label="protected workflow runs",
     )
     completed = 0
+    workflow_id = caller_workflow_id(actions_api, repository, config)
     for value in runs:
-        run = require_mapping(value, "protected workflow run")
+        run_value = require_mapping(value, "protected workflow run")
         try:
-            pull_number, head_sha, run_id, run_attempt, policy_sha = (
-                protected_run_identity(run, config)
+            run_id = require_integer(run_value.get("id"), "workflow run id")
+            run_attempt = require_integer(
+                run_value.get("run_attempt"), "workflow run attempt"
+            )
+            policy_sha = validate_sha(
+                run_value.get("head_sha"), "workflow policy SHA"
+            )
+            validate_run_metadata(
+                run_value,
+                config,
+                run_id=run_id,
+                run_attempt=run_attempt,
+                policy_sha=policy_sha,
+                workflow_id=workflow_id,
+            )
+            if run_value.get("status") != "completed":
+                continue
+            run = protected_run_identity(
+                actions_api,
+                config,
+                repository,
+                run_id,
+                run_attempt,
+                policy_sha,
+                require_binding=False,
             )
         except PolicyError:
             continue
-        matches = pending_checks_for_run(
+        if run is None:
+            continue
+        summary = (
+            f"Workflow run {run.run_id} attempt {run.run_attempt} is complete "
+            "and no protected finalizer completed this check."
+        )
+        completed += close_pending_check_for_run(
             app_api,
+            actions_api,
             config,
             repository,
-            pull_number,
-            head_sha,
-            run_id,
-            run_attempt,
-            policy_sha,
-        )
-        require(len(matches) <= 1, "multiple pending checks match one workflow run")
-        if not matches:
-            continue
-        status = require_string(run.get("status"), "protected workflow run status")
-        if status != "completed":
-            continue
-        check, _external = matches[0]
-        conclusion = run.get("conclusion")
-        complete_check(
-            app_api,
-            repository,
-            require_integer(check.get("id"), "check run id"),
-            "cancelled" if conclusion == "cancelled" else "failure",
+            observed_app_slug,
+            run,
             "Orphaned validation check closed",
-            f"Workflow run {run_id} is complete and no protected finalizer completed this check.",
+            summary,
         )
-        completed += 1
     return completed
 
 
@@ -1468,19 +1840,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    authorize_parser = subparsers.add_parser("authorize")
-    authorize_parser.add_argument("--event", required=True)
-    authorize_parser.add_argument("--config", required=True)
-    authorize_parser.add_argument("--github-output", required=True)
+    authorize_comment_parser = subparsers.add_parser("authorize-comment")
+    authorize_comment_parser.add_argument("--event", required=True)
+    authorize_comment_parser.add_argument("--config", required=True)
+    authorize_comment_parser.add_argument("--github-output", required=True)
 
-    dispatch_comment_parser = subparsers.add_parser("dispatch-comment")
-    dispatch_comment_parser.add_argument("--event", required=True)
-    dispatch_comment_parser.add_argument("--config", required=True)
-
-    authorize_dispatch_parser = subparsers.add_parser("authorize-dispatch")
-    authorize_dispatch_parser.add_argument("--event", required=True)
-    authorize_dispatch_parser.add_argument("--config", required=True)
-    authorize_dispatch_parser.add_argument("--github-output", required=True)
+    authorize_call_parser = subparsers.add_parser("authorize-call")
+    authorize_call_parser.add_argument("--event", required=True)
+    authorize_call_parser.add_argument("--config", required=True)
+    authorize_call_parser.add_argument("--github-output", required=True)
+    authorize_call_parser.add_argument("--comment-id", required=True, type=int)
+    add_external_arguments(authorize_call_parser)
 
     start_parser = subparsers.add_parser("start-check")
     start_parser.add_argument("--config", required=True)
@@ -1491,8 +1861,15 @@ def build_parser() -> argparse.ArgumentParser:
     finish_parser.add_argument("--event", required=True)
     finish_parser.add_argument("--config", required=True)
     finish_parser.add_argument("--check-id", required=True, type=int)
+    finish_parser.add_argument("--comment-id", required=True, type=int)
     finish_parser.add_argument("--result", action="append", default=[])
     add_external_arguments(finish_parser)
+
+    inspect_parser = subparsers.add_parser("inspect-run")
+    inspect_parser.add_argument("--event", required=True)
+    inspect_parser.add_argument("--config", required=True)
+    inspect_parser.add_argument("--github-output", required=True)
+    inspect_parser.add_argument("--repository", required=True)
 
     reconcile_parser = subparsers.add_parser("reconcile-run")
     reconcile_parser.add_argument("--event", required=True)
@@ -1510,33 +1887,38 @@ def main(argv: Sequence[str] | None = None) -> int:
     config = load_config(args.config)
     api_url = os.environ.get("GITHUB_API_URL", "https://api.github.com")
 
-    if args.command == "authorize":
-        auth = authorize(
+    if args.command == "authorize-comment":
+        auth = authorize_comment(
             require_mapping(load_json(args.event), "event"),
             config,
             GitHubApi(required_env("GITHUB_TOKEN"), api_url),
             environment(),
         )
-        write_github_outputs(args.github_output, auth.github_outputs())
+        if auth is None:
+            write_github_outputs(args.github_output, {"authorized": "false"})
+            print("Ignored non-command comment.")
+            return 0
+        outputs = dict(auth.github_outputs())
+        outputs["authorized"] = "true"
+        write_github_outputs(args.github_output, outputs)
         print(f"Authorized pull request #{auth.pull_number} at {auth.head_sha}.")
         return 0
 
-    if args.command == "dispatch-comment":
-        dispatched = dispatch_comment(
+    if args.command == "authorize-call":
+        external = external_from_args(args)
+        auth = authorize_call(
             require_mapping(load_json(args.event), "event"),
             config,
             GitHubApi(required_env("GITHUB_TOKEN"), api_url),
             environment(),
-        )
-        print("Dispatched protected validation." if dispatched else "Ignored non-command comment.")
-        return 0
-
-    if args.command == "authorize-dispatch":
-        auth = authorize_dispatch(
-            require_mapping(load_json(args.event), "event"),
-            config,
-            GitHubApi(required_env("GITHUB_TOKEN"), api_url),
-            environment(),
+            repository=external.repository,
+            pull_number=external.pull_number,
+            head_sha=external.head_sha,
+            base_sha=external.base_sha,
+            policy_sha=external.policy_sha,
+            comment_id=args.comment_id,
+            run_id=external.run_id,
+            run_attempt=external.run_attempt,
         )
         write_github_outputs(args.github_output, auth.github_outputs())
         print(f"Authorized pull request #{auth.pull_number} at {auth.head_sha}.")
@@ -1564,6 +1946,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             require_mapping(load_json(args.event), "event"),
             environment(),
             external_from_args(args),
+            args.comment_id,
             args.check_id,
             args.result,
             required_env("APP_SLUG"),
@@ -1572,11 +1955,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     repository = validate_repository(args.repository)
+    if args.command == "inspect-run":
+        protected = completed_run_from_event(
+            GitHubApi(required_env("GITHUB_TOKEN"), api_url),
+            config,
+            require_mapping(load_json(args.event), "event"),
+            repository,
+        )
+        write_github_outputs(
+            args.github_output,
+            {"protected": "true" if protected is not None else "false"},
+        )
+        print("Recognized protected reusable call." if protected else "Ignored ordinary command run.")
+        return 0
+
     app_api = GitHubApi(required_env("APP_TOKEN"), api_url)
     app_slug = required_env("APP_SLUG")
     if args.command == "reconcile-run":
         count = reconcile_run(
             app_api,
+            GitHubApi(required_env("GITHUB_TOKEN"), api_url),
             config,
             require_mapping(load_json(args.event), "event"),
             repository,
