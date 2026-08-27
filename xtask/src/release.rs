@@ -242,12 +242,14 @@ fn install_tools_with(
     toolchain: crate::release_policy::ReleaseToolchain,
     runner: &mut impl Runner,
 ) -> Result<(), String> {
+    // cargo-binstall reserves --version for package selection; -V reports
+    // the installed cargo-binstall version.
     require_command_version(
         root,
         runner,
         OsStr::new("cargo-binstall"),
-        &[OsString::from("--version")],
-        &format!("cargo-binstall {}", toolchain.cargo_binstall_version),
+        &[OsString::from("-V")],
+        toolchain.cargo_binstall_version,
     )?;
     let install_args = [
         OsString::from("--force"),
@@ -1068,13 +1070,7 @@ mod tests {
     fn tool_installation_binds_exact_versions_and_argv() {
         let mut runner = FakeRunner {
             responses: [
-                success(
-                    format!(
-                        "cargo-binstall {}\n",
-                        TRAITS_TOOLCHAIN.cargo_binstall_version
-                    )
-                    .into_bytes(),
-                ),
+                success(format!("{}\n", TRAITS_TOOLCHAIN.cargo_binstall_version).into_bytes()),
                 success(
                     format!("release-plz {}\n", TRAITS_TOOLCHAIN.release_plz_version).into_bytes(),
                 ),
@@ -1095,7 +1091,7 @@ mod tests {
         assert_eq!(runner.calls.len(), 4);
         assert_eq!(runner.calls[0].mode, CallMode::Output);
         assert_eq!(runner.calls[0].program, "cargo-binstall");
-        assert_eq!(runner.calls[0].args, ["--version"]);
+        assert_eq!(runner.calls[0].args, ["-V"]);
         assert_eq!(runner.calls[1].mode, CallMode::Status);
         assert_eq!(runner.calls[1].program, "cargo-binstall");
         assert_eq!(
@@ -1120,8 +1116,7 @@ mod tests {
 
     #[test]
     fn tool_installation_fails_closed_on_versions_status_and_spawn() {
-        let mut wrong_bootstrap =
-            FakeRunner::with_responses(vec![success(b"cargo-binstall 1.20.0\n".to_vec())]);
+        let mut wrong_bootstrap = FakeRunner::with_responses(vec![success(b"1.20.0\n".to_vec())]);
         assert!(
             install_tools_with(Path::new("."), TRAITS_TOOLCHAIN, &mut wrong_bootstrap).is_err()
         );
@@ -1138,11 +1133,7 @@ mod tests {
         ] {
             let mut runner = FakeRunner {
                 responses: [success(
-                    format!(
-                        "cargo-binstall {}\n",
-                        TRAITS_TOOLCHAIN.cargo_binstall_version
-                    )
-                    .into_bytes(),
+                    format!("{}\n", TRAITS_TOOLCHAIN.cargo_binstall_version).into_bytes(),
                 )]
                 .into(),
                 status_responses: [install_status].into(),
@@ -1156,23 +1147,11 @@ mod tests {
 
         for responses in [
             vec![
-                success(
-                    format!(
-                        "cargo-binstall {}\n",
-                        TRAITS_TOOLCHAIN.cargo_binstall_version
-                    )
-                    .into_bytes(),
-                ),
+                success(format!("{}\n", TRAITS_TOOLCHAIN.cargo_binstall_version).into_bytes()),
                 success(b"release-plz 0.3.159\n".to_vec()),
             ],
             vec![
-                success(
-                    format!(
-                        "cargo-binstall {}\n",
-                        TRAITS_TOOLCHAIN.cargo_binstall_version
-                    )
-                    .into_bytes(),
-                ),
+                success(format!("{}\n", TRAITS_TOOLCHAIN.cargo_binstall_version).into_bytes()),
                 success(
                     format!("release-plz {}\n", TRAITS_TOOLCHAIN.release_plz_version).into_bytes(),
                 ),
@@ -1191,7 +1170,7 @@ mod tests {
 
     #[test]
     fn tool_versions_require_one_exact_line() {
-        let expected = format!("cargo-binstall {}", TRAITS_TOOLCHAIN.cargo_binstall_version);
+        let expected = TRAITS_TOOLCHAIN.cargo_binstall_version;
         for output in [
             format!(" {expected}\n").into_bytes(),
             format!("{expected} \n").into_bytes(),
@@ -1207,8 +1186,8 @@ mod tests {
                     Path::new("."),
                     &mut runner,
                     OsStr::new("cargo-binstall"),
-                    &[OsString::from("--version")],
-                    &expected,
+                    &[OsString::from("-V")],
+                    expected,
                 )
                 .is_err()
             );
@@ -1223,8 +1202,8 @@ mod tests {
                 Path::new("."),
                 &mut runner,
                 OsStr::new("cargo-binstall"),
-                &[OsString::from("--version")],
-                &expected,
+                &[OsString::from("-V")],
+                expected,
             )
             .unwrap();
             runner.assert_consumed();

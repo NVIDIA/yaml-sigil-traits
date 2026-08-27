@@ -124,7 +124,7 @@ git fetch origin main --tags
 test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"
 rustc_version="$(rustc --version)"
 test "${rustc_version%% (*}" = "rustc 1.95.0"
-test "$(cargo-binstall --version)" = "cargo-binstall 1.20.1"
+test "$(cargo-binstall -V)" = "1.20.1"
 cargo xtask release install-tools
 published_version="$(cargo xtask release-version show)"
 cargo xtask release verify-registry \
