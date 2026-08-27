@@ -1,5 +1,5 @@
 name: Protected pull request CI
-run-name: PR #${{ inputs.pull_number }} /ok to test ${{ inputs.head_sha }}
+run-name: "PR #${{ inputs.pull_number }} /ok to test ${{ inputs.head_sha }}"
 
 on:
   workflow_dispatch:
