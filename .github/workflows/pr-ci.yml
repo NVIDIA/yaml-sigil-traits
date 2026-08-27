@@ -1,5 +1,5 @@
 name: Protected pull request CI
-run-name: PR #${{ inputs.pull_number }} /ok to test ${{ inputs.head_sha }}
+run-name: "PR #${{ inputs.pull_number }} /ok to test ${{ inputs.head_sha }}"
 
 on:
   workflow_dispatch:
@@ -47,6 +47,7 @@ jobs:
       head_repository: ${{ steps.authorize.outputs.head_repository }}
       policy_sha: ${{ steps.authorize.outputs.policy_sha }}
       comment_id: ${{ steps.authorize.outputs.comment_id }}
+      candidate_ci_required: ${{ steps.authorize.outputs.candidate_ci_required }}
     steps:
       # Authorization code and its inventory come only from the immutable
       # protected-main commit that supplied this workflow run.
@@ -403,6 +404,109 @@ jobs:
           cargo run --locked --manifest-path policy/xtask/Cargo.toml --
           ci --candidate-root "${GITHUB_WORKSPACE}/candidate"
 
+  candidate_ci:
+    name: Candidate cargo xtask CI (${{ matrix.name }})
+    if: ${{ needs.authorize.outputs.candidate_ci_required == 'true' }}
+    needs:
+      - authorize
+      - start_check
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      CARGO_HOME: ${{ github.workspace }}/.candidate-ci/cargo-home
+      CARGO_TARGET_DIR: ${{ github.workspace }}/.candidate-ci/cargo-target
+      RUSTFLAGS: -D warnings
+      RUSTUP_HOME: ${{ github.workspace }}/.candidate-ci/rustup-home
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            runner: ubuntu-latest
+          - name: macOS
+            runner: macos-latest
+          - name: Windows
+            runner: windows-latest
+    steps:
+      - name: Check out protected policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          path: policy
+          persist-credentials: false
+          ref: ${{ needs.authorize.outputs.policy_sha }}
+
+      - name: Check out exact candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          path: candidate
+          persist-credentials: false
+          ref: ${{ needs.authorize.outputs.head_sha }}
+          repository: ${{ needs.authorize.outputs.head_repository }}
+
+      # Resolve the candidate's exact gitlink with protected-main logic, then
+      # fetch it only from the fixed public specification repository.
+      - name: Resolve exact specification checkout
+        id: source_spec
+        shell: bash
+        run: >-
+          policy/.github/scripts/resolve-source-spec-gitlink.sh
+          candidate "${GITHUB_OUTPUT}"
+
+      - name: Check out exact specification
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          path: candidate/source-spec
+          persist-credentials: false
+          ref: ${{ steps.source_spec.outputs.sha }}
+          repository: NVIDIA/yaml-sigil-spec
+
+      - name: Remove unused preinstalled Homebrew source
+        if: ${{ runner.os == 'macOS' }}
+        shell: bash
+        run: policy/.github/scripts/remove-preinstalled-aws-tap.sh
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache: false
+          components: clippy, rustfmt
+
+      - name: Install protected Markdown validator
+        # Refresh this immutable pin frequently to keep pace with rumdl releases.
+        uses: rvben/rumdl@95a982d941d00cf41a0dcef4d0788bd15a29be1b # v0.2.54
+        with:
+          install-only: true
+          version: "0.2.54"
+
+      # This section would benefit by a change to the action allowlist
+      - name: Install protected Rust validation tools
+        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2.83.2
+        with:
+          checksum: true
+          fallback: none
+          tool: cargo-audit,cargo-deny@0.20.2,cargo-machete@0.9.2
+
+      # Only this supplemental, GitHub-hosted job executes the exact candidate
+      # validator. It has no secrets, OIDC, write permission, cache, or retained
+      # artifacts; the protected-main validator remains the required authority.
+      - name: Run exact candidate validation
+        env:
+          ACTIONS_CACHE_URL: ""
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_URL: ""
+          ACTIONS_RESULTS_URL: ""
+          ACTIONS_RUNTIME_TOKEN: ""
+          GH_TOKEN: ""
+          GITHUB_TOKEN: ""
+        shell: bash
+        run: cargo xtask ci
+        working-directory: candidate
+
   finish_check:
     name: Finalize protected Required CI check
     if: ${{ always() && needs.start_check.result == 'success' }}
@@ -413,6 +517,7 @@ jobs:
       - workflow_lint
       - static_checks
       - rust
+      - candidate_ci
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: protected-automation
@@ -471,3 +576,4 @@ jobs:
           --result "workflow_lint=${{ needs.workflow_lint.result }}"
           --result "static_checks=${{ needs.static_checks.result }}"
           --result "rust=${{ needs.rust.result }}"
+          --result "candidate_ci=${{ needs.candidate_ci.result }}"
