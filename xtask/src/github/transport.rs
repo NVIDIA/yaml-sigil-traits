@@ -3,19 +3,22 @@
 
 //! Injected, bounded transport around the GitHub CLI.
 
-use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use crate::bounded_process::{self, OutputLimits};
+
 pub(crate) const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 pub(crate) const MAX_ERROR_BYTES: usize = 64 * 1024;
 const MAX_PAGES: usize = 20;
 const PAGE_SIZE: usize = 100;
 const READ_ATTEMPTS: usize = 3;
+const GITHUB_API_VERSION: &str = "2026-03-10";
+const GITHUB_JSON_MEDIA_TYPE: &str = "application/vnd.github+json";
 
 pub(crate) trait Transport {
     fn get<T: DeserializeOwned>(&mut self, path: &str) -> Result<T, String>;
@@ -27,6 +30,12 @@ pub(crate) trait Transport {
         path: &str,
         payload: &P,
     ) -> Result<T, String>;
+    fn mutate_empty<P: Serialize>(
+        &mut self,
+        method: &str,
+        path: &str,
+        payload: &P,
+    ) -> Result<(), String>;
     fn delete(&mut self, path: &str) -> Result<(), String>;
     fn graphql<T: DeserializeOwned, P: Serialize>(&mut self, payload: &P) -> Result<T, String>;
 }
@@ -35,14 +44,17 @@ pub(crate) struct GhCli;
 
 impl GhCli {
     pub(crate) fn new() -> Result<Self, String> {
-        let output = Command::new("gh")
-            .args(["--version"])
-            .output()
-            .map_err(|error| format!("run gh: {error}"))?;
-        if output.stdout.len() > MAX_ERROR_BYTES
-            || output.stderr.len() > MAX_ERROR_BYTES
-            || !output.status.success()
-        {
+        let mut command = Command::new("gh");
+        command.args(["--version"]);
+        let output = bounded_process::output(
+            &mut command,
+            OutputLimits {
+                stdout: MAX_ERROR_BYTES,
+                stderr: MAX_ERROR_BYTES,
+            },
+        )
+        .map_err(|error| format!("run gh: {error}"))?;
+        if !output.status.success() {
             return Err("gh is unavailable".to_string());
         }
         Ok(Self)
@@ -67,35 +79,28 @@ impl GhCli {
         let mut last = None;
         for attempt in 1..=attempts {
             let mut command = Command::new("gh");
-            command.args(["api", "--method", method, path]);
+            command.args([
+                "api",
+                "--method",
+                method,
+                "--header",
+                &format!("Accept: {GITHUB_JSON_MEDIA_TYPE}"),
+                "--header",
+                &format!("X-GitHub-Api-Version: {GITHUB_API_VERSION}"),
+                path,
+            ]);
             if payload.is_some() {
                 command.args(["--input", "-"]);
-                command.stdin(Stdio::piped());
-            } else {
-                command.stdin(Stdio::null());
             }
-            command.stdout(Stdio::piped()).stderr(Stdio::piped());
-            let mut child = command
-                .spawn()
-                .map_err(|error| RequestError::Permanent(format!("run gh api: {error}")))?;
-            if let Some(body) = payload {
-                child
-                    .stdin
-                    .take()
-                    .expect("piped stdin")
-                    .write_all(body)
-                    .map_err(|error| {
-                        RequestError::Permanent(format!("write gh api request: {error}"))
-                    })?;
+            let limits = OutputLimits {
+                stdout: MAX_RESPONSE_BYTES,
+                stderr: MAX_ERROR_BYTES,
+            };
+            let output = match payload {
+                Some(body) => bounded_process::output_with_input(&mut command, body, limits),
+                None => bounded_process::output(&mut command, limits),
             }
-            let output = child
-                .wait_with_output()
-                .map_err(|error| RequestError::Permanent(format!("wait for gh api: {error}")))?;
-            if output.stdout.len() > MAX_RESPONSE_BYTES || output.stderr.len() > MAX_ERROR_BYTES {
-                return Err(RequestError::Permanent(
-                    "GitHub response exceeded its bound".to_string(),
-                ));
-            }
+            .map_err(|error| RequestError::Permanent(format!("run gh api: {error}")))?;
             if output.status.success() {
                 return Ok(output.stdout);
             }
@@ -172,6 +177,29 @@ impl Transport for GhCli {
             .request(method, path, Some(&body), false)
             .map_err(RequestError::message)?;
         self.decode(method, path, &response)
+    }
+
+    fn mutate_empty<P: Serialize>(
+        &mut self,
+        method: &str,
+        path: &str,
+        payload: &P,
+    ) -> Result<(), String> {
+        if method != "POST" {
+            return Err("GitHub no-content mutation method is unsupported".to_string());
+        }
+        let body = serde_json::to_vec(payload)
+            .map_err(|error| format!("serialize GitHub request: {error}"))?;
+        if body.len() > MAX_RESPONSE_BYTES {
+            return Err("GitHub request exceeded its bound".to_string());
+        }
+        let response = self
+            .request(method, path, Some(&body), false)
+            .map_err(RequestError::message)?;
+        if !response.is_empty() {
+            return Err(format!("{method} {path} unexpectedly returned a body"));
+        }
+        Ok(())
     }
 
     fn delete(&mut self, path: &str) -> Result<(), String> {
@@ -430,6 +458,17 @@ pub(crate) mod fake {
                 .map_err(|error| format!("serialize fake mutation: {error}"))?;
             let value = self.call(method, path, Some(payload))?;
             Self::decode(value, method, path)
+        }
+
+        fn mutate_empty<P: Serialize>(
+            &mut self,
+            method: &str,
+            path: &str,
+            payload: &P,
+        ) -> Result<(), String> {
+            let payload = serde_json::to_value(payload)
+                .map_err(|error| format!("serialize fake mutation: {error}"))?;
+            self.call(method, path, Some(payload)).map(|_| ())
         }
 
         fn delete(&mut self, path: &str) -> Result<(), String> {

@@ -1,8 +1,7 @@
 name: Publish
 
-# This workflow distributes one crates.io source package and creates an
-# annotated version tag plus a source-only GitHub Release. It builds, uploads,
-# and retains no executable artifact.
+# This workflow publishes source crates and creates only annotated tags and
+# immutable, zero-asset GitHub Releases. It retains no executable artifact.
 on:
   workflow_dispatch:
     inputs:
@@ -14,6 +13,9 @@ on:
         options:
           - validate
           - publish
+  repository_dispatch:
+    types:
+      - official-release-published
 
 permissions: {}
 
@@ -21,31 +23,36 @@ env:
   # Resolve the manifest's explicit `crates-io` publish allowlist by name.
   CARGO_REGISTRIES_CRATES_IO_INDEX: https://github.com/rust-lang/crates.io-index
 
-# Publication is resumable, so never cancel a run that may already have
-# uploaded a source package while a replacement waits for approval.
+# Publication is resumable and its authenticated receiver is serialized behind
+# the originating run. Neither path is payload-controlled.
 concurrency:
   group: publish-${{ github.repository }}
   cancel-in-progress: false
 
 jobs:
-  validation:
-    name: Validate release
-    if: ${{ inputs.operation == 'validate' || inputs.operation == 'publish' }}
+  release-readiness:
+    name: Validate source-only release readiness
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' &&
+          (inputs.operation == 'validate' || inputs.operation == 'publish') }}
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     permissions:
       contents: read
       pull-requests: read
+    outputs:
+      ruleset_evidence_sha256: ${{ steps.evidence.outputs.ruleset_evidence_sha256 }}
     steps:
-      - name: Check out release source
+      - name: Check out dispatch source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
+          ref: ${{ github.sha }}
 
       - name: Validate exact main invocation
         run: |
-          # Official release authority belongs only to exact protected main.
+          # Release readiness belongs only to the dispatched protected main.
           if [[ "${GITHUB_REF}" != "refs/heads/main" \
             || "$(git rev-parse HEAD)" != "${GITHUB_SHA}" ]]; then
             echo "Official release operations must use exact main." >&2
@@ -66,10 +73,42 @@ jobs:
       - name: Install and verify release analyzers
         run: cargo xtask release install-tools
 
-      - name: Configure read-only release forge identity
+      - name: Configure read-only forge identity
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: cargo xtask github git-identity configure
+
+      - name: Discover fresh or recoverable release source
+        id: discover
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          cargo xtask github release-train discover
+          --repository "${GITHUB_REPOSITORY}"
+          --commit "${GITHUB_SHA}"
+
+      - name: Check out captured release source
+        if: ${{ steps.discover.outputs.captured_release_sha != github.sha }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ steps.discover.outputs.captured_release_sha }}
+
+      # This is the first command after a recovery checkout and binds it to the
+      # archive-discovered protected-main ancestor before project execution.
+      - name: Verify captured source identity
+        env:
+          CAPTURED_SHA: ${{ steps.discover.outputs.captured_release_sha }}
+          REGISTRY_STATE: ${{ steps.discover.outputs.registry_state }}
+        run: |
+          test "$(git rev-parse HEAD)" = "${CAPTURED_SHA}"
+          # A fresh release must still be exact current main before publication.
+          if [[ "${REGISTRY_STATE}" = "absent" ]]; then
+            cargo xtask release require-current-main \
+              --head "${CAPTURED_SHA}" \
+              --fetch-url "https://github.com/${GITHUB_REPOSITORY}"
+          fi
 
       - name: Require a committed release version
         run: |
@@ -79,14 +118,15 @@ jobs:
       - name: Prepare the official tagged baseline
         id: baseline
         env:
+          CAPTURED_SHA: ${{ steps.discover.outputs.captured_release_sha }}
           GIT_CONFIG_COUNT: 1
           GIT_CONFIG_KEY_0: remote.origin.pushurl
-          GIT_CONFIG_VALUE_0: disabled://yaml-sigil-release-proposal
+          GIT_CONFIG_VALUE_0: disabled://yaml-sigil-release-readiness
         run: |
           current_version="$(cargo xtask release-version show)"
           result="${RUNNER_TEMP}/baseline-result.json"
           cargo xtask release baseline prepare \
-            --head "${GITHUB_SHA}" \
+            --head "${CAPTURED_SHA}" \
             --exclude-version "${current_version}" \
             --output "${RUNNER_TEMP}/official-release-baseline" \
             --result "${result}" \
@@ -95,8 +135,7 @@ jobs:
             '"commit=\(.commit)",
              "manifest=\(.manifest)",
              "version=\(.version)",
-             "inventory=\(.inventory)",
-             "tags=\(.tags | @json)"' \
+             "inventory=\(.inventory)"' \
             "${result}" >>"${GITHUB_OUTPUT}"
 
       - name: Require the tagged baseline on crates.io
@@ -118,9 +157,7 @@ jobs:
             --expected-current-version "${current_version}" \
             --intent "${intent}"
 
-      # `autobins = false` prevents implicit executable targets. Reject an
-      # explicit `[[bin]]` target before any release-plz invocation.
-      - name: Require a library-only release package
+      - name: Require the exact source-package inventory
         run: cargo xtask release check-packages yaml-sigil-traits
 
       - name: Package with Cargo
@@ -128,55 +165,107 @@ jobs:
 
       - name: Require exact merged release authorization
         env:
+          CAPTURED_SHA: ${{ steps.discover.outputs.captured_release_sha }}
           GH_TOKEN: ${{ github.token }}
         run: |
           cargo xtask github release-source authorize \
             --repository "${GITHUB_REPOSITORY}" \
-            --commit "${GITHUB_SHA}" \
+            --commit "${CAPTURED_SHA}" \
             --baseline-version "${{ steps.baseline.outputs.version }}" \
             --baseline-commit "${{ steps.baseline.outputs.commit }}"
 
-      # Change only release-plz's publication switch and impossible branch
-      # prefix so it cannot replace the already authorized current checkout.
-      - name: Prepare checkout-bound release configuration
-        run: |
-          cargo xtask release prepare-publication-config \
-            --output "${RUNNER_TEMP}/release-plz-publication.toml"
+      - name: Prepare source-only publication configuration
+        run: >-
+          cargo xtask release prepare-publication-config
+          --output "${RUNNER_TEMP}/release-plz-publication.toml"
 
       - name: Validate release-plz publication plan
         env:
+          CAPTURED_SHA: ${{ steps.discover.outputs.captured_release_sha }}
           GIT_TOKEN: ${{ github.token }}
         run: |
-          cargo xtask release require-current-main \
-            --head "${GITHUB_SHA}" \
-            --fetch-url "https://github.com/${GITHUB_REPOSITORY}"
-          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
-          # Exercise package selection and forge discovery without OIDC or writes.
+          test "$(git rev-parse HEAD)" = "${CAPTURED_SHA}"
+          # Dry-run exercises package selection without OIDC or writes.
           release-plz release \
             --dry-run \
             --forge github \
             --config "${RUNNER_TEMP}/release-plz-publication.toml" \
             --manifest-path Cargo.toml
-          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
+          test "$(git rev-parse HEAD)" = "${CAPTURED_SHA}"
+
+      - name: Capture canonical release plan
+        id: capture
+        env:
+          CAPTURED_SHA: ${{ steps.discover.outputs.captured_release_sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          cargo xtask github release-train capture
+          --repository "${GITHUB_REPOSITORY}"
+          --commit "${CAPTURED_SHA}"
+          --baseline-version "${{ steps.baseline.outputs.version }}"
+          --baseline-commit "${{ steps.baseline.outputs.commit }}"
+
+      - name: Verify pinned historical source-only Releases
+        id: legacy
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python3 .github/scripts/legacy_release_preflight.py
+          --inventory .github/legacy-release-inventory.json
+          --github-output "${GITHUB_OUTPUT}"
+
+      # The protected-environment reviewer performs the fresh repository-admin
+      # setting readback for this exact run and confirms this displayed digest.
+      - name: Bind repository-admin setting evidence to this run
+        id: evidence
+        env:
+          CAPTURED_SHA: ${{ steps.capture.outputs.captured_release_sha }}
+        run: |
+          evidence_digest="$(printf '%s\0' \
+            'yaml-sigil-release-setting-evidence-v1' \
+            "${GITHUB_REPOSITORY}" \
+            "${GITHUB_RUN_ID}" \
+            "${GITHUB_RUN_ATTEMPT}" \
+            "${CAPTURED_SHA}" \
+            'immutable-releases=true' \
+            'creation=refs/tags/v*:Integration:4653064:always' \
+            'update-delete=refs/tags/v*:no-bypass' \
+            'forbidden-required-check=Release finalization intent' \
+            | sha256sum | cut -d' ' -f1)"
+          printf 'ruleset_evidence_sha256=%s\n' "${evidence_digest}" \
+            >>"${GITHUB_OUTPUT}"
+          echo "::notice title=Repository-admin release evidence::release_sha=${CAPTURED_SHA};run_id=${GITHUB_RUN_ID};run_attempt=${GITHUB_RUN_ATTEMPT};digest=${evidence_digest}"
 
   publication:
-    name: Publish release
-    if: ${{ inputs.operation == 'publish' }}
-    needs: validation
+    name: Publish source crate
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' &&
+          inputs.operation == 'publish' }}
+    needs: release-readiness
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     environment: crates-io
     permissions:
-      # Create the version tag and source-only Release after publication.
-      contents: write
+      contents: read
       pull-requests: read
       id-token: write
+    outputs:
+      baseline_commit: ${{ steps.baseline.outputs.commit }}
+      baseline_version: ${{ steps.baseline.outputs.version }}
+      captured_release_sha: ${{ steps.capture.outputs.captured_release_sha }}
+      existing_intent: ${{ steps.capture.outputs.existing_intent }}
+      existing_intent_check_id: ${{ steps.capture.outputs.existing_intent_check_id }}
+      existing_intent_digest: ${{ steps.capture.outputs.existing_intent_digest }}
+      plan: ${{ steps.capture.outputs.plan }}
+      plan_digest: ${{ steps.capture.outputs.plan_digest }}
+      registry_state: ${{ steps.capture.outputs.registry_state }}
     steps:
-      - name: Check out release source
+      - name: Check out dispatch source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
+          ref: ${{ github.sha }}
 
       - name: Set up Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
@@ -197,22 +286,43 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: cargo xtask github git-identity configure
 
-      - name: Recheck the committed release version
+      - name: Rediscover fresh or partial release source
+        id: discover
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          cargo xtask github release-train discover
+          --repository "${GITHUB_REPOSITORY}"
+          --commit "${GITHUB_SHA}"
+
+      - name: Check out captured release source
+        if: ${{ steps.discover.outputs.captured_release_sha != github.sha }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ steps.discover.outputs.captured_release_sha }}
+
+      - name: Recheck captured source and committed version
+        env:
+          CAPTURED_SHA: ${{ steps.discover.outputs.captured_release_sha }}
         run: |
+          test "$(git rev-parse HEAD)" = "${CAPTURED_SHA}"
           cargo xtask release-version check
           git diff --exit-code
 
       - name: Prepare the official tagged baseline
         id: baseline
         env:
+          CAPTURED_SHA: ${{ steps.discover.outputs.captured_release_sha }}
           GIT_CONFIG_COUNT: 1
           GIT_CONFIG_KEY_0: remote.origin.pushurl
-          GIT_CONFIG_VALUE_0: disabled://yaml-sigil-release-proposal
+          GIT_CONFIG_VALUE_0: disabled://yaml-sigil-release-publication
         run: |
           current_version="$(cargo xtask release-version show)"
           result="${RUNNER_TEMP}/baseline-result.json"
           cargo xtask release baseline prepare \
-            --head "${GITHUB_SHA}" \
+            --head "${CAPTURED_SHA}" \
             --exclude-version "${current_version}" \
             --output "${RUNNER_TEMP}/official-release-baseline" \
             --result "${result}" \
@@ -221,18 +331,17 @@ jobs:
             '"commit=\(.commit)",
              "manifest=\(.manifest)",
              "version=\(.version)",
-             "inventory=\(.inventory)",
-             "tags=\(.tags | @json)"' \
+             "inventory=\(.inventory)"' \
             "${result}" >>"${GITHUB_OUTPUT}"
 
-      - name: Require the tagged baseline on crates.io
-        run: >-
-          cargo xtask release verify-registry
-          --check-version "${{ steps.baseline.outputs.version }}"
-          yaml-sigil-traits
-
-      - name: Check release API compatibility
+      - name: Repeat publication authority and package checks
+        env:
+          CAPTURED_SHA: ${{ steps.discover.outputs.captured_release_sha }}
+          GH_TOKEN: ${{ github.token }}
         run: |
+          cargo xtask release verify-registry \
+            --check-version "${{ steps.baseline.outputs.version }}" \
+            yaml-sigil-traits
           current_version="$(cargo xtask release-version show)"
           intent="$(cargo xtask release-version intent \
             --published "${{ steps.baseline.outputs.version }}")"
@@ -243,101 +352,423 @@ jobs:
             --expected-baseline-version "${{ steps.baseline.outputs.version }}" \
             --expected-current-version "${current_version}" \
             --intent "${intent}"
-
-      # Change only release-plz's publication switch and impossible branch
-      # prefix so it cannot replace the already authorized current checkout.
-      - name: Prepare checkout-bound release configuration
-        run: |
-          cargo xtask release prepare-publication-config \
-            --output "${RUNNER_TEMP}/release-plz-publication.toml"
-
-      - name: Publish with Trusted Publishing
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GIT_TOKEN: ${{ github.token }}
-        run: |
-          version="$(cargo xtask release-version show)"
-          set +e
-          cargo xtask release verify-registry \
-            --check-version "${version}" yaml-sigil-traits
-          registry_status="$?"
-          set -e
+          cargo xtask release check-packages yaml-sigil-traits
+          cargo package
           cargo xtask github release-source authorize \
             --repository "${GITHUB_REPOSITORY}" \
-            --commit "${GITHUB_SHA}" \
+            --commit "${CAPTURED_SHA}" \
             --baseline-version "${{ steps.baseline.outputs.version }}" \
             --baseline-commit "${{ steps.baseline.outputs.commit }}"
-          GIT_CONFIG_COUNT=1 \
-            GIT_CONFIG_KEY_0=remote.origin.pushurl \
-            GIT_CONFIG_VALUE_0=disabled://yaml-sigil-release-proposal \
-            cargo xtask release baseline verify \
-            --head "${GITHUB_SHA}" \
-            --inventory "${{ steps.baseline.outputs.inventory }}" \
-            --expected-fetch-url "https://github.com/${GITHUB_REPOSITORY}"
-          cargo xtask release require-current-main \
-            --head "${GITHUB_SHA}" \
-            --fetch-url "https://github.com/${GITHUB_REPOSITORY}"
-          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
-          # Complete registry publication selects recovery. Any absent package
-          # permits a fresh or fail-closed resumed Trusted Publishing attempt.
-          case "${registry_status}" in
-            0)
-              cargo xtask github release-objects reconcile \
-                --mode recover \
-                --repository "${GITHUB_REPOSITORY}" \
-                --version "${version}" \
-                --commit "${GITHUB_SHA}"
+
+      - name: Prepare source-only publication configuration
+        run: >-
+          cargo xtask release prepare-publication-config
+          --output "${RUNNER_TEMP}/release-plz-publication.toml"
+
+      - name: Capture canonical publication plan
+        id: capture
+        env:
+          CAPTURED_SHA: ${{ steps.discover.outputs.captured_release_sha }}
+          GH_TOKEN: ${{ github.token }}
+          REGISTRY_STATE: ${{ steps.discover.outputs.registry_state }}
+        run: |
+          # A fresh plan is captured only from exact current protected main.
+          if [[ "${REGISTRY_STATE}" = "absent" ]]; then
+            cargo xtask release require-current-main \
+              --head "${CAPTURED_SHA}" \
+              --fetch-url "https://github.com/${GITHUB_REPOSITORY}"
+          fi
+          test "$(git rev-parse HEAD)" = "${CAPTURED_SHA}"
+          cargo xtask github release-train capture \
+            --repository "${GITHUB_REPOSITORY}" \
+            --commit "${CAPTURED_SHA}" \
+            --baseline-version "${{ steps.baseline.outputs.version }}" \
+            --baseline-commit "${{ steps.baseline.outputs.commit }}"
+          test "$(git rev-parse HEAD)" = "${CAPTURED_SHA}"
+
+      - name: Recheck pinned historical source-only Releases
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python3 .github/scripts/legacy_release_preflight.py
+          --inventory .github/legacy-release-inventory.json
+          --github-output "${GITHUB_OUTPUT}"
+
+      - name: Publish missing source package and await exact registry state
+        id: publish
+        env:
+          CAPTURED_SHA: ${{ steps.capture.outputs.captured_release_sha }}
+          GH_TOKEN: ${{ github.token }}
+          GIT_TOKEN: ${{ github.token }}
+          PLAN: ${{ steps.capture.outputs.plan }}
+          PLAN_DIGEST: ${{ steps.capture.outputs.plan_digest }}
+          REGISTRY_STATE: ${{ steps.capture.outputs.registry_state }}
+        run: |
+          publisher_status=0
+          # Complete recovery performs no registry mutation; other prefixes may.
+          case "${REGISTRY_STATE}" in
+            complete)
               echo "The exact crate is already published; skipping registry mutation."
               ;;
-            3)
-              cargo xtask github release-objects reconcile \
-                --mode prepublish \
-                --repository "${GITHUB_REPOSITORY}" \
-                --version "${version}" \
-                --commit "${GITHUB_SHA}"
-              cargo xtask release require-current-main \
-                --head "${GITHUB_SHA}" \
-                --fetch-url "https://github.com/${GITHUB_REPOSITORY}"
-              test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
-              # Exchange only this protected job's OIDC identity, publish the
-              # source package, and create its annotated tag and Release.
+            absent|partial)
+              test "$(git rev-parse HEAD)" = "${CAPTURED_SHA}"
+              set +e
+              # Pinned release-plz has source-crate publication authority only.
               release-plz release \
                 --forge github \
                 --config "${RUNNER_TEMP}/release-plz-publication.toml" \
                 --manifest-path Cargo.toml
-              test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
+              publisher_status="$?"
+              set -e
+              test "$(git rev-parse HEAD)" = "${CAPTURED_SHA}"
               ;;
             *)
-              echo "The exact crates.io publication state is invalid." >&2
+              echo "The captured registry state is invalid." >&2
               exit 1
               ;;
           esac
-
-      - name: Verify crates.io publication
-        run: cargo xtask release verify-registry yaml-sigil-traits
-
-      - name: Verify or recover source-only release objects
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          version="$(cargo xtask release-version show)"
-          cargo xtask release require-current-main \
-            --head "${GITHUB_SHA}" \
-            --fetch-url "https://github.com/${GITHUB_REPOSITORY}"
-          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
-          # Recovery can create only missing annotated tags and Releases after
-          # it independently rechecks the exact non-yanked registry version.
-          cargo xtask github release-objects reconcile \
-            --mode recover \
+          cargo xtask github release-train wait \
             --repository "${GITHUB_REPOSITORY}" \
-            --version "${version}" \
-            --commit "${GITHUB_SHA}"
+            --plan "${PLAN}" \
+            --plan-digest "${PLAN_DIGEST}"
+          # Exact complete registry state, not the publisher exit alone, wins.
+          if [[ "${publisher_status}" -ne 0 ]]; then
+            echo "release-plz exited ${publisher_status}; exact registry confirmation recovered the run."
+          fi
+          printf 'publisher_status=%s\n' "${publisher_status}" >>"${GITHUB_OUTPUT}"
 
-      - name: Request the next release proposal
+  release-intent:
+    name: Attest release finalization intent
+    if: >-
+      ${{ always() && needs.publication.result == 'success' &&
+          needs.publication.outputs.plan != '' }}
+    needs:
+      - release-readiness
+      - publication
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: protected-automation
+    permissions:
+      checks: read
+      contents: read
+      pull-requests: read
+    outputs:
+      binary_sha256: ${{ steps.compile.outputs.binary_sha256 }}
+      intent: ${{ steps.create.outputs.intent }}
+      intent_check_id: ${{ steps.create.outputs.intent_check_id }}
+      intent_digest: ${{ steps.create.outputs.intent_digest }}
+      intent_external_id: ${{ steps.create.outputs.intent_external_id }}
+    steps:
+      - name: Check out captured trusted source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ needs.publication.outputs.captured_release_sha }}
+
+      - name: Verify exact captured checkout
+        env:
+          CAPTURED_SHA: ${{ needs.publication.outputs.captured_release_sha }}
+        run: test "$(git rev-parse HEAD)" = "${CAPTURED_SHA}"
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache: false
+          toolchain: 1.95.0
+
+      - name: Recompute release plan
         env:
           GH_TOKEN: ${{ github.token }}
+          PLAN: ${{ needs.publication.outputs.plan }}
+          PLAN_DIGEST: ${{ needs.publication.outputs.plan_digest }}
+        run: >-
+          cargo xtask github release-train verify
+          --repository "${GITHUB_REPOSITORY}"
+          --plan "${PLAN}"
+          --plan-digest "${PLAN_DIGEST}"
+          --baseline-version "${{ needs.publication.outputs.baseline_version }}"
+          --baseline-commit "${{ needs.publication.outputs.baseline_commit }}"
+
+      - name: Compile and bind typed intent attestor
+        id: compile
+        env:
+          EXISTING_INTENT: ${{ needs.publication.outputs.existing_intent }}
+          EXISTING_INTENT_CHECK_ID: ${{ needs.publication.outputs.existing_intent_check_id }}
+          EXISTING_INTENT_DIGEST: ${{ needs.publication.outputs.existing_intent_digest }}
+          PLAN: ${{ needs.publication.outputs.plan }}
+          PLAN_DIGEST: ${{ needs.publication.outputs.plan_digest }}
+          RULESET_EVIDENCE_SHA256: ${{ needs.release-readiness.outputs.ruleset_evidence_sha256 }}
         run: |
-          version="$(cargo xtask release-version show)"
-          jq --null-input --arg version "${version}" \
-            '{event_type: "official-release-published", client_payload: {version: $version}}' \
-            | gh api --method POST "repos/${GITHUB_REPOSITORY}/dispatches" --input -
+          cargo build --locked --release --manifest-path xtask/Cargo.toml
+          install -m 700 xtask/target/release/xtask \
+            "${RUNNER_TEMP}/yaml-sigil-release-xtask"
+          binary_sha256="$(sha256sum "${RUNNER_TEMP}/yaml-sigil-release-xtask" \
+            | cut -d' ' -f1)"
+          printf 'binary_sha256=%s\n' "${binary_sha256}" >>"${GITHUB_OUTPUT}"
+          # Preserve a durable original intent; otherwise create this run's intent.
+          case "${EXISTING_INTENT}" in
+            '')
+              "${RUNNER_TEMP}/yaml-sigil-release-xtask" \
+                github release-train prepare-intent \
+                --plan "${PLAN}" \
+                --plan-digest "${PLAN_DIGEST}" \
+                --origin-run-id "${GITHUB_RUN_ID}" \
+                --origin-run-attempt "${GITHUB_RUN_ATTEMPT}" \
+                --ruleset-evidence-sha256 "${RULESET_EVIDENCE_SHA256}"
+              ;;
+            *)
+              test "$(printf '%s' "${EXISTING_INTENT}" | sha256sum | cut -d' ' -f1)" \
+                = "${EXISTING_INTENT_DIGEST}"
+              printf 'intent=%s\n' "${EXISTING_INTENT}" >>"${GITHUB_OUTPUT}"
+              printf 'intent_digest=%s\n' "${EXISTING_INTENT_DIGEST}" >>"${GITHUB_OUTPUT}"
+              printf 'intent_check_id=%s\n' "${EXISTING_INTENT_CHECK_ID}" >>"${GITHUB_OUTPUT}"
+              ;;
+          esac
+          rm -rf "${GITHUB_WORKSPACE}"
+          mkdir -m 700 "${GITHUB_WORKSPACE}"
+          test "$(sha256sum "${RUNNER_TEMP}/yaml-sigil-release-xtask" \
+            | cut -d' ' -f1)" = "${binary_sha256}"
+
+      - name: Create checks-only repository token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.YAML_SIGIL_RELEASE_PR_APP_CLIENT_ID }}
+          private-key: ${{ secrets.YAML_SIGIL_RELEASE_PR_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-checks: write
+
+      - name: Create or verify durable intent Check
+        id: create
+        working-directory: ${{ runner.temp }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          INTENT: ${{ steps.compile.outputs.intent }}
+          PLAN: ${{ needs.publication.outputs.plan }}
+          PLAN_DIGEST: ${{ needs.publication.outputs.plan_digest }}
+        run: >-
+          "${RUNNER_TEMP}/yaml-sigil-release-xtask"
+          github release-train create-intent
+          --repository "${GITHUB_REPOSITORY}"
+          --plan "${PLAN}"
+          --plan-digest "${PLAN_DIGEST}"
+          --intent "${INTENT}"
+          --expected-app-slug "${{ steps.app-token.outputs.app-slug }}"
+          --expected-installation-id "${{ steps.app-token.outputs.installation-id }}"
+
+  release-finalizer:
+    name: Create immutable source-only release objects
+    if: ${{ needs.release-intent.result == 'success' }}
+    needs:
+      - publication
+      - release-intent
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: protected-automation
+    permissions:
+      checks: read
+      contents: read
+      pull-requests: read
+    outputs:
+      binary_sha256: ${{ steps.compile.outputs.binary_sha256 }}
+      complete: ${{ steps.finalize.outputs.complete }}
+      finalized_entries: ${{ steps.finalize.outputs.finalized_entries }}
+    steps:
+      - name: Check out captured trusted source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ needs.publication.outputs.captured_release_sha }}
+
+      - name: Verify exact captured checkout
+        env:
+          CAPTURED_SHA: ${{ needs.publication.outputs.captured_release_sha }}
+        run: test "$(git rev-parse HEAD)" = "${CAPTURED_SHA}"
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache: false
+          toolchain: 1.95.0
+
+      - name: Recompute plan and verify protected intent
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INTENT: ${{ needs.release-intent.outputs.intent }}
+          PLAN: ${{ needs.publication.outputs.plan }}
+          PLAN_DIGEST: ${{ needs.publication.outputs.plan_digest }}
+        run: |
+          cargo xtask github release-train verify \
+            --repository "${GITHUB_REPOSITORY}" \
+            --plan "${PLAN}" \
+            --plan-digest "${PLAN_DIGEST}" \
+            --baseline-version "${{ needs.publication.outputs.baseline_version }}" \
+            --baseline-commit "${{ needs.publication.outputs.baseline_commit }}"
+          cargo xtask github release-train verify-intent \
+            --repository "${GITHUB_REPOSITORY}" \
+            --plan "${PLAN}" \
+            --plan-digest "${PLAN_DIGEST}" \
+            --intent "${INTENT}" \
+            --check-id "${{ needs.release-intent.outputs.intent_check_id }}"
+
+      - name: Recheck pinned historical source-only Releases
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python3 .github/scripts/legacy_release_preflight.py
+          --inventory .github/legacy-release-inventory.json
+          --github-output "${GITHUB_OUTPUT}"
+
+      - name: Compile and bind checkout-independent finalizer
+        id: compile
+        run: |
+          cargo build --locked --release --manifest-path xtask/Cargo.toml
+          install -m 700 xtask/target/release/xtask \
+            "${RUNNER_TEMP}/yaml-sigil-release-xtask"
+          binary_sha256="$(sha256sum "${RUNNER_TEMP}/yaml-sigil-release-xtask" \
+            | cut -d' ' -f1)"
+          printf 'binary_sha256=%s\n' "${binary_sha256}" >>"${GITHUB_OUTPUT}"
+          rm -rf "${GITHUB_WORKSPACE}"
+          mkdir -m 700 "${GITHUB_WORKSPACE}"
+          test "$(sha256sum "${RUNNER_TEMP}/yaml-sigil-release-xtask" \
+            | cut -d' ' -f1)" = "${binary_sha256}"
+
+      - name: Create contents-only repository token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.YAML_SIGIL_RELEASE_PR_APP_CLIENT_ID }}
+          private-key: ${{ secrets.YAML_SIGIL_RELEASE_PR_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+
+      - name: Finalize exact published registry prefix
+        id: finalize
+        working-directory: ${{ runner.temp }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          INTENT: ${{ needs.release-intent.outputs.intent }}
+          PLAN: ${{ needs.publication.outputs.plan }}
+          PLAN_DIGEST: ${{ needs.publication.outputs.plan_digest }}
+        run: >-
+          "${RUNNER_TEMP}/yaml-sigil-release-xtask"
+          github release-train finalize
+          --repository "${GITHUB_REPOSITORY}"
+          --plan "${PLAN}"
+          --plan-digest "${PLAN_DIGEST}"
+          --intent "${INTENT}"
+          --expected-app-slug "${{ steps.app-token.outputs.app-slug }}"
+          --expected-installation-id "${{ steps.app-token.outputs.installation-id }}"
+
+  release-notification:
+    name: Emit complete release train notification
+    if: >-
+      ${{ needs.release-finalizer.result == 'success' &&
+          needs.release-finalizer.outputs.complete == 'true' }}
+    needs:
+      - publication
+      - release-intent
+      - release-finalizer
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: protected-automation
+    permissions:
+      contents: read
+    steps:
+      # Bootstrap exact attested protected source without a repository checkout,
+      # compile before token minting, and require finalizer binary parity.
+      - name: Compile checkout-free typed notifier
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ needs.publication.outputs.captured_release_sha }}
+        run: |
+          set -euo pipefail
+          source_archive="${RUNNER_TEMP}/yaml-sigil-release-source.tar.gz"
+          gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/${GITHUB_REPOSITORY}/tarball/${RELEASE_SHA}" \
+            >"${source_archive}"
+          test "$(wc -c <"${source_archive}")" -gt 0
+          test "$(wc -c <"${source_archive}")" -le 33554432
+          inventory="${RUNNER_TEMP}/yaml-sigil-release-source.inventory"
+          tar -tzf "${source_archive}" >"${inventory}"
+          test "$(wc -l <"${inventory}")" -le 10000
+          source_prefix="$(head -n 1 "${inventory}" | cut -d/ -f1)"
+          test "${source_prefix}" = \
+            "NVIDIA-yaml-sigil-traits-${RELEASE_SHA:0:7}"
+          while IFS= read -r path; do
+            # Every archive member must remain under the one GitHub source root.
+            case "${path}" in
+              "${source_prefix}"|"${source_prefix}/"*) ;;
+              *)
+                echo "Source archive contains an unexpected path." >&2
+                exit 1
+                ;;
+            esac
+            [[ "${path}" != *"/../"* ]]
+          done <"${inventory}"
+          bootstrap="${RUNNER_TEMP}/yaml-sigil-release-bootstrap"
+          mkdir -m 700 "${bootstrap}"
+          tar -xzf "${source_archive}" --no-same-owner --no-same-permissions \
+            -C "${bootstrap}"
+          source_root="${bootstrap}/${source_prefix}"
+          cargo +1.95.0 build --locked --release \
+            --manifest-path "${source_root}/xtask/Cargo.toml"
+          install -m 700 "${source_root}/xtask/target/release/xtask" \
+            "${RUNNER_TEMP}/yaml-sigil-release-xtask"
+          binary_sha256="$(sha256sum "${RUNNER_TEMP}/yaml-sigil-release-xtask" \
+            | cut -d' ' -f1)"
+          rm -rf "${bootstrap}" "${source_archive}" "${inventory}"
+          test "$(sha256sum "${RUNNER_TEMP}/yaml-sigil-release-xtask" \
+            | cut -d' ' -f1)" = "${binary_sha256}"
+
+      - name: Create notification-only repository token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.YAML_SIGIL_RELEASE_PR_APP_CLIENT_ID }}
+          private-key: ${{ secrets.YAML_SIGIL_RELEASE_PR_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+
+      - name: Dispatch exact complete release train
+        working-directory: ${{ runner.temp }}
+        env:
+          FINALIZED_ENTRIES: ${{ needs.release-finalizer.outputs.finalized_entries }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          INTENT: ${{ needs.release-intent.outputs.intent }}
+          PLAN: ${{ needs.publication.outputs.plan }}
+          PLAN_DIGEST: ${{ needs.publication.outputs.plan_digest }}
+        run: >-
+          "${RUNNER_TEMP}/yaml-sigil-release-xtask"
+          github release-train notify
+          --repository "${GITHUB_REPOSITORY}"
+          --plan "${PLAN}"
+          --plan-digest "${PLAN_DIGEST}"
+          --intent "${INTENT}"
+          --intent-check-id "${{ needs.release-intent.outputs.intent_check_id }}"
+          --finalized-entries "${FINALIZED_ENTRIES}"
+          --expected-app-slug "${{ steps.app-token.outputs.app-slug }}"
+          --expected-installation-id "${{ steps.app-token.outputs.installation-id }}"
+
+  release-proposal:
+    name: Receive authenticated release notification
+    if: >-
+      ${{ github.event_name == 'repository_dispatch' &&
+          github.event.action == 'official-release-published' }}
+    permissions:
+      checks: read
+      contents: read
+      pull-requests: read
+    uses: ./.github/workflows/release-proposal.yml
+    with:
+      source-event: repository_dispatch
+      mode: next-candidate
+      bump: patch
+    secrets: inherit

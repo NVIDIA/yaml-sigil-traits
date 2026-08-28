@@ -4,7 +4,6 @@
 //! Authorize publication from immutable commits and exact Git trees.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
 use std::path::Path;
 
 use semver::Version;
@@ -20,6 +19,7 @@ use crate::github::{
     APP_EMAIL, APP_ID, APP_LOGIN, RELEASE_BRANCH, WEB_FLOW_EMAIL, WEB_FLOW_ID, WEB_FLOW_LOGIN,
     WEB_FLOW_NAME, git_line, is_sha, repository_policy_for_root,
 };
+use crate::safe_file;
 
 const MAX_MANUAL_COMMITS: usize = 100;
 const WRITER_PERMISSIONS: &[&str] = &["admin", "maintain", "write"];
@@ -32,7 +32,7 @@ pub(super) fn authorize_command(
     baseline_commit: &str,
     github: &mut impl Transport,
 ) -> Result<(), String> {
-    let number = authorize_source(
+    let authorization = authorize_source(
         github,
         repository,
         commit,
@@ -40,18 +40,30 @@ pub(super) fn authorize_command(
         baseline_version,
         baseline_commit,
     )?;
-    eprintln!("github: authorized exact merged release proposal PR #{number}");
+    eprintln!(
+        "github: authorized exact merged release proposal PR #{}",
+        authorization.pull_request
+    );
     Ok(())
 }
 
-fn authorize_source(
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceAuthorization {
+    pub(super) pull_request: u64,
+    pub(super) proposal_commit: String,
+    pub(super) base_commit: String,
+    pub(super) owner_id: u64,
+    pub(super) merger_id: u64,
+}
+
+pub(super) fn authorize_source(
     github: &mut impl Transport,
     repository: &str,
     commit: &str,
     root: &Path,
     baseline_version: &str,
     baseline_commit: &str,
-) -> Result<u64, String> {
+) -> Result<SourceAuthorization, String> {
     if !is_sha(commit) || !is_sha(baseline_commit) {
         return Err("repository or release commit is unsupported".to_string());
     }
@@ -151,8 +163,19 @@ fn authorize_source(
         .merged_by
         .as_ref()
         .ok_or_else(|| "release pull request lost its merger".to_string())?;
-    require_writer(github, repository, final_merger, "release merger")?;
-    Ok(number)
+    require_current_release_writers(
+        github,
+        repository,
+        final_merger,
+        manual_proposal.then_some(&final_pull.user),
+    )?;
+    Ok(SourceAuthorization {
+        pull_request: number,
+        proposal_commit: proposal.sha.clone(),
+        base_commit: base_sha.to_string(),
+        owner_id: pull.user.id,
+        merger_id: final_merger.id,
+    })
 }
 
 fn release_version(value: &str) -> Result<Version, String> {
@@ -173,7 +196,7 @@ fn release_version(value: &str) -> Result<Version, String> {
 }
 
 fn manifest_release_version(root: &Path, repository: &str) -> Result<Version, String> {
-    let body = fs::read_to_string(root.join("Cargo.toml"))
+    let body = safe_file::read_manifest(root, Path::new("Cargo.toml"))
         .map_err(|error| format!("read release manifest: {error}"))?;
     let document = body
         .parse::<DocumentMut>()
@@ -269,6 +292,19 @@ fn require_writer(
         || permission.user.id != user.id
     {
         return Err(format!("{label} lacks current write authority"));
+    }
+    Ok(())
+}
+
+fn require_current_release_writers(
+    github: &mut impl Transport,
+    repository: &str,
+    merger: &User,
+    manual_owner: Option<&User>,
+) -> Result<(), String> {
+    require_writer(github, repository, merger, "release merger")?;
+    if let Some(owner) = manual_owner {
+        require_writer(github, repository, owner, "release owner")?;
     }
     Ok(())
 }
@@ -499,6 +535,21 @@ mod tests {
         }
     }
 
+    fn user(login: &str, id: u64) -> User {
+        User {
+            login: login.to_string(),
+            id,
+            name: None,
+        }
+    }
+
+    fn permission(user: &User, value: &str) -> Value {
+        json!({
+            "permission": value,
+            "user": {"login": user.login, "id": user.id},
+        })
+    }
+
     #[test]
     fn release_versions_accept_only_stable_or_canonical_rc() {
         assert!(release_version("0.4.0").is_ok());
@@ -608,5 +659,48 @@ mod tests {
         ]);
         assert!(require_exact_tree_diff(&mut linked, TRAITS_REPOSITORY, &base, &proposal).is_err());
         linked.finish();
+    }
+
+    #[test]
+    fn final_manual_authorization_rechecks_merger_and_owner() {
+        let merger = user("release-merger", 41);
+        let owner = user("release-owner", 42);
+        let path = |user: &User| {
+            format!(
+                "repos/{TRAITS_REPOSITORY}/collaborators/{}/permission",
+                percent_encode(&user.login)
+            )
+        };
+        let mut github = FakeTransport::new([
+            Expected::json("GET", &path(&merger), permission(&merger, "maintain")),
+            Expected::json("GET", &path(&owner), permission(&owner, "write")),
+        ]);
+
+        require_current_release_writers(&mut github, TRAITS_REPOSITORY, &merger, Some(&owner))
+            .unwrap();
+        github.finish();
+    }
+
+    #[test]
+    fn final_manual_authorization_rejects_owner_permission_loss() {
+        let merger = user("release-merger", 41);
+        let owner = user("release-owner", 42);
+        let path = |user: &User| {
+            format!(
+                "repos/{TRAITS_REPOSITORY}/collaborators/{}/permission",
+                percent_encode(&user.login)
+            )
+        };
+        let mut github = FakeTransport::new([
+            Expected::json("GET", &path(&merger), permission(&merger, "admin")),
+            Expected::json("GET", &path(&owner), permission(&owner, "read")),
+        ]);
+
+        let error =
+            require_current_release_writers(&mut github, TRAITS_REPOSITORY, &merger, Some(&owner))
+                .unwrap_err();
+
+        assert_eq!(error, "release owner lacks current write authority");
+        github.finish();
     }
 }

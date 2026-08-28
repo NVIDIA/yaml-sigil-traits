@@ -12,9 +12,8 @@ use clap::{Args, Subcommand, ValueEnum};
 use semver::Version;
 use serde::Serialize;
 
+use crate::bounded_process::{self, VALIDATION_OUTPUT_LIMITS};
 use crate::release_policy::{ReleaseFamily, ReleasePolicy, detect};
-
-const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Args)]
 pub struct ProposalArgs {
@@ -269,15 +268,10 @@ fn command_line(root: &Path, program: &str, args: &[&str]) -> Result<String, Str
 }
 
 fn run_output(root: &Path, program: &str, args: &[&str]) -> Result<Output, String> {
-    let output = Command::new(program)
-        .current_dir(root)
-        .args(args)
-        .output()
-        .map_err(|error| format!("run {program}: {error}"))?;
-    if output.stdout.len() > MAX_OUTPUT_BYTES || output.stderr.len() > MAX_OUTPUT_BYTES {
-        return Err(format!("{program} output exceeded its bound"));
-    }
-    Ok(output)
+    let mut command = Command::new(program);
+    command.current_dir(root).args(args);
+    bounded_process::output(&mut command, VALIDATION_OUTPUT_LIMITS)
+        .map_err(|error| format!("run {program}: {error}"))
 }
 
 fn detail(output: &Output) -> String {

@@ -15,15 +15,17 @@ use serde_json::{Value, json};
 use tempfile::Builder;
 use toml_edit::DocumentMut;
 
-use crate::crate_archive::{CratesIo, Registry, require_archive, require_clean_source};
+use crate::bounded_process::{self, VALIDATION_OUTPUT_LIMITS};
+use crate::crate_archive::{
+    CratesIo, Registry, inspect_archive_entries, require_archive, require_clean_source,
+};
 use crate::github::consts::RepositoryKind;
 use crate::github::identity::token_signature;
 use crate::github::models::{GitObject, GitRef, Signature};
 use crate::github::transport::{Transport, percent_encode};
 use crate::github::{ReconcileMode, git_line, is_sha, repository_policy_for_root};
 use crate::release_policy::{PackagePolicy, ReleasePolicy, detect};
-
-const MAX_COMMAND_OUTPUT: usize = 4 * 1024 * 1024;
+use crate::safe_file;
 
 pub(super) fn reconcile_command(
     root: &Path,
@@ -80,12 +82,12 @@ fn token_identity(root: &Path, github: &mut impl Transport) -> Result<TokenIdent
 }
 
 #[derive(Clone, Debug)]
-struct ReleaseSpec<'a> {
-    policy: &'a PackagePolicy,
-    version: String,
-    tag: String,
-    body: String,
-    prerelease: bool,
+pub(super) struct ReleaseSpec<'a> {
+    pub(super) policy: &'a PackagePolicy,
+    pub(super) version: String,
+    pub(super) tag: String,
+    pub(super) body: String,
+    pub(super) prerelease: bool,
 }
 
 impl ReleaseSpec<'_> {
@@ -97,7 +99,7 @@ impl ReleaseSpec<'_> {
     }
 }
 
-fn release_specs<'a>(
+pub(super) fn release_specs<'a>(
     root: &Path,
     policy: &'a ReleasePolicy,
     version: &str,
@@ -275,35 +277,44 @@ fn require_registry_publication(
     Ok(checksums)
 }
 
-fn require_reproduced_archive(
+pub(super) fn require_reproduced_archive(
     root: &Path,
     registry: &mut impl Registry,
     spec: &ReleaseSpec<'_>,
     commit: &str,
 ) -> Result<String, String> {
-    let (checksum, mut published) = require_archive(registry, spec.policy, &spec.version, commit)?;
+    let (checksum, published) = require_archive(registry, spec.policy, &spec.version, commit)?;
     let archive = package_source(root, spec)?;
-    let mut reproduced =
-        crate::crate_archive::inspect_archive(&archive, spec.policy, &spec.version, commit)?;
-    require_generated_lock(&published, spec)?;
-    require_generated_lock(&reproduced, spec)?;
-    published.remove("Cargo.lock");
-    reproduced.remove("Cargo.lock");
-    if published != reproduced {
-        return Err(format!(
-            "local source content differs from {} {}",
-            spec.policy.package, spec.version
-        ));
-    }
+    let reproduced = inspect_archive_entries(&archive, spec.policy, &spec.version, commit)?;
+    require_matching_archive_entries(&published, &reproduced, spec)?;
     Ok(checksum)
 }
 
-fn package_source(root: &Path, spec: &ReleaseSpec<'_>) -> Result<Vec<u8>, String> {
+fn require_matching_archive_entries<T: Eq>(
+    published: &BTreeMap<String, T>,
+    reproduced: &BTreeMap<String, T>,
+    spec: &ReleaseSpec<'_>,
+) -> Result<(), String> {
+    if published != reproduced {
+        if published.get("Cargo.lock") != reproduced.get("Cargo.lock") {
+            return Err(format!(
+                "exact Cargo.lock entry differs between published and reproduced {} {} archives",
+                spec.policy.package, spec.version
+            ));
+        }
+        return Err(format!(
+            "local source content or Cargo archive metadata differs from {} {}",
+            spec.policy.package, spec.version
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn package_source(root: &Path, spec: &ReleaseSpec<'_>) -> Result<Vec<u8>, String> {
     let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let version = Command::new(&cargo)
-        .current_dir(root)
-        .arg("--version")
-        .output()
+    let mut version_command = Command::new(&cargo);
+    version_command.current_dir(root).arg("--version");
+    let version = bounded_process::output(&mut version_command, VALIDATION_OUTPUT_LIMITS)
         .map_err(|error| format!("read Cargo version: {error}"))?;
     let version_line = String::from_utf8_lossy(&version.stdout);
     if !version.status.success() || !version_line.starts_with("cargo 1.95.0 ") {
@@ -314,15 +325,13 @@ fn package_source(root: &Path, spec: &ReleaseSpec<'_>) -> Result<Vec<u8>, String
         .tempdir()
         .map_err(|error| format!("create source-package directory: {error}"))?;
     let target = temporary.path().join("target");
-    let output = Command::new(&cargo)
+    let mut package_command = Command::new(&cargo);
+    package_command
         .current_dir(root)
         .env("CARGO_TARGET_DIR", &target)
-        .args(["package", "--no-verify", "--package", spec.policy.package])
-        .output()
+        .args(["package", "--no-verify", "--package", spec.policy.package]);
+    let output = bounded_process::output(&mut package_command, VALIDATION_OUTPUT_LIMITS)
         .map_err(|error| format!("package {}: {error}", spec.policy.package))?;
-    if output.stdout.len() > MAX_COMMAND_OUTPUT || output.stderr.len() > MAX_COMMAND_OUTPUT {
-        return Err("Cargo package output exceeded its bound".to_string());
-    }
     if !output.status.success() {
         let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(format!(
@@ -339,57 +348,6 @@ fn package_source(root: &Path, spec: &ReleaseSpec<'_>) -> Result<Vec<u8>, String
         return Err("Cargo reproduced archive is missing or oversized".to_string());
     }
     fs::read(&archive).map_err(|error| format!("read reproduced source archive: {error}"))
-}
-
-fn require_generated_lock(
-    files: &BTreeMap<String, Vec<u8>>,
-    spec: &ReleaseSpec<'_>,
-) -> Result<(), String> {
-    let lock = files.get("Cargo.lock").ok_or_else(|| {
-        format!(
-            "{} source package lacks generated Cargo.lock",
-            spec.policy.package
-        )
-    })?;
-    let body = std::str::from_utf8(lock).map_err(|_| {
-        format!(
-            "{} source package has non-UTF-8 Cargo.lock",
-            spec.policy.package
-        )
-    })?;
-    let document = body.parse::<DocumentMut>().map_err(|error| {
-        format!(
-            "{} source package has invalid Cargo.lock: {error}",
-            spec.policy.package
-        )
-    })?;
-    let packages = document
-        .get("package")
-        .and_then(toml_edit::Item::as_array_of_tables)
-        .ok_or_else(|| {
-            format!(
-                "{} source package has no lock packages",
-                spec.policy.package
-            )
-        })?;
-    let matches: Vec<_> = packages
-        .iter()
-        .filter(|package| {
-            package.get("name").and_then(toml_edit::Item::as_str) == Some(spec.policy.package)
-                && package.get("version").and_then(toml_edit::Item::as_str)
-                    == Some(spec.version.as_str())
-        })
-        .collect();
-    if matches.len() != 1
-        || matches[0].contains_key("source")
-        || matches[0].contains_key("checksum")
-    {
-        return Err(format!(
-            "{} source package has an unbound generated Cargo.lock",
-            spec.policy.package
-        ));
-    }
-    Ok(())
 }
 
 fn recheck_registry(
@@ -633,8 +591,8 @@ fn require_main(github: &mut impl Transport, repository: &str, commit: &str) -> 
     Ok(())
 }
 
-fn manifest_version(root: &Path, kind: RepositoryKind) -> Result<String, String> {
-    let body = fs::read_to_string(root.join("Cargo.toml"))
+pub(super) fn manifest_version(root: &Path, kind: RepositoryKind) -> Result<String, String> {
+    let body = safe_file::read_manifest(root, Path::new("Cargo.toml"))
         .map_err(|error| format!("read release manifest: {error}"))?;
     let document = body
         .parse::<DocumentMut>()
@@ -655,7 +613,7 @@ fn manifest_version(root: &Path, kind: RepositoryKind) -> Result<String, String>
     Ok(value.to_string())
 }
 
-fn parse_version(value: &str) -> Result<Version, String> {
+pub(super) fn parse_version(value: &str) -> Result<Version, String> {
     let version = Version::parse(value)
         .map_err(|error| format!("unsupported release version {value}: {error}"))?;
     if !version.build.is_empty() {
@@ -881,5 +839,21 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn published_archive_comparison_includes_generated_cargo_lock() {
+        let release = spec(&crate::release_policy::TRAITS_POLICY.packages[0]);
+        let published = BTreeMap::from([
+            ("Cargo.lock".to_string(), b"published lock".to_vec()),
+            ("Cargo.toml".to_string(), b"manifest".to_vec()),
+        ]);
+        let mut reproduced = published.clone();
+        assert!(require_matching_archive_entries(&published, &reproduced, &release).is_ok());
+
+        reproduced.insert("Cargo.lock".to_string(), b"different lock".to_vec());
+        let error =
+            require_matching_archive_entries(&published, &reproduced, &release).unwrap_err();
+        assert!(error.contains("exact Cargo.lock entry differs"));
     }
 }

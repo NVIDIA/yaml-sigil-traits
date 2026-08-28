@@ -24,7 +24,13 @@ fi
 
 # Target-branch linear-history rules do not reject merge commits hidden inside
 # a pull request that is later squash-merged. Inspect parent counts directly.
-mapfile -t merge_commits < <(git rev-list --merges "${range}")
+merge_commit_output="$(git rev-list --merges "${range}")"
+merge_commits=()
+while IFS= read -r commit; do
+  if [[ -n "${commit}" ]]; then
+    merge_commits+=("${commit}")
+  fi
+done <<< "${merge_commit_output}"
 if ((${#merge_commits[@]} > 0)); then
   printf 'Merge commits are not allowed in pull requests:\n'
   git show --no-patch --format='  %H %s' "${merge_commits[@]}"
@@ -33,7 +39,13 @@ fi
 
 # An empty range indicates that the event and checkout do not describe a
 # reviewable change; do not silently report that as a successful policy check.
-mapfile -t commits < <(git rev-list --reverse "${range}")
+commit_output="$(git rev-list --reverse "${range}")"
+commits=()
+while IFS= read -r commit; do
+  if [[ -n "${commit}" ]]; then
+    commits+=("${commit}")
+  fi
+done <<< "${commit_output}"
 if ((${#commits[@]} == 0)); then
   echo "::error::The pull request commit range is empty."
   exit 1

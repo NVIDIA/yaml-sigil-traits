@@ -45,6 +45,40 @@ jobs:
           python3 -m unittest discover \
             -s .github/scripts -p 'test_*.py'
 
+  platform_verifier:
+    name: Protected checkout verifier (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            runner: ubuntu-latest
+          - name: macOS
+            runner: macos-latest
+          - name: Windows
+            runner: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Exercise the checkout verifier on each supported host, including a
+      # real Windows directory junction rather than a mocked reparse point.
+      - name: Compile and test protected checkout verifier
+        shell: bash
+        run: |
+          python3 -m py_compile \
+            .github/scripts/protected_checkout.py \
+            .github/scripts/protected_pr_ci.py \
+            .github/scripts/test_protected_pr_ci.py
+          python3 -m unittest discover \
+            -s .github/scripts -p 'test_protected_pr_ci.py'
+
   static_checks:
     name: Documentation
     runs-on: linux-amd64-cpu4
@@ -175,6 +209,7 @@ jobs:
     if: ${{ always() }}
     needs:
       - workflow_lint
+      - platform_verifier
       - static_checks
       - rust
     runs-on: linux-amd64-cpu4
@@ -185,6 +220,7 @@ jobs:
         env:
           GITHUB_ACTIONS_RESULT: ${{ needs.workflow_lint.result }}
           DOCUMENTATION_RESULT: ${{ needs.static_checks.result }}
+          PLATFORM_VERIFIER_RESULT: ${{ needs.platform_verifier.result }}
           RUST_RESULT: ${{ needs.rust.result }}
         run: |
           require_success() {
@@ -199,5 +235,6 @@ jobs:
           }
 
           require_success "GitHub Actions" "${GITHUB_ACTIONS_RESULT}"
+          require_success "Protected checkout verifier matrix" "${PLATFORM_VERIFIER_RESULT}"
           require_success "Documentation" "${DOCUMENTATION_RESULT}"
           require_success "Rust matrix" "${RUST_RESULT}"

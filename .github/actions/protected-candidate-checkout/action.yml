@@ -1,0 +1,73 @@
+name: Protected candidate checkout
+description: Stage protected policy, check out one exact candidate, and verify it.
+
+inputs:
+  policy-path:
+    description: Workspace-relative protected policy checkout.
+    required: false
+    default: policy
+  candidate-path:
+    description: Workspace-relative candidate checkout destination.
+    required: false
+    default: candidate
+  repository:
+    description: Exact candidate repository.
+    required: true
+  head-sha:
+    description: Exact authorized candidate commit.
+    required: true
+  base-sha:
+    description: Exact protected-main base commit.
+    required: true
+  fetch-depth:
+    description: Candidate checkout fetch depth.
+    required: false
+    default: "1"
+
+outputs:
+  python:
+    description: Absolute protected interpreter staged before candidate checkout.
+    value: ${{ steps.protected.outputs.python }}
+
+runs:
+  using: composite
+  steps:
+    # Candidate files do not exist while trusted policy and tool paths are staged.
+    - name: Stage protected verifier and trusted tools
+      id: protected
+      shell: bash
+      run: >-
+        python3 "${GITHUB_ACTION_PATH}/../../scripts/protected_checkout.py" stage
+        --source-root "${GITHUB_WORKSPACE}/${{ inputs.policy-path }}"
+        --destination "${RUNNER_TEMP}/yaml-sigil-protected-checkout"
+        --github-output "${GITHUB_OUTPUT}"
+
+    - name: Check out exact candidate
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        fetch-depth: ${{ inputs.fetch-depth }}
+        path: ${{ inputs.candidate-path }}
+        persist-credentials: false
+        ref: ${{ inputs.head-sha }}
+        repository: ${{ inputs.repository }}
+        submodules: false
+
+    # This is the first post-checkout step and executes only staged protected code.
+    - name: Verify exact candidate checkout
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+        PATH: ${{ steps.protected.outputs.path }}
+        TRUSTED_GIT: ${{ steps.protected.outputs.git }}
+        TRUSTED_PYTHON: ${{ steps.protected.outputs.python }}
+      run: >-
+        "${TRUSTED_PYTHON}" "${{ steps.protected.outputs.verifier }}" verify
+        --candidate-root "${GITHUB_WORKSPACE}/${{ inputs.candidate-path }}"
+        --git "${TRUSTED_GIT}"
+        --repository "${GITHUB_REPOSITORY}"
+        --base-sha "${{ inputs.base-sha }}"
+        --head-sha "${{ inputs.head-sha }}"
+        --config "${{ steps.protected.outputs.config }}"
+        --expected-verifier-sha256 "${{ steps.protected.outputs.verifier_sha256 }}"
+        --expected-controller-sha256 "${{ steps.protected.outputs.controller_sha256 }}"
+        --expected-config-sha256 "${{ steps.protected.outputs.config_sha256 }}"

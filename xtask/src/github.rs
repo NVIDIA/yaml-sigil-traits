@@ -9,6 +9,7 @@ mod intent;
 mod models;
 mod release_objects;
 mod release_pr;
+mod release_train;
 mod source;
 mod transport;
 
@@ -18,6 +19,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use crate::bounded_process::{self, OutputLimits};
 use clap::{Args, Subcommand, ValueEnum};
 use transport::GhCli;
 
@@ -43,6 +45,8 @@ enum GithubCommand {
     ReleaseSource(ReleaseSourceArgs),
     /// Verify or recover source-only official release objects.
     ReleaseObjects(ReleaseObjectsArgs),
+    /// Capture, attest, finalize, or notify one source-only release train.
+    ReleaseTrain(ReleaseTrainArgs),
 }
 
 #[derive(Args)]
@@ -127,6 +131,131 @@ enum ReleaseObjectsCommand {
     },
 }
 
+#[derive(Args)]
+struct ReleaseTrainArgs {
+    #[command(subcommand)]
+    command: ReleaseTrainCommand,
+}
+
+#[derive(Subcommand)]
+enum ReleaseTrainCommand {
+    /// Discover fresh or partial-publication source before plan capture.
+    Discover {
+        #[arg(long)]
+        repository: String,
+        #[arg(long)]
+        commit: String,
+    },
+    /// Capture one canonical release plan from exact protected source.
+    Capture {
+        #[arg(long)]
+        repository: String,
+        #[arg(long)]
+        commit: String,
+        #[arg(long)]
+        baseline_version: String,
+        #[arg(long)]
+        baseline_commit: String,
+    },
+    /// Recompute a captured plan and permit only exact registry progression.
+    Verify {
+        #[arg(long)]
+        repository: String,
+        #[arg(long)]
+        plan: String,
+        #[arg(long)]
+        plan_digest: String,
+        #[arg(long)]
+        baseline_version: String,
+        #[arg(long)]
+        baseline_commit: String,
+    },
+    /// Wait at most 20 minutes for the complete planned registry train.
+    Wait {
+        #[arg(long)]
+        repository: String,
+        #[arg(long)]
+        plan: String,
+        #[arg(long)]
+        plan_digest: String,
+    },
+    /// Prepare the canonical release-train intent before token minting.
+    PrepareIntent {
+        #[arg(long)]
+        plan: String,
+        #[arg(long)]
+        plan_digest: String,
+        #[arg(long)]
+        origin_run_id: String,
+        #[arg(long)]
+        origin_run_attempt: String,
+        #[arg(long)]
+        ruleset_evidence_sha256: String,
+    },
+    /// Create or verify the App-authored release-train intent Check.
+    CreateIntent {
+        #[arg(long)]
+        repository: String,
+        #[arg(long)]
+        plan: String,
+        #[arg(long)]
+        plan_digest: String,
+        #[arg(long)]
+        intent: String,
+        #[arg(long)]
+        expected_app_slug: String,
+        #[arg(long)]
+        expected_installation_id: String,
+    },
+    /// Re-read and verify the exact durable intent with a read-only token.
+    VerifyIntent {
+        #[arg(long)]
+        repository: String,
+        #[arg(long)]
+        plan: String,
+        #[arg(long)]
+        plan_digest: String,
+        #[arg(long)]
+        intent: String,
+        #[arg(long)]
+        check_id: String,
+    },
+    /// Finalize the exact published registry prefix with a contents-only token.
+    Finalize {
+        #[arg(long)]
+        repository: String,
+        #[arg(long)]
+        plan: String,
+        #[arg(long)]
+        plan_digest: String,
+        #[arg(long)]
+        intent: String,
+        #[arg(long)]
+        expected_app_slug: String,
+        #[arg(long)]
+        expected_installation_id: String,
+    },
+    /// Emit one closed complete-train repository dispatch.
+    Notify {
+        #[arg(long)]
+        repository: String,
+        #[arg(long)]
+        plan: String,
+        #[arg(long)]
+        plan_digest: String,
+        #[arg(long)]
+        intent: String,
+        #[arg(long)]
+        intent_check_id: String,
+        #[arg(long)]
+        finalized_entries: String,
+        #[arg(long)]
+        expected_app_slug: String,
+        #[arg(long)]
+        expected_installation_id: String,
+    },
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub(super) enum ReconcileMode {
     Prepublish,
@@ -182,6 +311,132 @@ pub fn run(root: &Path, args: GithubArgs) -> Result<(), String> {
                 &repository,
                 &version,
                 &commit,
+                &mut github,
+            ),
+        },
+        GithubCommand::ReleaseTrain(args) => match args.command {
+            ReleaseTrainCommand::Discover { repository, commit } => {
+                release_train::discover_command(root, &repository, &commit, &mut github)
+            }
+            ReleaseTrainCommand::Capture {
+                repository,
+                commit,
+                baseline_version,
+                baseline_commit,
+            } => release_train::capture_command(
+                root,
+                &repository,
+                &commit,
+                &baseline_version,
+                &baseline_commit,
+                &mut github,
+            ),
+            ReleaseTrainCommand::Verify {
+                repository,
+                plan,
+                plan_digest,
+                baseline_version,
+                baseline_commit,
+            } => release_train::verify_command(
+                root,
+                &repository,
+                &plan,
+                &plan_digest,
+                &baseline_version,
+                &baseline_commit,
+                &mut github,
+            ),
+            ReleaseTrainCommand::Wait {
+                repository,
+                plan,
+                plan_digest,
+            } => release_train::wait_command(&repository, &plan, &plan_digest),
+            ReleaseTrainCommand::PrepareIntent {
+                plan,
+                plan_digest,
+                origin_run_id,
+                origin_run_attempt,
+                ruleset_evidence_sha256,
+            } => release_train::prepare_intent_command(
+                root,
+                release_train::PrepareIntentInput {
+                    plan: &plan,
+                    plan_digest: &plan_digest,
+                    origin_run_id: &origin_run_id,
+                    origin_run_attempt: &origin_run_attempt,
+                    ruleset_evidence_sha256: &ruleset_evidence_sha256,
+                },
+            ),
+            ReleaseTrainCommand::CreateIntent {
+                repository,
+                plan,
+                plan_digest,
+                intent,
+                expected_app_slug,
+                expected_installation_id,
+            } => release_train::create_intent_command(
+                release_train::CreateIntentInput {
+                    repository: &repository,
+                    plan: &plan,
+                    plan_digest: &plan_digest,
+                    intent: &intent,
+                    expected_app_slug: &expected_app_slug,
+                    expected_installation_id: &expected_installation_id,
+                },
+                &mut github,
+            ),
+            ReleaseTrainCommand::VerifyIntent {
+                repository,
+                plan,
+                plan_digest,
+                intent,
+                check_id,
+            } => release_train::verify_intent_command(
+                &repository,
+                &plan,
+                &plan_digest,
+                &intent,
+                &check_id,
+                &mut github,
+            ),
+            ReleaseTrainCommand::Finalize {
+                repository,
+                plan,
+                plan_digest,
+                intent,
+                expected_app_slug,
+                expected_installation_id,
+            } => release_train::finalize_command(
+                release_train::FinalizeInput {
+                    repository: &repository,
+                    plan: &plan,
+                    plan_digest: &plan_digest,
+                    intent: &intent,
+                    expected_app_slug: &expected_app_slug,
+                    expected_installation_id: &expected_installation_id,
+                },
+                &mut github,
+            ),
+            ReleaseTrainCommand::Notify {
+                repository,
+                plan,
+                plan_digest,
+                intent,
+                intent_check_id,
+                finalized_entries,
+                expected_app_slug,
+                expected_installation_id,
+            } => release_train::notify_command(
+                release_train::NotifyInput {
+                    repository: &repository,
+                    plan: &plan,
+                    plan_digest: &plan_digest,
+                    intent: &intent,
+                    intent_check_id: &intent_check_id,
+                    finalized_entries: &finalized_entries,
+                    expected_app_slug: &expected_app_slug,
+                    expected_installation_id: &expected_installation_id,
+                },
                 &mut github,
             ),
         },
@@ -269,17 +524,16 @@ pub(super) fn append_outputs(values: &[(&str, &str)]) -> Result<(), String> {
 }
 
 pub(super) fn command_output(root: &Path, program: &str, args: &[&str]) -> Result<Output, String> {
-    let output = Command::new(program)
-        .current_dir(root)
-        .args(args)
-        .output()
-        .map_err(|error| format!("run {program}: {error}"))?;
-    if output.stdout.len() > transport::MAX_RESPONSE_BYTES
-        || output.stderr.len() > transport::MAX_ERROR_BYTES
-    {
-        return Err(format!("{program} output exceeded its bound"));
-    }
-    Ok(output)
+    let mut command = Command::new(program);
+    command.current_dir(root).args(args);
+    bounded_process::output(
+        &mut command,
+        OutputLimits {
+            stdout: transport::MAX_RESPONSE_BYTES,
+            stderr: transport::MAX_ERROR_BYTES,
+        },
+    )
+    .map_err(|error| format!("run {program}: {error}"))
 }
 
 pub(super) fn git_output(root: &Path, args: &[&str]) -> Result<String, String> {
