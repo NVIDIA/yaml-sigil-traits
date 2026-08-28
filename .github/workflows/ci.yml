@@ -1,5 +1,7 @@
 name: CI
 
+# This comment-only canary intentionally exercises sensitive-change adoption.
+
 on:
   workflow_dispatch:
   push:
