@@ -56,6 +56,7 @@ MAX_PULL_COMMITS = 250
 MAX_SIGNATURE_BATCH = 50
 MAX_SIGNATURE_REQUESTS = 5
 MAX_SIGNATURE_JSON_NODES = 25_000
+MAX_SIGNATURE_CURSOR_BYTES = 1_024
 MAX_TREE_ENTRIES = 10_000
 MAX_SENSITIVE_FILES = 512
 MAX_PATH_METADATA_BYTES = 4 * 1024 * 1024
@@ -331,9 +332,9 @@ class GitHubApi:
         return self.request("PATCH", path, payload)
 
     def commit_signatures(
-        self, repository: str, oids: Sequence[str]
+        self, repository: str, pull_number: int, oids: Sequence[str]
     ) -> Mapping[str, Mapping[str, Any]]:
-        """Read exact commit-signature identities within one aggregate budget."""
+        """Read exact PR commit-signature identities within one aggregate budget."""
 
         require(
             1 <= len(oids) <= MAX_PULL_COMMITS,
@@ -343,11 +344,17 @@ class GitHubApi:
             len(set(oids)) == len(oids),
             "signature inventory contains duplicate commit OIDs",
         )
+        require(
+            isinstance(pull_number, int) and not isinstance(pull_number, bool)
+            and pull_number > 0,
+            "signature pull request number must be positive",
+        )
         owner, name = validate_repository(repository).split("/", 1)
         observed: dict[str, Mapping[str, Any]] = {}
         aggregate_bytes = 0
         aggregate_nodes = 0
         request_count = 0
+        cursor: str | None = None
 
         for offset in range(0, len(oids), MAX_SIGNATURE_BATCH):
             batch = list(oids[offset : offset + MAX_SIGNATURE_BATCH])
@@ -356,22 +363,22 @@ class GitHubApi:
                 request_count <= MAX_SIGNATURE_REQUESTS,
                 "commit signatures require too many GraphQL requests",
             )
-            declarations = ["$owner:String!", "$name:String!"]
-            fields = []
-            variables: dict[str, Any] = {"owner": owner, "name": name}
             for index, oid in enumerate(batch):
                 validate_sha(oid, f"signature OID {offset + index}")
-                declarations.append(f"$oid{index}:GitObjectID!")
-                variables[f"oid{index}"] = oid
-                fields.append(
-                    f"c{index}:object(oid:$oid{index}){{... on Commit{{oid signature{{"
-                    "__typename email isValid state wasSignedByGitHub "
-                    "signer{databaseId login __typename}}}}}}"
-                )
+            variables: dict[str, Any] = {
+                "owner": owner,
+                "name": name,
+                "number": pull_number,
+                "first": len(batch),
+                "after": cursor,
+            }
             query = (
-                f"query({','.join(declarations)}){{repository(owner:$owner,name:$name){{"
-                f"{''.join(fields)}"
-                "}}}"
+                "query($owner:String!,$name:String!,$number:Int!,"
+                "$first:Int!,$after:String){repository(owner:$owner,name:$name){"
+                "pullRequest(number:$number){commits(first:$first,after:$after){"
+                "totalCount nodes{commit{oid signature{__typename email isValid "
+                "state wasSignedByGitHub signer{databaseId login __typename}}}}"
+                "pageInfo{hasNextPage endCursor}}}}}"
             )
             payload = json.dumps(
                 {"query": query, "variables": variables},
@@ -426,16 +433,65 @@ class GitHubApi:
             require("errors" not in envelope, "GraphQL signature response contains errors")
             data = require_mapping(envelope.get("data"), "GraphQL data")
             repo = require_mapping(data.get("repository"), "GraphQL repository")
+            pull = require_mapping(repo.get("pullRequest"), "GraphQL pull request")
+            commits = require_mapping(
+                pull.get("commits"), "GraphQL pull request commits"
+            )
             require(
-                set(repo) == {f"c{index}" for index in range(len(batch))},
+                set(commits) == {"totalCount", "nodes", "pageInfo"},
+                "GraphQL signature response fields are incomplete or ambiguous",
+            )
+            total_count = require_integer(
+                commits.get("totalCount"), "GraphQL signature total count"
+            )
+            require(
+                total_count == len(oids),
+                "GraphQL signature total count changed",
+            )
+            nodes = require_sequence(commits.get("nodes"), "GraphQL signature results")
+            require(
+                len(nodes) == len(batch),
                 "GraphQL signature response has missing or unrequested results",
             )
             for index, requested_oid in enumerate(batch):
-                commit = require_mapping(repo.get(f"c{index}"), f"signature result {index}")
+                node = require_mapping(nodes[index], f"signature node {offset + index}")
+                require(
+                    set(node) == {"commit"},
+                    f"signature node {offset + index} fields are ambiguous",
+                )
+                commit = require_mapping(
+                    node.get("commit"), f"signature result {offset + index}"
+                )
                 oid = validate_sha(commit.get("oid"), f"signature result {index} OID")
                 require(oid == requested_oid, "GraphQL signature result OID is out of order")
                 require(oid not in observed, "GraphQL signature result is duplicated")
                 observed[oid] = commit
+
+            page_info = require_mapping(
+                commits.get("pageInfo"), "GraphQL signature page info"
+            )
+            require(
+                set(page_info) == {"hasNextPage", "endCursor"},
+                "GraphQL signature page info fields are incomplete or ambiguous",
+            )
+            has_next = page_info.get("hasNextPage")
+            require(
+                isinstance(has_next, bool),
+                "GraphQL signature pagination state is missing",
+            )
+            more_expected = offset + len(batch) < len(oids)
+            require(
+                has_next is more_expected,
+                "GraphQL signature pagination does not match the commit inventory",
+            )
+            if more_expected:
+                cursor = require_string(
+                    page_info.get("endCursor"), "GraphQL signature cursor"
+                )
+                require(
+                    len(cursor.encode("utf-8")) <= MAX_SIGNATURE_CURSOR_BYTES,
+                    "GraphQL signature cursor exceeds the supported size limit",
+                )
 
         require(
             list(observed) == list(oids),
@@ -1448,7 +1504,7 @@ def authorize(
         validate_sha(commit.get("sha"), f"pull request commit {index} SHA")
         for index, commit in enumerate(commits)
     ]
-    signatures = api.commit_signatures(repository, commit_oids)
+    signatures = api.commit_signatures(repository, pull_number, commit_oids)
 
     repository_kind = require_string(config.get("repository_kind"), "repository_kind")
     inventory = sensitive_inventory(base_tree, head_tree, paths, statuses, repository_kind)

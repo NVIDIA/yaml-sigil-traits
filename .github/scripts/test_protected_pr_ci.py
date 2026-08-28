@@ -470,8 +470,9 @@ class FakeAuthorizationApi:
             return copy.deepcopy(self.runs)
         raise AssertionError(f"unexpected keyed pagination label {label}")
 
-    def commit_signatures(self, repository, oids):
+    def commit_signatures(self, repository, pull_number, oids):
         self.signature_repository = repository
+        self.signature_pull_number = pull_number
         return {oid: copy.deepcopy(self.signatures[oid]) for oid in oids}
 
     def post(self, path: str, payload: dict):
@@ -2005,44 +2006,143 @@ class GraphQlResponse:
         return self.raw[:limit]
 
 
-def requested_graphql_oids(request) -> list[str]:
+def requested_graphql_page(request) -> tuple[int, str | None, int, str]:
     body = json.loads(request.data)
     variables = body["variables"]
-    return [
-        variables[f"oid{index}"]
-        for index in range(len(variables) - 2)
-    ]
+    return variables["first"], variables["after"], variables["number"], body["query"]
 
 
-def graphql_signature_response(request, *_args, **_kwargs) -> GraphQlResponse:
-    oids = requested_graphql_oids(request)
-    return GraphQlResponse(
-        {
-            "data": {
-                "repository": {
-                    f"c{index}": git_signature(sha=oid)
-                    for index, oid in enumerate(oids)
+def graphql_signature_value(
+    signatures: list[dict],
+    *,
+    total_count: int,
+    has_next: bool,
+    end_cursor: str | None,
+) -> dict:
+    return {
+        "data": {
+            "repository": {
+                "pullRequest": {
+                    "commits": {
+                        "totalCount": total_count,
+                        "nodes": [{"commit": signature} for signature in signatures],
+                        "pageInfo": {
+                            "hasNextPage": has_next,
+                            "endCursor": end_cursor,
+                        },
+                    }
                 }
             }
         }
+    }
+
+
+def graphql_signature_response(
+    oids: list[str],
+    *,
+    total_count: int | None = None,
+    has_next: bool = False,
+    end_cursor: str | None = None,
+) -> GraphQlResponse:
+    return GraphQlResponse(
+        graphql_signature_value(
+            [git_signature(sha=oid) for oid in oids],
+            total_count=len(oids) if total_count is None else total_count,
+            has_next=has_next,
+            end_cursor=end_cursor,
+        )
     )
 
 
+def graphql_signature_pages(oids: list[str]):
+    offset = 0
+    expected_cursor = None
+
+    def respond(request, *_args, **_kwargs) -> GraphQlResponse:
+        nonlocal offset, expected_cursor
+        first, after, number, query = requested_graphql_page(request)
+        if number != PULL_NUMBER or after != expected_cursor:
+            raise AssertionError("unexpected pull request signature page")
+        if "pullRequest(number:$number)" not in query or "object(oid:" in query:
+            raise AssertionError("signature query escaped the pull request connection")
+        batch = oids[offset : offset + first]
+        offset += len(batch)
+        has_next = offset < len(oids)
+        end_cursor = f"cursor-{offset}"
+        expected_cursor = end_cursor if has_next else None
+        return graphql_signature_response(
+            batch,
+            total_count=len(oids),
+            has_next=has_next,
+            end_cursor=end_cursor,
+        )
+
+    return respond
+
+
 class GraphQlSignatureTests(unittest.TestCase):
+    def test_signature_query_text_matches_the_intended_selection_tree(self) -> None:
+        api = controller.GitHubApi("token", "https://example.invalid")
+        with mock.patch.object(
+            controller.urllib.request,
+            "urlopen",
+            return_value=graphql_signature_response([HEAD_SHA]),
+        ) as urlopen:
+            api.commit_signatures(REPOSITORY, PULL_NUMBER, [HEAD_SHA])
+
+        _, _, _, query = requested_graphql_page(urlopen.call_args.args[0])
+        expected = "".join(
+            """
+            query($owner:String!,$name:String!,$number:Int!,$first:Int!,$after:String){
+              repository(owner:$owner,name:$name){
+                pullRequest(number:$number){
+                  commits(first:$first,after:$after){
+                    totalCount
+                    nodes{
+                      commit{
+                        oid
+                        signature{
+                          __typename
+                          email
+                          isValid
+                          state
+                          wasSignedByGitHub
+                          signer{databaseId login __typename}
+                        }
+                      }
+                    }
+                    pageInfo{hasNextPage endCursor}
+                  }
+                }
+              }
+            }
+            """.split()
+        )
+        self.assertEqual("".join(query.split()), expected)
+
     def test_signature_inventory_is_batched_five_by_fifty(self) -> None:
         oids = [f"{index:040x}" for index in range(1, 251)]
         api = controller.GitHubApi("token", "https://example.invalid")
         with mock.patch.object(
             controller.urllib.request,
             "urlopen",
-            side_effect=graphql_signature_response,
+            side_effect=graphql_signature_pages(oids),
         ) as urlopen:
-            observed = api.commit_signatures(REPOSITORY, oids)
+            observed = api.commit_signatures(REPOSITORY, PULL_NUMBER, oids)
         self.assertEqual(list(observed), oids)
         self.assertEqual(urlopen.call_count, 5)
         self.assertTrue(
             all(
-                len(requested_graphql_oids(call.args[0])) == 50
+                requested_graphql_page(call.args[0])[0] == 50
+                for call in urlopen.call_args_list
+            )
+        )
+        self.assertTrue(
+            all(
+                requested_graphql_page(call.args[0])[2] == PULL_NUMBER
+                and "pullRequest(number:$number)"
+                in requested_graphql_page(call.args[0])[3]
+                and "object(oid:" not in requested_graphql_page(call.args[0])[3]
                 for call in urlopen.call_args_list
             )
         )
@@ -2051,7 +2151,7 @@ class GraphQlSignatureTests(unittest.TestCase):
         api = controller.GitHubApi("token", "https://example.invalid")
         oids = [f"{index:040x}" for index in range(1, 252)]
         with self.assertRaisesRegex(controller.PolicyError, "commit limit"):
-            api.commit_signatures(REPOSITORY, oids)
+            api.commit_signatures(REPOSITORY, PULL_NUMBER, oids)
 
         with (
             mock.patch.object(controller, "MAX_SIGNATURE_BATCH", 1),
@@ -2059,23 +2159,24 @@ class GraphQlSignatureTests(unittest.TestCase):
             mock.patch.object(
                 controller.urllib.request,
                 "urlopen",
-                side_effect=graphql_signature_response,
+                side_effect=graphql_signature_pages([HEAD_SHA, OLD_SHA]),
             ) as urlopen,
             self.assertRaisesRegex(controller.PolicyError, "too many GraphQL requests"),
         ):
-            api.commit_signatures(REPOSITORY, [HEAD_SHA, OLD_SHA])
+            api.commit_signatures(REPOSITORY, PULL_NUMBER, [HEAD_SHA, OLD_SHA])
         self.assertEqual(urlopen.call_count, 1)
 
     def test_aggregate_success_body_budget_has_a_sentinel(self) -> None:
         first = graphql_signature_response(
-            mock.Mock(data=json.dumps(
-                {"variables": {"owner": "NVIDIA", "name": "example", "oid0": HEAD_SHA}}
-            ).encode("utf-8"))
+            [HEAD_SHA],
+            total_count=2,
+            has_next=True,
+            end_cursor="cursor-1",
         )
         second = graphql_signature_response(
-            mock.Mock(data=json.dumps(
-                {"variables": {"owner": "NVIDIA", "name": "example", "oid0": OLD_SHA}}
-            ).encode("utf-8"))
+            [OLD_SHA],
+            total_count=2,
+            end_cursor="cursor-2",
         )
         budget = len(first.raw) + len(second.raw) - 1
         api = controller.GitHubApi("token", "https://example.invalid")
@@ -2089,14 +2190,10 @@ class GraphQlSignatureTests(unittest.TestCase):
             ),
             self.assertRaisesRegex(controller.PolicyError, "aggregate commit signature"),
         ):
-            api.commit_signatures(REPOSITORY, [HEAD_SHA, OLD_SHA])
+            api.commit_signatures(REPOSITORY, PULL_NUMBER, [HEAD_SHA, OLD_SHA])
 
     def test_partial_graphql_errors_are_rejected_even_with_data(self) -> None:
-        response = graphql_signature_response(
-            mock.Mock(data=json.dumps(
-                {"variables": {"owner": "NVIDIA", "name": "example", "oid0": HEAD_SHA}}
-            ).encode("utf-8"))
-        )
+        response = graphql_signature_response([HEAD_SHA], end_cursor="cursor-1")
         value = json.loads(response.raw)
         value["errors"] = [{"message": "partial"}]
         api = controller.GitHubApi("token", "https://example.invalid")
@@ -2108,26 +2205,26 @@ class GraphQlSignatureTests(unittest.TestCase):
             ),
             self.assertRaisesRegex(controller.PolicyError, "contains errors"),
         ):
-            api.commit_signatures(REPOSITORY, [HEAD_SHA])
+            api.commit_signatures(REPOSITORY, PULL_NUMBER, [HEAD_SHA])
 
     def test_missing_extra_duplicate_and_reordered_results_fail_closed(self) -> None:
         cases = {
-            "missing": {"c0": git_signature(sha=HEAD_SHA)},
-            "extra": {
-                "c0": git_signature(sha=HEAD_SHA),
-                "c1": git_signature(sha=OLD_SHA),
-                "c2": git_signature(sha=MAIN_SHA),
-            },
-            "duplicate": {
-                "c0": git_signature(sha=HEAD_SHA),
-                "c1": git_signature(sha=HEAD_SHA),
-            },
-            "reordered": {
-                "c0": git_signature(sha=OLD_SHA),
-                "c1": git_signature(sha=HEAD_SHA),
-            },
+            "missing": [git_signature(sha=HEAD_SHA)],
+            "extra": [
+                git_signature(sha=HEAD_SHA),
+                git_signature(sha=OLD_SHA),
+                git_signature(sha=MAIN_SHA),
+            ],
+            "duplicate": [
+                git_signature(sha=HEAD_SHA),
+                git_signature(sha=HEAD_SHA),
+            ],
+            "reordered": [
+                git_signature(sha=OLD_SHA),
+                git_signature(sha=HEAD_SHA),
+            ],
         }
-        for label, repository in cases.items():
+        for label, signatures in cases.items():
             with self.subTest(case=label):
                 api = controller.GitHubApi("token", "https://example.invalid")
                 with (
@@ -2135,12 +2232,19 @@ class GraphQlSignatureTests(unittest.TestCase):
                         controller.urllib.request,
                         "urlopen",
                         return_value=GraphQlResponse(
-                            {"data": {"repository": repository}}
+                            graphql_signature_value(
+                                signatures,
+                                total_count=2,
+                                has_next=False,
+                                end_cursor="cursor-2",
+                            )
                         ),
                     ),
                     self.assertRaises(controller.PolicyError),
                 ):
-                    api.commit_signatures(REPOSITORY, [HEAD_SHA, OLD_SHA])
+                    api.commit_signatures(
+                        REPOSITORY, PULL_NUMBER, [HEAD_SHA, OLD_SHA]
+                    )
 
     def test_duplicate_requested_oids_fail_before_network_access(self) -> None:
         api = controller.GitHubApi("token", "https://example.invalid")
@@ -2148,7 +2252,7 @@ class GraphQlSignatureTests(unittest.TestCase):
             mock.patch.object(controller.urllib.request, "urlopen") as urlopen,
             self.assertRaisesRegex(controller.PolicyError, "duplicate commit OIDs"),
         ):
-            api.commit_signatures(REPOSITORY, [HEAD_SHA, HEAD_SHA])
+            api.commit_signatures(REPOSITORY, PULL_NUMBER, [HEAD_SHA, HEAD_SHA])
         urlopen.assert_not_called()
 
 
