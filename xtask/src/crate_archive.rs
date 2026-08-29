@@ -14,15 +14,26 @@ use flate2::read::GzDecoder;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+use crate::bounded_process::{self, OutputLimits};
 use crate::release_policy::PackagePolicy;
 
 pub(crate) const MAX_CRATE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_JSON_BYTES: usize = 2 * 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 64 * 1024;
+const MAX_TOTAL_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_CRATE_FILES: usize = 10_000;
 const MAX_CRATE_UNPACKED_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_CRATE_DECOMPRESSED_BYTES: u64 = 160 * 1024 * 1024;
 const READ_ATTEMPTS: usize = 3;
+pub(crate) const CARGO_ARCHIVE_MTIME: u64 = 1_153_704_088;
+const CARGO_ARCHIVE_MODES: &[u32] = &[0o644, 0o755];
+const GNU_NUL_ZERO: [u8; 8] = [0; 8];
+const GNU_OCTAL_ZERO: [u8; 8] = *b"0000000\0";
+const GNU_UID_RANGE: std::ops::Range<usize> = 108..116;
+const GNU_GID_RANGE: std::ops::Range<usize> = 116..124;
+const GNU_TYPEFLAG_OFFSET: usize = 156;
+const GNU_DEVICE_MAJOR_RANGE: std::ops::Range<usize> = 329..337;
+const GNU_DEVICE_MINOR_RANGE: std::ops::Range<usize> = 337..345;
 const USER_AGENT: &str = "yaml-sigil-release-workflow/1.0";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -41,39 +52,58 @@ pub(crate) trait Registry {
     fn download(&mut self, package: &str, version: &str) -> Result<Vec<u8>, String>;
 }
 
-pub(crate) struct CratesIo;
+pub(crate) struct CratesIo {
+    total_response_bytes: usize,
+}
 
 impl CratesIo {
     pub(crate) fn new() -> Self {
-        Self
+        Self {
+            total_response_bytes: 0,
+        }
     }
 
-    fn request_json(&self, path: &str) -> Result<Option<Vec<u8>>, String> {
+    fn account_response(&mut self, bytes: usize) -> Result<(), String> {
+        self.total_response_bytes = self
+            .total_response_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| "aggregate registry response size overflowed".to_string())?;
+        if self.total_response_bytes > MAX_TOTAL_RESPONSE_BYTES {
+            return Err("aggregate registry response bytes exceeded 32 MiB".to_string());
+        }
+        Ok(())
+    }
+
+    fn request_json(&mut self, path: &str) -> Result<Option<Vec<u8>>, String> {
         let url = format!("https://crates.io/api/v1{path}");
         let mut last = None;
         for attempt in 1..=READ_ATTEMPTS {
-            let output = Command::new("curl")
-                .args([
-                    "--disable",
-                    "--silent",
-                    "--show-error",
-                    "--proto",
-                    "=https",
-                    "--proto-redir",
-                    "=https",
-                    "--max-time",
-                    "30",
-                    "--write-out",
-                    "\n%{http_code}",
-                    "--user-agent",
-                    USER_AGENT,
-                    &url,
-                ])
-                .output()
-                .map_err(|error| format!("run crates.io request: {error}"))?;
-            if output.stdout.len() > MAX_JSON_BYTES || output.stderr.len() > MAX_ERROR_BYTES {
-                return Err("crates.io response exceeded its bound".to_string());
-            }
+            let mut command = Command::new("curl");
+            command.args([
+                "--disable",
+                "--silent",
+                "--show-error",
+                "--proto",
+                "=https",
+                "--proto-redir",
+                "=https",
+                "--max-time",
+                "30",
+                "--write-out",
+                "\n%{http_code}",
+                "--user-agent",
+                USER_AGENT,
+                &url,
+            ]);
+            let output = bounded_process::output(
+                &mut command,
+                OutputLimits {
+                    stdout: MAX_JSON_BYTES,
+                    stderr: MAX_ERROR_BYTES,
+                },
+            )
+            .map_err(|error| format!("run crates.io request: {error}"))?;
+            self.account_response(output.stdout.len())?;
             if !output.status.success() {
                 let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
                 if attempt < READ_ATTEMPTS && transient_detail(&detail) {
@@ -127,30 +157,34 @@ impl Registry for CratesIo {
         let url = format!("https://crates.io/api/v1/crates/{package}/{version}/download");
         let mut last = None;
         for attempt in 1..=READ_ATTEMPTS {
-            let output = Command::new("curl")
-                .args([
-                    "--disable",
-                    "--silent",
-                    "--show-error",
-                    "--fail",
-                    "--location",
-                    "--proto",
-                    "=https",
-                    "--proto-redir",
-                    "=https",
-                    "--max-time",
-                    "60",
-                    "--max-filesize",
-                    &MAX_CRATE_BYTES.to_string(),
-                    "--user-agent",
-                    USER_AGENT,
-                    &url,
-                ])
-                .output()
-                .map_err(|error| format!("run crates.io archive download: {error}"))?;
-            if output.stdout.len() > MAX_CRATE_BYTES || output.stderr.len() > MAX_ERROR_BYTES {
-                return Err("crates.io archive response exceeded its bound".to_string());
-            }
+            let mut command = Command::new("curl");
+            command.args([
+                "--disable",
+                "--silent",
+                "--show-error",
+                "--fail",
+                "--location",
+                "--proto",
+                "=https",
+                "--proto-redir",
+                "=https",
+                "--max-time",
+                "60",
+                "--max-filesize",
+                &MAX_CRATE_BYTES.to_string(),
+                "--user-agent",
+                USER_AGENT,
+                &url,
+            ]);
+            let output = bounded_process::output(
+                &mut command,
+                OutputLimits {
+                    stdout: MAX_CRATE_BYTES,
+                    stderr: MAX_ERROR_BYTES,
+                },
+            )
+            .map_err(|error| format!("run crates.io archive download: {error}"))?;
+            self.account_response(output.stdout.len())?;
             if output.status.success() {
                 return Ok(output.stdout);
             }
@@ -205,7 +239,7 @@ pub(crate) fn require_archive(
     policy: &PackagePolicy,
     version: &str,
     commit: &str,
-) -> Result<(String, BTreeMap<String, Vec<u8>>), String> {
+) -> Result<(String, BTreeMap<String, ArchiveFile>), String> {
     let record = registry
         .exact_version(policy.package, version)?
         .ok_or_else(|| format!("crates.io lacks {} {version}", policy.package))?;
@@ -223,8 +257,27 @@ pub(crate) fn require_archive(
             policy.package
         ));
     }
-    let files = inspect_archive(&archive, policy, version, commit)?;
+    let files = inspect_archive_entries(&archive, policy, version, commit)?;
     Ok((record.checksum, files))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ArchiveFile {
+    pub(crate) body: Vec<u8>,
+    metadata: ArchiveMetadata,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ArchiveMetadata {
+    entry_type: u8,
+    mode: u32,
+    uid: Vec<u8>,
+    gid: Vec<u8>,
+    mtime: u64,
+    username: Vec<u8>,
+    groupname: Vec<u8>,
+    device_major: Vec<u8>,
+    device_minor: Vec<u8>,
 }
 
 pub(crate) fn inspect_archive(
@@ -242,6 +295,36 @@ pub(crate) fn inspect_archive(
     )
 }
 
+pub(crate) fn inspect_archive_entries(
+    archive: &[u8],
+    policy: &PackagePolicy,
+    version: &str,
+    commit: &str,
+) -> Result<BTreeMap<String, ArchiveFile>, String> {
+    inspect_archive_entries_with_limit(
+        archive,
+        policy,
+        version,
+        Some(commit),
+        MAX_CRATE_DECOMPRESSED_BYTES,
+    )
+}
+
+pub(crate) fn archive_vcs_commit(
+    archive: &[u8],
+    policy: &PackagePolicy,
+    version: &str,
+) -> Result<String, String> {
+    let files = inspect_archive_entries_with_limit(
+        archive,
+        policy,
+        version,
+        None,
+        MAX_CRATE_DECOMPRESSED_BYTES,
+    )?;
+    Ok(parse_vcs_info(&files, policy)?.git.sha1)
+}
+
 fn inspect_archive_with_limit(
     archive: &[u8],
     policy: &PackagePolicy,
@@ -249,6 +332,22 @@ fn inspect_archive_with_limit(
     commit: &str,
     decompressed_limit: u64,
 ) -> Result<BTreeMap<String, Vec<u8>>, String> {
+    inspect_archive_entries_with_limit(archive, policy, version, Some(commit), decompressed_limit)
+        .map(|entries| {
+            entries
+                .into_iter()
+                .map(|(path, file)| (path, file.body))
+                .collect()
+        })
+}
+
+fn inspect_archive_entries_with_limit(
+    archive: &[u8],
+    policy: &PackagePolicy,
+    version: &str,
+    commit: Option<&str>,
+    decompressed_limit: u64,
+) -> Result<BTreeMap<String, ArchiveFile>, String> {
     if archive.is_empty() || archive.len() > MAX_CRATE_BYTES {
         return Err(format!(
             "{} source archive is empty or oversized",
@@ -299,18 +398,9 @@ fn inspect_archive_with_limit(
             let raw_path = std::str::from_utf8(&raw_path)
                 .map_err(|_| format!("{} source archive has a non-UTF-8 path", policy.package))?
                 .to_string();
-            let directory = entry.header().entry_type().is_dir();
             let path = raw_path.strip_suffix('/').unwrap_or(&raw_path);
             validate_archive_path(path, &prefix, policy.package)?;
-            if directory {
-                continue;
-            }
-            if !entry.header().entry_type().is_file() {
-                return Err(format!(
-                    "{} source archive contains a non-file entry",
-                    policy.package
-                ));
-            }
+            let metadata = cargo_archive_metadata(entry.header(), policy.package)?;
             let relative = path
                 .strip_prefix(&format!("{prefix}/"))
                 .ok_or_else(|| format!("{} source archive path lacks its root", policy.package))?;
@@ -325,7 +415,11 @@ fn inspect_archive_with_limit(
                         policy.package
                     )
                 })?;
-            if body.len() as u64 != size || files.insert(relative.to_string(), body).is_some() {
+            if body.len() as u64 != size
+                || files
+                    .insert(relative.to_string(), ArchiveFile { body, metadata })
+                    .is_some()
+            {
                 return Err(format!(
                     "{} source archive contains a duplicate or truncated file",
                     policy.package
@@ -335,7 +429,13 @@ fn inspect_archive_with_limit(
         if count == 0 {
             return Err(format!("{} source archive is empty", policy.package));
         }
-        require_vcs_info(&files, policy, commit)?;
+        let vcs = parse_vcs_info(&files, policy)?;
+        if commit.is_some_and(|expected| vcs.git.sha1 != expected) {
+            return Err(format!(
+                "{} source archive is not bound to the exact clean release commit",
+                policy.package
+            ));
+        }
         Ok(files)
     })();
 
@@ -354,6 +454,89 @@ fn inspect_archive_with_limit(
         )
     })?;
     inspection
+}
+
+fn cargo_archive_metadata(header: &tar::Header, package: &str) -> Result<ArchiveMetadata, String> {
+    if header.as_gnu().is_none() {
+        return Err(format!(
+            "{package} source archive entry does not use Cargo's GNU header format"
+        ));
+    }
+    // The GNU tar header stores the raw type flag at byte 156. Cargo 1.95
+    // emits the canonical ASCII `0` regular-file spelling, not the NUL alias.
+    let entry_type = header.as_bytes()[GNU_TYPEFLAG_OFFSET];
+    if entry_type != tar::EntryType::file().as_byte() {
+        return Err(format!(
+            "{package} source archive contains a noncanonical entry type"
+        ));
+    }
+    let mode = header
+        .mode()
+        .map_err(|error| format!("{package} source archive has an invalid mode: {error}"))?;
+    if !CARGO_ARCHIVE_MODES.contains(&mode) {
+        return Err(format!(
+            "{package} source archive contains a noncanonical or unsafe mode"
+        ));
+    }
+    // Cargo 1.95 emits NUL zeroes for generated entries and octal zeroes for
+    // entries copied from disk. Preserve the raw form so reproduction catches
+    // a representation change even though both decode to numeric zero.
+    let uid = header.as_bytes()[GNU_UID_RANGE].to_vec();
+    let gid = header.as_bytes()[GNU_GID_RANGE].to_vec();
+    if !cargo_zero_field(&uid) || !cargo_zero_field(&gid) {
+        return Err(format!(
+            "{package} source archive contains noncanonical ownership: UID {uid:?}, GID {gid:?}"
+        ));
+    }
+    let mtime = header
+        .mtime()
+        .map_err(|error| format!("{package} source archive has an invalid mtime: {error}"))?;
+    if mtime != CARGO_ARCHIVE_MTIME {
+        return Err(format!(
+            "{package} source archive contains a noncanonical mtime"
+        ));
+    }
+    let username = header
+        .username_bytes()
+        .ok_or_else(|| format!("{package} source archive omits Cargo's owner representation"))?;
+    let groupname = header
+        .groupname_bytes()
+        .ok_or_else(|| format!("{package} source archive omits Cargo's group representation"))?;
+    if !username.is_empty() || !groupname.is_empty() {
+        return Err(format!(
+            "{package} source archive contains noncanonical owner or group names"
+        ));
+    }
+    if header
+        .link_name_bytes()
+        .is_some_and(|name| !name.is_empty())
+    {
+        return Err(format!(
+            "{package} source archive regular entry contains a link target"
+        ));
+    }
+    let device_major = header.as_bytes()[GNU_DEVICE_MAJOR_RANGE].to_vec();
+    let device_minor = header.as_bytes()[GNU_DEVICE_MINOR_RANGE].to_vec();
+    if !cargo_zero_field(&device_major) || !cargo_zero_field(&device_minor) {
+        return Err(format!(
+            "{package} source archive contains noncanonical device metadata"
+        ));
+    }
+    Ok(ArchiveMetadata {
+        entry_type,
+        mode,
+        uid,
+        gid,
+        mtime,
+        username: username.to_vec(),
+        groupname: groupname.to_vec(),
+        device_major,
+        device_minor,
+    })
+}
+
+fn cargo_zero_field(field: &[u8]) -> bool {
+    field == GNU_NUL_ZERO || field == GNU_OCTAL_ZERO
 }
 
 fn validate_archive_path(path: &str, prefix: &str, package: &str) -> Result<(), String> {
@@ -384,30 +567,40 @@ struct VcsGit {
     dirty: bool,
 }
 
-fn require_vcs_info(
-    files: &BTreeMap<String, Vec<u8>>,
+fn parse_vcs_info(
+    files: &BTreeMap<String, ArchiveFile>,
     policy: &PackagePolicy,
-    commit: &str,
-) -> Result<(), String> {
-    let body = files.get(".cargo_vcs_info.json").ok_or_else(|| {
-        format!(
-            "{} source archive lacks .cargo_vcs_info.json",
-            policy.package
-        )
-    })?;
+) -> Result<VcsInfo, String> {
+    let body = &files
+        .get(".cargo_vcs_info.json")
+        .ok_or_else(|| {
+            format!(
+                "{} source archive lacks .cargo_vcs_info.json",
+                policy.package
+            )
+        })?
+        .body;
     let vcs: VcsInfo = serde_json::from_slice(body).map_err(|error| {
         format!(
             "{} source archive has invalid VCS metadata: {error}",
             policy.package
         )
     })?;
-    if vcs.git.sha1 != commit || vcs.git.dirty || vcs.path_in_vcs != policy.path_in_vcs {
+    if vcs.git.sha1.len() != 40
+        || !vcs
+            .git
+            .sha1
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        || vcs.git.dirty
+        || vcs.path_in_vcs != policy.path_in_vcs
+    {
         return Err(format!(
-            "{} source archive is not bound to the exact clean release commit",
+            "{} source archive contains invalid VCS identity",
             policy.package
         ));
     }
-    Ok(())
+    Ok(vcs)
 }
 
 pub(crate) fn is_checksum(value: &str) -> bool {
@@ -418,28 +611,32 @@ pub(crate) fn is_checksum(value: &str) -> bool {
 }
 
 pub(crate) fn require_clean_source(root: &Path, commit: &str) -> Result<(), String> {
-    let head = Command::new("git")
-        .current_dir(root)
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .map_err(|error| format!("read release source commit: {error}"))?;
-    if head.stdout.len() > MAX_ERROR_BYTES
-        || head.stderr.len() > MAX_ERROR_BYTES
-        || !head.status.success()
-        || String::from_utf8_lossy(&head.stdout).trim() != commit
-    {
+    let mut head_command = Command::new("git");
+    head_command.current_dir(root).args(["rev-parse", "HEAD"]);
+    let head = bounded_process::output(
+        &mut head_command,
+        OutputLimits {
+            stdout: MAX_ERROR_BYTES,
+            stderr: MAX_ERROR_BYTES,
+        },
+    )
+    .map_err(|error| format!("read release source commit: {error}"))?;
+    if !head.status.success() || String::from_utf8_lossy(&head.stdout).trim() != commit {
         return Err("release source is not at the expected commit".to_string());
     }
-    let status = Command::new("git")
+    let mut status_command = Command::new("git");
+    status_command
         .current_dir(root)
-        .args(["status", "--porcelain"])
-        .output()
-        .map_err(|error| format!("read release source status: {error}"))?;
-    if status.stdout.len() > MAX_JSON_BYTES
-        || status.stderr.len() > MAX_ERROR_BYTES
-        || !status.status.success()
-        || !status.stdout.is_empty()
-    {
+        .args(["status", "--porcelain"]);
+    let status = bounded_process::output(
+        &mut status_command,
+        OutputLimits {
+            stdout: MAX_JSON_BYTES,
+            stderr: MAX_ERROR_BYTES,
+        },
+    )
+    .map_err(|error| format!("read release source status: {error}"))?;
+    if !status.status.success() || !status.stdout.is_empty() {
         return Err("release source is not a clean checkout".to_string());
     }
     Ok(())
@@ -451,21 +648,241 @@ mod tests {
     use flate2::Compression;
     use flate2::write::GzEncoder;
 
+    #[derive(Clone, Copy)]
+    struct TestMetadata {
+        gnu: bool,
+        entry_type: u8,
+        mode: u32,
+        uid: [u8; 8],
+        gid: [u8; 8],
+        mtime: u64,
+        username: &'static str,
+        groupname: &'static str,
+        device_major: [u8; 8],
+        device_minor: [u8; 8],
+    }
+
+    impl Default for TestMetadata {
+        fn default() -> Self {
+            Self {
+                gnu: true,
+                entry_type: tar::EntryType::file().as_byte(),
+                mode: 0o644,
+                uid: [0; 8],
+                gid: [0; 8],
+                mtime: CARGO_ARCHIVE_MTIME,
+                username: "",
+                groupname: "",
+                device_major: [0; 8],
+                device_minor: [0; 8],
+            }
+        }
+    }
+
+    fn append_test_file(
+        builder: &mut tar::Builder<GzEncoder<Vec<u8>>>,
+        path: &str,
+        body: &[u8],
+        metadata: TestMetadata,
+    ) {
+        let mut header = if metadata.gnu {
+            tar::Header::new_gnu()
+        } else {
+            tar::Header::new_ustar()
+        };
+        header.set_entry_type(tar::EntryType::new(metadata.entry_type));
+        header.as_mut_bytes()[GNU_TYPEFLAG_OFFSET] = metadata.entry_type;
+        header.set_mode(metadata.mode);
+        header.set_mtime(metadata.mtime);
+        header.set_username(metadata.username).unwrap();
+        header.set_groupname(metadata.groupname).unwrap();
+        header.as_mut_bytes()[GNU_UID_RANGE].copy_from_slice(&metadata.uid);
+        header.as_mut_bytes()[GNU_GID_RANGE].copy_from_slice(&metadata.gid);
+        header.as_mut_bytes()[GNU_DEVICE_MAJOR_RANGE].copy_from_slice(&metadata.device_major);
+        header.as_mut_bytes()[GNU_DEVICE_MINOR_RANGE].copy_from_slice(&metadata.device_minor);
+        header.set_size(body.len() as u64);
+        header.set_cksum();
+        builder.append_data(&mut header, path, body).unwrap();
+    }
+
     fn archive_with_files(files: &[(&str, &[u8])]) -> Vec<u8> {
         let encoder = GzEncoder::new(Vec::new(), Compression::default());
         let mut builder = tar::Builder::new(encoder);
         for (path, body) in files {
-            let mut header = tar::Header::new_gnu();
-            header.set_mode(0o644);
-            header.set_size(body.len() as u64);
-            header.set_cksum();
-            builder.append_data(&mut header, path, *body).unwrap();
+            append_test_file(&mut builder, path, body, TestMetadata::default());
         }
+        builder.into_inner().unwrap().finish().unwrap()
+    }
+
+    fn archive_with_metadata(path: &str, body: &[u8], metadata: TestMetadata) -> Vec<u8> {
+        let encoder = GzEncoder::new(Vec::new(), Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+        append_test_file(&mut builder, path, body, metadata);
         builder.into_inner().unwrap().finish().unwrap()
     }
 
     fn archive(path: &str, vcs: &[u8]) -> Vec<u8> {
         archive_with_files(&[(path, vcs)])
+    }
+
+    struct FixtureDirectory(std::path::PathBuf);
+
+    impl Drop for FixtureDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn run_fixture_command(command: &mut Command, label: &str) -> Vec<u8> {
+        let output = bounded_process::output(command, bounded_process::VALIDATION_OUTPUT_LIMITS)
+            .unwrap_or_else(|error| panic!("{label}: {error}"));
+        assert!(
+            output.status.success(),
+            "{label}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+
+    #[test]
+    fn cargo_1_95_archive_matches_observed_cross_platform_contract() {
+        if std::env::var_os("YAML_SIGIL_REQUIRE_CARGO_1_95_ARCHIVE").is_none() {
+            return;
+        }
+
+        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        let version =
+            run_fixture_command(Command::new(&cargo).arg("--version"), "read Cargo version");
+        let version = String::from_utf8(version).expect("Cargo version is UTF-8");
+        assert!(
+            version.starts_with("cargo 1.95.0 "),
+            "archive contract must be observed with exact Cargo 1.95.0, got {version:?}"
+        );
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is after Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "yaml-sigil-cargo-archive-contract-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(root.join("src")).expect("create fixture source directory");
+        let _fixture = FixtureDirectory(root.clone());
+        std::fs::write(
+            root.join("Cargo.toml"),
+            b"[package]\nname = \"cargo-archive-contract\"\nversion = \"0.1.0\"\nedition = \"2024\"\nlicense = \"Apache-2.0\"\ndescription = \"Cargo 1.95 archive contract fixture\"\n",
+        )
+        .expect("write fixture manifest");
+        let source = root.join("src/lib.rs");
+        std::fs::write(&source, b"pub fn fixture() -> bool { true }\n")
+            .expect("write fixture source");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mut permissions = std::fs::metadata(&source)
+                .expect("read fixture source permissions")
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&source, permissions).expect("make fixture source executable");
+        }
+
+        run_fixture_command(
+            Command::new("git")
+                .current_dir(&root)
+                .args(["init", "--quiet"]),
+            "initialize fixture repository",
+        );
+        run_fixture_command(
+            Command::new("git")
+                .current_dir(&root)
+                .args(["config", "core.autocrlf", "false"]),
+            "configure fixture line endings",
+        );
+        run_fixture_command(
+            Command::new("git").current_dir(&root).args([
+                "config",
+                "user.name",
+                "Cargo archive fixture",
+            ]),
+            "configure fixture author name",
+        );
+        run_fixture_command(
+            Command::new("git").current_dir(&root).args([
+                "config",
+                "user.email",
+                "fixture@example.invalid",
+            ]),
+            "configure fixture author email",
+        );
+        run_fixture_command(
+            Command::new("git")
+                .current_dir(&root)
+                .args(["add", "Cargo.toml", "src/lib.rs"]),
+            "stage fixture source",
+        );
+        run_fixture_command(
+            Command::new("git").current_dir(&root).args([
+                "commit",
+                "--quiet",
+                "--no-gpg-sign",
+                "-m",
+                "fixture",
+            ]),
+            "commit fixture source",
+        );
+        let commit = run_fixture_command(
+            Command::new("git")
+                .current_dir(&root)
+                .args(["rev-parse", "HEAD"]),
+            "read fixture commit",
+        );
+        let commit = String::from_utf8(commit)
+            .expect("fixture commit is UTF-8")
+            .trim()
+            .to_string();
+
+        run_fixture_command(
+            Command::new(&cargo).current_dir(&root).args([
+                "package",
+                "--no-verify",
+                "--offline",
+                "--target-dir",
+                "target",
+            ]),
+            "package Cargo archive fixture",
+        );
+        let archive = std::fs::read(root.join("target/package/cargo-archive-contract-0.1.0.crate"))
+            .expect("read packaged fixture");
+        let policy = PackagePolicy {
+            package: "cargo-archive-contract",
+            tag_prefix: "v",
+            changelog: "CHANGELOG.md",
+            path_in_vcs: "",
+        };
+        let entries = inspect_archive_entries(&archive, &policy, "0.1.0", &commit)
+            .expect("Cargo 1.95 fixture follows the encoded archive contract");
+
+        assert_eq!(entries["Cargo.toml"].metadata.mode, 0o644);
+        assert_eq!(entries["Cargo.toml.orig"].metadata.mode, 0o644);
+        assert_eq!(entries["Cargo.lock"].metadata.mode, 0o644);
+        assert_eq!(entries[".cargo_vcs_info.json"].metadata.mode, 0o644);
+        for generated in [".cargo_vcs_info.json", "Cargo.lock", "Cargo.toml"] {
+            assert_eq!(entries[generated].metadata.uid, GNU_NUL_ZERO);
+            assert_eq!(entries[generated].metadata.gid, GNU_NUL_ZERO);
+            assert_eq!(entries[generated].metadata.device_major, GNU_NUL_ZERO);
+            assert_eq!(entries[generated].metadata.device_minor, GNU_NUL_ZERO);
+        }
+        for copied in ["Cargo.toml.orig", "src/lib.rs"] {
+            assert_eq!(entries[copied].metadata.uid, GNU_OCTAL_ZERO);
+            assert_eq!(entries[copied].metadata.gid, GNU_OCTAL_ZERO);
+            assert_eq!(entries[copied].metadata.device_major, GNU_OCTAL_ZERO);
+            assert_eq!(entries[copied].metadata.device_minor, GNU_OCTAL_ZERO);
+        }
+        #[cfg(unix)]
+        assert_eq!(entries["src/lib.rs"].metadata.mode, 0o755);
+        #[cfg(windows)]
+        assert_eq!(entries["src/lib.rs"].metadata.mode, 0o644);
     }
 
     #[test]
@@ -486,6 +903,142 @@ mod tests {
         let root = format!("{package}-0.4.0");
         assert!(validate_archive_path(&format!("{root}/../escape"), &root, package).is_err());
         assert!(validate_archive_path("other-0.4.0/Cargo.toml", &root, package).is_err());
+    }
+
+    #[test]
+    fn cargo_metadata_contract_rejects_each_independent_drift() {
+        let package = &crate::release_policy::TRAITS_POLICY.packages[0];
+        let commit = "a".repeat(40);
+        let vcs = format!("{{\"git\":{{\"sha1\":\"{commit}\"}},\"path_in_vcs\":\"\"}}");
+        let path = format!("{}-0.4.0/.cargo_vcs_info.json", package.package);
+
+        let mut cases = Vec::new();
+        cases.push((
+            "header format",
+            TestMetadata {
+                gnu: false,
+                ..TestMetadata::default()
+            },
+        ));
+        cases.push((
+            "entry type",
+            TestMetadata {
+                entry_type: b'\0',
+                ..TestMetadata::default()
+            },
+        ));
+        cases.push((
+            "mode",
+            TestMetadata {
+                mode: 0o600,
+                ..TestMetadata::default()
+            },
+        ));
+        let mut metadata = TestMetadata::default();
+        metadata.uid[0] = b'1';
+        cases.push(("uid", metadata));
+        let mut metadata = TestMetadata::default();
+        metadata.gid[0] = b'1';
+        cases.push(("gid", metadata));
+        let mut metadata = TestMetadata::default();
+        metadata.mtime += 1;
+        cases.push(("mtime", metadata));
+        cases.push((
+            "username",
+            TestMetadata {
+                username: "root",
+                ..TestMetadata::default()
+            },
+        ));
+        cases.push((
+            "groupname",
+            TestMetadata {
+                groupname: "root",
+                ..TestMetadata::default()
+            },
+        ));
+        let mut metadata = TestMetadata::default();
+        metadata.device_major[0] = b'1';
+        cases.push(("device major", metadata));
+        let mut metadata = TestMetadata::default();
+        metadata.device_minor[0] = b'1';
+        cases.push(("device minor", metadata));
+
+        for (label, metadata) in cases {
+            let bytes = archive_with_metadata(&path, vcs.as_bytes(), metadata);
+            assert!(
+                inspect_archive(&bytes, package, "0.4.0", &commit).is_err(),
+                "accepted drift in {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn cargo_regular_modes_are_exact_and_metadata_affects_equality() {
+        let package = &crate::release_policy::TRAITS_POLICY.packages[0];
+        let commit = "a".repeat(40);
+        let vcs = format!("{{\"git\":{{\"sha1\":\"{commit}\"}},\"path_in_vcs\":\"\"}}");
+        let path = format!("{}-0.4.0/.cargo_vcs_info.json", package.package);
+        let regular = archive_with_metadata(&path, vcs.as_bytes(), TestMetadata::default());
+        let executable = archive_with_metadata(
+            &path,
+            vcs.as_bytes(),
+            TestMetadata {
+                mode: 0o755,
+                ..TestMetadata::default()
+            },
+        );
+
+        let regular = inspect_archive_entries(&regular, package, "0.4.0", &commit).unwrap();
+        let executable = inspect_archive_entries(&executable, package, "0.4.0", &commit).unwrap();
+        assert_ne!(regular, executable);
+        assert_eq!(
+            regular[".cargo_vcs_info.json"].body,
+            executable[".cargo_vcs_info.json"].body
+        );
+    }
+
+    #[test]
+    fn cargo_zero_representations_are_exact_and_affect_equality() {
+        let package = &crate::release_policy::TRAITS_POLICY.packages[0];
+        let commit = "a".repeat(40);
+        let vcs = format!("{{\"git\":{{\"sha1\":\"{commit}\"}},\"path_in_vcs\":\"\"}}");
+        let path = format!("{}-0.4.0/.cargo_vcs_info.json", package.package);
+        let nul = archive_with_metadata(&path, vcs.as_bytes(), TestMetadata::default());
+        let octal = archive_with_metadata(
+            &path,
+            vcs.as_bytes(),
+            TestMetadata {
+                uid: GNU_OCTAL_ZERO,
+                gid: GNU_OCTAL_ZERO,
+                device_major: GNU_OCTAL_ZERO,
+                device_minor: GNU_OCTAL_ZERO,
+                ..TestMetadata::default()
+            },
+        );
+
+        let nul = inspect_archive_entries(&nul, package, "0.4.0", &commit).unwrap();
+        let octal = inspect_archive_entries(&octal, package, "0.4.0", &commit).unwrap();
+        assert_ne!(nul, octal);
+    }
+
+    #[test]
+    fn special_archive_entry_types_are_rejected() {
+        let package = &crate::release_policy::TRAITS_POLICY.packages[0];
+        let commit = "a".repeat(40);
+        let vcs = format!("{{\"git\":{{\"sha1\":\"{commit}\"}},\"path_in_vcs\":\"\"}}");
+        let path = format!("{}-0.4.0/.cargo_vcs_info.json", package.package);
+        for entry_type in *b"23456" {
+            let bytes = archive_with_metadata(
+                &path,
+                vcs.as_bytes(),
+                TestMetadata {
+                    entry_type,
+                    ..TestMetadata::default()
+                },
+            );
+            assert!(inspect_archive(&bytes, package, "0.4.0", &commit).is_err());
+        }
     }
 
     #[test]

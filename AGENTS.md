@@ -289,7 +289,10 @@ NVIDIA's `linux-amd64-cpu8` runner and GitHub's moving `macos-latest` and
 validity, package contents, Clippy, tests, unused dependencies, and the
 dependency audit against that platform's resolved dependency graph. Linux
 commit-policy, Markdown, provider-workflow, and aggregation jobs run on
-`linux-amd64-cpu4`. The local command does not launch other operating systems.
+`linux-amd64-cpu4`. A separate GitHub-hosted Linux, macOS, and Windows matrix
+runs the protected checkout verifier regressions; its Windows leg creates an
+actual directory junction and a short-name-shaped path. The local command does
+not launch other operating systems.
 
 Validate shell scripts under `.github/scripts` with Shuck before landing
 changes. Install it from the `shuck-cli` crate and run it from the repository

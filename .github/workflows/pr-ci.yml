@@ -23,22 +23,14 @@ on:
         description: Exact authorization comment.
         required: true
         type: string
+      binding_digest:
+        description: Exact full authorization binding digest.
+        required: true
+        type: string
     outputs:
-      commit_policy:
-        description: Commit-policy job result.
-        value: ${{ jobs.results.outputs.commit_policy }}
-      workflow_lint:
-        description: GitHub Actions validation job result.
-        value: ${{ jobs.results.outputs.workflow_lint }}
-      static_checks:
-        description: Documentation validation job result.
-        value: ${{ jobs.results.outputs.static_checks }}
-      rust:
-        description: Protected Rust validation job result.
-        value: ${{ jobs.results.outputs.rust }}
-      candidate_ci:
-        description: Candidate validation job result.
-        value: ${{ jobs.results.outputs.candidate_ci }}
+      results_json:
+        description: Canonical complete protected-job result inventory.
+        value: ${{ jobs.results.outputs.results_json }}
 
 permissions: {}
 
@@ -99,6 +91,7 @@ jobs:
           --head-sha "${{ inputs.head_sha }}"
           --base-sha "${{ inputs.base_sha }}"
           --policy-sha "${{ inputs.policy_sha }}"
+          --binding-digest "${{ inputs.binding_digest }}"
           --comment-id "${{ inputs.comment_id }}"
           --run-id "${GITHUB_RUN_ID}"
           --run-attempt "${GITHUB_RUN_ATTEMPT}"
@@ -119,13 +112,14 @@ jobs:
           persist-credentials: false
           ref: ${{ needs.authorize.outputs.policy_sha }}
 
-      - name: Check out exact candidate
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check out and verify exact candidate
+        uses: ./policy/.github/actions/protected-candidate-checkout
         with:
+          base-sha: ${{ needs.authorize.outputs.base_sha }}
+          candidate-path: candidate
           fetch-depth: 0
-          path: candidate
-          persist-credentials: false
-          ref: ${{ needs.authorize.outputs.head_sha }}
+          head-sha: ${{ needs.authorize.outputs.head_sha }}
+          policy-path: policy
           repository: ${{ needs.authorize.outputs.head_repository }}
 
       # The fork checkout may not contain the base object. Fetch only the exact
@@ -160,13 +154,14 @@ jobs:
           persist-credentials: false
           ref: ${{ needs.authorize.outputs.policy_sha }}
 
-      - name: Check out exact candidate
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check out and verify exact candidate
+        uses: ./policy/.github/actions/protected-candidate-checkout
         with:
+          base-sha: ${{ needs.authorize.outputs.base_sha }}
+          candidate-path: candidate
           fetch-depth: 1
-          path: candidate
-          persist-credentials: false
-          ref: ${{ needs.authorize.outputs.head_sha }}
+          head-sha: ${{ needs.authorize.outputs.head_sha }}
+          policy-path: policy
           repository: ${{ needs.authorize.outputs.head_repository }}
 
       # actionlint discovers configuration and workflows at the workspace root.
@@ -220,6 +215,64 @@ jobs:
           python3 -m unittest discover \
             -s candidate/.github/scripts -p 'test_protected_pr_ci.py'
 
+  platform_verifier:
+    name: Protected checkout verifier (${{ matrix.name }})
+    needs: authorize
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            runner: ubuntu-latest
+          - name: macOS
+            runner: macos-latest
+          - name: Windows
+            runner: windows-latest
+    steps:
+      - name: Check out protected policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          path: policy
+          persist-credentials: false
+          ref: ${{ needs.authorize.outputs.policy_sha }}
+
+      - name: Check out and verify exact candidate
+        id: candidate_checkout
+        uses: ./policy/.github/actions/protected-candidate-checkout
+        with:
+          base-sha: ${{ needs.authorize.outputs.base_sha }}
+          candidate-path: candidate
+          fetch-depth: 1
+          head-sha: ${{ needs.authorize.outputs.head_sha }}
+          policy-path: policy
+          repository: ${{ needs.authorize.outputs.head_repository }}
+
+      # Candidate tests are unprivileged; the interpreter was resolved and
+      # staged by protected policy before candidate files existed.
+      - name: Test candidate checkout verifier on host platform
+        env:
+          ACTIONS_CACHE_URL: ""
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_URL: ""
+          ACTIONS_RESULTS_URL: ""
+          ACTIONS_RUNTIME_TOKEN: ""
+          GH_TOKEN: ""
+          GITHUB_TOKEN: ""
+          TRUSTED_PYTHON: ${{ steps.candidate_checkout.outputs.python }}
+        shell: bash
+        run: |
+          "${TRUSTED_PYTHON}" -m py_compile \
+            candidate/.github/scripts/protected_checkout.py \
+            candidate/.github/scripts/protected_pr_ci.py \
+            candidate/.github/scripts/test_protected_pr_ci.py
+          "${TRUSTED_PYTHON}" -m unittest discover \
+            -s candidate/.github/scripts -p 'test_protected_pr_ci.py'
+
   static_checks:
     name: Documentation
     needs: authorize
@@ -236,13 +289,14 @@ jobs:
           persist-credentials: false
           ref: ${{ needs.authorize.outputs.policy_sha }}
 
-      - name: Check out exact candidate
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check out and verify exact candidate
+        uses: ./policy/.github/actions/protected-candidate-checkout
         with:
+          base-sha: ${{ needs.authorize.outputs.base_sha }}
+          candidate-path: candidate
           fetch-depth: 1
-          path: candidate
-          persist-credentials: false
-          ref: ${{ needs.authorize.outputs.head_sha }}
+          head-sha: ${{ needs.authorize.outputs.head_sha }}
+          policy-path: policy
           repository: ${{ needs.authorize.outputs.head_repository }}
 
       # Resolve the candidate's exact gitlink with protected-main logic, then
@@ -301,13 +355,14 @@ jobs:
           persist-credentials: false
           ref: ${{ needs.authorize.outputs.policy_sha }}
 
-      - name: Check out exact candidate
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check out and verify exact candidate
+        uses: ./policy/.github/actions/protected-candidate-checkout
         with:
+          base-sha: ${{ needs.authorize.outputs.base_sha }}
+          candidate-path: candidate
           fetch-depth: 1
-          path: candidate
-          persist-credentials: false
-          ref: ${{ needs.authorize.outputs.head_sha }}
+          head-sha: ${{ needs.authorize.outputs.head_sha }}
+          policy-path: policy
           repository: ${{ needs.authorize.outputs.head_repository }}
 
       # Resolve the candidate's exact gitlink with protected-main logic, then
@@ -338,6 +393,7 @@ jobs:
         with:
           cache: false
           components: clippy, rustfmt
+          toolchain: 1.95.0
 
       - name: Install protected Markdown validator
         # Refresh this immutable pin frequently to keep pace with rumdl releases.
@@ -403,13 +459,14 @@ jobs:
           persist-credentials: false
           ref: ${{ needs.authorize.outputs.policy_sha }}
 
-      - name: Check out exact candidate
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check out and verify exact candidate
+        uses: ./policy/.github/actions/protected-candidate-checkout
         with:
+          base-sha: ${{ needs.authorize.outputs.base_sha }}
+          candidate-path: candidate
           fetch-depth: 1
-          path: candidate
-          persist-credentials: false
-          ref: ${{ needs.authorize.outputs.head_sha }}
+          head-sha: ${{ needs.authorize.outputs.head_sha }}
+          policy-path: policy
           repository: ${{ needs.authorize.outputs.head_repository }}
 
       # Resolve the candidate's exact gitlink with protected-main logic, then
@@ -459,6 +516,16 @@ jobs:
       # Only this supplemental, GitHub-hosted job executes the exact candidate
       # validator. It has no secrets, OIDC, write permission, cache, or retained
       # artifacts; the protected-main validator remains the required authority.
+      - name: Verify exact Cargo 1.95 archive metadata
+        env:
+          YAML_SIGIL_REQUIRE_CARGO_1_95_ARCHIVE: "1"
+        shell: bash
+        run: >-
+          cargo test --locked --manifest-path xtask/Cargo.toml
+          crate_archive::tests::cargo_1_95_archive_matches_observed_cross_platform_contract
+          -- --exact
+        working-directory: candidate
+
       - name: Run exact candidate validation
         env:
           ACTIONS_CACHE_URL: ""
@@ -479,6 +546,7 @@ jobs:
       - authorize
       - commit_policy
       - workflow_lint
+      - platform_verifier
       - static_checks
       - rust
       - candidate_ci
@@ -486,11 +554,21 @@ jobs:
     timeout-minutes: 5
     permissions: {}
     outputs:
-      commit_policy: ${{ needs.commit_policy.result }}
-      workflow_lint: ${{ needs.workflow_lint.result }}
-      static_checks: ${{ needs.static_checks.result }}
-      rust: ${{ needs.rust.result }}
-      candidate_ci: ${{ needs.candidate_ci.result }}
+      results_json: ${{ steps.results.outputs.results_json }}
     steps:
+      # Only fixed job-result enums enter this closed, complete JSON inventory.
       - name: Expose exact candidate results to the protected caller
-        run: true
+        id: results
+        env:
+          CANDIDATE_CI_RESULT: ${{ needs.candidate_ci.result }}
+          COMMIT_POLICY_RESULT: ${{ needs.commit_policy.result }}
+          PLATFORM_VERIFIER_RESULT: ${{ needs.platform_verifier.result }}
+          RUST_RESULT: ${{ needs.rust.result }}
+          STATIC_CHECKS_RESULT: ${{ needs.static_checks.result }}
+          WORKFLOW_LINT_RESULT: ${{ needs.workflow_lint.result }}
+        run: >-
+          printf 'results_json={"commit_policy":"%s","workflow_lint":"%s","platform_verifier":"%s","static_checks":"%s","rust":"%s","candidate_ci":"%s"}\n'
+          "${COMMIT_POLICY_RESULT}" "${WORKFLOW_LINT_RESULT}"
+          "${PLATFORM_VERIFIER_RESULT}" "${STATIC_CHECKS_RESULT}"
+          "${RUST_RESULT}" "${CANDIDATE_CI_RESULT}"
+          >> "${GITHUB_OUTPUT}"

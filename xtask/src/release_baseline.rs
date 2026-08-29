@@ -17,8 +17,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use toml_edit::DocumentMut;
 
+use crate::bounded_process::{self, VALIDATION_OUTPUT_LIMITS};
 use crate::crate_archive::{CratesIo, Registry, RegistryVersion, inspect_archive, is_checksum};
 use crate::release_policy::{ReleaseFamily, ReleasePolicy, detect};
+use crate::safe_file;
 
 const INVENTORY_SCHEMA: u64 = 3;
 const READ_ONLY_PUSH_URL: &str = "disabled://yaml-sigil-release-proposal";
@@ -292,7 +294,7 @@ fn prepare(
         return Err("detached baseline checkout is not exact and clean".to_string());
     }
     let manifest = output.join("Cargo.toml");
-    if manifest_version(&manifest, policy.family)? != version {
+    if manifest_version(output, policy.family)? != version {
         return Err("detached baseline manifest does not match its official tag".to_string());
     }
 
@@ -545,7 +547,7 @@ fn require_excluded_current_version(
     head: &str,
     tags: &BTreeMap<String, TagRecord>,
 ) -> Result<(), String> {
-    if manifest_version(&root.join("Cargo.toml"), policy.family)? != version {
+    if manifest_version(root, policy.family)? != version {
         return Err("excluded retry version does not match current source".to_string());
     }
     for package in policy.packages {
@@ -705,8 +707,9 @@ fn require_repository_state(root: &Path, args: &ParsedArgs) -> Result<(), String
     Ok(())
 }
 
-fn manifest_version(path: &Path, family: ReleaseFamily) -> Result<String, String> {
-    let body = fs::read_to_string(path)
+fn manifest_version(root: &Path, family: ReleaseFamily) -> Result<String, String> {
+    let path = Path::new("Cargo.toml");
+    let body = safe_file::read_manifest(root, path)
         .map_err(|error| format!("read baseline manifest {}: {error}", path.display()))?;
     let document = body
         .parse::<DocumentMut>()
@@ -822,15 +825,10 @@ fn git_status(root: &Path, args: &[&str]) -> Result<(), String> {
 }
 
 fn git_process(root: &Path, args: &[&str]) -> Result<Output, String> {
-    let output = Command::new("git")
-        .current_dir(root)
-        .args(args)
-        .output()
-        .map_err(|error| format!("run git {}: {error}", args.join(" ")))?;
-    if output.stdout.len() > MAX_GIT_OUTPUT || output.stderr.len() > MAX_GIT_OUTPUT {
-        return Err("Git output exceeded its bound".to_string());
-    }
-    Ok(output)
+    let mut command = Command::new("git");
+    command.current_dir(root).args(args);
+    bounded_process::output(&mut command, VALIDATION_OUTPUT_LIMITS)
+        .map_err(|error| format!("run git {}: {error}", args.join(" ")))
 }
 
 fn detail(output: &Output) -> String {
@@ -1012,7 +1010,9 @@ mod tests {
         let encoder = GzEncoder::new(Vec::new(), Compression::default());
         let mut builder = tar::Builder::new(encoder);
         let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::file());
         header.set_mode(0o644);
+        header.set_mtime(crate::crate_archive::CARGO_ARCHIVE_MTIME);
         header.set_size(vcs.len() as u64);
         header.set_cksum();
         builder

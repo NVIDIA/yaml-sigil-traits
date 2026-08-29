@@ -15,6 +15,7 @@ mod release_baseline;
 mod release_policy;
 mod release_proposal;
 mod release_version;
+mod safe_file;
 
 use std::path::PathBuf;
 use std::process::ExitCode;

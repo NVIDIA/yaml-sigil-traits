@@ -9,6 +9,8 @@ use std::process::Command;
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::bounded_process::{self, VALIDATION_OUTPUT_LIMITS};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReleaseFamily {
     Traits,
@@ -99,19 +101,17 @@ pub(crate) const RUST_POLICY: ReleasePolicy = ReleasePolicy {
 };
 
 pub(crate) fn detect(root: &Path) -> Result<&'static ReleasePolicy, String> {
-    let output = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
+    let mut command = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+    command
         .current_dir(root)
-        .args(["metadata", "--no-deps", "--format-version", "1"])
-        .output()
+        .args(["metadata", "--no-deps", "--format-version", "1"]);
+    let output = bounded_process::output(&mut command, VALIDATION_OUTPUT_LIMITS)
         .map_err(|error| format!("run Cargo metadata for release policy: {error}"))?;
     if !output.status.success() {
         let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(format!(
             "Cargo metadata failed while selecting release policy: {detail}"
         ));
-    }
-    if output.stdout.len() > 4 * 1024 * 1024 {
-        return Err("Cargo release metadata exceeded its bound".to_string());
     }
     let metadata: Metadata = serde_json::from_slice(&output.stdout)
         .map_err(|error| format!("Cargo returned invalid release metadata: {error}"))?;

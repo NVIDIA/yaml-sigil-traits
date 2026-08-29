@@ -6,7 +6,7 @@
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
@@ -17,7 +17,9 @@ use semver::Version;
 use serde_json::Value;
 use toml_edit::DocumentMut;
 
+use crate::bounded_process::{self, VALIDATION_OUTPUT_LIMITS};
 use crate::release_policy::TRAITS_POLICY;
+use crate::safe_file;
 
 const REGISTRY_USER_AGENT: &str = "yaml-sigil-release-workflow/1.0";
 const REGISTRY_ATTEMPTS: usize = 30;
@@ -181,10 +183,9 @@ impl Runner for SystemRunner {
         args: &[OsString],
         root: &Path,
     ) -> Result<CommandResult, String> {
-        let output = Command::new(program)
-            .current_dir(root)
-            .args(args)
-            .output()
+        let mut command = Command::new(program);
+        command.current_dir(root).args(args);
+        let output = bounded_process::output(&mut command, VALIDATION_OUTPUT_LIMITS)
             .map_err(|error| format!("run {}: {error}", program.to_string_lossy()))?;
         Ok(CommandResult {
             success: output.status.success(),
@@ -775,12 +776,47 @@ fn require_publication_fields(
             "reviewed config must set release_always = {release_always}"
         ));
     }
+    for field in ["git_tag_enable", "git_release_enable"] {
+        if workspace.get(field).and_then(toml_edit::Item::as_bool) != Some(false) {
+            return Err(format!(
+                "reviewed workspace config must set {field} = false"
+            ));
+        }
+    }
+    let packages = document
+        .get("package")
+        .and_then(toml_edit::Item::as_array_of_tables)
+        .ok_or_else(|| "release config has no package overrides".to_string())?;
+    if packages.len() != TRAITS_POLICY.packages.len() {
+        return Err("release config has an unexpected package override set".to_string());
+    }
+    for (package, policy) in packages.iter().zip(TRAITS_POLICY.packages) {
+        if package.get("name").and_then(toml_edit::Item::as_str) != Some(policy.package) {
+            return Err("release config package overrides are not exact or ordered".to_string());
+        }
+        for field in ["git_tag_enable", "git_release_enable"] {
+            if package.get(field).and_then(toml_edit::Item::as_bool) != Some(false) {
+                return Err(format!(
+                    "reviewed {} config must set {field} = false",
+                    policy.package
+                ));
+            }
+        }
+    }
     match (workspace.get("pr_branch_prefix"), branch_prefix) {
         (None, None) => Ok(()),
         (Some(value), Some(expected)) if value.as_str() == Some(expected) => Ok(()),
         (Some(_), None) => Err("reviewed config already selects a PR branch prefix".to_string()),
         _ => Err("publication config has an invalid PR branch prefix".to_string()),
     }
+}
+
+fn release_config_relative(root: &Path, source: &Path) -> Result<PathBuf, String> {
+    let relative = source.strip_prefix(root).unwrap_or(source);
+    if relative.is_absolute() {
+        return Err("release config must be inside the trusted checkout".to_string());
+    }
+    Ok(relative.to_path_buf())
 }
 
 fn source_newline(body: &str) -> Result<&'static str, String> {
@@ -798,12 +834,7 @@ fn source_newline(body: &str) -> Result<&'static str, String> {
 }
 
 fn prepare_publication_config(root: &Path, source: &Path, output: &Path) -> Result<(), String> {
-    let source = resolve_path(root, source).canonicalize().map_err(|error| {
-        format!(
-            "could not resolve release config {}: {error}",
-            source.display()
-        )
-    })?;
+    let source_relative = release_config_relative(root, source)?;
     let output = resolve_path(root, output);
     if output.exists() {
         return Err(format!(
@@ -811,12 +842,14 @@ fn prepare_publication_config(root: &Path, source: &Path, output: &Path) -> Resu
             output.display()
         ));
     }
-    let body = fs::read_to_string(&source).map_err(|error| {
-        format!(
-            "could not read release config {}: {error}",
-            source.display()
-        )
-    })?;
+    let body = safe_file::TrustedRoot::open(root)
+        .and_then(|trusted| trusted.read_manifest(&source_relative))
+        .map_err(|error| {
+            format!(
+                "could not read release config {}: {error}",
+                source.display()
+            )
+        })?;
     let original: DocumentMut = body.parse().map_err(|error| {
         format!(
             "could not parse release config {}: {error}",
@@ -825,10 +858,13 @@ fn prepare_publication_config(root: &Path, source: &Path, output: &Path) -> Resu
     })?;
     require_publication_fields(&original, false, None)?;
 
-    let valid_ref_check = Command::new("git")
-        .current_dir(root)
-        .args(["check-ref-format", "--branch", "release-plz-publication"])
-        .output()
+    let mut valid_ref_command = Command::new("git");
+    valid_ref_command.current_dir(root).args([
+        "check-ref-format",
+        "--branch",
+        "release-plz-publication",
+    ]);
+    let valid_ref_check = bounded_process::output(&mut valid_ref_command, VALIDATION_OUTPUT_LIMITS)
         .map_err(|error| format!("run git check-ref-format: {error}"))?;
     if !valid_ref_check.status.success() {
         return Err(format!(
@@ -836,11 +872,15 @@ fn prepare_publication_config(root: &Path, source: &Path, output: &Path) -> Resu
             process_output_detail(&valid_ref_check)
         ));
     }
-    let invalid_ref_check = Command::new("git")
-        .current_dir(root)
-        .args(["check-ref-format", "--branch", ":release-plz-publication"])
-        .output()
-        .map_err(|error| format!("run git check-ref-format: {error}"))?;
+    let mut invalid_ref_command = Command::new("git");
+    invalid_ref_command.current_dir(root).args([
+        "check-ref-format",
+        "--branch",
+        ":release-plz-publication",
+    ]);
+    let invalid_ref_check =
+        bounded_process::output(&mut invalid_ref_command, VALIDATION_OUTPUT_LIMITS)
+            .map_err(|error| format!("run git check-ref-format: {error}"))?;
     if invalid_ref_check.status.success() {
         return Err("the publication branch prefix is a valid Git ref".to_string());
     }
@@ -864,6 +904,7 @@ fn prepare_publication_config(root: &Path, source: &Path, output: &Path) -> Resu
             .map_err(|error| format!("create publication config directory: {error}"))?;
     }
     let mut file = OpenOptions::new()
+        .read(true)
         .write(true)
         .create_new(true)
         .open(&output)
@@ -872,20 +913,21 @@ fn prepare_publication_config(root: &Path, source: &Path, output: &Path) -> Resu
         .write_all(updated.as_bytes())
         .and_then(|()| file.sync_all())
     {
+        drop(file);
         let _ = fs::remove_file(&output);
         return Err(format!(
             "write publication config {}: {error}",
             output.display()
         ));
     }
-    drop(file);
     let verify_result = (|| {
-        let actual_bytes = fs::read(&output).map_err(|error| {
-            format!(
-                "read generated publication config {}: {error}",
-                output.display()
-            )
-        })?;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|error| format!("rewind generated publication config: {error}"))?;
+        let mut actual_bytes = Vec::with_capacity(updated.len() + 1);
+        Read::by_ref(&mut file)
+            .take((updated.len() + 1) as u64)
+            .read_to_end(&mut actual_bytes)
+            .map_err(|error| format!("reread generated publication config: {error}"))?;
         if actual_bytes != updated.as_bytes() {
             return Err("publication config bytes changed while writing".to_string());
         }
@@ -897,6 +939,7 @@ fn prepare_publication_config(root: &Path, source: &Path, output: &Path) -> Resu
         require_publication_fields(&actual, true, Some(":"))?;
         Ok(())
     })();
+    drop(file);
     if let Err(error) = verify_result {
         let _ = fs::remove_file(&output);
         return Err(error);
@@ -1805,10 +1848,14 @@ mod tests {
                 "# Retain this comment and all surrounding bytes.",
                 "release = false",
                 "release_always = false",
+                "git_tag_enable = false",
+                "git_release_enable = false",
                 "",
                 "[[package]]",
-                "name = \"fixture\"",
+                "name = \"yaml-sigil-traits\"",
                 "release = true",
+                "git_tag_enable = false",
+                "git_release_enable = false",
                 "",
             ]
             .join(newline);
@@ -1864,7 +1911,11 @@ mod tests {
     fn publication_config_rejects_output_path_collisions_and_io_failures() {
         let temporary = TestDirectory::new("publication-collisions");
         let source = temporary.path().join("release-plz.toml");
-        fs::write(&source, "[workspace]\nrelease_always = false\n").unwrap();
+        fs::write(
+            &source,
+            "[workspace]\nrelease_always = false\ngit_tag_enable = false\ngit_release_enable = false\n\n[[package]]\nname = \"yaml-sigil-traits\"\ngit_tag_enable = false\ngit_release_enable = false\n",
+        )
+        .unwrap();
 
         assert!(prepare_publication_config(temporary.path(), &source, &source).is_err());
         let blocking_file = temporary.path().join("blocking-file");
@@ -1883,7 +1934,11 @@ mod tests {
         let source = temporary.path().join("release-plz.toml");
         let target = temporary.path().join("target.toml");
         let output = temporary.path().join("publication.toml");
-        fs::write(&source, "[workspace]\nrelease_always = false\n").unwrap();
+        fs::write(
+            &source,
+            "[workspace]\nrelease_always = false\ngit_tag_enable = false\ngit_release_enable = false\n\n[[package]]\nname = \"yaml-sigil-traits\"\ngit_tag_enable = false\ngit_release_enable = false\n",
+        )
+        .unwrap();
         fs::write(&target, "preserve\n").unwrap();
         symlink(&target, &output).unwrap();
 

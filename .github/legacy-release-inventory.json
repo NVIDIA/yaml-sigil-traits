@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "api_version": "2026-03-10",
+  "repository": "NVIDIA/yaml-sigil-traits",
+  "legacy_author": {
+    "id": 41898282,
+    "login": "github-actions[bot]",
+    "type": "Bot"
+  },
+  "prospective_author": {
+    "id": 318780254,
+    "login": "nvidia-yamlsigil-release-pr[bot]",
+    "type": "Bot"
+  },
+  "entries": [
+    {
+      "release_id": 378147417,
+      "package": "yaml-sigil-traits",
+      "version": "0.4.0-rc.2",
+      "tag": "v0.4.0-rc.2",
+      "tag_object_sha": "c7523fea72b4f9e34159fab03493820c84b0a7ed",
+      "peeled_commit_sha": "6f0efd78d94abcb1d960a0f094e89748af9eda4e",
+      "target_commitish": "main",
+      "draft": false,
+      "prerelease": true,
+      "immutable": false,
+      "asset_count": 0,
+      "body_sha256": "a030af0a4dba2d45507c84a89e3e88f40fe1ee3819ad2170dd33f6e58f8bbcbf",
+      "source_archive_sha256": "b9b7f85dd8f080724925ba0f362b626d88e0ce935d723633bfdecd4aef1d9d54",
+      "path_in_vcs": ""
+    },
+    {
+      "release_id": 374133735,
+      "package": "yaml-sigil-traits",
+      "version": "0.4.0-rc.1",
+      "tag": "v0.4.0-rc.1",
+      "tag_object_sha": "a988690467250276d5a4c34de4094016fb2c46ab",
+      "peeled_commit_sha": "6ad8264ba808f47751145597c6c5db6888fb2e2d",
+      "target_commitish": "main",
+      "draft": false,
+      "prerelease": true,
+      "immutable": false,
+      "asset_count": 0,
+      "body_sha256": "636f7659755111d38f1b20deaa94e18bf71e87654a6aed76c4b15d969fd67198",
+      "source_archive_sha256": "a877411fba7d655b46a6616917fe9c25a1dd3695e0661993e48af249d2c0bac9",
+      "path_in_vcs": ""
+    },
+    {
+      "release_id": 373924156,
+      "package": "yaml-sigil-traits",
+      "version": "0.3.0-rc.2",
+      "tag": "v0.3.0-rc.2",
+      "tag_object_sha": "f03512efdfe3916a0962d8d41de782b50456509e",
+      "peeled_commit_sha": "4620f58f86a4a6b3d213a59f3dd80db37fab70d6",
+      "target_commitish": "main",
+      "draft": false,
+      "prerelease": true,
+      "immutable": false,
+      "asset_count": 0,
+      "body_sha256": "b75954967c2d707ddaad4609410f74ec85230a5d3b71283378ca20a5a45f07cb",
+      "source_archive_sha256": "45d6b52ccd4b0aac0ee1ec5bbfe6da2d2ade9c049dd39bede914ed13d5c1fa24",
+      "path_in_vcs": ""
+    },
+    {
+      "release_id": 372733790,
+      "package": "yaml-sigil-traits",
+      "version": "0.3.0-rc.1",
+      "tag": "v0.3.0-rc.1",
+      "tag_object_sha": "83a63cc045abf937ec68fa45b8ebbd63cb6d43db",
+      "peeled_commit_sha": "3eb2b600912aaa7b9dfbfc1f30da9694cf2405f1",
+      "target_commitish": "main",
+      "draft": false,
+      "prerelease": true,
+      "immutable": false,
+      "asset_count": 0,
+      "body_sha256": "d25fc4778a31264305a0f570871bfa4fb4d3f55cf51e425dd2e0d20f28509650",
+      "source_archive_sha256": "cc713b132c19d839507c81b0481ca907da5dac774f8c063f06e4e1e2f0546980",
+      "path_in_vcs": ""
+    }
+  ]
+}

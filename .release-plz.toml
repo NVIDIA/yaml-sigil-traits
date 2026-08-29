@@ -2,10 +2,10 @@
 release = false
 release_always = false
 changelog_update = true
-# Tags and GitHub Releases carry version metadata and changelog text only.
-# release-plz does not build or attach binary assets.
-git_tag_enable = true
-git_release_enable = true
+# release-plz publishes source crates only. The protected App finalizer owns
+# annotated tags and immutable, zero-asset GitHub Releases.
+git_tag_enable = false
+git_release_enable = false
 git_release_type = "auto"
 publish_allow_dirty = false
 publish_no_verify = false
@@ -17,13 +17,12 @@ semver_check = false
 name = "yaml-sigil-traits"
 release = true
 publish = true
-# Preserve changelog, tag, and source-only GitHub Release behavior if workspace
-# defaults later change.
+# Preserve source-only publication if workspace defaults later change.
 changelog_update = true
 changelog_path = "CHANGELOG.md"
-git_tag_enable = true
+git_tag_enable = false
 git_tag_name = "v{{ version }}"
-git_release_enable = true
+git_release_enable = false
 git_release_name = "v{{ version }}"
 git_release_body = "{{ changelog }}"
 git_release_type = "auto"

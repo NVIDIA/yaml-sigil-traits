@@ -16,6 +16,7 @@ use toml_edit::DocumentMut;
 use crate::bounded_process::{self, VALIDATION_OUTPUT_LIMITS};
 use crate::release::exact_output_line;
 use crate::release_policy::TRAITS_TOOLCHAIN;
+use crate::safe_file;
 
 const CHANGELOG: &str = "CHANGELOG.md";
 
@@ -168,7 +169,7 @@ fn validate_date(date: &str) -> Result<(), String> {
 }
 
 fn read_version(root: &Path) -> Result<Version, String> {
-    let manifest = fs::read_to_string(root.join("Cargo.toml"))
+    let manifest = safe_file::read_manifest(root, Path::new("Cargo.toml"))
         .map_err(|error| format!("read Cargo.toml: {error}"))?;
     let value = section_version(&manifest, "[package]")?
         .ok_or_else(|| "missing [package] version in Cargo.toml".to_string())?;
@@ -511,8 +512,8 @@ fn check_api_compatibility_with_runner(
 
 fn write_version(root: &Path, version: &Version) -> Result<(), String> {
     let path = root.join("Cargo.toml");
-    let manifest =
-        fs::read_to_string(&path).map_err(|error| format!("read Cargo.toml: {error}"))?;
+    let manifest = safe_file::read_manifest(root, Path::new("Cargo.toml"))
+        .map_err(|error| format!("read Cargo.toml: {error}"))?;
     let updated = replace_section_version(&manifest, "[package]", &version.to_string())?;
     if updated != manifest {
         fs::write(path, updated).map_err(|error| format!("write Cargo.toml: {error}"))?;
@@ -800,13 +801,8 @@ fn promote_changelog(
 }
 
 fn release_tag_url(root: &Path, version: &Version) -> Result<String, String> {
-    let path = root.join("Cargo.toml");
-    let metadata = fs::symlink_metadata(&path)
-        .map_err(|error| format!("read Cargo.toml metadata: {error}"))?;
-    if !metadata.file_type().is_file() || metadata.len() > 1024 * 1024 {
-        return Err("Cargo.toml is missing, indirect, or oversized".to_string());
-    }
-    let body = fs::read_to_string(&path).map_err(|error| format!("read Cargo.toml: {error}"))?;
+    let body = safe_file::read_manifest(root, Path::new("Cargo.toml"))
+        .map_err(|error| format!("read Cargo.toml: {error}"))?;
     let document = body
         .parse::<DocumentMut>()
         .map_err(|error| format!("parse Cargo.toml: {error}"))?;

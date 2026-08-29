@@ -9,8 +9,11 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import json
 import os
 import pathlib
+import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -19,13 +22,30 @@ from unittest import mock
 
 
 MODULE_PATH = pathlib.Path(__file__).with_name("protected_pr_ci.py")
+VERIFIER_PATH = MODULE_PATH.with_name("protected_checkout.py")
 COMMIT_POLICY_PATH = MODULE_PATH.with_name("check-pull-request-commits.sh")
 POLICY_PATH = MODULE_PATH.parent.parent / "protected-pr-ci.json"
+COMMAND_WORKFLOW_PATH = MODULE_PATH.parent.parent / "workflows" / "pr-ci-command.yml"
+REUSABLE_WORKFLOW_PATH = MODULE_PATH.parent.parent / "workflows" / "pr-ci.yml"
+RECONCILE_WORKFLOW_PATH = (
+    MODULE_PATH.parent.parent / "workflows" / "pr-ci-reconcile.yml"
+)
+CHECKOUT_ACTION_PATH = (
+    MODULE_PATH.parent.parent
+    / "actions"
+    / "protected-candidate-checkout"
+    / "action.yml"
+)
 SPEC = importlib.util.spec_from_file_location("protected_pr_ci", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None
 controller = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = controller
 SPEC.loader.exec_module(controller)
+VERIFIER_SPEC = importlib.util.spec_from_file_location("protected_checkout", VERIFIER_PATH)
+assert VERIFIER_SPEC is not None and VERIFIER_SPEC.loader is not None
+verifier = importlib.util.module_from_spec(VERIFIER_SPEC)
+sys.modules[VERIFIER_SPEC.name] = verifier
+VERIFIER_SPEC.loader.exec_module(verifier)
 
 
 REPOSITORY = "NVIDIA/yaml-sigil-example"
@@ -55,7 +75,9 @@ MAINTAINER = "maintainer"
 
 def policy() -> dict:
     return {
-        "version": 2,
+        "version": 3,
+        "repository": REPOSITORY,
+        "repository_kind": "traits",
         "default_branch": "main",
         "workflow_file": ".github/workflows/pr-ci-command.yml",
         "required_check": "Required CI",
@@ -74,16 +96,30 @@ def policy() -> dict:
             "allowed_paths": ["Cargo.toml", "CHANGELOG.md"],
         },
         "expected_jobs": ["commit_policy", "workflow_lint", "candidate_ci"],
-        "candidate_ci_paths": [
-            ".cargo/**",
-            "**/.cargo/**",
-            ".github/workflows/ci.yml",
-            ".github/workflows/pr-ci.yml",
-            "deny.toml",
-            "deny.exceptions.toml",
-            "xtask/**",
-        ],
+        "supplemental_candidate_ci": True,
     }
+
+
+def policy_bash() -> str:
+    """Return Git Bash on Windows instead of the WSL launcher."""
+    if os.name != "nt":
+        return "bash"
+
+    git = shutil.which("git")
+    if git is None:
+        raise RuntimeError("cannot locate Git while resolving Git Bash")
+    git_path = pathlib.Path(git)
+    candidates = (
+        git_path.parent / "bash.exe",
+        git_path.parent.parent / "bin" / "bash.exe",
+        git_path.parent.parent / "usr" / "bin" / "bash.exe",
+        git_path.parent.parent.parent / "bin" / "bash.exe",
+        git_path.parent.parent.parent / "usr" / "bin" / "bash.exe",
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return os.fspath(candidate)
+    raise RuntimeError(f"cannot locate Git Bash beside {git_path}")
 
 
 def event(body: str | None = None) -> dict:
@@ -94,9 +130,16 @@ def event(body: str | None = None) -> dict:
         "comment": {
             "id": 19,
             "body": body if body is not None else f"/ok to test {HEAD_SHA}",
-            "user": {"login": MAINTAINER},
+            "created_at": "2026-08-28T12:00:00Z",
+            "updated_at": "2026-08-28T12:00:00Z",
+            "user": {"id": 1, "login": MAINTAINER, "type": "User"},
         },
+        "sender": {"id": 1, "login": MAINTAINER, "type": "User"},
     }
+
+
+def adoption_event() -> dict:
+    return event(f"/ok to test-and-adopt {HEAD_SHA}")
 
 
 def environment() -> dict[str, str]:
@@ -188,6 +231,8 @@ def git_commit(
     committer_login: str = MAINTAINER,
     author_id: int = 1,
     committer_id: int = 1,
+    author_type: str = "User",
+    committer_type: str = "User",
     author_name: str = "Maintainer",
     author_email: str = "maintainer@example.invalid",
     committer_name: str = "Maintainer",
@@ -207,8 +252,12 @@ def git_commit(
     return {
         "sha": sha,
         "parents": [{"sha": parent}],
-        "author": {"login": author_login, "id": author_id},
-        "committer": {"login": committer_login, "id": committer_id},
+        "author": {"login": author_login, "id": author_id, "type": author_type},
+        "committer": {
+            "login": committer_login,
+            "id": committer_id,
+            "type": committer_type,
+        },
         "commit": {
             "author": {"name": author_name, "email": author_email},
             "committer": {"name": committer_name, "email": committer_email},
@@ -216,6 +265,33 @@ def git_commit(
             "verification": {
                 "verified": verified,
                 "reason": "valid" if verified else "unsigned",
+            },
+        },
+    }
+
+
+def git_signature(
+    *,
+    sha: str = HEAD_SHA,
+    signer_login: str = MAINTAINER,
+    signer_id: int = 1,
+    email: str = "maintainer@example.invalid",
+    valid: bool = True,
+    github_signed: bool = False,
+    kind: str = "GpgSignature",
+) -> dict:
+    return {
+        "oid": sha,
+        "signature": {
+            "__typename": kind,
+            "email": email,
+            "isValid": valid,
+            "state": "VALID" if valid else "INVALID",
+            "wasSignedByGitHub": github_signed,
+            "signer": {
+                "databaseId": signer_id,
+                "login": signer_login,
+                "__typename": "User",
             },
         },
     }
@@ -258,6 +334,7 @@ class FakeAuthorizationApi:
         self.permissions = {MAINTAINER: "write"}
         self.commits = [{"sha": HEAD_SHA, "parents": [{"sha": MAIN_SHA}]}]
         self.details = {HEAD_SHA: git_commit()}
+        self.signatures = {HEAD_SHA: git_signature()}
         self.git_commits = {
             MAIN_SHA: {"sha": MAIN_SHA, "tree": {"sha": BASE_TREE_SHA}},
             HEAD_SHA: {"sha": HEAD_SHA, "tree": {"sha": HEAD_TREE_SHA}},
@@ -280,7 +357,7 @@ class FakeAuthorizationApi:
         self.pull = {
             "number": 7,
             "state": "open",
-            "user": {"login": "contributor", "id": 42},
+            "user": {"login": "contributor", "id": 42, "type": "User"},
             "base": {
                 "ref": "main",
                 "sha": MAIN_SHA,
@@ -293,6 +370,7 @@ class FakeAuthorizationApi:
             },
             "changed_files": 1,
             "commits": 1,
+            "maintainer_can_modify": True,
         }
 
     def set_tree_files(
@@ -392,52 +470,74 @@ class FakeAuthorizationApi:
             return copy.deepcopy(self.runs)
         raise AssertionError(f"unexpected keyed pagination label {label}")
 
+    def commit_signatures(self, repository, pull_number, oids):
+        self.signature_repository = repository
+        self.signature_pull_number = pull_number
+        return {oid: copy.deepcopy(self.signatures[oid]) for oid in oids}
+
     def post(self, path: str, payload: dict):
         self.posts.append((path, payload))
         return None
+
+
+def authorize_fixture(
+    api: FakeAuthorizationApi,
+    approval: dict | None = None,
+) -> controller.Authorization:
+    selected = approval or event()
+    api.comment = copy.deepcopy(selected["comment"])
+    return controller.authorize(selected, policy(), api, environment())
 
 
 class AuthorizationTests(unittest.TestCase):
     def test_repository_policy_configuration_is_valid(self) -> None:
         controller.load_config(str(POLICY_PATH))
 
-    def test_repository_policy_covers_candidate_validation_surfaces(self) -> None:
+    def test_shared_classifier_covers_candidate_validation_surfaces(self) -> None:
         repository_policy = controller.load_config(str(POLICY_PATH))
-        required = {
-            ".cargo/**",
-            "**/.cargo/**",
+        kind = repository_policy["repository_kind"]
+        for path in (
             ".github/workflows/ci.yml",
+            ".github/workflows/pr-ci-command.yml",
+            ".github/workflows/pr-ci-reconcile.yml",
             ".github/workflows/pr-ci.yml",
+            ".github/scripts/protected_pr_ci.py",
+            ".github/scripts/protected_checkout.py",
+            ".github/scripts/check-pull-request-commits.sh",
+            ".github/protected-pr-ci.json",
+            ".cargo/config.toml",
+            "nested/.cargo/config.toml",
+            "Cargo.toml",
+            "nested/Cargo.lock",
+            "build.rs",
             "deny.toml",
-            "deny.exceptions.toml",
-            "xtask/**",
-        }
-        self.assertLessEqual(required, set(repository_policy["candidate_ci_paths"]))
+            "xtask/src/main.rs",
+            ".release-plz.toml",
+            "RELEASING.md",
+        ):
+            with self.subTest(path=path):
+                self.assertTrue(controller.is_sensitive_path(path, kind))
 
-    def test_repository_directory_patterns_match_roots_and_descendants(self) -> None:
-        repository_policy = controller.load_config(str(POLICY_PATH))
-        declarations = [
-            pattern
-            for pattern in repository_policy["candidate_ci_paths"]
-            if pattern.endswith("/**")
-        ]
-        self.assertTrue(declarations)
-
-        for declaration in declarations:
-            root = declaration[:-3]
-            if root.startswith("**/"):
-                root = f"nested/{root[3:]}"
-            with self.subTest(declaration=declaration, root=root):
-                self.assertTrue(controller.matches_path_inventory(root, [declaration]))
-                self.assertTrue(
-                    controller.matches_path_inventory(
-                        f"{root}/representative-file", [declaration]
-                    )
-                )
-
-    def test_repository_policy_has_no_path_based_adoption_rule(self) -> None:
-        repository_policy = controller.load_config(str(POLICY_PATH))
-        self.assertNotIn("sensitive_paths", repository_policy)
+    def test_spec_and_rs_classifier_extensions_are_explicit(self) -> None:
+        self.assertTrue(
+            controller.is_sensitive_path(
+                "conformance/rebuild-rs/vendor/acvp/vectors.json", "spec"
+            )
+        )
+        self.assertTrue(
+            controller.is_sensitive_path(
+                "conformance/rebuild-rs/pinned-dir/src/lib.rs", "spec"
+            )
+        )
+        self.assertTrue(
+            controller.is_sensitive_path(
+                "conformance/rebuild-rs/xtask/src/main.rs", "spec"
+            )
+        )
+        self.assertTrue(
+            controller.is_sensitive_path("crates/core/buf.yaml", "rs")
+        )
+        self.assertFalse(controller.is_sensitive_path("README.md", "traits"))
 
     def test_writer_permissions_are_accepted(self) -> None:
         for permission in ("write", "push", "maintain", "admin"):
@@ -462,18 +562,23 @@ class AuthorizationTests(unittest.TestCase):
             controller.authorize(event(), policy(), api, env)
 
     def test_command_is_exact_and_sha_bound(self) -> None:
-        api = FakeAuthorizationApi()
         for body in (
             f" /ok to test {HEAD_SHA}",
             f"/ok to test {HEAD_SHA}\n",
             f"/ok to test {HEAD_SHA.upper()}",
             "/ok to test main",
         ):
+            candidate_event = event(body)
+            api = FakeAuthorizationApi()
+            api.comment = copy.deepcopy(candidate_event["comment"])
             with self.subTest(body=body), self.assertRaises(controller.PolicyError):
-                controller.authorize(event(body), policy(), api, environment())
+                controller.authorize(candidate_event, policy(), api, environment())
 
+        candidate_event = event(f"/ok to test {OLD_SHA}")
+        api = FakeAuthorizationApi()
+        api.comment = copy.deepcopy(candidate_event["comment"])
         with self.assertRaisesRegex(controller.PolicyError, "exact current pull request head"):
-            controller.authorize(event(f"/ok to test {OLD_SHA}"), policy(), api, environment())
+            controller.authorize(candidate_event, policy(), api, environment())
 
     def test_stale_policy_and_base_are_rejected(self) -> None:
         api = FakeAuthorizationApi()
@@ -522,7 +627,9 @@ class AuthorizationTests(unittest.TestCase):
             "renamed",
             previous_filename=".github/workflows/ci.yml",
         )
-        result = controller.authorize(event(), policy(), api, environment())
+        approval = adoption_event()
+        api.comment = copy.deepcopy(approval["comment"])
+        result = controller.authorize(approval, policy(), api, environment())
         self.assertTrue(result.candidate_ci_required)
 
     def test_mutable_pull_file_view_is_never_authoritative(self) -> None:
@@ -535,7 +642,9 @@ class AuthorizationTests(unittest.TestCase):
     def test_workflow_change_from_fork_is_authorized(self) -> None:
         api = FakeAuthorizationApi()
         api.set_change(".github/workflows/ci.yml")
-        result = controller.authorize(event(), policy(), api, environment())
+        approval = adoption_event()
+        api.comment = copy.deepcopy(approval["comment"])
+        result = controller.authorize(approval, policy(), api, environment())
         self.assertEqual(
             result.head_repository, "contributor/yaml-sigil-example"
         )
@@ -549,27 +658,23 @@ class AuthorizationTests(unittest.TestCase):
             with self.subTest(path=path):
                 api = FakeAuthorizationApi()
                 api.set_change(path)
-                result = controller.authorize(event(), policy(), api, environment())
+                approval = adoption_event()
+                api.comment = copy.deepcopy(approval["comment"])
+                result = controller.authorize(
+                    approval, policy(), api, environment()
+                )
                 self.assertTrue(result.candidate_ci_required)
 
-    def test_directory_patterns_cover_roots_descendants_and_near_misses(self) -> None:
-        patterns = [
-            ".cargo/**",
-            "**/.cargo/**",
-            "source-spec/**",
-        ]
+    def test_classifier_directory_roots_descendants_and_near_misses(self) -> None:
         for path in (
             ".cargo",
             ".CARGO/config.toml",
             ".ＣＡＲＧＯ",
             "nested/.cargo",
             "nested/.ＣＡＲＧＯ/config.toml",
-            "source-spec",
-            "SOURCE-SPEC/proto/schema.proto",
-            "ＳＯＵＲＣＥ－ＳＰＥＣ/README.md",
         ):
             with self.subTest(path=path):
-                self.assertTrue(controller.matches_path_inventory(path, patterns))
+                self.assertTrue(controller.is_sensitive_path(path, "traits"))
 
         for path in (
             ".carg",
@@ -580,7 +685,7 @@ class AuthorizationTests(unittest.TestCase):
             "source-specification/README.md",
         ):
             with self.subTest(near_miss=path):
-                self.assertFalse(controller.matches_path_inventory(path, patterns))
+                self.assertFalse(controller.is_sensitive_path(path, "traits"))
 
     def test_unusual_directory_entries_use_the_same_commit_policy(self) -> None:
         for path, leaf in (
@@ -597,7 +702,13 @@ class AuthorizationTests(unittest.TestCase):
             with self.subTest(path=path, entry_type=leaf[0]):
                 api = FakeAuthorizationApi()
                 api.set_tree_files({}, {path: leaf})
-                result = controller.authorize(event(), policy(), api, environment())
+                approval = (
+                    adoption_event()
+                    if controller.is_sensitive_path(path, "traits")
+                    else event()
+                )
+                api.comment = copy.deepcopy(approval["comment"])
+                result = controller.authorize(approval, policy(), api, environment())
                 self.assertEqual(result.head_sha, HEAD_SHA)
 
     def test_candidate_ci_directory_entries_match_any_leaf_type(self) -> None:
@@ -610,7 +721,11 @@ class AuthorizationTests(unittest.TestCase):
             with self.subTest(path=path, entry_type=leaf[0]):
                 api = FakeAuthorizationApi()
                 api.set_tree_files({}, {path: leaf})
-                result = controller.authorize(event(), policy(), api, environment())
+                approval = adoption_event()
+                api.comment = copy.deepcopy(approval["comment"])
+                result = controller.authorize(
+                    approval, policy(), api, environment()
+                )
                 self.assertTrue(result.candidate_ci_required)
 
     def test_executable_targets_use_the_same_commit_policy(self) -> None:
@@ -632,25 +747,26 @@ class AuthorizationTests(unittest.TestCase):
             with self.subTest(path=path):
                 api = FakeAuthorizationApi()
                 api.set_change(path)
-                result = controller.authorize(event(), policy(), api, environment())
+                approval = adoption_event()
+                api.comment = copy.deepcopy(approval["comment"])
+                result = controller.authorize(approval, policy(), api, environment())
                 self.assertEqual(result.head_sha, HEAD_SHA)
-                self.assertFalse(result.candidate_ci_required)
+                self.assertTrue(result.candidate_ci_required)
 
-    def test_verified_human_commit_requires_only_exact_author_dco(self) -> None:
+    def test_sensitive_adoption_preserves_author_and_adopter_dco(self) -> None:
         api = FakeAuthorizationApi()
         api.set_change("Cargo.toml")
         api.details[HEAD_SHA] = git_commit(
             author_login="contributor",
+            author_id=42,
             author_name="Contributor",
             author_email="contributor@example.invalid",
             committer_name="Maintainer",
             committer_email="maintainer@example.invalid",
-            message=(
-                "ci: update policy\n\n"
-                "Signed-off-by: Contributor <contributor@example.invalid>\n"
-            ),
         )
-        result = controller.authorize(event(), policy(), api, environment())
+        approval = adoption_event()
+        api.comment = copy.deepcopy(approval["comment"])
+        result = controller.authorize(approval, policy(), api, environment())
         self.assertEqual(
             result.head_repository, "contributor/yaml-sigil-example"
         )
@@ -659,49 +775,40 @@ class AuthorizationTests(unittest.TestCase):
             "ci: update policy\n\n"
             "Signed-off-by: Maintainer <maintainer@example.invalid>\n"
         )
-        with self.assertRaisesRegex(controller.PolicyError, "author's DCO sign-off"):
-            controller.authorize(event(), policy(), api, environment())
+        with self.assertRaisesRegex(controller.PolicyError, "original author's DCO"):
+            controller.authorize(approval, policy(), api, environment())
+
+        api.details[HEAD_SHA]["commit"]["message"] = (
+            "ci: update policy\n\n"
+            "Signed-off-by: Contributor <contributor@example.invalid>\n"
+        )
+        with self.assertRaisesRegex(controller.PolicyError, "adopting committer's DCO"):
+            controller.authorize(approval, policy(), api, environment())
 
     def test_every_human_commit_requires_valid_github_verification(self) -> None:
         api = FakeAuthorizationApi()
         api.set_change("AGENTS.md")
-        api.details[HEAD_SHA] = git_commit(verified=False)
+        api.signatures[HEAD_SHA] = git_signature(valid=False)
         with self.assertRaisesRegex(controller.PolicyError, "not GitHub Verified"):
             controller.authorize(event(), policy(), api, environment())
 
+        api = FakeAuthorizationApi()
+        api.set_change("AGENTS.md")
         api.details[HEAD_SHA] = git_commit(committer_login="outsider")
-        api.permissions["outsider"] = "read"
-        result = controller.authorize(event(), policy(), api, environment())
-        self.assertEqual(result.head_sha, HEAD_SHA)
+        with self.assertRaisesRegex(controller.PolicyError, "verified signer"):
+            controller.authorize(event(), policy(), api, environment())
 
     def test_full_commit_response_must_match_requested_sha(self) -> None:
         api = FakeAuthorizationApi()
         api.set_change("Cargo.toml")
         api.details[HEAD_SHA]["sha"] = OLD_SHA
+        approval = adoption_event()
+        api.comment = copy.deepcopy(approval["comment"])
         with self.assertRaisesRegex(controller.PolicyError, "requested SHA"):
-            controller.authorize(event(), policy(), api, environment())
+            controller.authorize(approval, policy(), api, environment())
 
     def test_exact_release_app_author_and_committer_are_accepted(self) -> None:
-        api = FakeAuthorizationApi()
-        api.set_change("Cargo.toml")
-        api.pull["user"] = {"login": BOT, "id": BOT_ID}
-        api.pull["head"]["repo"]["full_name"] = REPOSITORY
-        api.pull["head"]["ref"] = "release-plz-next"
-        api.details[HEAD_SHA] = git_commit(
-            author_login=BOT,
-            author_id=BOT_ID,
-            committer_login=WEB_FLOW,
-            committer_id=WEB_FLOW_ID,
-            author_name=BOT,
-            author_email=BOT_EMAIL,
-            committer_name=GITHUB_COMMITTER_NAME,
-            committer_email=GITHUB_COMMITTER_EMAIL,
-            message=(
-                "chore(release): prepare candidate\n\n"
-                "Signed-off-by: nvidia-yamlsigil-release-pr[bot] "
-                f"<{BOT_EMAIL}>\n"
-            ),
-        )
+        api = self.release_app_api()
         result = controller.authorize(event(), policy(), api, environment())
         self.assertEqual(result.head_sha, HEAD_SHA)
 
@@ -712,12 +819,13 @@ class AuthorizationTests(unittest.TestCase):
     def release_app_api(self) -> FakeAuthorizationApi:
         api = FakeAuthorizationApi()
         api.set_change("Cargo.toml")
-        api.pull["user"] = {"login": BOT, "id": BOT_ID}
+        api.pull["user"] = {"login": BOT, "id": BOT_ID, "type": "Bot"}
         api.pull["head"]["repo"]["full_name"] = REPOSITORY
         api.pull["head"]["ref"] = "release-plz-next"
         api.details[HEAD_SHA] = git_commit(
             author_login=BOT,
             author_id=BOT_ID,
+            author_type="Bot",
             committer_login=WEB_FLOW,
             committer_id=WEB_FLOW_ID,
             author_name=BOT,
@@ -730,22 +838,28 @@ class AuthorizationTests(unittest.TestCase):
                 f"<{BOT_EMAIL}>\n"
             ),
         )
+        api.signatures[HEAD_SHA] = git_signature(
+            signer_login=WEB_FLOW,
+            signer_id=WEB_FLOW_ID,
+            email=GITHUB_COMMITTER_EMAIL,
+            github_signed=True,
+        )
         return api
 
     def test_release_app_rejects_wrong_bot_id_and_raw_author(self) -> None:
         api = self.release_app_api()
         api.pull["user"]["id"] += 1
-        with self.assertRaisesRegex(controller.PolicyError, "pull request author ID"):
+        with self.assertRaisesRegex(controller.PolicyError, "exact release App identity"):
             controller.authorize(event(), policy(), api, environment())
 
         api = self.release_app_api()
         api.pull["user"]["login"] = "release-app-lookalike"
-        with self.assertRaisesRegex(controller.PolicyError, "not owned by the release App"):
+        with self.assertRaisesRegex(controller.PolicyError, "exact release App identity"):
             controller.authorize(event(), policy(), api, environment())
 
         api = self.release_app_api()
         api.details[HEAD_SHA]["author"]["id"] += 1
-        with self.assertRaisesRegex(controller.PolicyError, "author ID"):
+        with self.assertRaisesRegex(controller.PolicyError, "author is unexpected"):
             controller.authorize(event(), policy(), api, environment())
 
         for field in ("name", "email"):
@@ -781,7 +895,7 @@ class AuthorizationTests(unittest.TestCase):
     def test_release_app_rejects_wrong_web_flow_user_id(self) -> None:
         api = self.release_app_api()
         api.details[HEAD_SHA]["committer"]["id"] += 1
-        with self.assertRaisesRegex(controller.PolicyError, "committer ID"):
+        with self.assertRaisesRegex(controller.PolicyError, "committer is unexpected"):
             controller.authorize(event(), policy(), api, environment())
 
     def test_release_app_rejects_wrong_web_flow_and_raw_github_identity(self) -> None:
@@ -799,10 +913,13 @@ class AuthorizationTests(unittest.TestCase):
 
     def test_release_app_rejects_invalid_signature(self) -> None:
         api = self.release_app_api()
-        api.details[HEAD_SHA]["commit"]["verification"] = {
-            "verified": False,
-            "reason": "invalid",
-        }
+        api.signatures[HEAD_SHA] = git_signature(
+            signer_login=WEB_FLOW,
+            signer_id=WEB_FLOW_ID,
+            email=GITHUB_COMMITTER_EMAIL,
+            valid=False,
+            github_signed=True,
+        )
         with self.assertRaisesRegex(controller.PolicyError, "not GitHub Verified"):
             controller.authorize(event(), policy(), api, environment())
 
@@ -822,13 +939,14 @@ class AuthorizationTests(unittest.TestCase):
     def test_release_app_identity_parent_and_allowlist_are_exact(self) -> None:
         base_api = FakeAuthorizationApi()
         base_api.set_change("Cargo.toml")
-        base_api.pull["user"] = {"login": BOT, "id": BOT_ID}
+        base_api.pull["user"] = {"login": BOT, "id": BOT_ID, "type": "Bot"}
         base_api.pull["head"]["repo"]["full_name"] = REPOSITORY
         base_api.pull["head"]["ref"] = "release-plz-next"
         base_api.details[HEAD_SHA] = git_commit(
             parent=OLD_SHA,
             author_login=BOT,
             author_id=BOT_ID,
+            author_type="Bot",
             committer_login=WEB_FLOW,
             committer_id=WEB_FLOW_ID,
             author_name=BOT,
@@ -840,6 +958,12 @@ class AuthorizationTests(unittest.TestCase):
                 "Signed-off-by: nvidia-yamlsigil-release-pr[bot] "
                 f"<{BOT_EMAIL}>\n"
             ),
+        )
+        base_api.signatures[HEAD_SHA] = git_signature(
+            signer_login=WEB_FLOW,
+            signer_id=WEB_FLOW_ID,
+            email=GITHUB_COMMITTER_EMAIL,
+            github_signed=True,
         )
         with self.assertRaisesRegex(controller.PolicyError, "current main"):
             controller.authorize(event(), policy(), base_api, environment())
@@ -874,6 +998,9 @@ class AuthorizationTests(unittest.TestCase):
                 "head_repository": "contributor/yaml-sigil-example",
                 "policy_sha": MAIN_SHA,
                 "comment_id": str(COMMENT_ID),
+                "binding_digest": authorization.binding_digest,
+                "command_mode": "test",
+                "sensitive": "false",
                 "candidate_ci_required": "false",
             },
         )
@@ -930,7 +1057,7 @@ class AuthorizationTests(unittest.TestCase):
     def test_reusable_call_rejects_changed_comment_issue_or_ref(self) -> None:
         api = FakeAuthorizationApi()
         api.comment["body"] = f"/ok to test {OLD_SHA}"
-        with self.assertRaisesRegex(controller.PolicyError, "exact current pull request head"):
+        with self.assertRaisesRegex(controller.PolicyError, "comment or identity changed"):
             controller.authorize_call(
                 event(),
                 policy(),
@@ -948,7 +1075,7 @@ class AuthorizationTests(unittest.TestCase):
 
         api = FakeAuthorizationApi()
         api.comment_issue_number = 8
-        with self.assertRaisesRegex(controller.PolicyError, "another issue"):
+        with self.assertRaisesRegex(controller.PolicyError, "comment moved"):
             controller.authorize_call(
                 event(),
                 policy(),
@@ -1078,6 +1205,129 @@ class AuthorizationTests(unittest.TestCase):
             )
 
 
+    def test_sensitive_change_rejects_the_ordinary_command(self) -> None:
+        api = FakeAuthorizationApi()
+        api.set_change("Cargo.toml")
+        with self.assertRaisesRegex(controller.PolicyError, "test-and-adopt"):
+            controller.authorize(event(), policy(), api, environment())
+
+    def test_sensitive_fork_requires_maintainer_edits(self) -> None:
+        api = FakeAuthorizationApi()
+        api.set_change(".github/workflows/ci.yml")
+        api.pull["maintainer_can_modify"] = False
+        with self.assertRaisesRegex(controller.PolicyError, "maintainer edits"):
+            authorize_fixture(api, adoption_event())
+
+    def test_edit_away_and_restore_invalidates_the_comment_timestamp(self) -> None:
+        api = FakeAuthorizationApi()
+        api.comment["updated_at"] = "2026-08-28T12:00:01Z"
+        with self.assertRaisesRegex(controller.PolicyError, "comment or identity changed"):
+            controller.authorize(event(), policy(), api, environment())
+
+    def test_direct_external_contributor_identity_is_valid_without_membership(self) -> None:
+        api = FakeAuthorizationApi()
+        api.set_change("src/lib.rs")
+        api.details[HEAD_SHA] = git_commit(
+            author_login="external-contributor",
+            committer_login="external-contributor",
+            author_id=42,
+            committer_id=42,
+            author_name="External Contributor",
+            committer_name="External Contributor",
+            author_email="external@example.invalid",
+            committer_email="external@example.invalid",
+        )
+        api.signatures[HEAD_SHA] = git_signature(
+            signer_login="external-contributor",
+            signer_id=42,
+            email="external@example.invalid",
+            kind="SshSignature",
+        )
+        result = authorize_fixture(api)
+        self.assertEqual(result.head_sha, HEAD_SHA)
+        self.assertNotIn("external-contributor", api.permissions)
+
+    def test_direct_identity_id_login_and_type_disagreements_fail_closed(self) -> None:
+        mutations = (
+            ("id", 2),
+            ("login", "lookalike"),
+            ("type", "Bot"),
+        )
+        for field, value in mutations:
+            with self.subTest(field=field):
+                api = FakeAuthorizationApi()
+                api.set_change("src/lib.rs")
+                api.details[HEAD_SHA]["author"][field] = value
+                with self.assertRaisesRegex(controller.PolicyError, "verified signer"):
+                    authorize_fixture(api)
+
+    def test_null_signature_signer_and_forged_dco_fail_closed(self) -> None:
+        api = FakeAuthorizationApi()
+        api.set_change("src/lib.rs")
+        api.signatures[HEAD_SHA]["signature"]["signer"] = None
+        with self.assertRaisesRegex(controller.PolicyError, "signer must be an object"):
+            authorize_fixture(api)
+
+        api = FakeAuthorizationApi()
+        api.set_change("src/lib.rs")
+        api.details[HEAD_SHA]["commit"]["message"] = (
+            "ci: forged trailer\n\n"
+            "Signed-off-by: Lookalike <maintainer@example.invalid>\n"
+        )
+        with self.assertRaisesRegex(controller.PolicyError, "author's DCO"):
+            authorize_fixture(api)
+
+    def test_web_flow_does_not_authorize_an_arbitrary_human_commit(self) -> None:
+        api = FakeAuthorizationApi()
+        api.set_change("src/lib.rs")
+        api.details[HEAD_SHA] = git_commit(
+            author_login=WEB_FLOW,
+            committer_login=WEB_FLOW,
+            author_id=WEB_FLOW_ID,
+            committer_id=WEB_FLOW_ID,
+            author_name=GITHUB_COMMITTER_NAME,
+            committer_name=GITHUB_COMMITTER_NAME,
+            author_email=GITHUB_COMMITTER_EMAIL,
+            committer_email=GITHUB_COMMITTER_EMAIL,
+        )
+        api.signatures[HEAD_SHA] = git_signature(
+            signer_login=WEB_FLOW,
+            signer_id=WEB_FLOW_ID,
+            email=GITHUB_COMMITTER_EMAIL,
+            github_signed=True,
+        )
+        with self.assertRaisesRegex(controller.PolicyError, "unsupported GitHub web-flow"):
+            authorize_fixture(api)
+
+    def test_release_app_requires_the_exact_gpg_web_flow_shape(self) -> None:
+        api = self.release_app_api()
+        api.signatures[HEAD_SHA]["signature"]["__typename"] = "SshSignature"
+        with self.assertRaisesRegex(controller.PolicyError, "exact GitHub web-flow"):
+            controller.authorize(event(), policy(), api, environment())
+
+    def test_adopting_signer_must_remain_a_writer(self) -> None:
+        api = FakeAuthorizationApi()
+        api.set_change("Cargo.toml")
+        api.details[HEAD_SHA] = git_commit(
+            author_login="external-contributor",
+            author_id=42,
+            author_name="External Contributor",
+            author_email="external@example.invalid",
+            committer_login="adopter",
+            committer_id=2,
+            committer_name="Adopter",
+            committer_email="adopter@example.invalid",
+        )
+        api.signatures[HEAD_SHA] = git_signature(
+            signer_login="adopter",
+            signer_id=2,
+            email="adopter@example.invalid",
+        )
+        api.permissions["adopter"] = "read"
+        with self.assertRaisesRegex(controller.PolicyError, "adopting signer"):
+            authorize_fixture(api, adoption_event())
+
+
 class ImmutableTreeTests(unittest.TestCase):
     @staticmethod
     def snapshot(leaves: dict[str, tuple[str, str, str]]) -> controller.GitTree:
@@ -1109,7 +1359,7 @@ class ImmutableTreeTests(unittest.TestCase):
             list(zip(paths, statuses, strict=True)),
             [
                 ("added.txt", "added"),
-                ("modified.txt", "modified"),
+                ("modified.txt", "mode-or-type-changed"),
                 ("new-name.txt", "added"),
                 ("old-name.txt", "removed"),
                 ("removed.txt", "removed"),
@@ -1253,6 +1503,280 @@ class ImmutableTreeTests(unittest.TestCase):
                     controller.authorize(event(), policy(), api, environment())
 
 
+class ProtectedCheckoutTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_directory.cleanup)
+        self.temporary_directory = pathlib.Path(temporary_directory.name)
+        self.repository = self.temporary_directory / "repository"
+        self.repository.mkdir()
+        discovered_git = shutil.which("git")
+        assert discovered_git is not None
+        self.git = os.path.realpath(discovered_git)
+        self.run_git("init", "--quiet", "--initial-branch=main")
+        self.run_git("config", "user.name", "Verifier Test")
+        self.run_git("config", "user.email", "verifier@example.invalid")
+        workflow = self.repository / ".github" / "workflows" / "ci.yml"
+        workflow.parent.mkdir(parents=True)
+        workflow.write_text("name: candidate\n", encoding="utf-8")
+        self.run_git("add", ".github/workflows/ci.yml")
+        self.run_git("commit", "--quiet", "-m", "test: candidate")
+        self.head_sha = self.run_git("rev-parse", "HEAD").stdout.strip()
+        self.blob_sha = self.run_git(
+            "hash-object", "--no-filters", "--", ".github/workflows/ci.yml"
+        ).stdout.strip()
+        self.base_tree = controller.GitTree(paths=frozenset(), leaves={})
+        self.head_tree = controller.GitTree(
+            paths=frozenset(
+                {
+                    ".github",
+                    ".github/workflows",
+                    ".github/workflows/ci.yml",
+                }
+            ),
+            leaves={
+                ".github/workflows/ci.yml": (
+                    "blob",
+                    "100644",
+                    self.blob_sha,
+                )
+            },
+        )
+        self.config = self.temporary_directory / "protected-pr-ci.json"
+        self.config.write_text(
+            json.dumps(policy(), sort_keys=True), encoding="utf-8"
+        )
+
+    def run_git(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [self.git, *arguments],
+            cwd=self.repository,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+
+    def verify(self) -> None:
+        with mock.patch.object(
+            verifier.policy,
+            "git_tree_for_commit",
+            side_effect=[self.base_tree, self.head_tree],
+        ):
+            verifier.verify(
+                self.repository,
+                self.git,
+                REPOSITORY,
+                MAIN_SHA,
+                self.head_sha,
+                os.fspath(self.config),
+                mock.Mock(),
+            )
+
+    def test_exact_sensitive_blob_and_head_are_accepted(self) -> None:
+        self.verify()
+
+    def test_policy_staging_records_exact_files_digests_and_tools(self) -> None:
+        destination = self.temporary_directory / "staged-policy"
+        github_output = self.temporary_directory / "github-output"
+        verifier.stage_policy(
+            MODULE_PATH.parents[2], destination, os.fspath(github_output)
+        )
+        outputs = dict(
+            line.split("=", 1)
+            for line in github_output.read_text(encoding="utf-8").splitlines()
+        )
+        self.assertEqual(
+            set(outputs),
+            {
+                "verifier",
+                "verifier_sha256",
+                "controller",
+                "controller_sha256",
+                "config",
+                "config_sha256",
+                "python",
+                "git",
+                "path",
+            },
+        )
+        for label in ("verifier", "controller", "config"):
+            value = pathlib.Path(outputs[label]).read_bytes()
+            self.assertEqual(outputs[f"{label}_sha256"], verifier.sha256_bytes(value))
+        self.assertTrue(os.path.isabs(outputs["python"]))
+        self.assertTrue(os.path.isabs(outputs["git"]))
+
+    def test_modified_or_untracked_sensitive_file_fails_closed(self) -> None:
+        workflow = self.repository / ".github" / "workflows" / "ci.yml"
+        workflow.write_text("name: tampered\n", encoding="utf-8")
+        with self.assertRaisesRegex(controller.PolicyError, "authorized Git blob"):
+            self.verify()
+
+        self.run_git("checkout", "--quiet", "--", ".github/workflows/ci.yml")
+        (self.repository / "Cargo.toml").write_text("[package]\n", encoding="utf-8")
+        with self.assertRaisesRegex(controller.PolicyError, "untracked sensitive"):
+            self.verify()
+
+    def test_sensitive_symlink_and_reparse_point_fail_closed(self) -> None:
+        workflow = self.repository / ".github" / "workflows" / "ci.yml"
+        if os.name != "nt":
+            workflow.unlink()
+            workflow.symlink_to(self.repository / ".git" / "HEAD")
+            with self.assertRaisesRegex(
+                controller.PolicyError, "link, reparse point"
+            ):
+                self.verify()
+
+            workflow.unlink()
+            workflow.write_text("name: candidate\n", encoding="utf-8")
+        with (
+            mock.patch.object(
+                verifier,
+                "has_reparse_point",
+                side_effect=lambda metadata: stat.S_ISREG(metadata.st_mode),
+            ),
+            self.assertRaisesRegex(controller.PolicyError, "link, reparse point"),
+        ):
+            self.verify()
+
+    @unittest.skipUnless(os.name == "nt", "Windows reparse-point regression")
+    def test_windows_intermediate_junction_fails_closed(self) -> None:
+        workflows = self.repository / ".github" / "workflows"
+        target = self.repository / "workflows-target"
+        workflows.replace(target)
+        completed = subprocess.run(
+            [
+                os.environ.get("COMSPEC", "cmd.exe"),
+                "/d",
+                "/c",
+                "mklink",
+                "/J",
+                os.fspath(workflows),
+                os.fspath(target),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            f"cannot create test junction: {completed.stdout}{completed.stderr}",
+        )
+        self.addCleanup(os.rmdir, workflows)
+
+        with self.assertRaisesRegex(
+            controller.PolicyError, "missing or untracked sensitive paths"
+        ):
+            self.verify()
+
+    def test_aliases_and_short_name_shapes_fail_closed(self) -> None:
+        if os.name != "nt":
+            alias_root = self.repository / ".GITHUB"
+            if not alias_root.exists():
+                alias = alias_root / "workflows"
+                alias.mkdir(parents=True)
+                (alias / "extra.yml").write_text(
+                    "name: alias\n", encoding="utf-8"
+                )
+                with self.assertRaisesRegex(
+                    controller.PolicyError, "casefold aliases"
+                ):
+                    self.verify()
+
+                shutil.rmtree(alias_root)
+            else:
+                self.assertTrue(
+                    os.path.samefile(alias_root, self.repository / ".github")
+                )
+        (self.repository / "CARGO~1.TOM").write_text("alias\n", encoding="utf-8")
+        with self.assertRaisesRegex(controller.PolicyError, "short-name-shaped"):
+            self.verify()
+
+    def test_enumeration_entry_metadata_and_time_limits_fail_closed(self) -> None:
+        with (
+            mock.patch.object(controller, "MAX_TREE_ENTRIES", 0),
+            self.assertRaisesRegex(controller.PolicyError, "exceeds 0 entries"),
+        ):
+            self.verify()
+
+        with (
+            mock.patch.object(controller, "MAX_PATH_METADATA_BYTES", 1),
+            self.assertRaisesRegex(controller.PolicyError, "metadata exceeds"),
+        ):
+            self.verify()
+
+        with (
+            mock.patch.object(verifier.time, "monotonic", side_effect=[0.0, 31.0]),
+            self.assertRaisesRegex(controller.PolicyError, "exceeded 30 seconds"),
+        ):
+            self.verify()
+
+    def test_trusted_git_uses_only_the_resolved_tool_directory(self) -> None:
+        completed = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        with mock.patch.object(
+            verifier.subprocess, "run", return_value=completed
+        ) as run:
+            verifier.trusted_git(self.git, self.repository, ["status"])
+        environment = run.call_args.kwargs["env"]
+        self.assertEqual(environment["PATH"], os.path.dirname(self.git))
+        self.assertNotIn("HOME", environment)
+        self.assertEqual(run.call_args.args[0][0], self.git)
+
+
+class WorkflowStructureTests(unittest.TestCase):
+    def test_composite_verifier_is_the_first_post_checkout_step(self) -> None:
+        action = CHECKOUT_ACTION_PATH.read_text(encoding="utf-8")
+        stage = action.index("- name: Stage protected verifier and trusted tools")
+        checkout = action.index("- name: Check out exact candidate")
+        verify_step = action.index("- name: Verify exact candidate checkout")
+        self.assertLess(stage, checkout)
+        self.assertLess(checkout, verify_step)
+        between = action[checkout:verify_step]
+        self.assertNotIn("\n    - name:", between)
+        self.assertIn("persist-credentials: false", between)
+        self.assertIn("submodules: false", between)
+        self.assertIn("--expected-verifier-sha256", action[verify_step:])
+        self.assertIn('PATH: ${{ steps.protected.outputs.path }}', action[verify_step:])
+
+    def test_every_primary_candidate_checkout_uses_the_protected_action(self) -> None:
+        workflow = REUSABLE_WORKFLOW_PATH.read_text(encoding="utf-8")
+        protected_uses = (
+            "uses: ./policy/.github/actions/protected-candidate-checkout"
+        )
+        self.assertGreaterEqual(workflow.count(protected_uses), 1)
+        self.assertNotIn("- name: Check out exact candidate\n", workflow)
+        self.assertIn("binding_digest:", workflow)
+        self.assertIn("--binding-digest", workflow)
+        self.assertIn("results_json:", workflow)
+
+    def test_controller_token_jobs_compile_before_checks_only_tokens(self) -> None:
+        command = COMMAND_WORKFLOW_PATH.read_text(encoding="utf-8")
+        self.assertEqual(command.count("Create checks-only GitHub App token"), 2)
+        self.assertEqual(command.count("permission-checks: write"), 2)
+        self.assertNotIn("permission-contents:", command)
+        start = command.index("  start_check:")
+        protected = command.index("  protected_ci:")
+        finish = command.index("  finish_check:")
+        start_job = command[start:protected]
+        finish_job = command[finish:]
+        for job in (start_job, finish_job):
+            self.assertLess(
+                job.index("Load immutable check policy"),
+                job.index("Create checks-only GitHub App token"),
+            )
+            self.assertLess(
+                job.index("Verify exact App token repository scope"),
+                job.index("App-owned in-progress check")
+                if "App-owned in-progress check" in job
+                else job.index("Revalidate state and finalize App check"),
+            )
+            self.assertNotIn("actions/checkout@", job)
+
+    def test_reconciliation_token_jobs_remain_checkout_free(self) -> None:
+        workflow = RECONCILE_WORKFLOW_PATH.read_text(encoding="utf-8")
+        self.assertNotIn("actions/checkout@", workflow)
+
+
 class CommitPolicyTests(unittest.TestCase):
     def setUp(self) -> None:
         temporary_directory = tempfile.TemporaryDirectory()
@@ -1312,7 +1836,7 @@ class CommitPolicyTests(unittest.TestCase):
         process_environment = os.environ.copy()
         process_environment.update({"BASE_SHA": base_sha, "HEAD_SHA": head_sha})
         return subprocess.run(
-            ["bash", str(COMMIT_POLICY_PATH)],
+            [policy_bash(), str(COMMIT_POLICY_PATH)],
             cwd=self.repository,
             env=process_environment,
             text=True,
@@ -1466,6 +1990,300 @@ class PaginationTests(unittest.TestCase):
                 api.paginate("/items", max_items=200, label="items")
 
 
+class GraphQlResponse:
+    status = 200
+
+    def __init__(self, value: dict) -> None:
+        self.raw = json.dumps(value, separators=(",", ":")).encode("utf-8")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def read(self, limit: int) -> bytes:
+        return self.raw[:limit]
+
+
+def requested_graphql_page(request) -> tuple[int, str | None, int, str]:
+    body = json.loads(request.data)
+    variables = body["variables"]
+    return variables["first"], variables["after"], variables["number"], body["query"]
+
+
+def graphql_signature_value(
+    signatures: list[dict],
+    *,
+    total_count: int,
+    has_next: bool,
+    end_cursor: str | None,
+) -> dict:
+    return {
+        "data": {
+            "repository": {
+                "pullRequest": {
+                    "commits": {
+                        "totalCount": total_count,
+                        "nodes": [{"commit": signature} for signature in signatures],
+                        "pageInfo": {
+                            "hasNextPage": has_next,
+                            "endCursor": end_cursor,
+                        },
+                    }
+                }
+            }
+        }
+    }
+
+
+def graphql_signature_response(
+    oids: list[str],
+    *,
+    total_count: int | None = None,
+    has_next: bool = False,
+    end_cursor: str | None = None,
+) -> GraphQlResponse:
+    return GraphQlResponse(
+        graphql_signature_value(
+            [git_signature(sha=oid) for oid in oids],
+            total_count=len(oids) if total_count is None else total_count,
+            has_next=has_next,
+            end_cursor=end_cursor,
+        )
+    )
+
+
+def graphql_signature_pages(oids: list[str]):
+    offset = 0
+    expected_cursor = None
+
+    def respond(request, *_args, **_kwargs) -> GraphQlResponse:
+        nonlocal offset, expected_cursor
+        first, after, number, query = requested_graphql_page(request)
+        if number != PULL_NUMBER or after != expected_cursor:
+            raise AssertionError("unexpected pull request signature page")
+        if "pullRequest(number:$number)" not in query or "object(oid:" in query:
+            raise AssertionError("signature query escaped the pull request connection")
+        batch = oids[offset : offset + first]
+        offset += len(batch)
+        has_next = offset < len(oids)
+        end_cursor = f"cursor-{offset}"
+        expected_cursor = end_cursor if has_next else None
+        return graphql_signature_response(
+            batch,
+            total_count=len(oids),
+            has_next=has_next,
+            end_cursor=end_cursor,
+        )
+
+    return respond
+
+
+class GraphQlSignatureTests(unittest.TestCase):
+    def test_signature_query_text_matches_the_intended_selection_tree(self) -> None:
+        api = controller.GitHubApi("token", "https://example.invalid")
+        with mock.patch.object(
+            controller.urllib.request,
+            "urlopen",
+            return_value=graphql_signature_response([HEAD_SHA]),
+        ) as urlopen:
+            api.commit_signatures(REPOSITORY, PULL_NUMBER, [HEAD_SHA])
+
+        _, _, _, query = requested_graphql_page(urlopen.call_args.args[0])
+        expected = "".join(
+            """
+            query($owner:String!,$name:String!,$number:Int!,$first:Int!,$after:String){
+              repository(owner:$owner,name:$name){
+                pullRequest(number:$number){
+                  commits(first:$first,after:$after){
+                    totalCount
+                    nodes{
+                      commit{
+                        oid
+                        signature{
+                          __typename
+                          email
+                          isValid
+                          state
+                          wasSignedByGitHub
+                          signer{databaseId login __typename}
+                        }
+                      }
+                    }
+                    pageInfo{hasNextPage endCursor}
+                  }
+                }
+              }
+            }
+            """.split()
+        )
+        self.assertEqual("".join(query.split()), expected)
+
+    def test_signature_inventory_is_batched_five_by_fifty(self) -> None:
+        oids = [f"{index:040x}" for index in range(1, 251)]
+        api = controller.GitHubApi("token", "https://example.invalid")
+        with mock.patch.object(
+            controller.urllib.request,
+            "urlopen",
+            side_effect=graphql_signature_pages(oids),
+        ) as urlopen:
+            observed = api.commit_signatures(REPOSITORY, PULL_NUMBER, oids)
+        self.assertEqual(list(observed), oids)
+        self.assertEqual(urlopen.call_count, 5)
+        self.assertTrue(
+            all(
+                requested_graphql_page(call.args[0])[0] == 50
+                for call in urlopen.call_args_list
+            )
+        )
+        self.assertTrue(
+            all(
+                requested_graphql_page(call.args[0])[2] == PULL_NUMBER
+                and "pullRequest(number:$number)"
+                in requested_graphql_page(call.args[0])[3]
+                and "object(oid:" not in requested_graphql_page(call.args[0])[3]
+                for call in urlopen.call_args_list
+            )
+        )
+
+    def test_251_commits_and_excess_requests_fail_before_ambiguity(self) -> None:
+        api = controller.GitHubApi("token", "https://example.invalid")
+        oids = [f"{index:040x}" for index in range(1, 252)]
+        with self.assertRaisesRegex(controller.PolicyError, "commit limit"):
+            api.commit_signatures(REPOSITORY, PULL_NUMBER, oids)
+
+        with (
+            mock.patch.object(controller, "MAX_SIGNATURE_BATCH", 1),
+            mock.patch.object(controller, "MAX_SIGNATURE_REQUESTS", 1),
+            mock.patch.object(
+                controller.urllib.request,
+                "urlopen",
+                side_effect=graphql_signature_pages([HEAD_SHA, OLD_SHA]),
+            ) as urlopen,
+            self.assertRaisesRegex(controller.PolicyError, "too many GraphQL requests"),
+        ):
+            api.commit_signatures(REPOSITORY, PULL_NUMBER, [HEAD_SHA, OLD_SHA])
+        self.assertEqual(urlopen.call_count, 1)
+
+    def test_aggregate_success_body_budget_has_a_sentinel(self) -> None:
+        first = graphql_signature_response(
+            [HEAD_SHA],
+            total_count=2,
+            has_next=True,
+            end_cursor="cursor-1",
+        )
+        second = graphql_signature_response(
+            [OLD_SHA],
+            total_count=2,
+            end_cursor="cursor-2",
+        )
+        budget = len(first.raw) + len(second.raw) - 1
+        api = controller.GitHubApi("token", "https://example.invalid")
+        with (
+            mock.patch.object(controller, "MAX_SIGNATURE_BATCH", 1),
+            mock.patch.object(controller, "MAX_API_RESPONSE_BYTES", budget),
+            mock.patch.object(
+                controller.urllib.request,
+                "urlopen",
+                side_effect=[first, second],
+            ),
+            self.assertRaisesRegex(controller.PolicyError, "aggregate commit signature"),
+        ):
+            api.commit_signatures(REPOSITORY, PULL_NUMBER, [HEAD_SHA, OLD_SHA])
+
+    def test_partial_graphql_errors_are_rejected_even_with_data(self) -> None:
+        response = graphql_signature_response([HEAD_SHA], end_cursor="cursor-1")
+        value = json.loads(response.raw)
+        value["errors"] = [{"message": "partial"}]
+        api = controller.GitHubApi("token", "https://example.invalid")
+        with (
+            mock.patch.object(
+                controller.urllib.request,
+                "urlopen",
+                return_value=GraphQlResponse(value),
+            ),
+            self.assertRaisesRegex(controller.PolicyError, "contains errors"),
+        ):
+            api.commit_signatures(REPOSITORY, PULL_NUMBER, [HEAD_SHA])
+
+    def test_missing_extra_duplicate_and_reordered_results_fail_closed(self) -> None:
+        cases = {
+            "missing": [git_signature(sha=HEAD_SHA)],
+            "extra": [
+                git_signature(sha=HEAD_SHA),
+                git_signature(sha=OLD_SHA),
+                git_signature(sha=MAIN_SHA),
+            ],
+            "duplicate": [
+                git_signature(sha=HEAD_SHA),
+                git_signature(sha=HEAD_SHA),
+            ],
+            "reordered": [
+                git_signature(sha=OLD_SHA),
+                git_signature(sha=HEAD_SHA),
+            ],
+        }
+        for label, signatures in cases.items():
+            with self.subTest(case=label):
+                api = controller.GitHubApi("token", "https://example.invalid")
+                with (
+                    mock.patch.object(
+                        controller.urllib.request,
+                        "urlopen",
+                        return_value=GraphQlResponse(
+                            graphql_signature_value(
+                                signatures,
+                                total_count=2,
+                                has_next=False,
+                                end_cursor="cursor-2",
+                            )
+                        ),
+                    ),
+                    self.assertRaises(controller.PolicyError),
+                ):
+                    api.commit_signatures(
+                        REPOSITORY, PULL_NUMBER, [HEAD_SHA, OLD_SHA]
+                    )
+
+    def test_duplicate_requested_oids_fail_before_network_access(self) -> None:
+        api = controller.GitHubApi("token", "https://example.invalid")
+        with (
+            mock.patch.object(controller.urllib.request, "urlopen") as urlopen,
+            self.assertRaisesRegex(controller.PolicyError, "duplicate commit OIDs"),
+        ):
+            api.commit_signatures(REPOSITORY, PULL_NUMBER, [HEAD_SHA, HEAD_SHA])
+        urlopen.assert_not_called()
+
+
+class AppTokenScopeTests(unittest.TestCase):
+    def test_exact_single_repository_inventory_is_required(self) -> None:
+        api = mock.Mock()
+        api.paginate_key.return_value = [{"id": 11, "full_name": REPOSITORY}]
+        controller.require_app_token_repository_scope(api, REPOSITORY)
+        api.paginate_key.assert_called_once_with(
+            "/installation/repositories",
+            "repositories",
+            max_items=2,
+            label="App token repository inventory",
+        )
+
+        for inventory in (
+            [],
+            [
+                {"id": 11, "full_name": REPOSITORY},
+                {"id": 12, "full_name": "NVIDIA/another"},
+            ],
+            [{"id": 11, "full_name": "NVIDIA/another"}],
+            [{"id": 0, "full_name": REPOSITORY}],
+        ):
+            with self.subTest(inventory=inventory):
+                api = mock.Mock()
+                api.paginate_key.return_value = inventory
+                with self.assertRaises(controller.PolicyError):
+                    controller.require_app_token_repository_scope(api, REPOSITORY)
+
+
 class FakeCheckApi:
     def __init__(self, checks=None) -> None:
         self.checks = list(checks or [])
@@ -1506,15 +2324,46 @@ class FakeCheckApi:
         return check
 
 
-def external(run_id: int = 101, attempt: int = 1) -> object:
+def authorization_digest(
+    api: FakeAuthorizationApi | None = None,
+    approval: dict | None = None,
+) -> str:
+    selected_api = api or FakeAuthorizationApi()
+    selected_event = approval or event()
+    selected_api.comment = copy.deepcopy(selected_event["comment"])
+    return controller.authorize(
+        selected_event, policy(), selected_api, environment()
+    ).binding_digest
+
+
+def external(
+    run_id: int = 101,
+    attempt: int = 1,
+    binding_digest: str | None = None,
+) -> object:
     return controller.ExternalId(
         repository=REPOSITORY,
         pull_number=7,
         head_sha=HEAD_SHA,
         base_sha=MAIN_SHA,
         policy_sha=MAIN_SHA,
+        binding_digest=binding_digest or authorization_digest(),
         run_id=run_id,
         run_attempt=attempt,
+    )
+
+
+def job_results(
+    *, workflow_lint: str = "success", candidate_ci: str = "skipped"
+) -> str:
+    return json.dumps(
+        {
+            "commit_policy": "success",
+            "workflow_lint": workflow_lint,
+            "candidate_ci": candidate_ci,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
     )
 
 
@@ -1532,7 +2381,15 @@ def pending_check(check_id: int, binding, slug: str = APP_SLUG) -> dict:
 class CheckRunTests(unittest.TestCase):
     def test_external_id_round_trip_binds_all_fields(self) -> None:
         binding = external()
-        self.assertEqual(controller.ExternalId.decode(binding.encode()), binding)
+        self.assertEqual(
+            controller.ExternalId.decode(
+                binding.encode(),
+                repository=REPOSITORY,
+                base_sha=MAIN_SHA,
+                policy_sha=MAIN_SHA,
+            ),
+            binding,
+        )
         self.assertLessEqual(len(binding.encode()), 255)
 
     def test_retry_closes_prior_app_check_but_not_actions_check(self) -> None:
@@ -1604,11 +2461,7 @@ class CheckRunTests(unittest.TestCase):
             binding,
             COMMENT_ID,
             1,
-            [
-                "commit_policy=success",
-                "workflow_lint=success",
-                "candidate_ci=skipped",
-            ],
+            job_results(),
             APP_SLUG,
         )
         self.assertEqual(app_api.patches[-1][1]["conclusion"], "success")
@@ -1624,36 +2477,34 @@ class CheckRunTests(unittest.TestCase):
                 binding,
                 COMMENT_ID,
                 1,
-                [
-                    "commit_policy=success",
-                    "workflow_lint=skipped",
-                    "candidate_ci=skipped",
-                ],
+                job_results(workflow_lint="skipped"),
                 APP_SLUG,
             )
         self.assertEqual(app_api.patches[-1][1]["conclusion"], "failure")
 
     def test_required_candidate_ci_may_not_be_skipped(self) -> None:
-        binding = external()
+        approval = adoption_event()
+        binding_api = FakeAuthorizationApi()
+        binding_api.set_change(".github/workflows/ci.yml")
+        binding = external(
+            binding_digest=authorization_digest(binding_api, approval)
+        )
         app_api = FakeCheckApi([pending_check(1, binding)])
         auth_api = FakeAuthorizationApi()
         auth_api.set_change(".github/workflows/ci.yml")
+        auth_api.comment = copy.deepcopy(approval["comment"])
 
         with self.assertRaisesRegex(controller.PolicyError, "did not all succeed"):
             controller.finish_check(
                 app_api,
                 auth_api,
                 policy(),
-                event(),
+                approval,
                 environment(),
                 binding,
                 COMMENT_ID,
                 1,
-                [
-                    "commit_policy=success",
-                    "workflow_lint=success",
-                    "candidate_ci=skipped",
-                ],
+                job_results(),
                 APP_SLUG,
             )
 
@@ -1685,11 +2536,7 @@ class CheckRunTests(unittest.TestCase):
                 binding,
                 COMMENT_ID,
                 1,
-                [
-                    "commit_policy=success",
-                    "workflow_lint=success",
-                    "candidate_ci=skipped",
-                ],
+                job_results(),
                 APP_SLUG,
             )
 
@@ -1716,11 +2563,7 @@ class CheckRunTests(unittest.TestCase):
                 binding,
                 COMMENT_ID,
                 1,
-                [
-                    "commit_policy=success",
-                    "workflow_lint=success",
-                    "candidate_ci=skipped",
-                ],
+                job_results(),
                 APP_SLUG,
             )
 
@@ -1750,11 +2593,7 @@ class CheckRunTests(unittest.TestCase):
                 binding,
                 COMMENT_ID,
                 1,
-                [
-                    "commit_policy=success",
-                    "workflow_lint=success",
-                    "candidate_ci=skipped",
-                ],
+                job_results(),
                 APP_SLUG,
             )
 

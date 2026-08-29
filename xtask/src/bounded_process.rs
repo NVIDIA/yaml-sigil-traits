@@ -1,12 +1,16 @@
 // SPDX-FileCopyrightText: Copyright 2026 NVIDIA CORPORATION & AFFILIATES
 // SPDX-License-Identifier: Apache-2.0
 
-//! Bounded subprocess output capture for candidate-controlled validation.
+//! Bounded subprocess-tree execution for release-reachable validation.
 
 use std::io::{self, Read};
-use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::mpsc::{self, Sender};
-use std::thread::{self, JoinHandle};
+use std::process::{Command, ExitStatus};
+use std::time::Duration;
+
+const PIPE_CLOSE_GRACE: Duration = Duration::from_millis(250);
+const POST_CANCEL_TIMEOUT: Duration = Duration::from_secs(2);
+const POLL_INTERVAL: Duration = Duration::from_millis(10);
+const MAX_INPUT_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct OutputLimits {
@@ -19,14 +23,9 @@ pub(crate) const VALIDATION_OUTPUT_LIMITS: OutputLimits = OutputLimits {
     stderr: 64 * 1024,
 };
 
-#[derive(Debug)]
-pub(crate) struct Output {
-    pub(crate) status: ExitStatus,
-    pub(crate) stdout: Vec<u8>,
-    pub(crate) stderr: Vec<u8>,
-}
+pub(crate) type Output = std::process::Output;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Stream {
     Stdout,
     Stderr,
@@ -48,60 +47,57 @@ impl Stream {
     }
 }
 
+#[cfg(any(windows, test))]
 #[derive(Debug)]
 struct BoundedPipe {
     bytes: Vec<u8>,
     exceeded: bool,
 }
 
-type ReaderMessage = (Stream, io::Result<BoundedPipe>);
-
-fn read_bounded_pipe(reader: impl Read, limit: usize) -> io::Result<BoundedPipe> {
+#[cfg(any(windows, test))]
+fn read_bounded_pipe(mut reader: impl Read, limit: usize) -> io::Result<BoundedPipe> {
     let sentinel = limit
         .checked_add(1)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid output limit"))?;
     let mut bytes = Vec::with_capacity(sentinel.min(8 * 1024));
-    reader.take(sentinel as u64).read_to_end(&mut bytes)?;
+    reader
+        .by_ref()
+        .take(sentinel as u64)
+        .read_to_end(&mut bytes)?;
     Ok(BoundedPipe {
         exceeded: bytes.len() > limit,
         bytes,
     })
 }
 
-fn spawn_reader(
-    reader: impl Read + Send + 'static,
-    stream: Stream,
-    limit: usize,
-    sender: Sender<ReaderMessage>,
-) -> JoinHandle<()> {
-    thread::spawn(move || {
-        let _ = sender.send((stream, read_bounded_pipe(reader, limit)));
+fn validate_limits(limits: OutputLimits, input: Option<&[u8]>) -> io::Result<()> {
+    limits
+        .stdout
+        .checked_add(1)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid stdout limit"))?;
+    limits
+        .stderr
+        .checked_add(1)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid stderr limit"))?;
+    if input.is_some_and(|bytes| bytes.len() > MAX_INPUT_BYTES) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("subprocess stdin exceeded its {MAX_INPUT_BYTES}-byte limit"),
+        ));
+    }
+    Ok(())
+}
+
+fn status_poll(
+    result: io::Result<Option<ExitStatus>>,
+    program: &str,
+) -> io::Result<Option<ExitStatus>> {
+    result.map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("poll {program} subprocess status: {error}"),
+        )
     })
-}
-
-fn kill_and_reap(child: &mut Child) -> io::Result<ExitStatus> {
-    if let Some(status) = child.try_wait()? {
-        return Ok(status);
-    }
-    if let Err(kill_error) = child.kill() {
-        return match child.try_wait()? {
-            Some(status) => Ok(status),
-            None => Err(kill_error),
-        };
-    }
-    child.wait()
-}
-
-fn join_reader(reader: JoinHandle<()>, stream: Stream) -> io::Result<()> {
-    reader
-        .join()
-        .map_err(|_| io::Error::other(format!("{} reader thread panicked", stream.label())))
-}
-
-fn record_failure(failure: &mut Option<io::Error>, error: io::Error) {
-    if failure.is_none() {
-        *failure = Some(error);
-    }
 }
 
 pub(crate) fn require_within_limit(bytes: &[u8], limit: usize, label: &str) -> io::Result<()> {
@@ -114,123 +110,970 @@ pub(crate) fn require_within_limit(bytes: &[u8], limit: usize, label: &str) -> i
     Ok(())
 }
 
-/// Capture both output streams without retaining more than each limit plus one
-/// sentinel byte. An overflow or reader failure terminates and reaps the child
-/// before both reader threads are joined.
+/// Capture both output streams while containing descendants and retaining no
+/// more than each configured limit plus one sentinel byte.
 pub(crate) fn output(command: &mut Command, limits: OutputLimits) -> io::Result<Output> {
-    let program = command.get_program().to_string_lossy().into_owned();
-    let mut child = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| io::Error::other(format!("{program} stdout was not captured")))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| io::Error::other(format!("{program} stderr was not captured")))?;
+    validate_limits(limits, None)?;
+    platform::output(command, limits, None)
+}
 
-    let (sender, receiver) = mpsc::channel();
-    let stdout_reader = spawn_reader(stdout, Stream::Stdout, limits.stdout, sender.clone());
-    let stderr_reader = spawn_reader(stderr, Stream::Stderr, limits.stderr, sender.clone());
-    drop(sender);
+/// Write bounded input and capture both bounded output streams under the same
+/// process-tree containment contract as output.
+pub(crate) fn output_with_input(
+    command: &mut Command,
+    input: &[u8],
+    limits: OutputLimits,
+) -> io::Result<Output> {
+    validate_limits(limits, Some(input))?;
+    platform::output(command, limits, Some(input))
+}
 
-    let mut stdout = None;
-    let mut stderr = None;
-    let mut status = None;
-    let mut failure = None;
+#[cfg(unix)]
+mod platform {
+    use super::*;
 
-    for _ in 0..2 {
-        let (stream, capture) = match receiver.recv() {
-            Ok(message) => message,
-            Err(error) => {
-                record_failure(
-                    &mut failure,
-                    io::Error::other(format!("output reader stopped before reporting: {error}")),
-                );
-                if status.is_none() {
-                    match kill_and_reap(&mut child) {
-                        Ok(reaped) => status = Some(reaped),
-                        Err(error) => record_failure(&mut failure, error),
+    use std::io::Write;
+    use std::os::fd::AsFd;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Child, ChildStdin, Stdio};
+    use std::thread;
+    use std::time::Instant;
+
+    use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+    use rustix::process::{Pid, Signal, kill_process_group, setpgid};
+
+    struct Capture<R> {
+        reader: Option<R>,
+        bytes: Vec<u8>,
+        limit: usize,
+        stream: Stream,
+    }
+
+    impl<R: Read> Capture<R> {
+        fn new(reader: R, stream: Stream, limit: usize) -> io::Result<Self> {
+            let sentinel = limit.checked_add(1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "invalid output limit")
+            })?;
+            Ok(Self {
+                reader: Some(reader),
+                bytes: Vec::with_capacity(sentinel.min(8 * 1024)),
+                limit,
+                stream,
+            })
+        }
+
+        fn complete(&self) -> bool {
+            self.reader.is_none()
+        }
+
+        fn exceeded(&self) -> bool {
+            self.bytes.len() > self.limit
+        }
+
+        fn drain(&mut self) -> io::Result<bool> {
+            let Some(reader) = self.reader.as_mut() else {
+                return Ok(false);
+            };
+            let sentinel = self.limit + 1;
+            if self.bytes.len() >= sentinel {
+                return Ok(false);
+            }
+
+            let mut progressed = false;
+            loop {
+                let remaining = sentinel - self.bytes.len();
+                let mut buffer = [0_u8; 8192];
+                let wanted = remaining.min(buffer.len());
+                match reader.read(&mut buffer[..wanted]) {
+                    Ok(0) => {
+                        self.reader = None;
+                        return Ok(true);
+                    }
+                    Ok(count) => {
+                        self.bytes.extend_from_slice(&buffer[..count]);
+                        progressed = true;
+                        if self.bytes.len() >= sentinel {
+                            return Ok(true);
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        return Ok(progressed);
+                    }
+                    Err(error) => {
+                        return Err(io::Error::new(
+                            error.kind(),
+                            format!("read {}: {error}", self.stream.label()),
+                        ));
                     }
                 }
-                break;
             }
+        }
+    }
+
+    trait CaptureState {
+        fn has_exceeded(&self) -> bool;
+        fn stream(&self) -> Stream;
+    }
+
+    impl<R: Read> CaptureState for Capture<R> {
+        fn has_exceeded(&self) -> bool {
+            self.exceeded()
+        }
+
+        fn stream(&self) -> Stream {
+            self.stream
+        }
+    }
+
+    fn set_nonblocking(handle: &impl AsFd) -> io::Result<()> {
+        let flags = fcntl_getfl(handle)?;
+        fcntl_setfl(handle, flags | OFlags::NONBLOCK)?;
+        Ok(())
+    }
+
+    fn prepare(command: &mut Command) {
+        // SAFETY: the post-fork hook performs only the async-signal-safe
+        // setpgid system call and returns its operating-system error.
+        unsafe {
+            command.pre_exec(|| {
+                setpgid(None, None).map_err(io::Error::from)?;
+                Ok(())
+            });
+        }
+    }
+
+    fn terminate_tree(child: &mut Child, group: Pid) {
+        let _ = kill_process_group(group, Signal::KILL);
+        if child.try_wait().ok().flatten().is_none() {
+            let _ = child.kill();
+        }
+    }
+
+    fn reap_until(child: &mut Child, deadline: Instant) -> io::Result<ExitStatus> {
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return Ok(status),
+                Ok(None) => {}
+                Err(error) => return Err(error),
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "direct child did not exit before the post-cancellation deadline",
+                ));
+            }
+            thread::sleep(POLL_INTERVAL);
+        }
+    }
+
+    fn write_input(
+        writer: &mut Option<ChildStdin>,
+        input: &[u8],
+        offset: &mut usize,
+    ) -> io::Result<bool> {
+        let Some(stdin) = writer.as_mut() else {
+            return Ok(false);
+        };
+        let mut progressed = false;
+        while *offset < input.len() {
+            match stdin.write(&input[*offset..]) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "subprocess stdin stopped accepting input",
+                    ));
+                }
+                Ok(count) => {
+                    *offset += count;
+                    progressed = true;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(progressed),
+                Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
+                    *writer = None;
+                    return Ok(true);
+                }
+                Err(error) => {
+                    return Err(io::Error::new(
+                        error.kind(),
+                        format!("write subprocess stdin: {error}"),
+                    ));
+                }
+            }
+        }
+        *writer = None;
+        Ok(true)
+    }
+
+    fn cleanup_error(primary: io::Error, cleanup: io::Result<ExitStatus>) -> io::Error {
+        match cleanup {
+            Ok(_) => primary,
+            Err(error) => io::Error::other(format!("{primary}; cleanup failed: {error}")),
+        }
+    }
+
+    pub(super) fn output(
+        command: &mut Command,
+        limits: OutputLimits,
+        input: Option<&[u8]>,
+    ) -> io::Result<Output> {
+        output_with_status_poll(command, limits, input, |child| child.try_wait())
+    }
+
+    pub(super) fn output_with_status_poll(
+        command: &mut Command,
+        limits: OutputLimits,
+        input: Option<&[u8]>,
+        mut poll: impl FnMut(&mut Child) -> io::Result<Option<ExitStatus>>,
+    ) -> io::Result<Output> {
+        let program = command.get_program().to_string_lossy().into_owned();
+        prepare(command);
+        command
+            .stdin(if input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let mut child = command.spawn()?;
+        let group = Pid::from_child(&child);
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other(format!("{program} stdout was not captured")))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| io::Error::other(format!("{program} stderr was not captured")))?;
+        let mut stdin = if input.is_some() {
+            Some(
+                child
+                    .stdin
+                    .take()
+                    .ok_or_else(|| io::Error::other(format!("{program} stdin was not captured")))?,
+            )
+        } else {
+            None
         };
 
-        match capture {
-            Ok(capture) => {
-                if capture.exceeded {
-                    record_failure(
-                        &mut failure,
-                        io::Error::new(
+        let setup = (|| -> io::Result<()> {
+            set_nonblocking(&stdout)?;
+            set_nonblocking(&stderr)?;
+            if let Some(handle) = stdin.as_ref() {
+                set_nonblocking(handle)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = setup {
+            terminate_tree(&mut child, group);
+            drop(stdout);
+            drop(stderr);
+            drop(stdin);
+            return Err(cleanup_error(
+                error,
+                reap_until(&mut child, Instant::now() + POST_CANCEL_TIMEOUT),
+            ));
+        }
+
+        let mut stdout = Capture::new(stdout, Stream::Stdout, limits.stdout)?;
+        let mut stderr = Capture::new(stderr, Stream::Stderr, limits.stderr)?;
+        let input = input.unwrap_or_default();
+        let mut input_offset = 0_usize;
+        if input.is_empty() {
+            stdin = None;
+        }
+
+        let mut status = None;
+        let mut direct_exit = None;
+        let mut failure = None;
+
+        loop {
+            let mut progressed = false;
+            match stdout.drain() {
+                Ok(value) => progressed |= value,
+                Err(error) => failure = Some(error),
+            }
+            if failure.is_none() {
+                match stderr.drain() {
+                    Ok(value) => progressed |= value,
+                    Err(error) => failure = Some(error),
+                }
+            }
+            if failure.is_none() {
+                match write_input(&mut stdin, input, &mut input_offset) {
+                    Ok(value) => progressed |= value,
+                    Err(error) => failure = Some(error),
+                }
+            }
+
+            for capture in [&stdout as &dyn CaptureState, &stderr as &dyn CaptureState] {
+                if failure.is_none() && capture.has_exceeded() {
+                    failure = Some(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "{program} {} exceeded its {}-byte limit",
+                            capture.stream().label(),
+                            capture.stream().limit(limits)
+                        ),
+                    ));
+                }
+            }
+            if failure.is_some() {
+                break;
+            }
+
+            if status.is_none() {
+                match status_poll(poll(&mut child), &program) {
+                    Ok(Some(reaped)) => {
+                        status = Some(reaped);
+                        direct_exit = Some(Instant::now());
+                        progressed = true;
+                    }
+                    Ok(None) => {}
+                    // Route polling errors through process-tree termination and
+                    // bounded reaping instead of returning past cleanup.
+                    Err(error) => {
+                        failure = Some(error);
+                        break;
+                    }
+                }
+            }
+
+            if status.is_some() && stdout.complete() && stderr.complete() {
+                break;
+            }
+            if direct_exit.is_some_and(|started| started.elapsed() >= PIPE_CLOSE_GRACE) {
+                failure = Some(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "{program} descendants retained output pipes after the direct child exited"
+                    ),
+                ));
+                break;
+            }
+            if !progressed {
+                thread::sleep(POLL_INTERVAL);
+            }
+        }
+
+        if let Some(error) = failure {
+            terminate_tree(&mut child, group);
+            drop(stdout);
+            drop(stderr);
+            drop(stdin);
+            let cleanup = match status {
+                Some(reaped) => Ok(reaped),
+                None => reap_until(&mut child, Instant::now() + POST_CANCEL_TIMEOUT),
+            };
+            return Err(cleanup_error(error, cleanup));
+        }
+
+        Ok(Output {
+            status: status.ok_or_else(|| io::Error::other("direct child was not reaped"))?,
+            stdout: stdout.bytes,
+            stderr: stderr.bytes,
+        })
+    }
+}
+
+#[cfg(windows)]
+mod platform {
+    use super::*;
+
+    use std::io::Write;
+    use std::mem::size_of;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
+    use std::os::windows::process::CommandExt;
+    use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Stdio};
+    use std::ptr::null;
+    use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+    use std::thread::{self, JoinHandle};
+    use std::time::Instant;
+
+    use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+    };
+    use windows_sys::Win32::System::IO::CancelSynchronousIo;
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, TerminateJobObject,
+    };
+    use windows_sys::Win32::System::Threading::{
+        CREATE_SUSPENDED, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
+    };
+
+    enum WorkerMessage {
+        Capture(Stream, io::Result<BoundedPipe>),
+        Input(io::Result<()>),
+    }
+
+    struct Job {
+        handle: OwnedHandle,
+    }
+
+    impl Job {
+        fn create() -> io::Result<Self> {
+            let raw = unsafe { CreateJobObjectW(null(), null()) };
+            if raw.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            let handle = unsafe { OwnedHandle::from_raw_handle(raw as RawHandle) };
+            let mut information = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            information.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if information.BasicLimitInformation.LimitFlags
+                & (JOB_OBJECT_LIMIT_BREAKAWAY_OK | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK)
+                != 0
+            {
+                return Err(io::Error::other(
+                    "bounded job object unexpectedly permits process breakaway",
+                ));
+            }
+            let configured = unsafe {
+                SetInformationJobObject(
+                    handle.as_raw_handle() as HANDLE,
+                    JobObjectExtendedLimitInformation,
+                    (&information as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                    size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                )
+            };
+            if configured == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(Self { handle })
+        }
+
+        fn assign(&self, child: &Child) -> io::Result<()> {
+            let assigned = unsafe {
+                AssignProcessToJobObject(
+                    self.handle.as_raw_handle() as HANDLE,
+                    child.as_raw_handle() as HANDLE,
+                )
+            };
+            if assigned == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        }
+
+        fn terminate(&self) -> io::Result<()> {
+            let terminated =
+                unsafe { TerminateJobObject(self.handle.as_raw_handle() as HANDLE, 1) };
+            if terminated == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        }
+    }
+
+    fn resume_primary_thread(child: &Child) -> io::Result<()> {
+        let raw_snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+        if raw_snapshot == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        let snapshot = unsafe { OwnedHandle::from_raw_handle(raw_snapshot as RawHandle) };
+        let mut entry = THREADENTRY32 {
+            dwSize: size_of::<THREADENTRY32>() as u32,
+            ..THREADENTRY32::default()
+        };
+        let mut available =
+            unsafe { Thread32First(snapshot.as_raw_handle() as HANDLE, &mut entry) };
+        while available != 0 {
+            if entry.th32OwnerProcessID == child.id() {
+                let raw_thread =
+                    unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
+                if raw_thread.is_null() {
+                    return Err(io::Error::last_os_error());
+                }
+                let thread = unsafe { OwnedHandle::from_raw_handle(raw_thread as RawHandle) };
+                let previous = unsafe { ResumeThread(thread.as_raw_handle() as HANDLE) };
+                if previous == u32::MAX {
+                    return Err(io::Error::last_os_error());
+                }
+                if previous != 1 {
+                    return Err(io::Error::other(format!(
+                        "suspended child thread had unsupported suspend count {previous}"
+                    )));
+                }
+                return Ok(());
+            }
+            entry.dwSize = size_of::<THREADENTRY32>() as u32;
+            available = unsafe { Thread32Next(snapshot.as_raw_handle() as HANDLE, &mut entry) };
+        }
+        Err(io::Error::other(
+            "could not locate the suspended child primary thread",
+        ))
+    }
+
+    fn spawn_reader(
+        reader: impl Read + Send + 'static,
+        stream: Stream,
+        limit: usize,
+        sender: Sender<WorkerMessage>,
+    ) -> JoinHandle<()> {
+        thread::spawn(move || {
+            let _ = sender.send(WorkerMessage::Capture(
+                stream,
+                read_bounded_pipe(reader, limit),
+            ));
+        })
+    }
+
+    fn spawn_writer(
+        mut writer: ChildStdin,
+        input: Vec<u8>,
+        sender: Sender<WorkerMessage>,
+    ) -> JoinHandle<()> {
+        thread::spawn(move || {
+            let result = writer.write_all(&input).and_then(|()| writer.flush());
+            let _ = sender.send(WorkerMessage::Input(result));
+        })
+    }
+
+    fn cancel_worker(worker: &JoinHandle<()>) {
+        // ERROR_NOT_FOUND is benign when the worker is between synchronous
+        // calls or has already finished, so cancellation is best-effort here.
+        let _ = unsafe { CancelSynchronousIo(worker.as_raw_handle() as HANDLE) };
+    }
+
+    fn join_worker(worker: Option<JoinHandle<()>>, label: &str) -> io::Result<()> {
+        if let Some(worker) = worker {
+            worker
+                .join()
+                .map_err(|_| io::Error::other(format!("{label} worker thread panicked")))?;
+        }
+        Ok(())
+    }
+
+    fn reap_until(child: &mut Child, deadline: Instant) -> io::Result<ExitStatus> {
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return Ok(status),
+                Ok(None) => {}
+                Err(error) => return Err(error),
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "direct child did not exit before the post-cancellation deadline",
+                ));
+            }
+            thread::sleep(POLL_INTERVAL);
+        }
+    }
+
+    struct Captures {
+        stdout: Option<Vec<u8>>,
+        stderr: Option<Vec<u8>>,
+        stdout_finished: bool,
+        stderr_finished: bool,
+        input_finished: bool,
+    }
+
+    impl Captures {
+        fn finished(&self, input_expected: bool) -> bool {
+            self.stdout_finished && self.stderr_finished && (!input_expected || self.input_finished)
+        }
+
+        fn record(
+            &mut self,
+            message: WorkerMessage,
+            limits: OutputLimits,
+            program: &str,
+        ) -> Option<io::Error> {
+            match message {
+                WorkerMessage::Capture(stream, Ok(capture)) => {
+                    let exceeded = capture.exceeded;
+                    match stream {
+                        Stream::Stdout => {
+                            self.stdout_finished = true;
+                            self.stdout = Some(capture.bytes);
+                        }
+                        Stream::Stderr => {
+                            self.stderr_finished = true;
+                            self.stderr = Some(capture.bytes);
+                        }
+                    }
+                    if exceeded {
+                        Some(io::Error::new(
                             io::ErrorKind::InvalidData,
                             format!(
                                 "{program} {} exceeded its {}-byte limit",
                                 stream.label(),
                                 stream.limit(limits)
                             ),
-                        ),
-                    );
-                    if status.is_none() {
-                        match kill_and_reap(&mut child) {
-                            Ok(reaped) => status = Some(reaped),
-                            Err(error) => record_failure(&mut failure, error),
-                        }
+                        ))
+                    } else {
+                        None
                     }
                 }
-                match stream {
-                    Stream::Stdout => stdout = Some(capture.bytes),
-                    Stream::Stderr => stderr = Some(capture.bytes),
-                }
-            }
-            Err(error) => {
-                record_failure(
-                    &mut failure,
-                    io::Error::new(error.kind(), format!("read {}: {error}", stream.label())),
-                );
-                if status.is_none() {
-                    match kill_and_reap(&mut child) {
-                        Ok(reaped) => status = Some(reaped),
-                        Err(error) => record_failure(&mut failure, error),
+                WorkerMessage::Capture(stream, Err(error)) => {
+                    match stream {
+                        Stream::Stdout => self.stdout_finished = true,
+                        Stream::Stderr => self.stderr_finished = true,
                     }
+                    Some(io::Error::new(
+                        error.kind(),
+                        format!("read {}: {error}", stream.label()),
+                    ))
+                }
+                WorkerMessage::Input(Ok(())) => {
+                    self.input_finished = true;
+                    None
+                }
+                WorkerMessage::Input(Err(error)) if error.kind() == io::ErrorKind::BrokenPipe => {
+                    self.input_finished = true;
+                    None
+                }
+                WorkerMessage::Input(Err(error)) => {
+                    self.input_finished = true;
+                    Some(io::Error::new(
+                        error.kind(),
+                        format!("write subprocess stdin: {error}"),
+                    ))
                 }
             }
         }
     }
 
-    if status.is_none() {
-        match child.wait() {
-            Ok(reaped) => status = Some(reaped),
-            Err(error) => record_failure(&mut failure, error),
+    fn receive_until(
+        receiver: &Receiver<WorkerMessage>,
+        captures: &mut Captures,
+        limits: OutputLimits,
+        program: &str,
+        input_expected: bool,
+        deadline: Instant,
+    ) {
+        while !captures.finished(input_expected) && Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match receiver.recv_timeout(remaining.min(POLL_INTERVAL)) {
+                Ok(message) => {
+                    let _ = captures.record(message, limits, program);
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
         }
     }
-    if let Err(error) = join_reader(stdout_reader, Stream::Stdout) {
-        record_failure(&mut failure, error);
-    }
-    if let Err(error) = join_reader(stderr_reader, Stream::Stderr) {
-        record_failure(&mut failure, error);
-    }
-    if let Some(error) = failure {
-        return Err(error);
+
+    fn cleanup_error(
+        primary: io::Error,
+        cleanup: io::Result<ExitStatus>,
+        workers_finished: bool,
+        join: io::Result<()>,
+    ) -> io::Error {
+        let mut details = vec![primary.to_string()];
+        if let Err(error) = cleanup {
+            details.push(format!("cleanup failed: {error}"));
+        }
+        if !workers_finished {
+            details.push("I/O workers did not cancel before the hard deadline".to_string());
+        }
+        if let Err(error) = join {
+            details.push(format!("worker cleanup failed: {error}"));
+        }
+        io::Error::other(details.join("; "))
     }
 
-    Ok(Output {
-        status: status.ok_or_else(|| io::Error::other("child was not reaped"))?,
-        stdout: stdout.ok_or_else(|| io::Error::other("stdout reader returned no bytes"))?,
-        stderr: stderr.ok_or_else(|| io::Error::other("stderr reader returned no bytes"))?,
-    })
+    pub(super) fn output(
+        command: &mut Command,
+        limits: OutputLimits,
+        input: Option<&[u8]>,
+    ) -> io::Result<Output> {
+        output_with_status_poll(command, limits, input, |child| child.try_wait())
+    }
+
+    pub(super) fn output_with_status_poll(
+        command: &mut Command,
+        limits: OutputLimits,
+        input: Option<&[u8]>,
+        mut poll: impl FnMut(&mut Child) -> io::Result<Option<ExitStatus>>,
+    ) -> io::Result<Output> {
+        let program = command.get_program().to_string_lossy().into_owned();
+        let job = Job::create()?;
+        command
+            .creation_flags(CREATE_SUSPENDED)
+            .stdin(if input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let mut child = command.spawn()?;
+        if let Err(error) = job.assign(&child) {
+            let _ = child.kill();
+            let cleanup = child.wait();
+            return Err(match cleanup {
+                Ok(_) => error,
+                Err(cleanup) => io::Error::other(format!("{error}; cleanup failed: {cleanup}")),
+            });
+        }
+
+        let stdout: ChildStdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other(format!("{program} stdout was not captured")))?;
+        let stderr: ChildStderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| io::Error::other(format!("{program} stderr was not captured")))?;
+        let stdin: Option<ChildStdin> = if input.is_some() {
+            Some(
+                child
+                    .stdin
+                    .take()
+                    .ok_or_else(|| io::Error::other(format!("{program} stdin was not captured")))?,
+            )
+        } else {
+            None
+        };
+
+        let (sender, receiver) = mpsc::channel();
+        let mut stdout_worker = Some(spawn_reader(
+            stdout,
+            Stream::Stdout,
+            limits.stdout,
+            sender.clone(),
+        ));
+        let mut stderr_worker = Some(spawn_reader(
+            stderr,
+            Stream::Stderr,
+            limits.stderr,
+            sender.clone(),
+        ));
+        let mut stdin_worker = stdin
+            .map(|writer| spawn_writer(writer, input.unwrap_or_default().to_vec(), sender.clone()));
+        drop(sender);
+
+        if let Err(error) = resume_primary_thread(&child) {
+            let _ = job.terminate();
+            if let Some(worker) = stdout_worker.as_ref() {
+                cancel_worker(worker);
+            }
+            if let Some(worker) = stderr_worker.as_ref() {
+                cancel_worker(worker);
+            }
+            if let Some(worker) = stdin_worker.as_ref() {
+                cancel_worker(worker);
+            }
+            drop(job);
+            let _ = child.kill();
+            let cleanup = reap_until(&mut child, Instant::now() + POST_CANCEL_TIMEOUT);
+            return Err(cleanup_error(error, cleanup, false, Ok(())));
+        }
+
+        let input_expected = stdin_worker.is_some();
+        let mut captures = Captures {
+            stdout: None,
+            stderr: None,
+            stdout_finished: false,
+            stderr_finished: false,
+            input_finished: !input_expected,
+        };
+        let mut status = None;
+        let mut direct_exit = None;
+        let mut failure = None;
+
+        loop {
+            match receiver.recv_timeout(POLL_INTERVAL) {
+                Ok(message) => {
+                    if let Some(error) = captures.record(message, limits, &program)
+                        && failure.is_none()
+                    {
+                        failure = Some(error);
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    if !captures.finished(input_expected) && failure.is_none() {
+                        failure = Some(io::Error::other(
+                            "subprocess I/O workers stopped before reporting",
+                        ));
+                    }
+                }
+            }
+
+            if status.is_none() {
+                match status_poll(poll(&mut child), &program) {
+                    Ok(Some(reaped)) => {
+                        status = Some(reaped);
+                        direct_exit = Some(Instant::now());
+                    }
+                    Ok(None) => {}
+                    // Route polling errors through job termination and bounded
+                    // reaping instead of returning past cleanup.
+                    Err(error) => {
+                        failure = Some(error);
+                        break;
+                    }
+                }
+            }
+            if failure.is_some() {
+                break;
+            }
+            if status.is_some() && captures.finished(input_expected) {
+                break;
+            }
+            if direct_exit.is_some_and(|started| started.elapsed() >= PIPE_CLOSE_GRACE) {
+                failure = Some(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "{program} descendants retained output pipes after the direct child exited"
+                    ),
+                ));
+                break;
+            }
+        }
+
+        if let Some(error) = failure {
+            let _ = job.terminate();
+            if !captures.stdout_finished
+                && let Some(worker) = stdout_worker.as_ref()
+            {
+                cancel_worker(worker);
+            }
+            if !captures.stderr_finished
+                && let Some(worker) = stderr_worker.as_ref()
+            {
+                cancel_worker(worker);
+            }
+            if input_expected
+                && !captures.input_finished
+                && let Some(worker) = stdin_worker.as_ref()
+            {
+                cancel_worker(worker);
+            }
+            drop(job);
+            if status.is_none() {
+                let _ = child.kill();
+            }
+            let deadline = Instant::now() + POST_CANCEL_TIMEOUT;
+            let cleanup = match status {
+                Some(reaped) => Ok(reaped),
+                None => reap_until(&mut child, deadline),
+            };
+            receive_until(
+                &receiver,
+                &mut captures,
+                limits,
+                &program,
+                input_expected,
+                deadline,
+            );
+
+            let mut join_result = Ok(());
+            if captures.stdout_finished
+                && let Err(error) = join_worker(stdout_worker.take(), "stdout")
+            {
+                join_result = Err(error);
+            }
+            if captures.stderr_finished
+                && let Err(error) = join_worker(stderr_worker.take(), "stderr")
+                && join_result.is_ok()
+            {
+                join_result = Err(error);
+            }
+            if captures.input_finished
+                && let Err(error) = join_worker(stdin_worker.take(), "stdin")
+                && join_result.is_ok()
+            {
+                join_result = Err(error);
+            }
+            return Err(cleanup_error(
+                error,
+                cleanup,
+                captures.finished(input_expected),
+                join_result,
+            ));
+        }
+
+        drop(job);
+        join_worker(stdout_worker.take(), "stdout")?;
+        join_worker(stderr_worker.take(), "stderr")?;
+        join_worker(stdin_worker.take(), "stdin")?;
+
+        Ok(Output {
+            status: status.ok_or_else(|| io::Error::other("direct child was not reaped"))?,
+            stdout: captures
+                .stdout
+                .ok_or_else(|| io::Error::other("stdout worker returned no bytes"))?,
+            stderr: captures
+                .stderr
+                .ok_or_else(|| io::Error::other("stderr worker returned no bytes"))?,
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use std::fs;
     use std::io::{Cursor, Write};
-    use std::time::{Duration, Instant};
+    use std::path::{Path, PathBuf};
+    use std::thread;
+    use std::time::Instant;
+
+    fn test_command(name: &str) -> Command {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.args(["--ignored", "--exact", name, "--nocapture", "--quiet"]);
+        command
+    }
+
+    fn wait_for_pid(path: &Path) -> u32 {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Ok(value) = fs::read_to_string(path)
+                && let Ok(pid) = value.trim().parse()
+            {
+                return pid;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "grandchild did not record its process ID"
+            );
+            thread::sleep(POLL_INTERVAL);
+        }
+    }
+
+    #[cfg(unix)]
+    fn process_exists(pid: u32) -> bool {
+        rustix::process::Pid::from_raw(pid as i32)
+            .is_some_and(|pid| rustix::process::test_kill_process(pid).is_ok())
+    }
+
+    #[cfg(windows)]
+    fn process_exists(pid: u32) -> bool {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
+
+        use windows_sys::Win32::Foundation::{HANDLE, STILL_ACTIVE};
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+
+        let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if raw.is_null() {
+            return false;
+        }
+        let handle = unsafe { OwnedHandle::from_raw_handle(raw as RawHandle) };
+        let mut code = 0_u32;
+        let query_succeeded =
+            unsafe { GetExitCodeProcess(handle.as_raw_handle() as HANDLE, &mut code) != 0 };
+        query_succeeded && code == STILL_ACTIVE as u32
+    }
+
+    fn wait_for_exit(pid: u32) {
+        let deadline = Instant::now() + POST_CANCEL_TIMEOUT;
+        while process_exists(pid) && Instant::now() < deadline {
+            thread::sleep(POLL_INTERVAL);
+        }
+        assert!(!process_exists(pid), "contained grandchild {pid} survived");
+    }
 
     #[test]
     fn bounded_pipe_reads_only_limit_plus_sentinel() {
@@ -248,39 +1091,269 @@ mod tests {
     }
 
     #[test]
-    fn output_kills_and_reaps_a_child_that_keeps_running_after_overflow() {
-        let mut command = Command::new(std::env::current_exe().unwrap());
-        command.args([
-            "--ignored",
-            "--exact",
-            "bounded_process::tests::oversized_stderr_then_sleep_child",
-            "--nocapture",
-        ]);
+    fn status_poll_failure_terminates_and_reaps_the_process_tree() {
+        let temporary = tempfile::tempdir().unwrap();
+        let parent_pid_file = temporary.path().join("parent.pid");
+        let descendant_pid_file = temporary.path().join("descendant.pid");
+        let mut command = test_command("bounded_process::tests::spawn_poll_failure_tree");
+        command.env("YAML_SIGIL_TEST_PARENT_PID_FILE", &parent_pid_file);
+        command.env("YAML_SIGIL_TEST_PID_FILE", &descendant_pid_file);
+        let observed_parent = parent_pid_file.clone();
+        let observed_descendant = descendant_pid_file.clone();
         let started = Instant::now();
-        let error = output(
+
+        let error = platform::output_with_status_poll(
             &mut command,
             OutputLimits {
-                stdout: 64 * 1024,
-                stderr: 8,
+                stdout: 4096,
+                stderr: 4096,
+            },
+            None,
+            |child| {
+                if observed_parent.is_file() && observed_descendant.is_file() {
+                    Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "synthetic status-poll failure",
+                    ))
+                } else {
+                    child.try_wait()
+                }
             },
         )
         .unwrap_err()
         .to_string();
 
-        assert!(error.contains("stderr exceeded its 8-byte limit"));
+        assert!(error.contains("synthetic status-poll failure"), "{error}");
         assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "overflowing child was not terminated promptly"
+            started.elapsed() < Duration::from_secs(5),
+            "status-poll failure did not terminate the process tree promptly"
+        );
+        wait_for_exit(wait_for_pid(&parent_pid_file));
+        wait_for_exit(wait_for_pid(&descendant_pid_file));
+    }
+
+    #[test]
+    fn output_kills_a_pipe_inheriting_grandchild_after_overflow() {
+        let temporary = tempfile::tempdir().unwrap();
+        let pid_file = temporary.path().join("grandchild.pid");
+        let mut command = test_command("bounded_process::tests::spawn_oversized_grandchild");
+        command.env("YAML_SIGIL_TEST_PID_FILE", &pid_file);
+        let started = Instant::now();
+        let error = output(
+            &mut command,
+            OutputLimits {
+                stdout: 512,
+                stderr: 512,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("exceeded its 512-byte limit"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "overflowing process tree was not terminated promptly"
+        );
+        wait_for_exit(wait_for_pid(&pid_file));
+    }
+
+    #[test]
+    fn bounded_input_is_delivered_without_changing_output_limits() {
+        let temporary = tempfile::tempdir().unwrap();
+        let output_file = temporary.path().join("stdin.bin");
+        let mut command = test_command("bounded_process::tests::echo_stdin_child");
+        command.env("YAML_SIGIL_TEST_INPUT_FILE", &output_file);
+        let result = output_with_input(
+            &mut command,
+            b"bounded input",
+            OutputLimits {
+                stdout: 4096,
+                stderr: 4096,
+            },
+        )
+        .unwrap();
+        assert!(result.status.success());
+        assert_eq!(fs::read(output_file).unwrap(), b"bounded input");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn escaped_session_cannot_hold_the_validator_open() {
+        let temporary = tempfile::tempdir().unwrap();
+        let pid_file = temporary.path().join("escapee.pid");
+        let mut command = test_command("bounded_process::tests::spawn_session_escapee");
+        command.env("YAML_SIGIL_TEST_PID_FILE", &pid_file);
+        let started = Instant::now();
+        let error = output(
+            &mut command,
+            OutputLimits {
+                stdout: 4096,
+                stderr: 4096,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("retained output pipes"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "escaped descendant held the validator open"
+        );
+
+        let pid = wait_for_pid(&pid_file);
+        if let Some(pid) = rustix::process::Pid::from_raw(pid as i32) {
+            let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn child_cannot_break_away_from_the_job() {
+        let mut command = test_command("bounded_process::tests::attempt_job_breakaway");
+        let result = output(
+            &mut command,
+            OutputLimits {
+                stdout: 4096,
+                stderr: 4096,
+            },
+        )
+        .unwrap();
+        assert!(result.status.success());
+        assert!(
+            result
+                .stdout
+                .windows(b"breakaway-rejected\n".len())
+                .any(|window| window == b"breakaway-rejected\n")
+        );
+        assert!(
+            !result
+                .stdout
+                .windows(b"breakaway-allowed\n".len())
+                .any(|window| window == b"breakaway-allowed\n")
         );
     }
 
     #[test]
-    #[ignore = "spawned explicitly by the bounded-process lifecycle regression"]
-    fn oversized_stderr_then_sleep_child() {
-        let mut stderr = std::io::stderr().lock();
-        stderr.write_all(b"123456789").unwrap();
-        stderr.flush().unwrap();
-        drop(stderr);
-        std::thread::sleep(Duration::from_secs(30));
+    #[ignore = "spawned explicitly by the bounded-process regression"]
+    fn spawn_oversized_grandchild() {
+        let mut child = test_command("bounded_process::tests::oversized_grandchild");
+        child.env(
+            "YAML_SIGIL_TEST_PID_FILE",
+            std::env::var_os("YAML_SIGIL_TEST_PID_FILE").unwrap(),
+        );
+        let _ = child.status();
+    }
+
+    #[test]
+    #[ignore = "spawned explicitly by the bounded-process regression"]
+    fn spawn_poll_failure_tree() {
+        fs::write(
+            std::env::var_os("YAML_SIGIL_TEST_PARENT_PID_FILE").unwrap(),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+        let mut child = test_command("bounded_process::tests::poll_failure_descendant");
+        child.env(
+            "YAML_SIGIL_TEST_PID_FILE",
+            std::env::var_os("YAML_SIGIL_TEST_PID_FILE").unwrap(),
+        );
+        let _ = child.status();
+    }
+
+    #[test]
+    #[ignore = "spawned explicitly by the bounded-process regression"]
+    fn poll_failure_descendant() {
+        fs::write(
+            std::env::var_os("YAML_SIGIL_TEST_PID_FILE").unwrap(),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+        thread::sleep(Duration::from_secs(30));
+    }
+
+    #[test]
+    #[ignore = "spawned explicitly by the bounded-process regression"]
+    fn oversized_grandchild() {
+        let pid_file = PathBuf::from(std::env::var_os("YAML_SIGIL_TEST_PID_FILE").unwrap());
+        fs::write(pid_file, std::process::id().to_string()).unwrap();
+        let bytes = vec![b'x'; 1024];
+        std::io::stdout().write_all(&bytes).unwrap();
+        std::io::stdout().flush().unwrap();
+        std::io::stderr().write_all(&bytes).unwrap();
+        std::io::stderr().flush().unwrap();
+        thread::sleep(Duration::from_secs(30));
+    }
+
+    #[test]
+    #[ignore = "spawned explicitly by the bounded-process regression"]
+    fn echo_stdin_child() {
+        let mut bytes = Vec::new();
+        std::io::stdin().read_to_end(&mut bytes).unwrap();
+        fs::write(
+            std::env::var_os("YAML_SIGIL_TEST_INPUT_FILE").unwrap(),
+            bytes,
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "spawned explicitly by the bounded-process regression"]
+    // This helper deliberately orphans a new-session child so the parent
+    // regression can prove that timeout cleanup finds process-tree escapees.
+    #[allow(clippy::zombie_processes)]
+    fn spawn_session_escapee() {
+        use std::os::unix::process::CommandExt;
+
+        let mut child = test_command("bounded_process::tests::sleeping_escapee");
+        child.env(
+            "YAML_SIGIL_TEST_PID_FILE",
+            std::env::var_os("YAML_SIGIL_TEST_PID_FILE").unwrap(),
+        );
+        // SAFETY: the post-fork hook performs only the async-signal-safe
+        // setsid system call and returns its operating-system error.
+        unsafe {
+            child.pre_exec(|| {
+                rustix::process::setsid().map_err(io::Error::from)?;
+                Ok(())
+            });
+        }
+        child.spawn().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "spawned explicitly by the bounded-process regression"]
+    fn sleeping_escapee() {
+        let pid_file = PathBuf::from(std::env::var_os("YAML_SIGIL_TEST_PID_FILE").unwrap());
+        fs::write(pid_file, std::process::id().to_string()).unwrap();
+        thread::sleep(Duration::from_secs(30));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "spawned explicitly by the bounded-process regression"]
+    fn attempt_job_breakaway() {
+        use std::os::windows::process::CommandExt;
+
+        use windows_sys::Win32::System::Threading::CREATE_BREAKAWAY_FROM_JOB;
+
+        let mut child = test_command("bounded_process::tests::sleep_child");
+        child.creation_flags(CREATE_BREAKAWAY_FROM_JOB);
+        match child.spawn() {
+            Ok(mut child) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                println!("breakaway-allowed");
+            }
+            Err(_) => println!("breakaway-rejected"),
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "spawned explicitly by the bounded-process regression"]
+    fn sleep_child() {
+        thread::sleep(Duration::from_secs(30));
     }
 }
