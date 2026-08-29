@@ -393,7 +393,6 @@ jobs:
         with:
           cache: false
           components: clippy, rustfmt
-          toolchain: 1.95.0
 
       - name: Install protected Markdown validator
         # Refresh this immutable pin frequently to keep pace with rumdl releases.
@@ -497,6 +496,7 @@ jobs:
         with:
           cache: false
           components: clippy, rustfmt
+          toolchain: 1.95.0,stable
 
       - name: Install protected Markdown validator
         # Refresh this immutable pin frequently to keep pace with rumdl releases.
@@ -521,7 +521,7 @@ jobs:
           YAML_SIGIL_REQUIRE_CARGO_1_95_ARCHIVE: "1"
         shell: bash
         run: >-
-          cargo test --locked --manifest-path xtask/Cargo.toml
+          cargo +1.95.0 test --locked --manifest-path xtask/Cargo.toml
           crate_archive::tests::cargo_1_95_archive_matches_observed_cross_platform_contract
           -- --exact
         working-directory: candidate
