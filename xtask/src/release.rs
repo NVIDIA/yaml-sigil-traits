@@ -12,6 +12,7 @@ use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
+use cargo_metadata::{Metadata, Package};
 use clap::{Args, Subcommand};
 use semver::Version;
 use serde_json::Value;
@@ -400,7 +401,7 @@ pub(crate) fn exact_output_line(output: &[u8], label: &str) -> Result<String, St
     Ok(line.to_string())
 }
 
-fn cargo_metadata(root: &Path, runner: &mut impl Runner) -> Result<Value, String> {
+fn cargo_metadata(root: &Path, runner: &mut impl Runner) -> Result<Metadata, String> {
     let args = [
         OsString::from("metadata"),
         OsString::from("--no-deps"),
@@ -411,16 +412,7 @@ fn cargo_metadata(root: &Path, runner: &mut impl Runner) -> Result<Value, String
     if !output.success {
         return Err(format!("Cargo metadata failed: {}", output_detail(&output)));
     }
-    serde_json::from_slice(&output.stdout)
-        .map_err(|error| format!("Cargo returned invalid metadata: {error}"))
-}
-
-fn metadata_packages(metadata: &Value) -> Result<&[Value], String> {
-    metadata
-        .get("packages")
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .ok_or_else(|| "Cargo returned invalid package metadata".to_string())
+    crate::cargo_metadata_output::parse_bounded(&output.stdout, "Cargo returned invalid metadata")
 }
 
 fn check_packages(root: &Path, expected: &[String]) -> Result<(), String> {
@@ -434,68 +426,22 @@ fn check_packages(root: &Path, expected: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn check_packages_in_metadata(metadata: &Value, expected: &[String]) -> Result<(), String> {
+fn check_packages_in_metadata(metadata: &Metadata, expected: &[String]) -> Result<(), String> {
     let mut actual = Vec::new();
-    for package in metadata_packages(metadata)? {
-        let name = package
-            .get("name")
-            .and_then(Value::as_str)
-            .ok_or_else(|| "Cargo returned a package without a valid name".to_string())?;
-        let publishes_to_crates_io = match package.get("publish") {
-            // Cargo permits publication to its default registry when the
-            // manifest omits an explicit publish allowlist.
-            None | Some(Value::Null) | Some(Value::Bool(true)) => true,
-            Some(Value::Bool(false)) => false,
-            Some(Value::Array(registries)) => {
-                if registries.is_empty() {
-                    false
-                } else {
-                    let mut publishes = false;
-                    for registry in registries {
-                        let registry = registry.as_str().ok_or_else(|| {
-                            format!("Cargo returned invalid publish registries for {name}")
-                        })?;
-                        publishes |= registry == "crates-io";
-                    }
-                    if !publishes {
-                        return Err(format!("publishable package {name} excludes crates-io"));
-                    }
-                    true
-                }
-            }
-            Some(_) => {
-                return Err(format!(
-                    "Cargo returned invalid publish metadata for {name}"
-                ));
-            }
-        };
-        if !publishes_to_crates_io {
+    for package in &metadata.packages {
+        let name: &str = package.name.as_ref();
+        if !crate::cargo_metadata_output::publishes_to_crates_io(package.publish.as_deref())? {
             continue;
         }
-        let targets = package
-            .get("targets")
-            .and_then(Value::as_array)
-            .ok_or_else(|| format!("Cargo returned invalid targets for {name}"))?;
-        validate_publishable_package_identity(metadata, name, package, targets)?;
-        let mut has_binary = false;
-        let mut has_build_script = false;
-        for target in targets {
-            let kinds = target
-                .get("kind")
-                .and_then(Value::as_array)
-                .ok_or_else(|| format!("Cargo returned invalid target kinds for {name}"))?;
-            if !kinds.iter().all(Value::is_string) {
-                return Err(format!("Cargo returned invalid target kinds for {name}"));
-            }
-            has_binary |= kinds.iter().any(|kind| kind.as_str() == Some("bin"));
-            has_build_script |= kinds
-                .iter()
-                .any(|kind| kind.as_str() == Some("custom-build"));
-        }
-        if has_binary {
+        validate_publishable_package_identity(metadata, name, package)?;
+        if package.targets.iter().any(cargo_metadata::Target::is_bin) {
             return Err(format!("crates.io package {name} contains a binary target"));
         }
-        if has_build_script {
+        if package
+            .targets
+            .iter()
+            .any(cargo_metadata::Target::is_custom_build)
+        {
             return Err(format!(
                 "crates.io package {name} contains an unexpected build script"
             ));
@@ -513,52 +459,36 @@ fn check_packages_in_metadata(metadata: &Value, expected: &[String]) -> Result<(
 }
 
 fn validate_publishable_package_identity(
-    metadata: &Value,
+    metadata: &Metadata,
     package_name: &str,
-    package: &Value,
-    targets: &[Value],
+    package: &Package,
 ) -> Result<(), String> {
     if package_name != TRAITS_PACKAGE {
         return Err(format!(
             "crates.io package {package_name} has no approved workspace identity"
         ));
     }
-    let workspace_root = metadata
-        .get("workspace_root")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "Cargo returned no workspace root for package validation".to_string())?;
-    let expected_manifest = Path::new(workspace_root).join("Cargo.toml");
-    let manifest = package
-        .get("manifest_path")
-        .and_then(Value::as_str)
-        .ok_or_else(|| format!("Cargo returned no manifest path for {package_name}"))?;
-    if Path::new(manifest) != expected_manifest {
+    let workspace_root = metadata.workspace_root.as_std_path();
+    let expected_manifest = workspace_root.join("Cargo.toml");
+    if package.manifest_path.as_std_path() != expected_manifest {
         return Err(format!(
             "crates.io package {package_name} manifest differs from {}",
             expected_manifest.display()
         ));
     }
 
-    let expected_library = Path::new(workspace_root).join("src/lib.rs");
-    let libraries: Vec<_> = targets
+    let expected_library = workspace_root.join("src/lib.rs");
+    let libraries: Vec<_> = package
+        .targets
         .iter()
-        .filter(|target| {
-            target
-                .get("kind")
-                .and_then(Value::as_array)
-                .is_some_and(|kinds| kinds.len() == 1 && kinds[0].as_str() == Some("lib"))
-        })
+        .filter(|target| target.kind.len() == 1 && target.is_lib())
         .collect();
     if libraries.len() != 1 {
         return Err(format!(
             "crates.io package {package_name} must contain one exact primary library target"
         ));
     }
-    let source = libraries[0]
-        .get("src_path")
-        .and_then(Value::as_str)
-        .ok_or_else(|| format!("Cargo returned no library source path for {package_name}"))?;
-    if Path::new(source) != expected_library {
+    if libraries[0].src_path.as_std_path() != expected_library {
         return Err(format!(
             "crates.io package {package_name} library differs from {}",
             expected_library.display()
@@ -641,10 +571,11 @@ fn verify_registry_with(
     })
 }
 
-fn metadata_package_version(metadata: &Value, package: &str) -> Result<Version, String> {
-    let matches: Vec<_> = metadata_packages(metadata)?
+fn metadata_package_version(metadata: &Metadata, package: &str) -> Result<Version, String> {
+    let matches: Vec<_> = metadata
+        .packages
         .iter()
-        .filter(|item| item.get("name").and_then(Value::as_str) == Some(package))
+        .filter(|item| item.name.as_ref() == package)
         .collect();
     if matches.len() != 1 {
         return Err(format!(
@@ -652,11 +583,7 @@ fn metadata_package_version(metadata: &Value, package: &str) -> Result<Version, 
             matches.len()
         ));
     }
-    let value = matches[0]
-        .get("version")
-        .and_then(Value::as_str)
-        .ok_or_else(|| format!("Cargo returned no version for {package}"))?;
-    Version::parse(value).map_err(|error| format!("invalid version for {package}: {error}"))
+    Ok(matches[0].version.clone())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -954,12 +881,58 @@ fn prepare_publication_config(root: &Path, source: &Path, output: &Path) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cargo_metadata_output::{parse_bounded, test_support as metadata_fixture};
     use crate::release_policy::{TRAITS_POLICY, TRAITS_TOOLCHAIN};
     use clap::Parser;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     const FIXTURE_FETCH_URL: &str = "https://example.invalid/repository";
+
+    fn parsed_metadata(document: serde_json::Value) -> Metadata {
+        parse_bounded(
+            &metadata_fixture::encoded(&document),
+            "Cargo returned invalid metadata",
+        )
+        .expect("parse complete Cargo metadata fixture")
+    }
+
+    fn traits_package(
+        root: &Path,
+        version: &str,
+        publish: Option<&[&str]>,
+        mut targets: Vec<serde_json::Value>,
+    ) -> serde_json::Value {
+        if targets.is_empty() {
+            targets.push(metadata_fixture::target(
+                TRAITS_PACKAGE,
+                "lib",
+                &root.join("src/lib.rs"),
+            ));
+        }
+        metadata_fixture::package(
+            TRAITS_PACKAGE,
+            version,
+            None,
+            &root.join("Cargo.toml"),
+            publish,
+            Vec::new(),
+            targets,
+        )
+    }
+
+    fn traits_metadata_output(version: &str) -> Vec<u8> {
+        let root = Path::new("/workspace");
+        metadata_fixture::encoded(&metadata_fixture::metadata(
+            root,
+            vec![traits_package(
+                root,
+                version,
+                Some(&["crates-io"]),
+                Vec::new(),
+            )],
+        ))
+    }
 
     #[derive(Parser)]
     struct TestCli {
@@ -1412,93 +1385,94 @@ mod tests {
 
     #[test]
     fn package_policy_requires_exact_order_and_no_binary_targets() {
-        let metadata = serde_json::json!({
-            "workspace_root": "/workspace",
-            "packages": [
-                {
-                    "name": "private-helper",
-                    "publish": [],
-                    "targets": [{"kind": ["lib"]}]
-                },
-                {
-                    "name": TRAITS_PACKAGE,
-                    "publish": ["crates-io"],
-                    "manifest_path": "/workspace/Cargo.toml",
-                    "targets": [{
-                        "kind": ["lib"],
-                        "src_path": "/workspace/src/lib.rs"
-                    }]
-                }
-            ]
-        });
+        let root = Path::new("/workspace");
+        let private_root = root.join("private-helper");
+        let private = metadata_fixture::package(
+            "private-helper",
+            "0.1.0",
+            None,
+            &private_root.join("Cargo.toml"),
+            Some(&[]),
+            Vec::new(),
+            vec![metadata_fixture::target(
+                "private_helper",
+                "lib",
+                &private_root.join("src/lib.rs"),
+            )],
+        );
+        let public = traits_package(root, "0.4.0-rc.1", Some(&["crates-io"]), Vec::new());
+        let metadata = parsed_metadata(metadata_fixture::metadata(
+            root,
+            vec![private.clone(), public.clone()],
+        ));
         assert!(check_packages_in_metadata(&metadata, &[TRAITS_PACKAGE.to_string()]).is_ok());
         assert!(check_packages_in_metadata(&metadata, &["wrong".to_string()]).is_err());
 
-        let mut alternate = metadata.clone();
-        alternate["packages"].as_array_mut().unwrap().insert(
-            1,
-            serde_json::json!({
-                "name": "alternate-registry-helper",
-                "publish": ["alternate"],
-                "targets": [{"kind": ["lib"]}]
-            }),
+        let alternate_root = root.join("alternate-registry-helper");
+        let alternate = metadata_fixture::package(
+            "alternate-registry-helper",
+            "0.1.0",
+            None,
+            &alternate_root.join("Cargo.toml"),
+            Some(&["alternate"]),
+            Vec::new(),
+            vec![metadata_fixture::target(
+                "alternate_registry_helper",
+                "lib",
+                &alternate_root.join("src/lib.rs"),
+            )],
         );
+        let alternate = parsed_metadata(metadata_fixture::metadata(
+            root,
+            vec![private.clone(), alternate, public.clone()],
+        ));
         assert!(check_packages_in_metadata(&alternate, &[TRAITS_PACKAGE.to_string()]).is_err());
 
-        let binary = serde_json::json!({
-            "workspace_root": "/workspace",
-            "packages": [{
-                "name": TRAITS_PACKAGE,
-                "publish": ["crates-io"],
-                "manifest_path": "/workspace/Cargo.toml",
-                "targets": [
-                    {"kind": ["lib"], "src_path": "/workspace/src/lib.rs"},
-                    {"kind": ["bin"]}
-                ]
-            }]
-        });
+        let binary = parsed_metadata(metadata_fixture::metadata(
+            root,
+            vec![traits_package(
+                root,
+                "0.4.0-rc.1",
+                Some(&["crates-io"]),
+                vec![
+                    metadata_fixture::target(TRAITS_PACKAGE, "lib", &root.join("src/lib.rs")),
+                    metadata_fixture::target(TRAITS_PACKAGE, "bin", &root.join("src/main.rs")),
+                ],
+            )],
+        ));
         assert!(check_packages_in_metadata(&binary, &[TRAITS_PACKAGE.to_string()]).is_err());
-        let build_script = serde_json::json!({
-            "workspace_root": "/workspace",
-            "packages": [{
-                "name": TRAITS_PACKAGE,
-                "publish": ["crates-io"],
-                "manifest_path": "/workspace/Cargo.toml",
-                "targets": [
-                    {"kind": ["lib"], "src_path": "/workspace/src/lib.rs"},
-                    {"kind": ["custom-build"]}
-                ]
-            }]
-        });
+        let build_script = parsed_metadata(metadata_fixture::metadata(
+            root,
+            vec![traits_package(
+                root,
+                "0.4.0-rc.1",
+                Some(&["crates-io"]),
+                vec![
+                    metadata_fixture::target(TRAITS_PACKAGE, "lib", &root.join("src/lib.rs")),
+                    metadata_fixture::target(
+                        "build-script-build",
+                        "custom-build",
+                        &root.join("build.rs"),
+                    ),
+                ],
+            )],
+        ));
         assert!(check_packages_in_metadata(&build_script, &[TRAITS_PACKAGE.to_string()]).is_err());
-        let malformed = serde_json::json!({
-            "workspace_root": "/workspace",
-            "packages": [{
-                "name": TRAITS_PACKAGE,
-                "publish": ["crates-io"],
-                "manifest_path": "/workspace/Cargo.toml",
-                "targets": [{}]
-            }]
-        });
-        assert!(check_packages_in_metadata(&malformed, &[TRAITS_PACKAGE.to_string()]).is_err());
     }
 
     #[test]
     fn package_policy_includes_cargo_default_publication() {
-        let default_publish = serde_json::json!({
-            "workspace_root": "/workspace",
-            "packages": [{
-                "name": TRAITS_PACKAGE,
-                "publish": null,
-                "manifest_path": "/workspace/Cargo.toml",
-                "targets": [{
-                    "kind": ["lib"],
-                    "src_path": "/workspace/src/lib.rs"
-                }]
-            }]
-        });
+        let root = Path::new("/workspace");
+        let default_publish = metadata_fixture::metadata(
+            root,
+            vec![traits_package(root, "0.4.0-rc.1", None, Vec::new())],
+        );
         assert!(
-            check_packages_in_metadata(&default_publish, &[TRAITS_PACKAGE.to_string()]).is_ok()
+            check_packages_in_metadata(
+                &parsed_metadata(default_publish.clone()),
+                &[TRAITS_PACKAGE.to_string()]
+            )
+            .is_ok()
         );
 
         let mut absent_publish = default_publish.clone();
@@ -1506,45 +1480,49 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("publish");
-        assert!(check_packages_in_metadata(&absent_publish, &[TRAITS_PACKAGE.to_string()]).is_ok());
+        assert!(
+            check_packages_in_metadata(
+                &parsed_metadata(absent_publish),
+                &[TRAITS_PACKAGE.to_string()]
+            )
+            .is_ok()
+        );
 
-        let unexpected = serde_json::json!({
-            "workspace_root": "/workspace",
-            "packages": [
-                {
-                    "name": TRAITS_PACKAGE,
-                    "publish": ["crates-io"],
-                    "manifest_path": "/workspace/Cargo.toml",
-                    "targets": [{
-                        "kind": ["lib"],
-                        "src_path": "/workspace/src/lib.rs"
-                    }]
-                },
-                {
-                    "name": "unexpected-default-package",
-                    "publish": null,
-                    "manifest_path": "/workspace/unexpected/Cargo.toml",
-                    "targets": [{
-                        "kind": ["lib"],
-                        "src_path": "/workspace/unexpected/src/lib.rs"
-                    }]
-                }
-            ]
-        });
+        let unexpected_root = root.join("unexpected");
+        let unexpected_package = metadata_fixture::package(
+            "unexpected-default-package",
+            "0.1.0",
+            None,
+            &unexpected_root.join("Cargo.toml"),
+            None,
+            Vec::new(),
+            vec![metadata_fixture::target(
+                "unexpected_default_package",
+                "lib",
+                &unexpected_root.join("src/lib.rs"),
+            )],
+        );
+        let unexpected = parsed_metadata(metadata_fixture::metadata(
+            root,
+            vec![
+                traits_package(root, "0.4.0-rc.1", Some(&["crates-io"]), Vec::new()),
+                unexpected_package,
+            ],
+        ));
         assert!(check_packages_in_metadata(&unexpected, &[TRAITS_PACKAGE.to_string()]).is_err());
 
-        let default_binary = serde_json::json!({
-            "workspace_root": "/workspace",
-            "packages": [{
-                "name": TRAITS_PACKAGE,
-                "publish": null,
-                "manifest_path": "/workspace/Cargo.toml",
-                "targets": [
-                    {"kind": ["lib"], "src_path": "/workspace/src/lib.rs"},
-                    {"kind": ["bin"]}
-                ]
-            }]
-        });
+        let default_binary = parsed_metadata(metadata_fixture::metadata(
+            root,
+            vec![traits_package(
+                root,
+                "0.4.0-rc.1",
+                None,
+                vec![
+                    metadata_fixture::target(TRAITS_PACKAGE, "lib", &root.join("src/lib.rs")),
+                    metadata_fixture::target(TRAITS_PACKAGE, "bin", &root.join("src/main.rs")),
+                ],
+            )],
+        ));
         assert!(
             check_packages_in_metadata(&default_binary, &[TRAITS_PACKAGE.to_string()]).is_err()
         );
@@ -1552,64 +1530,89 @@ mod tests {
 
     #[test]
     fn package_policy_binds_the_root_manifest_and_primary_library() {
+        let root = Path::new("/workspace");
         let expected = [TRAITS_PACKAGE.to_string()];
-        let valid = serde_json::json!({
-            "workspace_root": "/workspace",
-            "packages": [{
-                "name": TRAITS_PACKAGE,
-                "publish": ["crates-io"],
-                "manifest_path": "/workspace/Cargo.toml",
-                "targets": [{
-                    "kind": ["lib"],
-                    "src_path": "/workspace/src/lib.rs"
-                }]
-            }]
-        });
-        assert!(check_packages_in_metadata(&valid, &expected).is_ok());
+        let valid = metadata_fixture::metadata(
+            root,
+            vec![traits_package(
+                root,
+                "0.4.0-rc.1",
+                Some(&["crates-io"]),
+                Vec::new(),
+            )],
+        );
+        assert!(check_packages_in_metadata(&parsed_metadata(valid.clone()), &expected).is_ok());
 
         let mut relocated_manifest = valid.clone();
         relocated_manifest["packages"][0]["manifest_path"] =
             Value::String("/workspace/relocated/Cargo.toml".to_string());
-        assert!(check_packages_in_metadata(&relocated_manifest, &expected).is_err());
+        assert!(
+            check_packages_in_metadata(&parsed_metadata(relocated_manifest), &expected).is_err()
+        );
 
         let mut relocated_library = valid.clone();
         relocated_library["packages"][0]["targets"][0]["src_path"] =
             Value::String("/workspace/src/other.rs".to_string());
-        assert!(check_packages_in_metadata(&relocated_library, &expected).is_err());
+        assert!(
+            check_packages_in_metadata(&parsed_metadata(relocated_library), &expected).is_err()
+        );
 
         let mut missing_library = valid.clone();
-        missing_library["packages"][0]["targets"] =
-            serde_json::json!([{"kind": ["test"], "src_path": "/workspace/tests/api.rs"}]);
-        assert!(check_packages_in_metadata(&missing_library, &expected).is_err());
+        missing_library["packages"][0]["targets"] = serde_json::json!([metadata_fixture::target(
+            "api",
+            "test",
+            &root.join("tests/api.rs")
+        )]);
+        assert!(check_packages_in_metadata(&parsed_metadata(missing_library), &expected).is_err());
 
         let mut duplicate_library = valid;
         duplicate_library["packages"][0]["targets"] = serde_json::json!([
-            {"kind": ["lib"], "src_path": "/workspace/src/lib.rs"},
-            {"kind": ["lib"], "src_path": "/workspace/src/lib.rs"}
+            metadata_fixture::target(TRAITS_PACKAGE, "lib", &root.join("src/lib.rs")),
+            metadata_fixture::target(TRAITS_PACKAGE, "lib", &root.join("src/lib.rs"))
         ]);
-        assert!(check_packages_in_metadata(&duplicate_library, &expected).is_err());
+        assert!(
+            check_packages_in_metadata(&parsed_metadata(duplicate_library), &expected).is_err()
+        );
     }
 
     #[test]
     fn package_policy_rejects_ambiguous_publish_metadata() {
+        let root = Path::new("/workspace");
+        let valid = metadata_fixture::metadata(
+            root,
+            vec![traits_package(
+                root,
+                "0.4.0-rc.1",
+                Some(&["crates-io"]),
+                Vec::new(),
+            )],
+        );
         for publish in [serde_json::json!(true), serde_json::json!(["crates-io", 1])] {
-            let metadata = serde_json::json!({
-                "packages": [{
-                    "name": TRAITS_PACKAGE,
-                    "publish": publish,
-                    "targets": [{"kind": ["lib"]}]
-                }]
-            });
-            assert!(check_packages_in_metadata(&metadata, &[TRAITS_PACKAGE.to_string()]).is_err());
+            let mut metadata = valid.clone();
+            metadata["packages"][0]["publish"] = publish;
+            let error = parse_bounded(
+                &metadata_fixture::encoded(&metadata),
+                "Cargo returned invalid metadata",
+            )
+            .unwrap_err();
+            assert!(
+                error.starts_with("Cargo returned invalid metadata:"),
+                "{error}"
+            );
         }
 
-        let missing = serde_json::json!({
-            "packages": [{
-                "name": TRAITS_PACKAGE,
-                "targets": [{"kind": ["lib"]}]
-            }]
-        });
-        assert!(check_packages_in_metadata(&missing, &[TRAITS_PACKAGE.to_string()]).is_err());
+        let mut missing_targets = valid;
+        missing_targets["packages"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("targets");
+        assert!(
+            parse_bounded(
+                &metadata_fixture::encoded(&missing_targets),
+                "Cargo returned invalid metadata"
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1692,10 +1695,7 @@ mod tests {
 
     #[test]
     fn publication_verification_uses_metadata_polling_and_named_registry() {
-        let metadata = serde_json::to_vec(&serde_json::json!({
-            "packages": [{"name": TRAITS_PACKAGE, "version": "0.4.0-rc.1"}]
-        }))
-        .unwrap();
+        let metadata = traits_metadata_output("0.4.0-rc.1");
         let mut runner = FakeRunner::with_responses(vec![
             success(metadata),
             success(b"missing\n404".to_vec()),
@@ -1764,10 +1764,7 @@ mod tests {
 
     #[test]
     fn publication_verification_fails_on_resolution_or_bounded_absence() {
-        let metadata = serde_json::to_vec(&serde_json::json!({
-            "packages": [{"name": TRAITS_PACKAGE, "version": "0.4.0-rc.1"}]
-        }))
-        .unwrap();
+        let metadata = traits_metadata_output("0.4.0-rc.1");
         let available = b"{\"version\":{\"num\":\"0.4.0-rc.1\",\"yanked\":false}}\n200";
         let mut resolution_failure = FakeRunner::with_responses(vec![
             success(metadata.clone()),
@@ -1800,20 +1797,18 @@ mod tests {
 
     #[test]
     fn metadata_version_requires_one_exact_workspace_package() {
-        let metadata = serde_json::json!({
-            "packages": [{"name": TRAITS_PACKAGE, "version": "0.4.0-rc.1"}]
-        });
+        let root = Path::new("/workspace");
+        let package = traits_package(root, "0.4.0-rc.1", Some(&["crates-io"]), Vec::new());
+        let metadata = parsed_metadata(metadata_fixture::metadata(root, vec![package.clone()]));
         assert_eq!(
             metadata_package_version(&metadata, TRAITS_PACKAGE).unwrap(),
             Version::parse("0.4.0-rc.1").unwrap()
         );
         assert!(metadata_package_version(&metadata, "missing").is_err());
-        let duplicate = serde_json::json!({
-            "packages": [
-                {"name": TRAITS_PACKAGE, "version": "0.4.0-rc.1"},
-                {"name": TRAITS_PACKAGE, "version": "0.4.0-rc.1"}
-            ]
-        });
+        let duplicate = parsed_metadata(metadata_fixture::metadata(
+            root,
+            vec![package.clone(), package],
+        ));
         assert!(metadata_package_version(&duplicate, TRAITS_PACKAGE).is_err());
     }
 
