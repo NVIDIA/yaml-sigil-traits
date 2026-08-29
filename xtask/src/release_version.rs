@@ -323,30 +323,23 @@ fn metadata_version_from_json(
     manifest: &Path,
     package: &str,
 ) -> Result<Version, String> {
-    bounded_process::require_within_limit(
-        output,
-        VALIDATION_OUTPUT_LIMITS.stdout,
-        "Cargo metadata",
-    )
-    .map_err(|error| error.to_string())?;
-    let metadata: serde_json::Value = serde_json::from_slice(output)
-        .map_err(|error| format!("Cargo returned invalid metadata: {error}"))?;
-    let packages = metadata
-        .get("packages")
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| "Cargo returned invalid package metadata".to_string())?;
+    let metadata =
+        crate::cargo_metadata_output::parse_bounded(output, "Cargo returned invalid metadata")?;
     let mut matches = Vec::new();
-    for item in packages {
-        if item.get("name").and_then(serde_json::Value::as_str) != Some(package) {
+    for item in &metadata.packages {
+        if item.name.as_ref() != package {
             continue;
         }
-        let path = item
-            .get("manifest_path")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| format!("metadata did not contain a manifest path for {package}"))?;
-        let identity = Path::new(path)
+        let identity = item
+            .manifest_path
+            .as_std_path()
             .canonicalize()
-            .map_err(|error| format!("resolve Cargo metadata manifest {path}: {error}"))?;
+            .map_err(|error| {
+                format!(
+                    "resolve Cargo metadata manifest {}: {error}",
+                    item.manifest_path
+                )
+            })?;
         if identity == manifest {
             matches.push(item);
         }
@@ -357,12 +350,7 @@ fn metadata_version_from_json(
             manifest.display()
         ));
     }
-    let value = matches[0]
-        .get("version")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| format!("metadata did not contain a version for {package}"))?;
-    let version = Version::parse(value)
-        .map_err(|error| format!("metadata returned invalid version {value}: {error}"))?;
+    let version = matches[0].version.clone();
     release_rc(&version)?;
     Ok(version)
 }
@@ -868,6 +856,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use crate::cargo_metadata_output::test_support as metadata_fixture;
     use crate::release_policy::TRAITS_POLICY;
 
     const TRAITS_PACKAGE: &str = TRAITS_POLICY.packages[0].package;
@@ -1005,16 +994,29 @@ mod tests {
         manifest: &Path,
         version: &str,
     ) -> Result<CargoOutput, String> {
-        cargo_output(
-            serde_json::to_vec(&serde_json::json!({
-                "packages": [{
-                    "name": package,
-                    "manifest_path": manifest,
-                    "version": version
-                }]
-            }))
-            .unwrap(),
-        )
+        cargo_output(metadata_bytes(package, manifest, version))
+    }
+
+    fn metadata_bytes(package: &str, manifest: &Path, version: &str) -> Vec<u8> {
+        let root = manifest
+            .parent()
+            .expect("fixture manifest has a parent directory");
+        metadata_fixture::encoded(&metadata_fixture::metadata(
+            root,
+            vec![metadata_fixture::package(
+                package,
+                version,
+                None,
+                manifest,
+                Some(&["crates-io"]),
+                Vec::new(),
+                vec![metadata_fixture::target(
+                    package,
+                    "lib",
+                    &root.join("src/lib.rs"),
+                )],
+            )],
+        ))
     }
 
     fn compatibility_fixture(
@@ -1194,35 +1196,16 @@ mod tests {
         fs::write(other.join("Cargo.toml"), "[package]\n").unwrap();
         let manifest = release.join("Cargo.toml").canonicalize().unwrap();
         let equivalent_spelling = release.join("..").join("release").join("Cargo.toml");
-        let exact = serde_json::json!({
-            "packages": [{
-                "name": TRAITS_PACKAGE,
-                "version": "0.4.0-rc.1",
-                "manifest_path": equivalent_spelling
-            }]
-        });
+        let exact = metadata_bytes(TRAITS_PACKAGE, &equivalent_spelling, "0.4.0-rc.1");
         assert_eq!(
-            metadata_version_from_json(
-                &serde_json::to_vec(&exact).unwrap(),
-                &manifest,
-                TRAITS_PACKAGE
-            )
-            .unwrap(),
+            metadata_version_from_json(&exact, &manifest, TRAITS_PACKAGE).unwrap(),
             Version::parse("0.4.0-rc.1").unwrap()
         );
 
         let wrong_manifest = other.join("Cargo.toml").canonicalize().unwrap();
-        assert!(
-            metadata_version_from_json(
-                &serde_json::to_vec(&exact).unwrap(),
-                &wrong_manifest,
-                TRAITS_PACKAGE
-            )
-            .is_err()
-        );
-        assert!(
-            metadata_version_from_json(br#"{"packages":[]}"#, &manifest, TRAITS_PACKAGE).is_err()
-        );
+        assert!(metadata_version_from_json(&exact, &wrong_manifest, TRAITS_PACKAGE).is_err());
+        let empty = metadata_fixture::encoded(&metadata_fixture::metadata(&release, Vec::new()));
+        assert!(metadata_version_from_json(&empty, &manifest, TRAITS_PACKAGE).is_err());
     }
 
     #[test]

@@ -6,10 +6,10 @@
 use std::path::Path;
 use std::process::Command;
 
-use serde::Deserialize;
-use serde_json::Value;
+use cargo_metadata::Metadata;
 
 use crate::bounded_process::{self, VALIDATION_OUTPUT_LIMITS};
+use crate::cargo_metadata_output::{parse_bounded, publishes_to_crates_io};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReleaseFamily {
@@ -113,29 +113,15 @@ pub(crate) fn detect(root: &Path) -> Result<&'static ReleasePolicy, String> {
             "Cargo metadata failed while selecting release policy: {detail}"
         ));
     }
-    let metadata: Metadata = serde_json::from_slice(&output.stdout)
-        .map_err(|error| format!("Cargo returned invalid release metadata: {error}"))?;
+    let metadata = parse_bounded(&output.stdout, "Cargo returned invalid release metadata")?;
     detect_from_metadata(&metadata)
-}
-
-#[derive(Debug, Deserialize)]
-struct Metadata {
-    packages: Vec<MetadataPackage>,
-}
-
-#[derive(Debug, Deserialize)]
-struct MetadataPackage {
-    name: String,
-    #[serde(default)]
-    publish: Option<Value>,
 }
 
 fn detect_from_metadata(metadata: &Metadata) -> Result<&'static ReleasePolicy, String> {
     let mut publishable = Vec::new();
     for package in &metadata.packages {
-        match publish_state(package.publish.as_ref())? {
-            PublishState::Publishable => publishable.push(package.name.as_str()),
-            PublishState::Disabled => {}
+        if publishes_to_crates_io(package.publish.as_deref())? {
+            publishable.push(package.name.as_ref());
         }
     }
     let traits = exact_package_order(&publishable, TRAITS_POLICY.packages);
@@ -158,59 +144,16 @@ fn exact_package_order(actual: &[&str], expected: &[PackagePolicy]) -> bool {
             .all(|(actual, expected)| *actual == expected.package)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PublishState {
-    Publishable,
-    Disabled,
-}
-
-fn publish_state(value: Option<&Value>) -> Result<PublishState, String> {
-    match value {
-        None | Some(Value::Null) => Ok(PublishState::Publishable),
-        Some(Value::Array(registries)) if registries.is_empty() => Ok(PublishState::Disabled),
-        Some(Value::Array(registries)) => {
-            if !registries.iter().all(Value::is_string) {
-                return Err("Cargo returned invalid publish registry metadata".to_string());
-            }
-            if registries
-                .iter()
-                .any(|registry| registry.as_str() == Some("crates-io"))
-            {
-                Ok(PublishState::Publishable)
-            } else {
-                Err("a publishable release package excludes crates-io".to_string())
-            }
-        }
-        Some(_) => Err("Cargo returned invalid publish metadata".to_string()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
-    fn absent_null_and_default_registry_metadata_are_publishable() {
-        assert_eq!(publish_state(None).unwrap(), PublishState::Publishable);
-        assert_eq!(
-            publish_state(Some(&Value::Null)).unwrap(),
-            PublishState::Publishable
-        );
-        assert_eq!(
-            publish_state(Some(&json!(["crates-io"]))).unwrap(),
-            PublishState::Publishable
-        );
-    }
-
-    #[test]
-    fn only_cargo_false_encoding_disables_publication() {
-        assert_eq!(
-            publish_state(Some(&json!([]))).unwrap(),
-            PublishState::Disabled
-        );
-        assert!(publish_state(Some(&json!(["internal"]))).is_err());
-        assert!(publish_state(Some(&json!(false))).is_err());
+    fn cargo_publish_policy_is_typed_and_fail_closed() {
+        assert!(publishes_to_crates_io(None).unwrap());
+        assert!(!publishes_to_crates_io(Some(&[])).unwrap());
+        assert!(publishes_to_crates_io(Some(&["crates-io".to_string()])).unwrap());
+        assert!(publishes_to_crates_io(Some(&["alternate".to_string()])).is_err());
     }
 
     #[test]
