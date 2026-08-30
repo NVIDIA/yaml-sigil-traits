@@ -105,12 +105,13 @@ if [[ ! -f "${command_file}" ]]; then
 fi
 
 trusted_git="$(command -v git)"
-trusted_python="$(command -v python3)"
+trusted_python_command="$(command -v python3)"
+trusted_python_name="$(basename "${trusted_python_command}")"
 trusted_cargo="$(command -v cargo)"
 trusted_rustup="$(command -v rustup)"
 trusted_env="$(command -v env)"
 trusted_git="$(realpath "${trusted_git}")"
-trusted_python="$(realpath "${trusted_python}")"
+trusted_python="$(realpath "${trusted_python_command}")"
 trusted_cargo="$(realpath "${trusted_cargo}")"
 trusted_rustup="$(realpath "${trusted_rustup}")"
 trusted_env="$(realpath "${trusted_env}")"
@@ -145,8 +146,13 @@ while IFS='=' read -r name _; do
 done < <(env)
 
 # macOS gives its per-user temporary ancestors private traversal permissions.
+# Git for Windows likewise must not resolve a candidate path through the
+# runner account's private profile. Only the new sandbox below the drive root
+# is hardened; no ancestor ACL is changed.
 if [[ "${runner_os}" == 'macOS' ]]; then
   sandbox="$(mktemp -d /tmp/yaml-sigil-terminal.XXXXXX)"
+elif [[ "${runner_os}" == 'Windows' ]]; then
+  sandbox="$(mktemp -d /c/yaml-sigil-terminal.XXXXXX)"
 else
   sandbox="$(mktemp -d)"
 fi
@@ -169,6 +175,19 @@ mkdir -p \
   "${candidate_temp}" "${candidate_buf_cache}" "${candidate_pycache}" \
   "${trusted_tools}/bin" "${trusted_rustup_home}" "${setup_cargo_home}" \
   "${setup_target}"
+
+# A Windows Python installation loads DLLs and the standard library beside
+# its executable. Stage the complete runtime before creating the candidate
+# identity so that the interpreter and everything it loads share one
+# read-only ACL boundary.
+if [[ "${runner_os}" == 'Windows' ]]; then
+  trusted_python_source="$(dirname "${trusted_python}")"
+  trusted_python_root="${trusted_tools}/python"
+  mkdir -p "${trusted_python_root}"
+  cp -R "${trusted_python_source}/." "${trusted_python_root}/"
+  trusted_python="${trusted_python_root}/${trusted_python_name}"
+  "${trusted_python}" -c 'import hashlib, json, pathlib, sys'
+fi
 
 safe_path=''
 while IFS= read -r entry; do

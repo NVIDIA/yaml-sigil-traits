@@ -91,26 +91,25 @@ try {
     $commandDirectory = Split-Path -Parent $CommandFile
 
     # Candidate source, protected policy, and installed tools stay read-only;
-    # only task-specific build and temporary directories are writable. Replace
-    # inherited sandbox access after retaining full runner and system access.
+    # only task-specific build and temporary directories are writable. Give
+    # every existing object direct access entries before removing inheritance,
+    # so no recursive operation can strand a child with an incomplete ACL.
     Invoke-Icacls -Arguments @(
         $Sandbox,
         '/grant:r',
-        "${runnerSid}:(OI)(CI)F",
-        "${systemSid}:(OI)(CI)F",
-        "${administratorsSid}:(OI)(CI)F",
-        "${candidateSid}:(OI)(CI)RX",
-        '/T',
-        '/C'
+        "${runnerSid}:F",
+        "${systemSid}:F",
+        "${administratorsSid}:F",
+        "${candidateSid}:RX",
+        '/T'
     )
-    Invoke-Icacls -Arguments @($Sandbox, '/inheritance:r', '/T', '/C')
-    Invoke-Icacls -Arguments @($PolicyRoot, '/grant:r', "${candidateSid}:(OI)(CI)RX", '/T', '/C')
+    Invoke-Icacls -Arguments @($Sandbox, '/inheritance:r', '/T')
+    Invoke-Icacls -Arguments @($PolicyRoot, '/grant:r', "${candidateSid}:(OI)(CI)RX", '/T')
     Invoke-Icacls -Arguments @(
         $PolicyRoot,
         '/deny',
         "${candidateSid}:(OI)(CI)(WD,AD,WEA,WA,DE,DC,WDAC,WO)",
-        '/T',
-        '/C'
+        '/T'
     )
     foreach ($writable in @(
         $CandidateHome,
@@ -120,7 +119,15 @@ try {
         $CandidateBufCache,
         $CandidatePycache
     )) {
-        Invoke-Icacls -Arguments @($writable, '/grant:r', "${candidateSid}:(OI)(CI)M", '/T', '/C')
+        Invoke-Icacls -Arguments @(
+            $writable,
+            '/grant:r',
+            "${runnerSid}:(OI)(CI)F",
+            "${systemSid}:(OI)(CI)F",
+            "${administratorsSid}:(OI)(CI)F",
+            "${candidateSid}:(OI)(CI)M",
+            '/T'
+        )
     }
     Invoke-Icacls -Arguments @($commandDirectory, '/deny', "${candidateSid}:(OI)(CI)F")
 

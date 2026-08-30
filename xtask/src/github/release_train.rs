@@ -40,6 +40,13 @@ const REGISTRY_POLL_SECONDS: u64 = 20;
 const APP_PUBLIC_ID: u64 = 4_653_064;
 const INTENT_NAME: &str = "Release finalization intent";
 const RELEASE_PLZ_VERSION: &str = "0.3.160";
+const TRAITS_TAG_PATTERNS: &[&str] = &["refs/tags/v*"];
+const RS_TAG_PATTERNS: &[&str] = &[
+    "refs/tags/yaml-sigil-core-v*",
+    "refs/tags/yaml-sigil-transcription-v*",
+    "refs/tags/yaml-sigil-signing-v*",
+    "refs/tags/yaml-sigil-verification-v*",
+];
 
 pub(super) struct PrepareIntentInput<'a> {
     pub(super) plan: &'a str,
@@ -860,6 +867,15 @@ fn build_intent(
     if !is_digest(ruleset_evidence_sha256) {
         return Err("ruleset evidence must be one SHA-256 digest".to_string());
     }
+    let expected_ruleset_evidence = settings_evidence_sha256(
+        &plan.repository,
+        &plan.release_sha,
+        origin_run_id,
+        origin_run_attempt,
+    )?;
+    if ruleset_evidence_sha256 != expected_ruleset_evidence {
+        return Err("ruleset evidence does not match canonical release settings".to_string());
+    }
     let external_id = sha256(
         format!(
             "release-intent-v{INTENT_SCHEMA}\0{}\0{}\0{plan_digest}",
@@ -1092,6 +1108,17 @@ fn decode_intent(
         || record.tags.len() != plan.packages.len()
     {
         return Err("release intent binding is invalid".to_string());
+    }
+    let expected_ruleset_evidence = settings_evidence_sha256(
+        &record.repository,
+        &record.release_sha,
+        record.origin_run_id,
+        record.origin_run_attempt,
+    )?;
+    if record.ruleset_evidence_sha256 != expected_ruleset_evidence {
+        return Err(
+            "release intent ruleset evidence does not match canonical release settings".to_string(),
+        );
     }
     for ((tag, package), index) in record.tags.iter().zip(&plan.packages).zip(0..) {
         if tag.package != package.package
@@ -1834,6 +1861,63 @@ fn is_digest(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
+fn settings_evidence_tag_patterns(repository: &str) -> Result<&'static [&'static str], String> {
+    match repository {
+        "NVIDIA/yaml-sigil-traits" => Ok(TRAITS_TAG_PATTERNS),
+        "NVIDIA/yaml-sigil-rs" => Ok(RS_TAG_PATTERNS),
+        _ => Err("repository is outside the settings-evidence policy".to_string()),
+    }
+}
+
+fn update_settings_evidence_digest(digest: &mut Sha256, value: &str) {
+    digest.update(value.as_bytes());
+    digest.update(b"\0");
+}
+
+fn settings_evidence_sha256(
+    repository: &str,
+    release_sha: &str,
+    run_id: u64,
+    run_attempt: u64,
+) -> Result<String, String> {
+    let tag_patterns = settings_evidence_tag_patterns(repository)?;
+    if !is_sha(release_sha) {
+        return Err("release SHA is invalid".to_string());
+    }
+    if run_id == 0 {
+        return Err("workflow run ID is invalid".to_string());
+    }
+    if run_attempt == 0 {
+        return Err("workflow run attempt is invalid".to_string());
+    }
+
+    let mut digest = Sha256::new();
+    for value in [
+        "yaml-sigil-release-setting-evidence-v1",
+        repository,
+        &run_id.to_string(),
+        &run_attempt.to_string(),
+        release_sha,
+        "immutable-releases=true",
+    ] {
+        update_settings_evidence_digest(&mut digest, value);
+    }
+    for pattern in tag_patterns {
+        update_settings_evidence_digest(
+            &mut digest,
+            &format!("creation={pattern}:Integration:{APP_PUBLIC_ID}:always"),
+        );
+    }
+    for pattern in tag_patterns {
+        update_settings_evidence_digest(&mut digest, &format!("update-delete={pattern}:no-bypass"));
+    }
+    update_settings_evidence_digest(
+        &mut digest,
+        &format!("forbidden-required-check={INTENT_NAME}"),
+    );
+    Ok(format!("{:x}", digest.finalize()))
+}
+
 fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -1900,6 +1984,8 @@ mod tests {
     fn intent_fixture() -> (ReleasePlan, IntentRecord, String) {
         let plan = plan();
         let (_, plan_digest) = encode_plan(&plan).unwrap();
+        let ruleset_evidence_sha256 =
+            settings_evidence_sha256(&plan.repository, &plan.release_sha, 100, 1).unwrap();
         let intent = IntentRecord {
             schema_version: INTENT_SCHEMA,
             repository: plan.repository.clone(),
@@ -1908,7 +1994,7 @@ mod tests {
             external_id: "6".repeat(64),
             origin_run_id: 100,
             origin_run_attempt: 1,
-            ruleset_evidence_sha256: "7".repeat(64),
+            ruleset_evidence_sha256,
             plan: plan.clone(),
             tags: vec![TagIntent {
                 package: plan.packages[0].package.clone(),
@@ -1947,6 +2033,28 @@ mod tests {
         assert!(decode_plan(&body, &"0".repeat(64)).is_err());
         let unknown = body.replacen('{', "{\"unknown\":true,", 1);
         assert!(decode_plan(&unknown, &sha256(unknown.as_bytes())).is_err());
+    }
+
+    #[test]
+    fn settings_evidence_encoding_matches_cross_language_vectors() {
+        assert_eq!(
+            settings_evidence_sha256("NVIDIA/yaml-sigil-traits", &"a".repeat(40), 100, 1).unwrap(),
+            "a622fec239319172aefb628be3f81fccbc93d61803c5214c0729e054a2da6c09",
+        );
+        assert_eq!(
+            settings_evidence_sha256("NVIDIA/yaml-sigil-rs", &"a".repeat(40), 100, 1).unwrap(),
+            "917d89e6ef528f6db27ef6a93717c7d4907420e11e040ed8adec07508e339568",
+        );
+    }
+
+    #[test]
+    fn release_intent_rejects_a_mismatched_canonical_settings_digest() {
+        let (plan, mut intent, _) = intent_fixture();
+        let plan_digest = intent.plan_digest.clone();
+        intent.ruleset_evidence_sha256 = "0".repeat(64);
+        let body = canonical_intent(&intent).unwrap();
+        let error = decode_intent(&body, &plan, &plan_digest).unwrap_err();
+        assert!(error.contains("does not match canonical release settings"));
     }
 
     #[test]

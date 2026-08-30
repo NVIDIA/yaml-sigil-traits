@@ -1981,11 +1981,29 @@ class WorkflowStructureTests(unittest.TestCase):
         self.assertIn('sudo -n chown -R "${candidate_uid}"', shell)
         self.assertNotIn('\nchown -R "${candidate_uid}"', shell)
         self.assertIn("mktemp -d /tmp/yaml-sigil-terminal.XXXXXX", shell)
+        self.assertIn("mktemp -d /c/yaml-sigil-terminal.XXXXXX", shell)
         self.assertIn('policy_root="${sandbox}/protected-policy"', shell)
         self.assertIn('install -m 0555 "${trusted_cargo}"', shell)
         self.assertIn('protected_validator="${trusted_cargo}"', shell)
+        self.assertIn(
+            'cp -R "${trusted_python_source}/." "${trusted_python_root}/"', shell
+        )
+        self.assertIn(
+            'trusted_python="${trusted_python_root}/${trusted_python_name}"', shell
+        )
+        self.assertIn(
+            'trusted_python_name="$(basename "${trusted_python_command}")"', shell
+        )
+        self.assertIn(
+            'trusted_python="$(realpath "${trusted_python_command}")"', shell
+        )
         self.assertIn("-Description 'Disposable YamlSigil candidate'", windows)
         self.assertNotIn("candidate validation identity", windows)
+        self.assertLess(
+            windows.index('"${candidateSid}:RX"'),
+            windows.index("Invoke-Icacls -Arguments @($Sandbox, '/inheritance:r'"),
+        )
+        self.assertNotIn("'/C'", windows)
 
     def test_terminal_driver_rejects_runner_and_preload_environment(self) -> None:
         with mock.patch.dict(
@@ -2002,6 +2020,15 @@ class WorkflowStructureTests(unittest.TestCase):
             ):
                 with self.assertRaises(terminal_candidate.IsolationError):
                     terminal_candidate.require_minimal_environment()
+
+    def test_detached_helper_publishes_complete_pid_atomically(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            marker = root / "detached.pid"
+            with mock.patch.object(terminal_candidate.time, "sleep"):
+                self.assertEqual(terminal_candidate.detached_helper(marker), 0)
+            self.assertEqual(marker.read_text(encoding="ascii"), str(os.getpid()))
+            self.assertEqual(list(root.glob(".*.tmp")), [])
 
     def test_terminal_driver_rejects_reachable_command_files(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

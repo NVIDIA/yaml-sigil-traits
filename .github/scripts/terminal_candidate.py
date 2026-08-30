@@ -193,12 +193,16 @@ def require_trusted_path(trusted_cargo: pathlib.Path, trusted_python: pathlib.Pa
 
 
 def detached_helper(marker: pathlib.Path) -> int:
-    marker.write_text(str(os.getpid()), encoding="ascii")
+    process_id = os.getpid()
+    temporary = marker.with_name(f".{marker.name}.{process_id}.tmp")
+    temporary.write_text(str(process_id), encoding="ascii")
+    temporary.replace(marker)
     time.sleep(60 * 60)
     return 0
 
 
 def spawn_detached_canary(driver: pathlib.Path, marker: pathlib.Path) -> None:
+    require(not marker.exists(), "detached canary marker already exists")
     flags = 0
     if os.name == "nt":
         flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
