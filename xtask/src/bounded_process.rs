@@ -1328,15 +1328,16 @@ mod tests {
     // group so a successful direct child cannot leave background work alive.
     #[allow(clippy::zombie_processes)]
     fn spawn_success_descendant() {
+        let pid_file = PathBuf::from(std::env::var_os("YAML_SIGIL_TEST_PID_FILE").unwrap());
         let mut child = test_command("bounded_process::tests::sleeping_success_descendant");
-        child.env(
-            "YAML_SIGIL_TEST_PID_FILE",
-            std::env::var_os("YAML_SIGIL_TEST_PID_FILE").unwrap(),
-        );
+        child.env("YAML_SIGIL_TEST_PID_FILE", &pid_file);
         child.stdin(Stdio::null());
         child.stdout(Stdio::null());
         child.stderr(Stdio::null());
         child.spawn().unwrap();
+        // Do not let the direct child exit before its descendant has joined
+        // the process group and recorded the identity checked by the parent.
+        wait_for_pid(&pid_file);
     }
 
     #[cfg(unix)]
