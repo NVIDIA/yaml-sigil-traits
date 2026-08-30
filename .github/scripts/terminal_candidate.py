@@ -30,6 +30,7 @@ import time
 MAX_PROFILE_SECONDS = 80 * 60
 MAX_STDOUT_BYTES = 16 * 1024 * 1024
 MAX_STDERR_BYTES = 4 * 1024 * 1024
+CARGO_LOCKFILE_PATH_ENV = "CARGO_RESOLVER_LOCKFILE_PATH"
 FORBIDDEN_PREFIXES = ("ACTIONS_", "GITHUB_", "GH_", "RUNNER_")
 FORBIDDEN_NAMES = {
     "CI",
@@ -146,6 +147,34 @@ def require_tree_read_only(root: pathlib.Path, label: str) -> None:
         directories += 1
         require(directories <= 10_000, f"{label} contains too many directories")
         require_directory_read_only(pathlib.Path(directory), label)
+
+
+def require_tree_readable(root: pathlib.Path, label: str) -> None:
+    entries = 0
+
+    def walk_error(error: OSError) -> None:
+        raise IsolationError(f"cannot inspect {label}: {error}") from error
+
+    for directory, names, files in os.walk(
+        root, topdown=True, onerror=walk_error, followlinks=False
+    ):
+        names.sort()
+        files.sort()
+        for name in files:
+            entries += 1
+            require(entries <= 50_000, f"{label} contains too many files")
+            path = pathlib.Path(directory) / name
+            try:
+                if path.is_symlink():
+                    os.readlink(path)
+                else:
+                    with path.open("rb") as handle:
+                        handle.read(1)
+            except OSError as error:
+                relative = path.relative_to(root)
+                raise IsolationError(
+                    f"cannot read {label} entry {relative}: {error}"
+                ) from error
 
 
 def require_parent_process_isolated() -> None:
@@ -377,6 +406,7 @@ def run_profile(
     require(kind in {"traits", "rs"}, "candidate-ci is unsupported for this repository")
     manifest = candidate_root / "xtask" / "Cargo.toml"
     archive_environment = dict(os.environ)
+    archive_environment.pop(CARGO_LOCKFILE_PATH_ENV, None)
     archive_environment["YAML_SIGIL_REQUIRE_CARGO_1_95_ARCHIVE"] = "1"
     run_process(
         [
@@ -393,10 +423,31 @@ def run_profile(
         candidate_root,
         environment=archive_environment,
     )
+
+    # Compile the candidate xtask with its committed xtask/Cargo.lock before
+    # giving the resulting terminal workload Cargo's candidate-owned root
+    # lockfile path. This keeps the verified source tree read-only without
+    # treating the root and xtask workspaces as though they shared one lock.
+    build_environment = dict(os.environ)
+    build_environment.pop(CARGO_LOCKFILE_PATH_ENV, None)
     run_process(
-        [os.fspath(cargo), "+stable", "xtask", "ci"],
+        [
+            os.fspath(cargo),
+            "+stable",
+            "build",
+            "--locked",
+            "--manifest-path",
+            os.fspath(manifest),
+        ],
         candidate_root,
+        environment=build_environment,
     )
+    executable = "xtask.exe" if os.name == "nt" else "xtask"
+    candidate_xtask = resolved_executable(
+        pathlib.Path(os.environ["CARGO_TARGET_DIR"]) / "debug" / executable,
+        "candidate xtask",
+    )
+    run_process([os.fspath(candidate_xtask), "ci"], candidate_root)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -441,6 +492,7 @@ def main(argv: list[str] | None = None) -> int:
     require_parent_process_isolated()
     require_tree_read_only(policy_root, "protected policy tree")
     require_tree_read_only(candidate_root, "candidate source tree")
+    require_tree_readable(candidate_root, "candidate source tree")
     require_tree_read_only(rustup_home, "trusted Rust toolchain")
     require_file_read_only(cargo, "trusted Cargo")
     require_file_read_only(python, "trusted Python")

@@ -1956,6 +1956,14 @@ class WorkflowStructureTests(unittest.TestCase):
         self.assertIn("sudo -n -u", shell)
         self.assertIn('chmod 0700 "${command_directory}"', shell)
         self.assertIn('pkill -KILL -u "${candidate_uid}"', shell)
+        self.assertIn('launchctl bootout "user/${candidate_uid}"', shell)
+        self.assertIn("for _ in {1..300}", shell)
+        cleanup_tail = shell[shell.index("candidate_status=$?") :]
+        self.assertLess(
+            cleanup_tail.index("cleanup_candidate_user || true"),
+            cleanup_tail.index("for _ in {1..300}"),
+        )
+        self.assertIn('ps -U "${candidate_uid}"', cleanup_tail)
         for name in ("GITHUB_ENV", "GITHUB_PATH", "GITHUB_OUTPUT", "GITHUB_STEP_SUMMARY"):
             self.assertIn(name, shell)
         self.assertIn("runner command files do not share one protected directory", shell)
@@ -1964,6 +1972,10 @@ class WorkflowStructureTests(unittest.TestCase):
         self.assertIn("$startInfo.Environment.Clear()", windows)
         self.assertIn("'/deny'", windows)
         self.assertIn("'/inheritance:r'", windows)
+        self.assertIn("function Set-ReadOnlyReparsePointAccess", windows)
+        self.assertIn("-Attributes ReparsePoint", windows)
+        self.assertIn("'/L'", windows)
+        self.assertIn("@($CandidateRoot, $PolicyRoot)", windows)
         self.assertIn("(WD,AD,WEA,WA,DE,DC,WDAC,WO)", windows)
         self.assertIn("Stop-CandidateProcesses", windows)
         self.assertIn("Remove-LocalUser", windows)
@@ -1971,6 +1983,7 @@ class WorkflowStructureTests(unittest.TestCase):
         self.assertIn("require_command_files_inaccessible", driver)
         self.assertIn("require_parent_process_isolated", driver)
         self.assertIn("require_tree_read_only", driver)
+        self.assertIn("require_tree_readable", driver)
         self.assertIn("spawn_detached_canary", driver)
 
     def test_terminal_setup_uses_elevated_and_native_paths(self) -> None:
@@ -1982,9 +1995,27 @@ class WorkflowStructureTests(unittest.TestCase):
         self.assertNotIn('\nchown -R "${candidate_uid}"', shell)
         self.assertIn("mktemp -d /tmp/yaml-sigil-terminal.XXXXXX", shell)
         self.assertIn("mktemp -d /c/yaml-sigil-terminal.XXXXXX", shell)
+        physical_sandbox = shell.index('cd -P -- "${sandbox}"')
+        candidate_root = shell.index('candidate_root="${sandbox}/candidate"')
+        self.assertIn("pwd -P", shell)
+        self.assertLess(physical_sandbox, candidate_root)
         self.assertIn('policy_root="${sandbox}/protected-policy"', shell)
         self.assertIn('install -m 0555 "${trusted_cargo}"', shell)
         self.assertIn('protected_validator="${trusted_cargo}"', shell)
+        self.assertIn("CARGO_RESOLVER_LOCKFILE_PATH", shell)
+        self.assertIn("CARGO_RESOLVER_LOCKFILE_PATH", windows)
+        self.assertIn('if [[ "${repository_kind}" != \'spec\'', shell)
+        self.assertIn("$Kind -ne 'spec'", windows)
+        self.assertNotIn("trusted_bash=", shell)
+        self.assertNotIn("check-acvp-corpus.sh", shell)
+        protected_build = shell.index("cargo +stable build --locked")
+        protected_preflight = shell.index(
+            '"${protected_validator}" candidate-preflight'
+        )
+        candidate_boundary = shell.index('candidate_path="${safe_path}"')
+        self.assertLess(protected_build, protected_preflight)
+        self.assertLess(protected_preflight, candidate_boundary)
+        self.assertIn('--candidate-root "${preflight_root}"', shell)
         self.assertIn(
             'cp -R "${trusted_python_source}/." "${trusted_python_root}/"', shell
         )
@@ -2004,6 +2035,113 @@ class WorkflowStructureTests(unittest.TestCase):
             windows.index("Invoke-Icacls -Arguments @($Sandbox, '/inheritance:r'"),
         )
         self.assertNotIn("'/C'", windows)
+
+    def test_terminal_caches_are_candidate_owned(self) -> None:
+        shell = TERMINAL_SHELL_PATH.read_text(encoding="utf-8")
+        windows = TERMINAL_WINDOWS_PATH.read_text(encoding="utf-8")
+        self.assertIn('candidate_cache="${candidate_home}/.cache"', shell)
+        self.assertIn('XDG_CACHE_HOME="${candidate_cache}"', shell)
+        self.assertIn('BUF_CACHE_DIR="${candidate_buf_cache}"', shell)
+        self.assertIn('-CandidateCache "$(cygpath -w "${candidate_cache}")"', shell)
+        self.assertIn(
+            "$startInfo.Environment['LOCALAPPDATA'] = $CandidateCache", windows
+        )
+        self.assertIn(
+            "$startInfo.Environment['XDG_CACHE_HOME'] = $CandidateCache", windows
+        )
+        self.assertIn(
+            "$startInfo.Environment['BUF_CACHE_DIR'] = $CandidateBufCache", windows
+        )
+
+    def test_windows_terminal_selects_the_trusted_msvc_environment(self) -> None:
+        windows = TERMINAL_WINDOWS_PATH.read_text(encoding="utf-8")
+        self.assertIn("function Get-TrustedMsvcEnvironment", windows)
+        self.assertIn("function Test-PathUnderRoots", windows)
+        self.assertIn("function ConvertTo-TrustedDirectoryList", windows)
+        self.assertIn("[Environment+SpecialFolder]::ProgramFiles", windows)
+        self.assertIn(
+            r"Microsoft Visual Studio\Installer\vswhere.exe", windows
+        )
+        self.assertIn(
+            "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", windows
+        )
+        self.assertIn("Microsoft.VCToolsVersion.default.txt", windows)
+        self.assertIn(r"Common7\Tools\VsDevCmd.bat", windows)
+        self.assertIn("-no_logo -arch=x64", windows)
+        self.assertIn("-host_arch=x64 && set", windows)
+        self.assertIn("VCToolsInstallDir", windows)
+        self.assertIn("WindowsSdkDir", windows)
+        self.assertIn("[IO.Path]::IsPathFullyQualified", windows)
+        self.assertIn("[IO.Path]::TrimEndingDirectorySeparator", windows)
+        self.assertIn("$directories.Count -gt 64", windows)
+        self.assertNotIn("$PathValue.Split", windows)
+        self.assertNotIn("$developerEnvironment['PATH']", windows)
+        self.assertIn(
+            "$linker.VersionInfo.CompanyName -ne 'Microsoft Corporation'", windows
+        )
+        self.assertIn(
+            "$linker.VersionInfo.FileDescription -notlike '*Incremental Linker*'",
+            windows,
+        )
+        self.assertIn(
+            "$startInfo.Environment['PATH'] = $candidatePath", windows
+        )
+        self.assertIn(
+            "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER", windows
+        )
+        self.assertIn(
+            "$startInfo.Environment['LIB'] = $trustedMsvcEnvironment.Lib",
+            windows,
+        )
+        self.assertIn(
+            "$startInfo.Environment['INCLUDE'] = $trustedMsvcEnvironment.Include",
+            windows,
+        )
+
+    @mock.patch.object(terminal_candidate, "resolved_executable")
+    @mock.patch.object(terminal_candidate, "run_process")
+    def test_candidate_ci_separates_xtask_and_root_lockfiles(
+        self,
+        run_process: mock.Mock,
+        resolved_executable: mock.Mock,
+    ) -> None:
+        target = pathlib.Path("/candidate-target")
+        external_lock = "/candidate-home/Cargo.lock"
+        candidate_xtask = target / "debug" / (
+            "xtask.exe" if os.name == "nt" else "xtask"
+        )
+        resolved_executable.return_value = candidate_xtask
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "CARGO_TARGET_DIR": os.fspath(target),
+                terminal_candidate.CARGO_LOCKFILE_PATH_ENV: external_lock,
+            },
+            clear=True,
+        ):
+            terminal_candidate.run_profile(
+                "candidate-ci",
+                "traits",
+                pathlib.Path("/policy"),
+                pathlib.Path("/candidate"),
+                pathlib.Path("/trusted/cargo"),
+                pathlib.Path("/trusted/python"),
+                pathlib.Path("/trusted/validator"),
+            )
+
+        self.assertEqual(run_process.call_count, 3)
+        archive_environment = run_process.call_args_list[0].kwargs["environment"]
+        build_environment = run_process.call_args_list[1].kwargs["environment"]
+        self.assertNotIn(terminal_candidate.CARGO_LOCKFILE_PATH_ENV, archive_environment)
+        self.assertNotIn(terminal_candidate.CARGO_LOCKFILE_PATH_ENV, build_environment)
+        self.assertIn("+1.95.0", run_process.call_args_list[0].args[0])
+        self.assertIn("build", run_process.call_args_list[1].args[0])
+        self.assertEqual(
+            run_process.call_args_list[2].args[0],
+            [os.fspath(candidate_xtask), "ci"],
+        )
+        self.assertNotIn("environment", run_process.call_args_list[2].kwargs)
 
     def test_terminal_driver_rejects_runner_and_preload_environment(self) -> None:
         with mock.patch.dict(
@@ -2046,6 +2184,24 @@ class WorkflowStructureTests(unittest.TestCase):
                 terminal_candidate.require_tree_read_only(root, "trusted tree")
             with self.assertRaises(terminal_candidate.IsolationError):
                 terminal_candidate.require_file_read_only(trusted_file, "trusted tool")
+
+    def test_terminal_driver_names_an_unreadable_candidate_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            unreadable = root / "blocked.txt"
+            unreadable.write_bytes(b"blocked")
+            with mock.patch.object(
+                pathlib.Path,
+                "open",
+                side_effect=PermissionError(13, "denied"),
+            ):
+                with self.assertRaisesRegex(
+                    terminal_candidate.IsolationError,
+                    r"cannot read candidate source tree entry blocked\.txt",
+                ):
+                    terminal_candidate.require_tree_readable(
+                        root, "candidate source tree"
+                    )
 
     def test_controller_token_jobs_compile_before_checks_only_tokens(self) -> None:
         command = COMMAND_WORKFLOW_PATH.read_text(encoding="utf-8")

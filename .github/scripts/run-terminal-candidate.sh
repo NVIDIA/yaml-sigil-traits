@@ -156,14 +156,23 @@ elif [[ "${runner_os}" == 'Windows' ]]; then
 else
   sandbox="$(mktemp -d)"
 fi
+# Resolve only the just-created trusted sandbox before forming candidate
+# paths. macOS spells its system temporary directory through a symlink; the
+# protected no-follow preflight must receive the physical, trusted ancestor.
+sandbox="$(
+  cd -P -- "${sandbox}"
+  pwd -P
+)"
 chmod 0755 "${sandbox}"
 candidate_root="${sandbox}/candidate"
 candidate_home="${sandbox}/candidate-home"
+candidate_cache="${candidate_home}/.cache"
 candidate_cargo_home="${sandbox}/candidate-cargo-home"
 candidate_target="${sandbox}/candidate-target"
 candidate_temp="${sandbox}/candidate-temp"
 candidate_buf_cache="${sandbox}/candidate-buf-cache"
 candidate_pycache="${sandbox}/candidate-pycache"
+candidate_root_lockfile="${candidate_home}/Cargo.lock"
 trusted_tools="${sandbox}/trusted-tools"
 trusted_rustup_home="${sandbox}/trusted-rustup"
 setup_cargo_home="${sandbox}/setup-cargo-home"
@@ -171,7 +180,8 @@ setup_target="${sandbox}/setup-target"
 detached_pid_file="${candidate_home}/detached.pid"
 protected_validator="${trusted_cargo}"
 mkdir -p \
-  "${candidate_home}" "${candidate_cargo_home}" "${candidate_target}" \
+  "${candidate_home}" "${candidate_cache}" "${candidate_cargo_home}" \
+  "${candidate_target}" \
   "${candidate_temp}" "${candidate_buf_cache}" "${candidate_pycache}" \
   "${trusted_tools}/bin" "${trusted_rustup_home}" "${setup_cargo_home}" \
   "${setup_target}"
@@ -230,8 +240,12 @@ if [[ "${profile}" != 'controller' ]]; then
   fi
 
   if [[ "${repository_kind}" == 'spec' ]]; then
-    trusted_go="$(command -v go)"
-    GOBIN="${trusted_tools}/bin" "${trusted_go}" install github.com/bufbuild/buf/cmd/buf@v1.72.0
+    # The Rust installer verifies Buf's signed upstream checksum manifest
+    # before staging the pinned official binaries in the trusted tool tree.
+    BUF_RS_CACHE_DIR="${sandbox}/trusted-buf-cache" \
+      BUF_RS_TOOLCHAIN_BIN_DIR="${trusted_tools}/bin" \
+      cargo +stable install --locked --root "${trusted_tools}" \
+      buf-toolchain --version 1.72.0
   fi
 
   if [[ "${profile}" == 'candidate-ci' ]]; then
@@ -343,11 +357,6 @@ if [[ "${repository_kind}" == 'traits' && "${profile}" != 'controller' ]]; then
   fi
 fi
 
-if [[ "${repository_kind}" == 'spec' && "${profile}" == 'protected-ci' ]]; then
-  /usr/bin/bash --noprofile --norc \
-    "${policy_root}/.github/scripts/check-acvp-corpus.sh" "${candidate_root}"
-fi
-
 if [[ "${profile}" == 'protected-ci' ]]; then
   policy_manifest="${policy_root}/xtask/Cargo.toml"
   if [[ "${repository_kind}" == 'spec' ]]; then
@@ -361,6 +370,15 @@ if [[ "${profile}" == 'protected-ci' ]]; then
   protected_validator="${trusted_tools}/bin/protected-validator${validator_name#xtask}"
   cp "${setup_target}/debug/${validator_name}" "${protected_validator}"
   chmod 0555 "${protected_validator}"
+fi
+
+if [[ "${repository_kind}" == 'spec' && "${profile}" == 'protected-ci' ]]; then
+  preflight_root="${candidate_root}"
+  if [[ "${runner_os}" == 'Windows' ]]; then
+    preflight_root="$(cygpath -w "${candidate_root}")"
+  fi
+  "${protected_validator}" candidate-preflight \
+    --candidate-root "${preflight_root}"
 fi
 
 chmod -R a+rX,go-w "${policy_root}" "${candidate_root}" \
@@ -384,6 +402,7 @@ if [[ "${runner_os}" == 'Windows' ]]; then
     -ProtectedValidator "$(cygpath -w "${protected_validator}")" \
     -CommandFile "${command_file_windows}" \
     -CandidateHome "$(cygpath -w "${candidate_home}")" \
+    -CandidateCache "$(cygpath -w "${candidate_cache}")" \
     -CandidateCargoHome "$(cygpath -w "${candidate_cargo_home}")" \
     -CandidateTarget "$(cygpath -w "${candidate_target}")" \
     -CandidateTemp "$(cygpath -w "${candidate_temp}")" \
@@ -403,6 +422,12 @@ cleanup_candidate_user() {
     return
   fi
   if [[ -n "${candidate_uid:-}" ]]; then
+    if [[ "${runner_os}" == 'macOS' ]]; then
+      # A macOS per-user launchd domain can outlive the direct candidate
+      # process. Remove that domain before killing by the retained numeric UID;
+      # a missing domain is already quiescent and is therefore harmless.
+      sudo -n launchctl bootout "user/${candidate_uid}" >/dev/null 2>&1 || true
+    fi
     sudo -n pkill -KILL -u "${candidate_uid}" >/dev/null 2>&1 || true
   fi
   if [[ "${runner_os}" == 'Linux' ]]; then
@@ -452,13 +477,14 @@ fi
 chmod 0700 "${command_directory}"
 # Only elevated setup may transfer writable roots to the disposable identity.
 sudo -n chown -R "${candidate_uid}" \
-  "${candidate_home}" "${candidate_cargo_home}" "${candidate_target}" \
+  "${candidate_home}" "${candidate_cache}" "${candidate_cargo_home}" \
+  "${candidate_target}" \
   "${candidate_temp}" "${candidate_buf_cache}" "${candidate_pycache}"
 
-set +e
-sudo -n -u "${candidate_user}" -- "${trusted_env}" -i \
+candidate_environment=(
   PATH="${candidate_path}" \
   HOME="${candidate_home}" \
+  XDG_CACHE_HOME="${candidate_cache}" \
   LOGNAME="${candidate_user}" \
   USER="${candidate_user}" \
   TMPDIR="${candidate_temp}" \
@@ -467,10 +493,24 @@ sudo -n -u "${candidate_user}" -- "${trusted_env}" -i \
   RUSTUP_HOME="${trusted_rustup_home}" \
   RUSTUP_TOOLCHAIN='stable' \
   RUSTFLAGS='-D warnings' \
+  BUF_CACHE_DIR="${candidate_buf_cache}" \
   BUF_RS_CACHE_DIR="${candidate_buf_cache}" \
   PYTHONPYCACHEPREFIX="${candidate_pycache}" \
   YAML_SIGIL_PROFILE="${profile}" \
-  YAML_SIGIL_TERMINAL_CANDIDATE='1' \
+  YAML_SIGIL_TERMINAL_CANDIDATE='1'
+)
+if [[ "${repository_kind}" != 'spec' && "${profile}" != 'controller' ]]; then
+  # Current Cargo keeps its generated root lock outside the deliberately
+  # read-only candidate source. The Rust validator separately preserves each
+  # committed xtask lock for xtask-workspace commands.
+  candidate_environment+=(
+    CARGO_RESOLVER_LOCKFILE_PATH="${candidate_root_lockfile}"
+  )
+fi
+
+set +e
+sudo -n -u "${candidate_user}" -- "${trusted_env}" -i \
+  "${candidate_environment[@]}" \
   "${trusted_python}" "${driver}" run \
   --profile "${profile}" \
   --kind "${repository_kind}" \
@@ -485,8 +525,14 @@ sudo -n -u "${candidate_user}" -- "${trusted_env}" -i \
 candidate_status=$?
 set -e
 
-sudo -n pkill -KILL -u "${candidate_uid}" >/dev/null 2>&1 || true
-for _ in {1..100}; do
+if [[ "${runner_os}" == 'macOS' ]]; then
+  # Delete the launchd domain and disposable account before polling by the
+  # retained numeric UID so per-user services cannot respawn during cleanup.
+  cleanup_candidate_user || true
+else
+  sudo -n pkill -KILL -u "${candidate_uid}" >/dev/null 2>&1 || true
+fi
+for _ in {1..300}; do
   if ! pgrep -u "${candidate_uid}" >/dev/null 2>&1; then
     echo 'Terminal candidate identity is quiescent.'
     if ! cleanup_candidate_user; then
@@ -500,4 +546,5 @@ for _ in {1..100}; do
 done
 
 echo 'terminal candidate identity retained a process after cleanup' >&2
+ps -U "${candidate_uid}" -o pid=,ppid=,state=,comm= >&2 || true
 exit 1
