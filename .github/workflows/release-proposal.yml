@@ -30,6 +30,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
+      actions: read
       checks: read
       contents: read
       pull-requests: read
@@ -113,12 +114,18 @@ jobs:
             ".github/scripts/release_notification_preflight.py" \
             "${protected_root}/preflight.py" 131072
           fetch_protected_file \
+            ".github/scripts/release_evidence.py" \
+            "${protected_root}/release_evidence.py" 131072
+          fetch_protected_file \
             ".github/release-notification-policy.json" \
             "${protected_root}/policy.json" 65536
 
           env PATH=/usr/local/bin:/usr/bin:/bin PYTHONDONTWRITEBYTECODE=1 \
-            "${trusted_python}" -m py_compile "${protected_root}/preflight.py"
+            PYTHONPATH="${protected_root}" "${trusted_python}" -m py_compile \
+            "${protected_root}/preflight.py" \
+            "${protected_root}/release_evidence.py"
           env PATH=/usr/local/bin:/usr/bin:/bin PYTHONDONTWRITEBYTECODE=1 \
+            PYTHONPATH="${protected_root}" \
             GITHUB_TOKEN="${GITHUB_TOKEN}" \
             "${trusted_python}" "${protected_root}/preflight.py" \
             --event "${GITHUB_EVENT_PATH}" \
@@ -208,7 +215,7 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           cache: false
-          toolchain: 1.95.0
+          toolchain: stable
 
       - name: Bind repository and workflow identity
         env:

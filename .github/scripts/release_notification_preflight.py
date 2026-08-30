@@ -8,17 +8,21 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import io
 import json
 import os
 import re
-import tarfile
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from release_evidence import (
+    EvidenceError,
+    crate_inventory_sha256,
+    settings_evidence_sha256,
+)
 
 API_VERSION = "2026-03-10"
 EVENT_TYPE = "official-release-published"
@@ -34,9 +38,6 @@ MAX_API_CALLS = 96
 MAX_API_RESPONSE_BYTES = 4 * 1024 * 1024
 MAX_TOTAL_API_BYTES = 32 * 1024 * 1024
 MAX_ARCHIVE_BYTES = 32 * 1024 * 1024
-MAX_ARCHIVE_FILES = 10_000
-MAX_ARCHIVE_CONTENT_BYTES = 128 * 1024 * 1024
-MAX_VCS_BYTES = 1024 * 1024
 SHA_RE = re.compile(r"[0-9a-f]{40}\Z")
 DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
 VERSION_RE = re.compile(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-rc\.[1-9][0-9]*)?\Z")
@@ -314,7 +315,7 @@ def validate_intent(check: dict[str, Any], policy: Policy, payload: dict[str, An
     require(check["name"] == INTENT_NAME, "intent Check name is wrong")
     require(check["head_sha"] == payload["captured_sha"], "intent Check SHA is wrong")
     require(check["external_id"] == payload["intent_external_id"], "intent Check external ID is wrong")
-    require(check["status"] == "completed" and check["conclusion"] == "neutral", "intent Check state is wrong")
+    require(check["status"] == "completed" and check["conclusion"] == "success", "intent Check state is wrong")
     app = check.get("app")
     require(type(app) is dict, "intent Check App is missing")
     require(app["id"] == policy.app_id and app["slug"] == policy.app_slug, "intent Check App is wrong")
@@ -368,46 +369,17 @@ def validate_intent(check: dict[str, Any], policy: Policy, payload: dict[str, An
     return intent
 
 
-def inspect_archive(archive: bytes, package: PackagePolicy, version: str, commit: str) -> None:
-    require(0 < len(archive) <= MAX_ARCHIVE_BYTES, "crate archive is empty or oversized")
-    prefix = f"{package.name}-{version}"
-    total = 0
-    count = 0
-    vcs_body: bytes | None = None
+def inspect_archive(archive: bytes, package: PackagePolicy, version: str, commit: str) -> str:
     try:
-        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as cargo:
-            for member in cargo:
-                count += 1
-                require(count <= MAX_ARCHIVE_FILES, "crate archive file count exceeded its bound")
-                require(member.isfile(), "crate archive contains a non-file entry")
-                parts = member.name.split("/")
-                require(parts[0] == prefix and all(part not in ("", ".", "..") for part in parts), "crate archive contains an unsafe path")
-                require(member.size >= 0, "crate archive contains an invalid size")
-                total += member.size
-                require(total <= MAX_ARCHIVE_CONTENT_BYTES, "crate archive content exceeded its bound")
-                if member.name == f"{prefix}/.cargo_vcs_info.json":
-                    require(vcs_body is None and member.size <= MAX_VCS_BYTES, "crate VCS metadata is duplicate or oversized")
-                    handle = cargo.extractfile(member)
-                    require(handle is not None, "crate VCS metadata is unreadable")
-                    vcs_body = handle.read(MAX_VCS_BYTES + 1)
-                    require(len(vcs_body) == member.size, "crate VCS metadata is truncated")
-    except (tarfile.TarError, EOFError, OSError) as error:
-        raise PreflightError(f"crate archive is invalid: {error}") from error
-    require(vcs_body is not None, "crate archive lacks VCS metadata")
-    try:
-        vcs = json.loads(vcs_body.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise PreflightError(f"crate VCS metadata is invalid: {error}") from error
-    vcs = require_keys(vcs, ("git", "path_in_vcs"), "crate VCS metadata")
-    require(type(vcs["git"]) is dict, "crate Git metadata must be an object")
-    git_keys = set(vcs["git"])
-    require(
-        git_keys in ({"sha1"}, {"sha1", "dirty"}),
-        "crate Git metadata has missing or unknown fields",
-    )
-    git = vcs["git"]
-    require(git["sha1"] == commit and git.get("dirty", False) is False, "crate VCS commit is wrong or dirty")
-    require(vcs["path_in_vcs"] == package.path_in_vcs, "crate VCS path is wrong")
+        return crate_inventory_sha256(
+            archive,
+            package.name,
+            version,
+            commit,
+            package.path_in_vcs,
+        )
+    except EvidenceError as error:
+        raise PreflightError(str(error)) from error
 
 
 def validate_registry(api: Api, policy: Policy, plan: dict[str, Any]) -> None:
@@ -421,7 +393,42 @@ def validate_registry(api: Api, policy: Policy, plan: dict[str, Any]) -> None:
         require(checksum == package["source_archive_sha256"], "crates.io checksum differs from the release plan")
         archive = api.crate_archive(expected.name, package["version"])
         require(sha256(archive) == checksum, "downloaded crate checksum is wrong")
-        inspect_archive(archive, expected, package["version"], plan["release_sha"])
+        inventory = inspect_archive(archive, expected, package["version"], plan["release_sha"])
+        require(
+            inventory == package["package_inventory_sha256"],
+            "downloaded crate inventory differs from the release plan",
+        )
+
+
+def validate_origin_run(api: Api, policy: Policy, intent: dict[str, Any]) -> None:
+    run_id = require_positive(intent["origin_run_id"], "release intent origin run")
+    run_attempt = require_positive(intent["origin_run_attempt"], "release intent origin attempt")
+    run = api.github_json(f"repos/{policy.repository}/actions/runs/{run_id}")
+    require(type(run) is dict, "originating workflow run is invalid")
+    repository = run.get("repository")
+    require(type(repository) is dict, "originating workflow repository is missing")
+    require(
+        run.get("id") == run_id
+        and run.get("run_attempt") == run_attempt
+        and run.get("head_sha") == intent["release_sha"]
+        and run.get("head_branch") == policy.default_branch
+        and run.get("event") == "workflow_dispatch"
+        and run.get("path") == ".github/workflows/publish.yml"
+        and run.get("status") in {"queued", "in_progress", "waiting", "completed"}
+        and run.get("conclusion") in {None, "success"}
+        and repository.get("full_name") == policy.repository,
+        "originating workflow identity, source, attempt, or state is wrong",
+    )
+    expected = settings_evidence_sha256(
+        policy.repository,
+        intent["release_sha"],
+        run_id,
+        run_attempt,
+    )
+    require(
+        intent["ruleset_evidence_sha256"] == expected,
+        "ruleset evidence digest does not bind the originating workflow",
+    )
 
 
 def validate_release_set(api: Api, policy: Policy, payload: dict[str, Any], intent: dict[str, Any]) -> None:
@@ -430,12 +437,12 @@ def validate_release_set(api: Api, policy: Policy, payload: dict[str, Any], inte
     for release_entry, package, tag_intent in zip(payload["releases"], plan_packages, intent_tags, strict=True):
         release = api.github_json(f"repos/{policy.repository}/releases/{release_entry['release_id']}")
         require(type(release) is dict, "GitHub Release response is invalid")
+        require_string(release.get("target_commitish"), "GitHub Release target_commitish", 256)
         author = release.get("author")
         require(type(author) is dict, "GitHub Release author is missing")
         require(
             release.get("id") == release_entry["release_id"]
             and release.get("tag_name") == package["tag"]
-            and release.get("target_commitish") == policy.default_branch
             and release.get("name") == package["tag"]
             and release.get("body") == package["release_body"]
             and release.get("draft") is False
@@ -565,6 +572,7 @@ def validate_event(event: dict[str, Any], policy: Policy, api: Api, repository: 
         seen_tags.add(release["tag"])
     check = api.github_json(f"repos/{policy.repository}/check-runs/{payload['intent_check_id']}")
     intent = validate_intent(check, policy, payload)
+    validate_origin_run(api, policy, intent)
     validate_registry(api, policy, intent["plan"])
     validate_release_set(api, policy, payload, intent)
     replay_document = {

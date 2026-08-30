@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import legacy_release_preflight as legacy
+import release_evidence as evidence
 import release_notification_preflight as preflight
 
 
@@ -47,13 +48,21 @@ def source_archive(package: str, version: str, commit: str, path_in_vcs: str) ->
         {"git": {"sha1": commit}, "path_in_vcs": path_in_vcs}
     ).encode()
     output = io.BytesIO()
-    with tarfile.open(fileobj=output, mode="w:gz") as archive:
+    with tarfile.open(
+        fileobj=output,
+        mode="w:gz",
+        format=tarfile.GNU_FORMAT,
+    ) as archive:
         info = tarfile.TarInfo(f"{package}-{version}/.cargo_vcs_info.json")
         info.size = len(vcs)
+        info.mode = 0o644
+        info.mtime = evidence.CARGO_ARCHIVE_MTIME
         archive.addfile(info, io.BytesIO(vcs))
         source = b"pub fn historical_source_fixture() {}\n"
         info = tarfile.TarInfo(f"{package}-{version}/src/lib.rs")
         info.size = len(source)
+        info.mode = 0o644
+        info.mtime = evidence.CARGO_ARCHIVE_MTIME
         archive.addfile(info, io.BytesIO(source))
     return output.getvalue()
 

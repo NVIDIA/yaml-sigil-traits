@@ -23,6 +23,9 @@ from unittest import mock
 
 MODULE_PATH = pathlib.Path(__file__).with_name("protected_pr_ci.py")
 VERIFIER_PATH = MODULE_PATH.with_name("protected_checkout.py")
+TERMINAL_DRIVER_PATH = MODULE_PATH.with_name("terminal_candidate.py")
+TERMINAL_SHELL_PATH = MODULE_PATH.with_name("run-terminal-candidate.sh")
+TERMINAL_WINDOWS_PATH = MODULE_PATH.with_name("run-terminal-candidate-windows.ps1")
 COMMIT_POLICY_PATH = MODULE_PATH.with_name("check-pull-request-commits.sh")
 POLICY_PATH = MODULE_PATH.parent.parent / "protected-pr-ci.json"
 COMMAND_WORKFLOW_PATH = MODULE_PATH.parent.parent / "workflows" / "pr-ci-command.yml"
@@ -46,6 +49,13 @@ assert VERIFIER_SPEC is not None and VERIFIER_SPEC.loader is not None
 verifier = importlib.util.module_from_spec(VERIFIER_SPEC)
 sys.modules[VERIFIER_SPEC.name] = verifier
 VERIFIER_SPEC.loader.exec_module(verifier)
+TERMINAL_SPEC = importlib.util.spec_from_file_location(
+    "terminal_candidate", TERMINAL_DRIVER_PATH
+)
+assert TERMINAL_SPEC is not None and TERMINAL_SPEC.loader is not None
+terminal_candidate = importlib.util.module_from_spec(TERMINAL_SPEC)
+sys.modules[TERMINAL_SPEC.name] = terminal_candidate
+TERMINAL_SPEC.loader.exec_module(terminal_candidate)
 
 
 REPOSITORY = "NVIDIA/yaml-sigil-example"
@@ -57,6 +67,7 @@ HEAD_TREE_SHA = "e" * 40
 BASE_BLOB_SHA = "1" * 40
 HEAD_BLOB_SHA = "2" * 40
 DIRECTORY_TREE_SHA = "f" * 40
+SPEC_MAIN_SHA = "6" * 40
 RUN_ID = 101
 RUN_ATTEMPT = 1
 WORKFLOW_ID = 701
@@ -75,7 +86,7 @@ MAINTAINER = "maintainer"
 
 def policy() -> dict:
     return {
-        "version": 3,
+        "version": 4,
         "repository": REPOSITORY,
         "repository_kind": "traits",
         "default_branch": "main",
@@ -97,6 +108,13 @@ def policy() -> dict:
         },
         "expected_jobs": ["commit_policy", "workflow_lint", "candidate_ci"],
         "supplemental_candidate_ci": True,
+        "trusted_gitlinks": [
+            {
+                "path": "source-spec",
+                "repository": "NVIDIA/yaml-sigil-spec",
+                "branch": "main",
+            }
+        ],
     }
 
 
@@ -354,6 +372,8 @@ class FakeAuthorizationApi:
         self.main_reads = 0
         self.pull_reads = 0
         self.final_pull = None
+        self.spec_main_sha = SPEC_MAIN_SHA
+        self.comparisons = {}
         self.pull = {
             "number": 7,
             "state": "open",
@@ -371,6 +391,14 @@ class FakeAuthorizationApi:
             "changed_files": 1,
             "commits": 1,
             "maintainer_can_modify": True,
+        }
+
+    def allow_ancestry(self, ancestor: str, descendant: str) -> None:
+        self.comparisons[(ancestor, descendant)] = {
+            "status": "ahead",
+            "merge_base_commit": {"sha": ancestor},
+            "base_commit": {"sha": ancestor},
+            "head_commit": {"sha": descendant},
         }
 
     def set_tree_files(
@@ -407,6 +435,12 @@ class FakeAuthorizationApi:
         if "/collaborators/" in path and path.endswith("/permission"):
             login = path.split("/collaborators/", 1)[1].rsplit("/permission", 1)[0]
             return {"permission": self.permissions.get(login, "none")}
+        if path == "/repos/NVIDIA/yaml-sigil-spec/git/ref/heads/main":
+            return {"object": {"type": "commit", "sha": self.spec_main_sha}}
+        if path.startswith("/repos/NVIDIA/yaml-sigil-spec/compare/"):
+            pair = path.rsplit("/", 1)[1]
+            ancestor, descendant = pair.split("...", 1)
+            return copy.deepcopy(self.comparisons[(ancestor, descendant)])
         if path.endswith("/git/ref/heads/main"):
             self.main_reads += 1
             if self.main_reads == self.main_error_on_read:
@@ -519,6 +553,22 @@ class AuthorizationTests(unittest.TestCase):
                 self.assertTrue(controller.is_sensitive_path(path, kind))
 
     def test_spec_and_rs_classifier_extensions_are_explicit(self) -> None:
+        for path in (
+            "proto/buf.yaml",
+            "proto/buf.lock",
+            "proto/buf.gen.yaml",
+            "ＰＲＯＴＯ/ＢＵＦ.YAML",
+        ):
+            with self.subTest(spec_buf_policy=path):
+                self.assertTrue(controller.is_sensitive_path(path, "spec"))
+        for path in (
+            "buf.yaml",
+            "nested/proto/buf.yaml",
+            "proto/buf.yaml.example",
+            "proto/readme.md",
+        ):
+            with self.subTest(spec_buf_near_miss=path):
+                self.assertFalse(controller.is_sensitive_path(path, "spec"))
         self.assertTrue(
             controller.is_sensitive_path(
                 "conformance/rebuild-rs/vendor/acvp/vectors.json", "spec"
@@ -696,7 +746,6 @@ class AuthorizationTests(unittest.TestCase):
             ("nested/ＢＥＮＣＨＥＳ", ("blob", "120000", HEAD_BLOB_SHA)),
             ("examples", ("blob", "120000", HEAD_BLOB_SHA)),
             ("nested/ＥＸＡＭＰＬＥＳ", ("blob", "120000", HEAD_BLOB_SHA)),
-            ("source-spec", ("commit", "160000", HEAD_BLOB_SHA)),
             ("source-spec/README.md", ("blob", "100644", HEAD_BLOB_SHA)),
         ):
             with self.subTest(path=path, entry_type=leaf[0]):
@@ -710,6 +759,84 @@ class AuthorizationTests(unittest.TestCase):
                 api.comment = copy.deepcopy(approval["comment"])
                 result = controller.authorize(approval, policy(), api, environment())
                 self.assertEqual(result.head_sha, HEAD_SHA)
+
+    def test_changed_gitlink_requires_adoption_and_approved_forward_lineage(self) -> None:
+        api = FakeAuthorizationApi()
+        api.set_tree_files(
+            {"source-spec": ("commit", "160000", BASE_BLOB_SHA)},
+            {"source-spec": ("commit", "160000", HEAD_BLOB_SHA)},
+        )
+        api.allow_ancestry(BASE_BLOB_SHA, HEAD_BLOB_SHA)
+        api.allow_ancestry(HEAD_BLOB_SHA, SPEC_MAIN_SHA)
+
+        with self.assertRaisesRegex(controller.PolicyError, "sensitive changes require"):
+            controller.authorize(event(), policy(), api, environment())
+
+        result = authorize_fixture(api, adoption_event())
+        self.assertTrue(result.sensitive)
+        self.assertIn(
+            "/repos/NVIDIA/yaml-sigil-spec/compare/"
+            f"{HEAD_BLOB_SHA}...{SPEC_MAIN_SHA}",
+            api.get_paths,
+        )
+
+    def test_unchanged_gitlink_uses_the_protected_base_pin(self) -> None:
+        api = FakeAuthorizationApi()
+        source_spec = ("commit", "160000", BASE_BLOB_SHA)
+        api.set_tree_files(
+            {
+                "source-spec": source_spec,
+                "README.md": ("blob", "100644", BASE_BLOB_SHA),
+            },
+            {
+                "source-spec": source_spec,
+                "README.md": ("blob", "100644", HEAD_BLOB_SHA),
+            },
+        )
+
+        result = controller.authorize(event(), policy(), api, environment())
+        self.assertFalse(result.sensitive)
+        self.assertFalse(any("/compare/" in path for path in api.get_paths))
+
+    def test_gitlink_lineage_rejects_downgrades_and_fork_only_commits(self) -> None:
+        for failure in ("downgrade", "fork-only"):
+            with self.subTest(failure=failure):
+                api = FakeAuthorizationApi()
+                api.set_tree_files(
+                    {"source-spec": ("commit", "160000", BASE_BLOB_SHA)},
+                    {"source-spec": ("commit", "160000", HEAD_BLOB_SHA)},
+                )
+                api.allow_ancestry(BASE_BLOB_SHA, HEAD_BLOB_SHA)
+                api.allow_ancestry(HEAD_BLOB_SHA, SPEC_MAIN_SHA)
+                if failure == "downgrade":
+                    api.comparisons[(BASE_BLOB_SHA, HEAD_BLOB_SHA)][
+                        "merge_base_commit"
+                    ]["sha"] = HEAD_BLOB_SHA
+                else:
+                    api.comparisons[(HEAD_BLOB_SHA, SPEC_MAIN_SHA)][
+                        "merge_base_commit"
+                    ]["sha"] = OLD_SHA
+                with self.assertRaisesRegex(
+                    controller.PolicyError, "approved forward ancestry"
+                ):
+                    authorize_fixture(api, adoption_event())
+
+    def test_gitlink_lineage_rejects_untrusted_or_malformed_entries(self) -> None:
+        api = FakeAuthorizationApi()
+        api.set_tree_files(
+            {"other-spec": ("commit", "160000", BASE_BLOB_SHA)},
+            {"other-spec": ("commit", "160000", HEAD_BLOB_SHA)},
+        )
+        with self.assertRaisesRegex(controller.PolicyError, "trusted lineage policy"):
+            authorize_fixture(api, adoption_event())
+
+        api = FakeAuthorizationApi()
+        api.set_tree_files(
+            {"source-spec": ("commit", "160000", BASE_BLOB_SHA)},
+            {"source-spec": ("blob", "100644", HEAD_BLOB_SHA)},
+        )
+        with self.assertRaisesRegex(controller.PolicyError, "exact commit gitlink"):
+            authorize_fixture(api, adoption_event())
 
     def test_candidate_ci_directory_entries_match_any_leaf_type(self) -> None:
         for path, leaf in (
@@ -1575,6 +1702,39 @@ class ProtectedCheckoutTests(unittest.TestCase):
     def test_exact_sensitive_blob_and_head_are_accepted(self) -> None:
         self.verify()
 
+    def test_exact_sensitive_gitlink_is_verified_from_the_index(self) -> None:
+        source_sha = "6" * 40
+        self.run_git(
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            "160000",
+            source_sha,
+            "source-spec",
+        )
+        self.run_git("commit", "--quiet", "-m", "test: add exact gitlink")
+        self.head_sha = self.run_git("rev-parse", "HEAD").stdout.strip()
+        self.head_tree = controller.GitTree(
+            paths=self.head_tree.paths | {"source-spec"},
+            leaves={
+                **self.head_tree.leaves,
+                "source-spec": ("commit", "160000", source_sha),
+            },
+        )
+        self.verify()
+
+        self.head_tree = controller.GitTree(
+            paths=self.head_tree.paths,
+            leaves={
+                **self.head_tree.leaves,
+                "source-spec": ("commit", "160000", "7" * 40),
+            },
+        )
+        with self.assertRaisesRegex(
+            controller.PolicyError, "differs from its authorized Git entry"
+        ):
+            self.verify()
+
     def test_policy_staging_records_exact_files_digests_and_tools(self) -> None:
         destination = self.temporary_directory / "staged-policy"
         github_output = self.temporary_directory / "github-output"
@@ -1724,6 +1884,22 @@ class ProtectedCheckoutTests(unittest.TestCase):
 
 
 class WorkflowStructureTests(unittest.TestCase):
+    @staticmethod
+    def job_block(workflow: str, name: str) -> str:
+        lines = workflow.splitlines(keepends=True)
+        start = lines.index(f"  {name}:\n")
+        end = next(
+            (
+                index
+                for index in range(start + 1, len(lines))
+                if lines[index].startswith("  ")
+                and not lines[index].startswith("    ")
+                and lines[index].rstrip().endswith(":")
+            ),
+            len(lines),
+        )
+        return "".join(lines[start:end])
+
     def test_composite_verifier_is_the_first_post_checkout_step(self) -> None:
         action = CHECKOUT_ACTION_PATH.read_text(encoding="utf-8")
         stage = action.index("- name: Stage protected verifier and trusted tools")
@@ -1748,6 +1924,101 @@ class WorkflowStructureTests(unittest.TestCase):
         self.assertIn("binding_digest:", workflow)
         self.assertIn("--binding-digest", workflow)
         self.assertIn("results_json:", workflow)
+
+    def test_candidate_executing_jobs_are_terminal_and_action_free(self) -> None:
+        workflow = REUSABLE_WORKFLOW_PATH.read_text(encoding="utf-8")
+        config = json.loads(POLICY_PATH.read_text(encoding="utf-8"))
+        jobs = ["platform_verifier"]
+        jobs.extend(
+            ["rebuild_rs"]
+            if config["repository_kind"] == "spec"
+            else ["rust", "candidate_ci"]
+        )
+        for name in jobs:
+            block = self.job_block(workflow, name)
+            self.assertNotIn("uses:", block, name)
+            self.assertEqual(
+                sum(
+                    line.startswith("      - name:")
+                    for line in block.splitlines()
+                ),
+                1,
+                name,
+            )
+            self.assertIn("exec bash --noprofile --norc", block, name)
+            self.assertIn("run-terminal-candidate.sh", block, name)
+            self.assertIn('${GITHUB_ENV}', block, name)
+
+    def test_terminal_boundary_scrubs_and_separates_candidate_identity(self) -> None:
+        shell = TERMINAL_SHELL_PATH.read_text(encoding="utf-8")
+        windows = TERMINAL_WINDOWS_PATH.read_text(encoding="utf-8")
+        driver = TERMINAL_DRIVER_PATH.read_text(encoding="utf-8")
+        self.assertIn("sudo -n -u", shell)
+        self.assertIn('chmod 0700 "${command_directory}"', shell)
+        self.assertIn('pkill -KILL -u "${candidate_uid}"', shell)
+        for name in ("GITHUB_ENV", "GITHUB_PATH", "GITHUB_OUTPUT", "GITHUB_STEP_SUMMARY"):
+            self.assertIn(name, shell)
+        self.assertIn("runner command files do not share one protected directory", shell)
+        self.assertIn("disposable candidate identity could not be removed", shell)
+        self.assertIn("New-LocalUser", windows)
+        self.assertIn("$startInfo.Environment.Clear()", windows)
+        self.assertIn("'/deny'", windows)
+        self.assertIn("'/inheritance:r'", windows)
+        self.assertIn("(WD,AD,WEA,WA,DE,DC,WDAC,WO)", windows)
+        self.assertIn("Stop-CandidateProcesses", windows)
+        self.assertIn("Remove-LocalUser", windows)
+        self.assertIn("identity remains after removal", windows)
+        self.assertIn("require_command_files_inaccessible", driver)
+        self.assertIn("require_parent_process_isolated", driver)
+        self.assertIn("require_tree_read_only", driver)
+        self.assertIn("spawn_detached_canary", driver)
+
+    def test_terminal_setup_uses_elevated_and_native_paths(self) -> None:
+        shell = TERMINAL_SHELL_PATH.read_text(encoding="utf-8")
+        windows = TERMINAL_WINDOWS_PATH.read_text(encoding="utf-8")
+        self.assertIn("cygpath -w \"${trusted_git}\"", shell)
+        self.assertIn('--git "${verifier_git}"', shell)
+        self.assertIn('sudo -n chown -R "${candidate_uid}"', shell)
+        self.assertNotIn('\nchown -R "${candidate_uid}"', shell)
+        self.assertIn("mktemp -d /tmp/yaml-sigil-terminal.XXXXXX", shell)
+        self.assertIn('policy_root="${sandbox}/protected-policy"', shell)
+        self.assertIn('install -m 0555 "${trusted_cargo}"', shell)
+        self.assertIn('protected_validator="${trusted_cargo}"', shell)
+        self.assertIn("-Description 'Disposable YamlSigil candidate'", windows)
+        self.assertNotIn("candidate validation identity", windows)
+
+    def test_terminal_driver_rejects_runner_and_preload_environment(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"YAML_SIGIL_TERMINAL_CANDIDATE": "1"},
+            clear=True,
+        ):
+            terminal_candidate.require_minimal_environment()
+        for name in ("GITHUB_ENV", "ACTIONS_RUNTIME_TOKEN", "LD_PRELOAD"):
+            with self.subTest(name=name), mock.patch.dict(
+                os.environ,
+                {"YAML_SIGIL_TERMINAL_CANDIDATE": "1", name: "poison"},
+                clear=True,
+            ):
+                with self.assertRaises(terminal_candidate.IsolationError):
+                    terminal_candidate.require_minimal_environment()
+
+    def test_terminal_driver_rejects_reachable_command_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            command_file = pathlib.Path(directory) / "github_env"
+            command_file.write_text("", encoding="utf-8")
+            with self.assertRaises(terminal_candidate.IsolationError):
+                terminal_candidate.require_command_files_inaccessible(command_file)
+
+    def test_terminal_driver_rejects_writable_trusted_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            trusted_file = root / "trusted-tool"
+            trusted_file.write_bytes(b"tool")
+            with self.assertRaises(terminal_candidate.IsolationError):
+                terminal_candidate.require_tree_read_only(root, "trusted tree")
+            with self.assertRaises(terminal_candidate.IsolationError):
+                terminal_candidate.require_file_read_only(trusted_file, "trusted tool")
 
     def test_controller_token_jobs_compile_before_checks_only_tokens(self) -> None:
         command = COMMAND_WORKFLOW_PATH.read_text(encoding="utf-8")

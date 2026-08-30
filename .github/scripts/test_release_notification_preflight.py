@@ -44,15 +44,17 @@ def crate_archive(package: preflight.PackagePolicy, version: str, commit: str) -
         {"git": {"sha1": commit}, "path_in_vcs": package.path_in_vcs}
     ).encode()
     output = io.BytesIO()
-    with tarfile.open(fileobj=output, mode="w:gz") as archive:
+    with tarfile.open(fileobj=output, mode="w:gz", format=tarfile.GNU_FORMAT) as archive:
         info = tarfile.TarInfo(f"{package.name}-{version}/.cargo_vcs_info.json")
         info.size = len(vcs)
         info.mode = 0o644
+        info.mtime = 1_153_704_088
         archive.addfile(info, io.BytesIO(vcs))
         source = b"pub fn source_only_fixture() {}\n"
         info = tarfile.TarInfo(f"{package.name}-{version}/src/lib.rs")
         info.size = len(source)
         info.mode = 0o644
+        info.mtime = 1_153_704_088
         archive.addfile(info, io.BytesIO(source))
     return output.getvalue()
 
@@ -91,6 +93,12 @@ class Fixture:
         for index, package in enumerate(self.policy.packages):
             archive = crate_archive(package, self.version, self.captured_sha)
             digest = preflight.sha256(archive)
+            inventory_digest = preflight.inspect_archive(
+                archive,
+                package,
+                self.version,
+                self.captured_sha,
+            )
             self.archives[(package.name, self.version)] = archive
             body = f"### Changes\n\n- Source-only notes for {package.name}."
             body_digest = preflight.sha256(body.encode())
@@ -103,7 +111,7 @@ class Fixture:
                     "tag": tag,
                     "prerelease": True,
                     "source_archive_sha256": digest,
-                    "package_inventory_sha256": "2" * 64,
+                    "package_inventory_sha256": inventory_digest,
                     "release_body": body,
                     "release_body_sha256": body_digest,
                     "registry": {"state": "absent", "checksum": None},
@@ -206,7 +214,12 @@ class Fixture:
             "external_id": "6" * 64,
             "origin_run_id": 100,
             "origin_run_attempt": 1,
-            "ruleset_evidence_sha256": "7" * 64,
+            "ruleset_evidence_sha256": preflight.settings_evidence_sha256(
+                self.policy.repository,
+                self.captured_sha,
+                100,
+                1,
+            ),
             "plan": self.plan,
             "tags": intent_tags,
         }
@@ -238,10 +251,21 @@ class Fixture:
             "head_sha": self.captured_sha,
             "external_id": "6" * 64,
             "status": "completed",
-            "conclusion": "neutral",
+            "conclusion": "success",
             "app": {"id": self.policy.app_id, "slug": self.policy.app_slug, "extra": True},
             "output": {"title": preflight.INTENT_TITLE, "summary": preflight.canonical(self.intent), "text": None},
             "extra": True,
+        }
+        self.github[f"repos/{self.policy.repository}/actions/runs/100"] = {
+            "id": 100,
+            "run_attempt": 1,
+            "head_sha": self.captured_sha,
+            "head_branch": self.policy.default_branch,
+            "event": "workflow_dispatch",
+            "path": ".github/workflows/publish.yml",
+            "status": "in_progress",
+            "conclusion": None,
+            "repository": {"full_name": self.policy.repository},
         }
 
     def api(self) -> FakeApi:
@@ -325,6 +349,50 @@ class PreflightTests(unittest.TestCase):
         with self.assertRaises(preflight.PreflightError):
             fixture.validate()
 
+    def test_origin_run_and_recomputed_evidence_are_required(self) -> None:
+        fixture = Fixture()
+        fixture.github[f"repos/{fixture.policy.repository}/actions/runs/100"][
+            "run_attempt"
+        ] = 2
+        with self.assertRaisesRegex(preflight.PreflightError, "originating workflow"):
+            fixture.validate()
+
+        fixture = Fixture()
+        fixture.intent["ruleset_evidence_sha256"] = "0" * 64
+        fixture.github[f"repos/{fixture.policy.repository}/check-runs/900"]["output"][
+            "summary"
+        ] = preflight.canonical(fixture.intent)
+        with self.assertRaisesRegex(preflight.PreflightError, "ruleset evidence"):
+            fixture.validate()
+
+    def test_recomputed_archive_inventory_is_required(self) -> None:
+        fixture = Fixture()
+        fixture.plan["packages"][0]["package_inventory_sha256"] = "0" * 64
+        fixture.plan_digest = preflight.sha256(preflight.canonical(fixture.plan).encode())
+        fixture.intent["plan_digest"] = fixture.plan_digest
+        fixture.payload["release_plan_digest"] = fixture.plan_digest
+        fixture.github[f"repos/{fixture.policy.repository}/check-runs/900"]["output"][
+            "summary"
+        ] = preflight.canonical(fixture.intent)
+        with self.assertRaisesRegex(preflight.PreflightError, "crate inventory"):
+            fixture.validate()
+
+    def test_release_source_authority_is_the_exact_attested_tag(self) -> None:
+        fixture = Fixture()
+        release_id = fixture.payload["releases"][0]["release_id"]
+        fixture.github[f"repos/{fixture.policy.repository}/releases/{release_id}"][
+            "target_commitish"
+        ] = "a-non-authoritative-response-field"
+        self.assertEqual(fixture.validate()["authorized"], "true")
+
+        fixture = Fixture()
+        tag_object = fixture.payload["releases"][0]["tag_object_id"]
+        fixture.github[f"repos/{fixture.policy.repository}/git/tags/{tag_object}"]["object"][
+            "sha"
+        ] = "e" * 40
+        with self.assertRaisesRegex(preflight.PreflightError, "attested App object"):
+            fixture.validate()
+
     def test_archive_vcs_metadata_is_closed_and_commit_bound(self) -> None:
         fixture = Fixture()
         package = fixture.policy.packages[0]
@@ -339,13 +407,19 @@ class PreflightTests(unittest.TestCase):
 
         malformed = io.BytesIO()
         vcs = preflight.canonical({"git": "not-an-object", "path_in_vcs": package.path_in_vcs}).encode()
-        with tarfile.open(fileobj=malformed, mode="w:gz") as cargo:
+        with tarfile.open(
+            fileobj=malformed,
+            mode="w:gz",
+            format=tarfile.GNU_FORMAT,
+        ) as cargo:
             info = tarfile.TarInfo(
                 f"{package.name}-{fixture.version}/.cargo_vcs_info.json"
             )
             info.size = len(vcs)
+            info.mode = 0o644
+            info.mtime = 1_153_704_088
             cargo.addfile(info, io.BytesIO(vcs))
-        with self.assertRaisesRegex(preflight.PreflightError, "must be an object"):
+        with self.assertRaisesRegex(preflight.PreflightError, "VCS commit"):
             preflight.inspect_archive(
                 malformed.getvalue(),
                 package,

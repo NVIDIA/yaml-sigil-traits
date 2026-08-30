@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::bounded_process::{self, VALIDATION_OUTPUT_LIMITS};
-use crate::crate_archive::{CratesIo, Registry};
+use crate::crate_archive::{CratesIo, Registry, archive_inventory_sha256};
 use crate::github::consts::{APP_EMAIL, APP_ID, APP_LOGIN, APP_SLUG};
 use crate::github::release_objects::{
     ReleaseSpec, manifest_version, package_source, release_specs, require_reproduced_archive,
@@ -24,7 +24,6 @@ use crate::github::transport::{Transport, percent_encode};
 use crate::github::{
     append_outputs, git_output, is_positive_integer, is_sha, repository_policy_for_root,
 };
-use crate::package_content_policy::PACKAGE_SPECS;
 use crate::release_policy::detect;
 use crate::safe_file::TrustedRoot;
 
@@ -64,6 +63,7 @@ pub(super) struct FinalizeInput<'a> {
     pub(super) plan: &'a str,
     pub(super) plan_digest: &'a str,
     pub(super) intent: &'a str,
+    pub(super) intent_check_id: &'a str,
     pub(super) expected_app_slug: &'a str,
     pub(super) expected_installation_id: &'a str,
 }
@@ -494,12 +494,18 @@ fn observe_registry(
                     package.package
                 ));
             }
-            crate::crate_archive::inspect_archive_entries(
+            let entries = crate::crate_archive::inspect_archive_entries(
                 &archive,
                 package_policy,
                 &package.version,
                 &plan.release_sha,
             )?;
+            if archive_inventory_sha256(&entries) != package.package_inventory_sha256 {
+                return Err(format!(
+                    "{} registry archive inventory differs from the release plan",
+                    package.package
+                ));
+            }
             inspected[index] = true;
         }
     }
@@ -550,10 +556,13 @@ fn capture_plan(
     for spec in &specs {
         let archive = package_source(root, spec)?;
         let source_archive_sha256 = sha256(&archive);
-        let inventory = PACKAGE_SPECS
-            .iter()
-            .find(|item| item.name == spec.policy.package)
-            .ok_or_else(|| format!("{} lacks package-content policy", spec.policy.package))?;
+        let archive_entries = crate::crate_archive::inspect_archive_entries(
+            &archive,
+            spec.policy,
+            &spec.version,
+            commit,
+        )?;
+        let package_inventory_sha256 = archive_inventory_sha256(&archive_entries);
         let record = registry.exact_version(spec.policy.package, &spec.version)?;
         let registry = match record {
             None => RegistryBaseline {
@@ -580,7 +589,7 @@ fn capture_plan(
             tag: spec.tag.clone(),
             prerelease: spec.prerelease,
             source_archive_sha256,
-            package_inventory_sha256: sha256(inventory.inventory.as_bytes()),
+            package_inventory_sha256,
             release_body: spec.body.clone(),
             release_body_sha256: sha256(spec.body.as_bytes()),
             registry,
@@ -1005,7 +1014,7 @@ fn create_or_require_intent(
             "name": INTENT_NAME,
             "head_sha": record.release_sha,
             "status": "completed",
-            "conclusion": "neutral",
+            "conclusion": "success",
             "external_id": record.external_id,
             "output": {
                 "title": "Attested source-only release train",
@@ -1027,7 +1036,7 @@ fn validate_intent_check(
         || check.head_sha != record.release_sha
         || check.external_id != record.external_id
         || check.status != "completed"
-        || check.conclusion.as_deref() != Some("neutral")
+        || check.conclusion.as_deref() != Some("success")
         || check.app.id != APP_PUBLIC_ID
         || check.app.slug != APP_SLUG
         || check.output.title.as_deref() != Some("Attested source-only release train")
@@ -1107,6 +1116,7 @@ pub(super) fn finalize_command(
 ) -> Result<(), String> {
     let plan = decode_plan(input.plan, input.plan_digest)?;
     let intent = decode_intent(input.intent, &plan, input.plan_digest)?;
+    let intent_check_id = positive(input.intent_check_id, "intent Check ID")?;
     if plan.repository != input.repository {
         return Err("finalizer repository differs from the release plan".to_string());
     }
@@ -1142,12 +1152,18 @@ pub(super) fn finalize_command(
                     package.package
                 ));
             }
-            crate::crate_archive::inspect_archive_entries(
+            let entries = crate::crate_archive::inspect_archive_entries(
                 &archive,
                 package_policy,
                 &package.version,
                 &plan.release_sha,
             )?;
+            if archive_inventory_sha256(&entries) != package.package_inventory_sha256 {
+                return Err(format!(
+                    "{} registry archive inventory differs from the release plan",
+                    package.package
+                ));
+            }
             present += 1;
         } else {
             break;
@@ -1161,10 +1177,36 @@ pub(super) fn finalize_command(
             return Err("registry packages do not form the planned dependency prefix".to_string());
         }
     }
+    require_finalizer_intent(
+        github,
+        input.repository,
+        intent_check_id,
+        &intent,
+        input.intent,
+    )?;
+    let finalizer_intent = FinalizerIntent {
+        check_id: intent_check_id,
+        record: &intent,
+        body: input.intent,
+    };
     let mut entries = Vec::with_capacity(present);
     for (package, tag_intent) in plan.packages.iter().zip(&intent.tags).take(present) {
-        let tag_object_id = reconcile_tag(github, input.repository, &plan, package, tag_intent)?;
-        let release = reconcile_release(github, input.repository, package)?;
+        let tag_object_id = reconcile_tag(
+            github,
+            input.repository,
+            &plan,
+            package,
+            tag_intent,
+            &finalizer_intent,
+        )?;
+        let release = reconcile_release(
+            github,
+            input.repository,
+            &plan,
+            package,
+            tag_intent,
+            &finalizer_intent,
+        )?;
         entries.push(FinalizedEntry {
             package: package.package.clone(),
             version: package.version.clone(),
@@ -1187,6 +1229,160 @@ pub(super) fn finalize_command(
         ),
         ("finalized_entries", &entries_text),
     ])
+}
+
+fn require_finalizer_intent(
+    github: &mut impl Transport,
+    repository: &str,
+    check_id: u64,
+    intent: &IntentRecord,
+    intent_body: &str,
+) -> Result<(), String> {
+    let path = format!(
+        "repos/{repository}/commits/{}/check-runs?check_name={}&filter=all&per_page=100",
+        intent.release_sha,
+        percent_encode(INTENT_NAME)
+    );
+    let inventory: CheckRuns = github.get(&path)?;
+    if inventory.total_count != 1
+        || inventory.check_runs.len() != 1
+        || inventory.check_runs[0].id != check_id
+    {
+        return Err("finalizer intent Check is missing, duplicated, or incomplete".to_string());
+    }
+    validate_intent_check(&inventory.check_runs[0], intent, intent_body)?;
+    let check: CheckRun = github.get(&format!("repos/{repository}/check-runs/{check_id}"))?;
+    if check.id != check_id {
+        return Err("finalizer intent Check ID changed during re-read".to_string());
+    }
+    validate_intent_check(&check, intent, intent_body)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ReleaseObjectPackageIntent {
+    pub(super) package: String,
+    pub(super) version: String,
+    pub(super) tag: String,
+    pub(super) prerelease: bool,
+    pub(super) release_body: String,
+    pub(super) tag_object_id: String,
+    pub(super) tag_message: String,
+    pub(super) tagger_date: String,
+}
+
+pub(super) struct ReleaseObjectIntent {
+    check_id: u64,
+    record: IntentRecord,
+    body: String,
+    packages: Vec<ReleaseObjectPackageIntent>,
+}
+
+impl ReleaseObjectIntent {
+    pub(super) fn require_specs(
+        &self,
+        repository: &str,
+        release_sha: &str,
+        specs: &[ReleaseSpec<'_>],
+    ) -> Result<(), String> {
+        if self.record.repository != repository
+            || self.record.release_sha != release_sha
+            || self.packages.len() != specs.len()
+        {
+            return Err("release-object recovery differs from the App intent".to_string());
+        }
+        for (expected, spec) in self.packages.iter().zip(specs) {
+            if expected.package != spec.policy.package
+                || expected.version != spec.version
+                || expected.tag != spec.tag
+                || expected.prerelease != spec.prerelease
+                || expected.release_body != spec.body
+            {
+                return Err(format!(
+                    "release-object recovery for {} differs from the App intent",
+                    spec.policy.package
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn package(&self, package: &str) -> Result<&ReleaseObjectPackageIntent, String> {
+        self.packages
+            .iter()
+            .find(|item| item.package == package)
+            .ok_or_else(|| format!("release App intent lacks package {package}"))
+    }
+
+    pub(super) fn revalidate(
+        &self,
+        github: &mut impl Transport,
+        repository: &str,
+    ) -> Result<(), String> {
+        require_finalizer_intent(github, repository, self.check_id, &self.record, &self.body)
+    }
+}
+
+pub(super) fn release_object_intent(
+    github: &mut impl Transport,
+    repository: &str,
+    release_sha: &str,
+) -> Result<ReleaseObjectIntent, String> {
+    let path = format!(
+        "repos/{repository}/commits/{release_sha}/check-runs?check_name={}&filter=all&per_page=100",
+        percent_encode(INTENT_NAME)
+    );
+    let inventory: CheckRuns = github.get(&path)?;
+    if inventory.total_count != 1 || inventory.check_runs.len() != 1 {
+        return Err("release-object recovery requires one exact App intent Check".to_string());
+    }
+    let listed = inventory
+        .check_runs
+        .into_iter()
+        .next()
+        .ok_or_else(|| "release-object recovery intent inventory is empty".to_string())?;
+    let check: CheckRun = github.get(&format!("repos/{repository}/check-runs/{}", listed.id))?;
+    if check.id != listed.id {
+        return Err("release-object recovery intent Check ID changed".to_string());
+    }
+    let body = check
+        .output
+        .summary
+        .clone()
+        .ok_or_else(|| "release-object recovery intent body is absent".to_string())?;
+    if body.is_empty() || body.len() > MAX_INTENT_BYTES {
+        return Err("release-object recovery intent body is empty or oversized".to_string());
+    }
+    let preliminary: IntentRecord = serde_json::from_str(&body)
+        .map_err(|error| format!("release-object recovery intent is invalid: {error}"))?;
+    let (plan_body, plan_digest) = encode_plan(&preliminary.plan)?;
+    let plan = decode_plan(&plan_body, &plan_digest)?;
+    let record = decode_intent(&body, &plan, &plan_digest)?;
+    if record.repository != repository || record.release_sha != release_sha {
+        return Err("release-object recovery intent source is wrong".to_string());
+    }
+    validate_intent_check(&listed, &record, &body)?;
+    validate_intent_check(&check, &record, &body)?;
+    let packages = plan
+        .packages
+        .iter()
+        .zip(&record.tags)
+        .map(|(package, tag)| ReleaseObjectPackageIntent {
+            package: package.package.clone(),
+            version: package.version.clone(),
+            tag: package.tag.clone(),
+            prerelease: package.prerelease,
+            release_body: package.release_body.clone(),
+            tag_object_id: tag.tag_object_id.clone(),
+            tag_message: tag.tag_message.clone(),
+            tagger_date: plan.tagger_date.clone(),
+        })
+        .collect();
+    Ok(ReleaseObjectIntent {
+        check_id: check.id,
+        record,
+        body,
+        packages,
+    })
 }
 
 fn release_policy_for_repository(
@@ -1251,12 +1447,19 @@ struct TagTarget {
     sha: String,
 }
 
+struct FinalizerIntent<'a> {
+    check_id: u64,
+    record: &'a IntentRecord,
+    body: &'a str,
+}
+
 fn reconcile_tag(
     github: &mut impl Transport,
     repository: &str,
     plan: &ReleasePlan,
     package: &PlanPackage,
     intent: &TagIntent,
+    finalizer: &FinalizerIntent<'_>,
 ) -> Result<String, String> {
     let object_path = format!("repos/{repository}/git/tags/{}", intent.tag_object_id);
     let object = github.get_optional::<AnnotatedTag>(&object_path)?;
@@ -1279,6 +1482,13 @@ fn reconcile_tag(
         return Ok(intent.tag_object_id.clone());
     }
     if object.is_none() {
+        require_finalizer_intent(
+            github,
+            repository,
+            finalizer.check_id,
+            finalizer.record,
+            finalizer.body,
+        )?;
         let created: AnnotatedTag = github.mutate(
             "POST",
             &format!("repos/{repository}/git/tags"),
@@ -1296,6 +1506,13 @@ fn reconcile_tag(
         )?;
         validate_tag_object(&created, plan, package, intent)?;
     }
+    require_finalizer_intent(
+        github,
+        repository,
+        finalizer.check_id,
+        finalizer.record,
+        finalizer.body,
+    )?;
     let created: crate::github::models::GitRef = github.mutate(
         "POST",
         &format!("repos/{repository}/git/refs"),
@@ -1358,9 +1575,10 @@ struct ReleaseAuthor {
     kind: String,
 }
 
-fn release_create_payload(package: &PlanPackage) -> Value {
+fn release_create_payload(package: &PlanPackage, release_sha: &str) -> Value {
     json!({
         "tag_name": package.tag,
+        "target_commitish": release_sha,
         "name": package.tag,
         "body": package.release_body,
         "draft": false,
@@ -1371,7 +1589,10 @@ fn release_create_payload(package: &PlanPackage) -> Value {
 fn reconcile_release(
     github: &mut impl Transport,
     repository: &str,
+    plan: &ReleasePlan,
     package: &PlanPackage,
+    tag_intent: &TagIntent,
+    finalizer: &FinalizerIntent<'_>,
 ) -> Result<Release, String> {
     let path = format!(
         "repos/{repository}/releases/tags/{}",
@@ -1379,12 +1600,20 @@ fn reconcile_release(
     );
     if let Some(release) = github.get_optional::<Release>(&path)? {
         validate_release(&release, package)?;
+        require_attested_tag(github, repository, plan, package, tag_intent)?;
         return Ok(release);
     }
+    require_finalizer_intent(
+        github,
+        repository,
+        finalizer.check_id,
+        finalizer.record,
+        finalizer.body,
+    )?;
     let release: Release = github.mutate(
         "POST",
         &format!("repos/{repository}/releases"),
-        &release_create_payload(package),
+        &release_create_payload(package, &plan.release_sha),
     )?;
     validate_release(&release, package)?;
     let readback: Release = github.get(&path)?;
@@ -1392,13 +1621,47 @@ fn reconcile_release(
     if readback.id != release.id {
         return Err("GitHub Release identity changed during readback".to_string());
     }
+    require_attested_tag(github, repository, plan, package, tag_intent)?;
     Ok(readback)
 }
 
+fn require_attested_tag(
+    github: &mut impl Transport,
+    repository: &str,
+    plan: &ReleasePlan,
+    package: &PlanPackage,
+    intent: &TagIntent,
+) -> Result<(), String> {
+    let ref_path = format!(
+        "repos/{repository}/git/ref/tags/{}",
+        percent_encode(&package.tag)
+    );
+    let reference: crate::github::models::GitRef = github.get(&ref_path)?;
+    if reference.name != format!("refs/tags/{}", package.tag)
+        || reference.object.kind != "tag"
+        || reference.object.sha != intent.tag_object_id
+    {
+        return Err(format!(
+            "annotated tag {} changed during Release reconciliation",
+            package.tag
+        ));
+    }
+    let object: AnnotatedTag = github.get(&format!(
+        "repos/{repository}/git/tags/{}",
+        intent.tag_object_id
+    ))?;
+    validate_tag_object(&object, plan, package, intent)
+}
+
 fn validate_release(release: &Release, package: &PlanPackage) -> Result<(), String> {
+    // GitHub documents target_commitish as unused when the annotated tag
+    // already exists. The exact attested tag ref/object is the source
+    // authority; this response field is accepted only as bounded API data.
     if release.id == 0
         || release.tag_name != package.tag
-        || release.target_commitish != "main"
+        || release.target_commitish.is_empty()
+        || release.target_commitish.len() > 256
+        || release.target_commitish.contains(['\0', '\r', '\n'])
         || release.name != package.tag
         || release.body != package.release_body
         || sha256(release.body.as_bytes()) != package.release_body_sha256
@@ -1578,6 +1841,7 @@ fn sha256(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::github::transport::fake::{Expected, FakeTransport};
 
     struct MissingRegistry {
         reads: usize,
@@ -1633,6 +1897,47 @@ mod tests {
         }
     }
 
+    fn intent_fixture() -> (ReleasePlan, IntentRecord, String) {
+        let plan = plan();
+        let (_, plan_digest) = encode_plan(&plan).unwrap();
+        let intent = IntentRecord {
+            schema_version: INTENT_SCHEMA,
+            repository: plan.repository.clone(),
+            release_sha: plan.release_sha.clone(),
+            plan_digest,
+            external_id: "6".repeat(64),
+            origin_run_id: 100,
+            origin_run_attempt: 1,
+            ruleset_evidence_sha256: "7".repeat(64),
+            plan: plan.clone(),
+            tags: vec![TagIntent {
+                package: plan.packages[0].package.clone(),
+                tag: plan.packages[0].tag.clone(),
+                tag_object_id: "8".repeat(40),
+                tag_message: "chore: Release package yaml-sigil-traits version 0.4.0".to_string(),
+                release_body_sha256: plan.packages[0].release_body_sha256.clone(),
+            }],
+        };
+        let body = canonical_intent(&intent).unwrap();
+        (plan, intent, body)
+    }
+
+    fn intent_check(intent: &IntentRecord, body: &str, id: u64, conclusion: &str) -> Value {
+        json!({
+            "id": id,
+            "name": INTENT_NAME,
+            "head_sha": intent.release_sha,
+            "external_id": intent.external_id,
+            "status": "completed",
+            "conclusion": conclusion,
+            "app": {"id": APP_PUBLIC_ID, "slug": APP_SLUG},
+            "output": {
+                "title": "Attested source-only release train",
+                "summary": body,
+            },
+        })
+    }
+
     #[test]
     fn release_plan_rejects_unknown_noncanonical_and_wrong_digest_inputs() {
         let plan = plan();
@@ -1675,11 +1980,185 @@ mod tests {
     }
 
     #[test]
-    fn release_creation_omits_target_commitish_even_when_main_advances() {
+    fn release_creation_binds_implicit_tag_creation_to_the_release_commit() {
         let package = plan().packages.remove(0);
-        let payload = release_create_payload(&package);
+        let release_sha = "a".repeat(40);
+        let payload = release_create_payload(&package, &release_sha);
         assert_eq!(payload["tag_name"], "v0.4.0");
-        assert!(payload.get("target_commitish").is_none());
+        assert_eq!(payload["target_commitish"], release_sha);
+    }
+
+    #[test]
+    fn release_reconciliation_rereads_the_exact_attested_tag() {
+        let (plan, intent, _) = intent_fixture();
+        let package = &plan.packages[0];
+        let tag = &intent.tags[0];
+        let ref_path = format!(
+            "repos/{}/git/ref/tags/{}",
+            plan.repository,
+            percent_encode(&package.tag)
+        );
+        let object_path = format!("repos/{}/git/tags/{}", plan.repository, tag.tag_object_id);
+        let reference = json!({
+            "ref": format!("refs/tags/{}", package.tag),
+            "object": {"type": "tag", "sha": tag.tag_object_id},
+        });
+        let object = json!({
+            "sha": tag.tag_object_id,
+            "tag": package.tag,
+            "message": tag.tag_message,
+            "tagger": {
+                "name": APP_LOGIN,
+                "email": APP_EMAIL,
+                "date": plan.tagger_date,
+            },
+            "object": {"type": "commit", "sha": plan.release_sha},
+        });
+        let mut github = FakeTransport::new([
+            Expected::json("GET", &ref_path, reference),
+            Expected::json("GET", &object_path, object),
+        ]);
+        require_attested_tag(&mut github, &plan.repository, &plan, package, tag).unwrap();
+        github.finish();
+
+        let moved = json!({
+            "ref": format!("refs/tags/{}", package.tag),
+            "object": {"type": "tag", "sha": "f".repeat(40)},
+        });
+        let mut github = FakeTransport::new([Expected::json("GET", &ref_path, moved)]);
+        assert!(
+            require_attested_tag(&mut github, &plan.repository, &plan, package, tag)
+                .unwrap_err()
+                .contains("changed")
+        );
+        github.finish();
+    }
+
+    #[test]
+    fn finalizer_rereads_one_exact_successful_app_intent() {
+        let (_, intent, body) = intent_fixture();
+        let check = intent_check(&intent, &body, 900, "success");
+        let inventory_path = format!(
+            "repos/{}/commits/{}/check-runs?check_name={}&filter=all&per_page=100",
+            intent.repository,
+            intent.release_sha,
+            percent_encode(INTENT_NAME)
+        );
+        let check_path = format!("repos/{}/check-runs/900", intent.repository);
+        let mut github = FakeTransport::new([
+            Expected::json(
+                "GET",
+                &inventory_path,
+                json!({"total_count": 1, "check_runs": [check.clone()]}),
+            ),
+            Expected::json("GET", &check_path, check),
+        ]);
+        require_finalizer_intent(&mut github, &intent.repository, 900, &intent, &body).unwrap();
+        github.finish();
+
+        let duplicate = intent_check(&intent, &body, 901, "success");
+        let mut github = FakeTransport::new([Expected::json(
+            "GET",
+            &inventory_path,
+            json!({
+                "total_count": 2,
+                "check_runs": [intent_check(&intent, &body, 900, "success"), duplicate],
+            }),
+        )]);
+        assert!(
+            require_finalizer_intent(&mut github, &intent.repository, 900, &intent, &body)
+                .unwrap_err()
+                .contains("duplicated")
+        );
+        github.finish();
+    }
+
+    #[test]
+    fn recovery_loads_one_exact_successful_app_intent() {
+        let (plan, intent, body) = intent_fixture();
+        let check = intent_check(&intent, &body, 900, "success");
+        let inventory_path = format!(
+            "repos/{}/commits/{}/check-runs?check_name={}&filter=all&per_page=100",
+            intent.repository,
+            intent.release_sha,
+            percent_encode(INTENT_NAME)
+        );
+        let check_path = format!("repos/{}/check-runs/900", intent.repository);
+        let mut github = FakeTransport::new([
+            Expected::json(
+                "GET",
+                &inventory_path,
+                json!({"total_count": 1, "check_runs": [check.clone()]}),
+            ),
+            Expected::json("GET", &check_path, check),
+        ]);
+        let loaded =
+            release_object_intent(&mut github, &intent.repository, &intent.release_sha).unwrap();
+        let package = loaded.package(&plan.packages[0].package).unwrap();
+        assert_eq!(package.tag_object_id, intent.tags[0].tag_object_id);
+        assert_eq!(package.tagger_date, plan.tagger_date);
+        github.finish();
+
+        let duplicate = intent_check(&intent, &body, 901, "success");
+        let mut github = FakeTransport::new([Expected::json(
+            "GET",
+            &inventory_path,
+            json!({
+                "total_count": 2,
+                "check_runs": [intent_check(&intent, &body, 900, "success"), duplicate],
+            }),
+        )]);
+        let error = release_object_intent(&mut github, &intent.repository, &intent.release_sha)
+            .err()
+            .expect("duplicate intent must fail");
+        assert!(error.contains("one exact"));
+        github.finish();
+    }
+
+    #[test]
+    fn failed_intent_blocks_tag_mutation_after_read_only_reconciliation() {
+        let (plan, intent, body) = intent_fixture();
+        let package = &plan.packages[0];
+        let tag = &intent.tags[0];
+        let object_path = format!("repos/{}/git/tags/{}", plan.repository, tag.tag_object_id);
+        let ref_path = format!(
+            "repos/{}/git/ref/tags/{}",
+            plan.repository,
+            percent_encode(&package.tag)
+        );
+        let inventory_path = format!(
+            "repos/{}/commits/{}/check-runs?check_name={}&filter=all&per_page=100",
+            plan.repository,
+            plan.release_sha,
+            percent_encode(INTENT_NAME)
+        );
+        let failed = intent_check(&intent, &body, 900, "failure");
+        let mut github = FakeTransport::new([
+            Expected::missing(&object_path),
+            Expected::missing(&ref_path),
+            Expected::json(
+                "GET",
+                &inventory_path,
+                json!({"total_count": 1, "check_runs": [failed]}),
+            ),
+        ]);
+        let finalizer = FinalizerIntent {
+            check_id: 900,
+            record: &intent,
+            body: &body,
+        };
+        assert!(
+            reconcile_tag(
+                &mut github,
+                &plan.repository,
+                &plan,
+                package,
+                tag,
+                &finalizer,
+            )
+            .is_err()
+        );
+        github.finish();
     }
 
     #[test]

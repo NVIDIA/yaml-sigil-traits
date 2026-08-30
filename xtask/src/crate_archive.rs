@@ -10,7 +10,7 @@ use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
-use flate2::read::GzDecoder;
+use flate2::bufread::GzDecoder;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -24,6 +24,7 @@ const MAX_TOTAL_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_CRATE_FILES: usize = 10_000;
 const MAX_CRATE_UNPACKED_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_CRATE_DECOMPRESSED_BYTES: u64 = 160 * 1024 * 1024;
+const TAR_BLOCK_BYTES: usize = 512;
 const READ_ATTEMPTS: usize = 3;
 pub(crate) const CARGO_ARCHIVE_MTIME: u64 = 1_153_704_088;
 const CARGO_ARCHIVE_MODES: &[u32] = &[0o644, 0o755];
@@ -35,6 +36,7 @@ const GNU_TYPEFLAG_OFFSET: usize = 156;
 const GNU_DEVICE_MAJOR_RANGE: std::ops::Range<usize> = 329..337;
 const GNU_DEVICE_MINOR_RANGE: std::ops::Range<usize> = 337..345;
 const USER_AGENT: &str = "yaml-sigil-release-workflow/1.0";
+type RequiredArchive = (String, Vec<u8>, BTreeMap<String, ArchiveFile>);
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub(crate) struct RegistryVersion {
@@ -239,7 +241,7 @@ pub(crate) fn require_archive(
     policy: &PackagePolicy,
     version: &str,
     commit: &str,
-) -> Result<(String, BTreeMap<String, ArchiveFile>), String> {
+) -> Result<RequiredArchive, String> {
     let record = registry
         .exact_version(policy.package, version)?
         .ok_or_else(|| format!("crates.io lacks {} {version}", policy.package))?;
@@ -258,7 +260,7 @@ pub(crate) fn require_archive(
         ));
     }
     let files = inspect_archive_entries(&archive, policy, version, commit)?;
-    Ok((record.checksum, files))
+    Ok((record.checksum, archive, files))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -269,6 +271,7 @@ pub(crate) struct ArchiveFile {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ArchiveMetadata {
+    header_sha256: String,
     entry_type: u8,
     mode: u32,
     uid: Vec<u8>,
@@ -308,6 +311,75 @@ pub(crate) fn inspect_archive_entries(
         Some(commit),
         MAX_CRATE_DECOMPRESSED_BYTES,
     )
+}
+
+pub(crate) fn archive_inventory_sha256(files: &BTreeMap<String, ArchiveFile>) -> String {
+    let mut digest = Sha256::new();
+    inventory_value(&mut digest, b"yaml-sigil-crate-inventory-v1");
+    for (path, file) in files {
+        inventory_value(&mut digest, path.as_bytes());
+        inventory_value(
+            &mut digest,
+            format!("header-sha256={}", file.metadata.header_sha256).as_bytes(),
+        );
+        inventory_value(
+            &mut digest,
+            format!("entry-type={}", file.metadata.entry_type).as_bytes(),
+        );
+        inventory_value(
+            &mut digest,
+            format!("mode={}", file.metadata.mode).as_bytes(),
+        );
+        inventory_value(
+            &mut digest,
+            format!("uid={}", hex(&file.metadata.uid)).as_bytes(),
+        );
+        inventory_value(
+            &mut digest,
+            format!("gid={}", hex(&file.metadata.gid)).as_bytes(),
+        );
+        inventory_value(
+            &mut digest,
+            format!("mtime={}", file.metadata.mtime).as_bytes(),
+        );
+        inventory_value(
+            &mut digest,
+            format!("username={}", hex(&file.metadata.username)).as_bytes(),
+        );
+        inventory_value(
+            &mut digest,
+            format!("groupname={}", hex(&file.metadata.groupname)).as_bytes(),
+        );
+        inventory_value(
+            &mut digest,
+            format!("device-major={}", hex(&file.metadata.device_major)).as_bytes(),
+        );
+        inventory_value(
+            &mut digest,
+            format!("device-minor={}", hex(&file.metadata.device_minor)).as_bytes(),
+        );
+        inventory_value(&mut digest, format!("size={}", file.body.len()).as_bytes());
+        inventory_value(
+            &mut digest,
+            format!("sha256={:x}", Sha256::digest(&file.body)).as_bytes(),
+        );
+    }
+    format!("{:x}", digest.finalize())
+}
+
+fn inventory_value(digest: &mut Sha256, value: &[u8]) {
+    digest.update(value);
+    digest.update([0]);
+}
+
+fn hex(value: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(value.len() * 2);
+    for byte in value {
+        encoded.push(DIGITS[(byte >> 4) as usize] as char);
+        encoded.push(DIGITS[(byte & 0x0f) as usize] as char);
+    }
+    encoded
 }
 
 pub(crate) fn archive_vcs_commit(
@@ -355,13 +427,14 @@ fn inspect_archive_entries_with_limit(
         ));
     }
     let prefix = format!("{}-{version}", policy.package);
-    let decoder = GzDecoder::new(Cursor::new(archive));
-    let stream_limit = decompressed_limit + 1;
-    let mut package = tar::Archive::new(decoder.take(stream_limit));
-    let inspection = (|| {
+    let decompressed = decompress_single_gzip(archive, policy.package, decompressed_limit)?;
+    validate_tar_termination(&decompressed, policy.package)?;
+    let mut package = tar::Archive::new(Cursor::new(&decompressed));
+    (|| {
         let entries = package
             .entries()
-            .map_err(|error| format!("{} source archive is invalid: {error}", policy.package))?;
+            .map_err(|error| format!("{} source archive is invalid: {error}", policy.package))?
+            .raw(true);
         let mut files = BTreeMap::new();
         let mut count = 0usize;
         let mut total = 0u64;
@@ -395,11 +468,11 @@ fn inspect_archive_entries_with_limit(
                 ));
             }
             let raw_path = entry.path_bytes();
-            let raw_path = std::str::from_utf8(&raw_path)
+            let path = std::str::from_utf8(&raw_path)
                 .map_err(|_| format!("{} source archive has a non-UTF-8 path", policy.package))?
                 .to_string();
-            let path = raw_path.strip_suffix('/').unwrap_or(&raw_path);
-            validate_archive_path(path, &prefix, policy.package)?;
+            validate_raw_header_path(entry.header(), &path, policy.package)?;
+            validate_archive_path(&path, &prefix, policy.package)?;
             let metadata = cargo_archive_metadata(entry.header(), policy.package)?;
             let relative = path
                 .strip_prefix(&format!("{prefix}/"))
@@ -437,23 +510,82 @@ fn inspect_archive_entries_with_limit(
             ));
         }
         Ok(files)
-    })();
+    })()
+}
 
-    let mut stream = package.into_inner();
-    let drain = std::io::copy(&mut stream, &mut std::io::sink());
-    if stream_limit - stream.limit() > decompressed_limit {
+fn decompress_single_gzip(
+    archive: &[u8],
+    package: &str,
+    decompressed_limit: u64,
+) -> Result<Vec<u8>, String> {
+    let mut decoder = GzDecoder::new(Cursor::new(archive));
+    let mut decompressed = Vec::new();
+    decoder
+        .by_ref()
+        .take(decompressed_limit + 1)
+        .read_to_end(&mut decompressed)
+        .map_err(|error| format!("{package} source archive gzip stream is invalid: {error}"))?;
+    if decompressed.len() as u64 > decompressed_limit {
+        return Err(format!("{package} source archive expands beyond its limit"));
+    }
+    let consumed = decoder.into_inner().position();
+    if consumed != archive.len() as u64 {
         return Err(format!(
-            "{} source archive expands beyond its limit",
-            policy.package
+            "{package} source archive contains another gzip member or trailing bytes"
         ));
     }
-    drain.map_err(|error| {
-        format!(
-            "{} source archive decompressed stream is unreadable: {error}",
-            policy.package
-        )
-    })?;
-    inspection
+    Ok(decompressed)
+}
+
+fn validate_tar_termination(tar: &[u8], package: &str) -> Result<(), String> {
+    if tar.len() < TAR_BLOCK_BYTES * 2 || !tar.len().is_multiple_of(TAR_BLOCK_BYTES) {
+        return Err(format!(
+            "{package} source archive has a noncanonical tar length"
+        ));
+    }
+    let mut offset = 0usize;
+    while offset < tar.len() {
+        let header = &tar[offset..offset + TAR_BLOCK_BYTES];
+        if header.iter().all(|byte| *byte == 0) {
+            let second = tar
+                .get(offset + TAR_BLOCK_BYTES..offset + TAR_BLOCK_BYTES * 2)
+                .ok_or_else(|| {
+                    format!("{package} source archive lacks its canonical tar terminator")
+                })?;
+            if !second.iter().all(|byte| *byte == 0)
+                || tar[offset + TAR_BLOCK_BYTES * 2..]
+                    .iter()
+                    .any(|byte| *byte != 0)
+            {
+                return Err(format!(
+                    "{package} source archive contains records after its tar terminator"
+                ));
+            }
+            return Ok(());
+        }
+        let header = tar::Header::from_byte_slice(header);
+        let size = header.entry_size().map_err(|error| {
+            format!("{package} source archive has an invalid physical entry size: {error}")
+        })?;
+        let padded = size
+            .checked_add((TAR_BLOCK_BYTES - 1) as u64)
+            .map(|value| value / TAR_BLOCK_BYTES as u64 * TAR_BLOCK_BYTES as u64)
+            .ok_or_else(|| format!("{package} source archive physical size overflowed"))?;
+        let next = (offset as u64)
+            .checked_add(TAR_BLOCK_BYTES as u64)
+            .and_then(|value| value.checked_add(padded))
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| format!("{package} source archive physical size overflowed"))?;
+        if next > tar.len() {
+            return Err(format!(
+                "{package} source archive contains a truncated physical entry"
+            ));
+        }
+        offset = next;
+    }
+    Err(format!(
+        "{package} source archive lacks its canonical tar terminator"
+    ))
 }
 
 fn cargo_archive_metadata(header: &tar::Header, package: &str) -> Result<ArchiveMetadata, String> {
@@ -523,6 +655,7 @@ fn cargo_archive_metadata(header: &tar::Header, package: &str) -> Result<Archive
         ));
     }
     Ok(ArchiveMetadata {
+        header_sha256: format!("{:x}", Sha256::digest(header.as_bytes())),
         entry_type,
         mode,
         uid,
@@ -533,6 +666,20 @@ fn cargo_archive_metadata(header: &tar::Header, package: &str) -> Result<Archive
         device_major,
         device_minor,
     })
+}
+
+fn validate_raw_header_path(header: &tar::Header, path: &str, package: &str) -> Result<(), String> {
+    let name = &header.as_bytes()[..100];
+    let length = name
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(name.len());
+    if &name[..length] != path.as_bytes() || name[length..].iter().any(|byte| *byte != 0) {
+        return Err(format!(
+            "{package} source archive contains a noncanonical raw path"
+        ));
+    }
+    Ok(())
 }
 
 fn cargo_zero_field(field: &[u8]) -> bool {
@@ -647,6 +794,7 @@ mod tests {
     use super::*;
     use flate2::Compression;
     use flate2::write::GzEncoder;
+    use std::io::Write as _;
 
     #[derive(Clone, Copy)]
     struct TestMetadata {
@@ -723,6 +871,12 @@ mod tests {
 
     fn archive(path: &str, vcs: &[u8]) -> Vec<u8> {
         archive_with_files(&[(path, vcs)])
+    }
+
+    fn recompress(body: &[u8]) -> Vec<u8> {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(body).unwrap();
+        encoder.finish().unwrap()
     }
 
     struct FixtureDirectory(std::path::PathBuf);
@@ -903,6 +1057,8 @@ mod tests {
         let root = format!("{package}-0.4.0");
         assert!(validate_archive_path(&format!("{root}/../escape"), &root, package).is_err());
         assert!(validate_archive_path("other-0.4.0/Cargo.toml", &root, package).is_err());
+        assert!(validate_archive_path(&format!("{root}/trailing/"), &root, package).is_err());
+        assert!(validate_archive_path(&format!("{root}//alias"), &root, package).is_err());
     }
 
     #[test]
@@ -1028,7 +1184,7 @@ mod tests {
         let commit = "a".repeat(40);
         let vcs = format!("{{\"git\":{{\"sha1\":\"{commit}\"}},\"path_in_vcs\":\"\"}}");
         let path = format!("{}-0.4.0/.cargo_vcs_info.json", package.package);
-        for entry_type in *b"23456" {
+        for entry_type in *b"1234567xgLKSV" {
             let bytes = archive_with_metadata(
                 &path,
                 vcs.as_bytes(),
@@ -1039,6 +1195,65 @@ mod tests {
             );
             assert!(inspect_archive(&bytes, package, "0.4.0", &commit).is_err());
         }
+    }
+
+    #[test]
+    fn second_gzip_member_and_trailing_bytes_are_rejected() {
+        let package = &crate::release_policy::TRAITS_POLICY.packages[0];
+        let commit = "a".repeat(40);
+        let vcs = format!("{{\"git\":{{\"sha1\":\"{commit}\"}},\"path_in_vcs\":\"\"}}");
+        let root = format!("{}-0.4.0", package.package);
+        let archive = archive(&format!("{root}/.cargo_vcs_info.json"), vcs.as_bytes());
+
+        let mut second_member = archive.clone();
+        second_member.extend_from_slice(&archive);
+        assert!(inspect_archive(&second_member, package, "0.4.0", &commit).is_err());
+
+        let mut trailing = archive;
+        trailing.extend_from_slice(b"trailing");
+        assert!(inspect_archive(&trailing, package, "0.4.0", &commit).is_err());
+    }
+
+    #[test]
+    fn post_terminator_tar_record_is_rejected() {
+        let package = &crate::release_policy::TRAITS_POLICY.packages[0];
+        let commit = "a".repeat(40);
+        let vcs = format!("{{\"git\":{{\"sha1\":\"{commit}\"}},\"path_in_vcs\":\"\"}}");
+        let root = format!("{}-0.4.0", package.package);
+        let archive = archive(&format!("{root}/.cargo_vcs_info.json"), vcs.as_bytes());
+        let mut tar = decompress_single_gzip(&archive, package.package, 1024 * 1024).unwrap();
+        let mut record = [0u8; TAR_BLOCK_BYTES];
+        record[0] = b'x';
+        tar.extend_from_slice(&record);
+        let altered = recompress(&tar);
+
+        assert!(inspect_archive(&altered, package, "0.4.0", &commit).is_err());
+    }
+
+    #[test]
+    fn inventory_encoding_matches_the_cross_language_vector() {
+        let files = BTreeMap::from([(
+            "file".to_string(),
+            ArchiveFile {
+                body: b"body".to_vec(),
+                metadata: ArchiveMetadata {
+                    header_sha256: "a".repeat(64),
+                    entry_type: b'0',
+                    mode: 0o644,
+                    uid: GNU_OCTAL_ZERO.to_vec(),
+                    gid: GNU_OCTAL_ZERO.to_vec(),
+                    mtime: CARGO_ARCHIVE_MTIME,
+                    username: Vec::new(),
+                    groupname: Vec::new(),
+                    device_major: GNU_OCTAL_ZERO.to_vec(),
+                    device_minor: GNU_OCTAL_ZERO.to_vec(),
+                },
+            },
+        )]);
+        assert_eq!(
+            archive_inventory_sha256(&files),
+            "3c31e83038d128e6babaf8adcbcda975c18db383b6999a097d7a30c3f3a87a0d"
+        );
     }
 
     #[test]

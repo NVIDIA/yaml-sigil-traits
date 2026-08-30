@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 4,
   "repository": "NVIDIA/yaml-sigil-traits",
   "repository_kind": "traits",
   "default_branch": "main",
@@ -30,5 +30,12 @@
     "rust",
     "candidate_ci"
   ],
-  "supplemental_candidate_ci": true
+  "supplemental_candidate_ci": true,
+  "trusted_gitlinks": [
+    {
+      "path": "source-spec",
+      "repository": "NVIDIA/yaml-sigil-spec",
+      "branch": "main"
+    }
+  ]
 }

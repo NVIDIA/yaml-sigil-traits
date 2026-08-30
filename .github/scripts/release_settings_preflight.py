@@ -25,6 +25,11 @@ from release_notification_preflight import (
     require_string,
     sha256,
 )
+from release_evidence import (
+    TAG_PATTERNS,
+    settings_evidence_sha256,
+    settings_evidence_values,
+)
 
 APP_ID = 4_653_064
 MAIN_RULESET = "Protect main and require CI"
@@ -69,24 +74,11 @@ def binding_values(
     run_id: int,
     run_attempt: int,
 ) -> tuple[str, ...]:
-    values = [
-        "yaml-sigil-release-setting-evidence-v1",
-        policy.repository,
-        str(run_id),
-        str(run_attempt),
-        release_sha,
-        "immutable-releases=true",
-    ]
-    values.extend(
-        f"creation={pattern}:Integration:{APP_ID}:always"
-        for pattern in policy.tag_patterns
+    require(
+        TAG_PATTERNS.get(policy.repository) == policy.tag_patterns,
+        "settings-evidence tag policy is inconsistent",
     )
-    values.extend(
-        f"update-delete={pattern}:no-bypass"
-        for pattern in policy.tag_patterns
-    )
-    values.append(f"forbidden-required-check={INTENT_NAME}")
-    return tuple(values)
+    return settings_evidence_values(policy.repository, release_sha, run_id, run_attempt)
 
 
 def binding_digest(
@@ -95,11 +87,8 @@ def binding_digest(
     run_id: int,
     run_attempt: int,
 ) -> str:
-    body = b"".join(
-        value.encode("utf-8") + b"\0"
-        for value in binding_values(policy, release_sha, run_id, run_attempt)
-    )
-    return sha256(body)
+    binding_values(policy, release_sha, run_id, run_attempt)
+    return settings_evidence_sha256(policy.repository, release_sha, run_id, run_attempt)
 
 
 def ruleset_projection(ruleset: dict[str, Any]) -> dict[str, Any]:

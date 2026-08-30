@@ -197,24 +197,6 @@ jobs:
           python3 -m unittest discover \
             -s policy/.github/scripts -p 'test_protected_pr_ci.py'
 
-      # Candidate controller tests are unprivileged and exercise the proposed
-      # policy without using it to authorize or report this run.
-      - name: Compile and test candidate controller
-        env:
-          ACTIONS_CACHE_URL: ""
-          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
-          ACTIONS_ID_TOKEN_REQUEST_URL: ""
-          ACTIONS_RESULTS_URL: ""
-          ACTIONS_RUNTIME_TOKEN: ""
-          GH_TOKEN: ""
-          GITHUB_TOKEN: ""
-        run: |
-          python3 -m py_compile \
-            candidate/.github/scripts/protected_pr_ci.py \
-            candidate/.github/scripts/test_protected_pr_ci.py
-          python3 -m unittest discover \
-            -s candidate/.github/scripts -p 'test_protected_pr_ci.py'
-
   platform_verifier:
     name: Protected checkout verifier (${{ matrix.name }})
     needs: authorize
@@ -233,45 +215,34 @@ jobs:
           - name: Windows
             runner: windows-latest
     steps:
-      - name: Check out protected policy
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 1
-          path: policy
-          persist-credentials: false
-          ref: ${{ needs.authorize.outputs.policy_sha }}
-
-      - name: Check out and verify exact candidate
-        id: candidate_checkout
-        uses: ./policy/.github/actions/protected-candidate-checkout
-        with:
-          base-sha: ${{ needs.authorize.outputs.base_sha }}
-          candidate-path: candidate
-          fetch-depth: 1
-          head-sha: ${{ needs.authorize.outputs.head_sha }}
-          policy-path: policy
-          repository: ${{ needs.authorize.outputs.head_repository }}
-
-      # Candidate tests are unprivileged; the interpreter was resolved and
-      # staged by protected policy before candidate files existed.
-      - name: Test candidate checkout verifier on host platform
+      # This job has no repository-backed Action and therefore no registered
+      # post-hook. Protected policy prepares a distinct OS identity, then the
+      # final exec runs candidate tests as the terminal disposable workload.
+      - name: Run terminal candidate controller tests
         env:
-          ACTIONS_CACHE_URL: ""
-          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
-          ACTIONS_ID_TOKEN_REQUEST_URL: ""
-          ACTIONS_RESULTS_URL: ""
-          ACTIONS_RUNTIME_TOKEN: ""
-          GH_TOKEN: ""
-          GITHUB_TOKEN: ""
-          TRUSTED_PYTHON: ${{ steps.candidate_checkout.outputs.python }}
+          BASE_SHA: ${{ needs.authorize.outputs.base_sha }}
+          GITHUB_TOKEN: ${{ github.token }}
+          HEAD_REPOSITORY: ${{ needs.authorize.outputs.head_repository }}
+          HEAD_SHA: ${{ needs.authorize.outputs.head_sha }}
+          POLICY_SHA: ${{ needs.authorize.outputs.policy_sha }}
         shell: bash
         run: |
-          "${TRUSTED_PYTHON}" -m py_compile \
-            candidate/.github/scripts/protected_checkout.py \
-            candidate/.github/scripts/protected_pr_ci.py \
-            candidate/.github/scripts/test_protected_pr_ci.py
-          "${TRUSTED_PYTHON}" -m unittest discover \
-            -s candidate/.github/scripts -p 'test_protected_pr_ci.py'
+          set -euo pipefail
+          policy_root="$(mktemp -d)"
+          chmod 0755 "${policy_root}"
+          git -c core.autocrlf=false -c credential.helper= \
+            init --quiet --initial-branch=main "${policy_root}"
+          git -C "${policy_root}" remote add origin \
+            "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          GIT_TERMINAL_PROMPT=0 git -c core.autocrlf=false \
+            -c credential.helper= -C "${policy_root}" fetch --no-tags \
+            --no-recurse-submodules --depth=1 origin "${POLICY_SHA}"
+          git -C "${policy_root}" checkout --quiet --detach FETCH_HEAD
+          exec bash --noprofile --norc \
+            "${policy_root}/.github/scripts/run-terminal-candidate.sh" \
+            controller "${RUNNER_OS}" "${policy_root}" "${POLICY_SHA}" \
+            "${GITHUB_REPOSITORY}" "${HEAD_REPOSITORY}" \
+            "${BASE_SHA}" "${HEAD_SHA}" "${GITHUB_ENV}"
 
   static_checks:
     name: Documentation
@@ -328,14 +299,9 @@ jobs:
     name: Rust (${{ matrix.name }})
     needs: authorize
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
+    timeout-minutes: 120
     permissions:
       contents: read
-    env:
-      CARGO_HOME: ${{ github.workspace }}/.protected-ci/cargo-home
-      CARGO_TARGET_DIR: ${{ github.workspace }}/.protected-ci/cargo-target
-      RUSTFLAGS: -D warnings
-      RUSTUP_HOME: ${{ github.workspace }}/.protected-ci/rustup-home
     strategy:
       fail-fast: false
       matrix:
@@ -347,98 +313,43 @@ jobs:
           - name: Windows
             runner: windows-latest
     steps:
-      - name: Check out protected policy
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 1
-          path: policy
-          persist-credentials: false
-          ref: ${{ needs.authorize.outputs.policy_sha }}
-
-      - name: Check out and verify exact candidate
-        uses: ./policy/.github/actions/protected-candidate-checkout
-        with:
-          base-sha: ${{ needs.authorize.outputs.base_sha }}
-          candidate-path: candidate
-          fetch-depth: 1
-          head-sha: ${{ needs.authorize.outputs.head_sha }}
-          policy-path: policy
-          repository: ${{ needs.authorize.outputs.head_repository }}
-
-      # Resolve the candidate's exact gitlink with protected-main logic, then
-      # fetch it only from the fixed public specification repository.
-      - name: Resolve exact specification checkout
-        id: source_spec
-        shell: bash
-        run: >-
-          policy/.github/scripts/resolve-source-spec-gitlink.sh
-          candidate "${GITHUB_OUTPUT}"
-
-      - name: Check out exact specification
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 1
-          path: candidate/source-spec
-          persist-credentials: false
-          ref: ${{ steps.source_spec.outputs.sha }}
-          repository: NVIDIA/yaml-sigil-spec
-
-      - name: Remove unused preinstalled Homebrew source
-        if: ${{ runner.os == 'macOS' }}
-        shell: bash
-        run: policy/.github/scripts/remove-preinstalled-aws-tap.sh
-
-      - name: Set up Rust
-        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
-        with:
-          cache: false
-          components: clippy, rustfmt
-
-      - name: Install protected Markdown validator
-        # Refresh this immutable pin frequently to keep pace with rumdl releases.
-        uses: rvben/rumdl@95a982d941d00cf41a0dcef4d0788bd15a29be1b # v0.2.54
-        with:
-          install-only: true
-          version: "0.2.54"
-
-      # This section would benefit by a change to the action allowlist
-      - name: Install Rust validation tools
-        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2.83.2
-        with:
-          checksum: true
-          fallback: none
-          tool: cargo-audit,cargo-deny@0.20.2,cargo-machete@0.9.2
-
-      # Every OS builds the validator from protected main and runs the same
-      # provider-neutral checks against the candidate, including candidate
-      # xtask compilation and tests. No candidate-controlled cache is saved.
-      - name: Run protected validation against candidate
+      # No Action is registered in this candidate-executing job. The protected
+      # validator is built before candidate execution and runs read-only source
+      # under a distinct identity as the terminal disposable workload.
+      - name: Run terminal protected Rust validation
         env:
-          ACTIONS_CACHE_URL: ""
-          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
-          ACTIONS_ID_TOKEN_REQUEST_URL: ""
-          ACTIONS_RESULTS_URL: ""
-          ACTIONS_RUNTIME_TOKEN: ""
-          GH_TOKEN: ""
-          GITHUB_TOKEN: ""
+          BASE_SHA: ${{ needs.authorize.outputs.base_sha }}
+          GITHUB_TOKEN: ${{ github.token }}
+          HEAD_REPOSITORY: ${{ needs.authorize.outputs.head_repository }}
+          HEAD_SHA: ${{ needs.authorize.outputs.head_sha }}
+          POLICY_SHA: ${{ needs.authorize.outputs.policy_sha }}
         shell: bash
-        run: >-
-          cargo run --locked --manifest-path policy/xtask/Cargo.toml --
-          ci --candidate-root "${GITHUB_WORKSPACE}/candidate"
+        run: |
+          set -euo pipefail
+          policy_root="$(mktemp -d)"
+          chmod 0755 "${policy_root}"
+          git -c core.autocrlf=false -c credential.helper= \
+            init --quiet --initial-branch=main "${policy_root}"
+          git -C "${policy_root}" remote add origin \
+            "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          GIT_TERMINAL_PROMPT=0 git -c core.autocrlf=false \
+            -c credential.helper= -C "${policy_root}" fetch --no-tags \
+            --no-recurse-submodules --depth=1 origin "${POLICY_SHA}"
+          git -C "${policy_root}" checkout --quiet --detach FETCH_HEAD
+          exec bash --noprofile --norc \
+            "${policy_root}/.github/scripts/run-terminal-candidate.sh" \
+            protected-ci "${RUNNER_OS}" "${policy_root}" "${POLICY_SHA}" \
+            "${GITHUB_REPOSITORY}" "${HEAD_REPOSITORY}" \
+            "${BASE_SHA}" "${HEAD_SHA}" "${GITHUB_ENV}"
 
   candidate_ci:
     name: Candidate cargo xtask CI (${{ matrix.name }})
     if: ${{ needs.authorize.outputs.candidate_ci_required == 'true' }}
     needs: authorize
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
+    timeout-minutes: 120
     permissions:
       contents: read
-    env:
-      CARGO_HOME: ${{ github.workspace }}/.candidate-ci/cargo-home
-      CARGO_TARGET_DIR: ${{ github.workspace }}/.candidate-ci/cargo-target
-      RUSTFLAGS: -D warnings
-      RUSTUP_HOME: ${{ github.workspace }}/.candidate-ci/rustup-home
     strategy:
       fail-fast: false
       matrix:
@@ -450,94 +361,34 @@ jobs:
           - name: Windows
             runner: windows-latest
     steps:
-      - name: Check out protected policy
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 1
-          path: policy
-          persist-credentials: false
-          ref: ${{ needs.authorize.outputs.policy_sha }}
-
-      - name: Check out and verify exact candidate
-        uses: ./policy/.github/actions/protected-candidate-checkout
-        with:
-          base-sha: ${{ needs.authorize.outputs.base_sha }}
-          candidate-path: candidate
-          fetch-depth: 1
-          head-sha: ${{ needs.authorize.outputs.head_sha }}
-          policy-path: policy
-          repository: ${{ needs.authorize.outputs.head_repository }}
-
-      # Resolve the candidate's exact gitlink with protected-main logic, then
-      # fetch it only from the fixed public specification repository.
-      - name: Resolve exact specification checkout
-        id: source_spec
-        shell: bash
-        run: >-
-          policy/.github/scripts/resolve-source-spec-gitlink.sh
-          candidate "${GITHUB_OUTPUT}"
-
-      - name: Check out exact specification
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 1
-          path: candidate/source-spec
-          persist-credentials: false
-          ref: ${{ steps.source_spec.outputs.sha }}
-          repository: NVIDIA/yaml-sigil-spec
-
-      - name: Remove unused preinstalled Homebrew source
-        if: ${{ runner.os == 'macOS' }}
-        shell: bash
-        run: policy/.github/scripts/remove-preinstalled-aws-tap.sh
-
-      - name: Set up Rust
-        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
-        with:
-          cache: false
-          components: clippy, rustfmt
-          toolchain: 1.95.0,stable
-
-      - name: Install protected Markdown validator
-        # Refresh this immutable pin frequently to keep pace with rumdl releases.
-        uses: rvben/rumdl@95a982d941d00cf41a0dcef4d0788bd15a29be1b # v0.2.54
-        with:
-          install-only: true
-          version: "0.2.54"
-
-      # This section would benefit by a change to the action allowlist
-      - name: Install protected Rust validation tools
-        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2.83.2
-        with:
-          checksum: true
-          fallback: none
-          tool: cargo-audit,cargo-deny@0.20.2,cargo-machete@0.9.2
-
-      # Only this supplemental, GitHub-hosted job executes the exact candidate
-      # validator. It has no secrets, OIDC, write permission, cache, or retained
-      # artifacts; the protected-main validator remains the required authority.
-      - name: Verify exact Cargo 1.95 archive metadata
+      # Stable performs the complete candidate validation; the focused archive
+      # contract uses its exact toolchain only for that compatibility check.
+      # This terminal job has no Action post-hook, cache, token, or artifact.
+      - name: Run terminal exact candidate validation
         env:
-          YAML_SIGIL_REQUIRE_CARGO_1_95_ARCHIVE: "1"
+          BASE_SHA: ${{ needs.authorize.outputs.base_sha }}
+          GITHUB_TOKEN: ${{ github.token }}
+          HEAD_REPOSITORY: ${{ needs.authorize.outputs.head_repository }}
+          HEAD_SHA: ${{ needs.authorize.outputs.head_sha }}
+          POLICY_SHA: ${{ needs.authorize.outputs.policy_sha }}
         shell: bash
-        run: >-
-          cargo +1.95.0 test --locked --manifest-path xtask/Cargo.toml
-          crate_archive::tests::cargo_1_95_archive_matches_observed_cross_platform_contract
-          -- --exact
-        working-directory: candidate
-
-      - name: Run exact candidate validation
-        env:
-          ACTIONS_CACHE_URL: ""
-          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
-          ACTIONS_ID_TOKEN_REQUEST_URL: ""
-          ACTIONS_RESULTS_URL: ""
-          ACTIONS_RUNTIME_TOKEN: ""
-          GH_TOKEN: ""
-          GITHUB_TOKEN: ""
-        shell: bash
-        run: cargo xtask ci
-        working-directory: candidate
+        run: |
+          set -euo pipefail
+          policy_root="$(mktemp -d)"
+          chmod 0755 "${policy_root}"
+          git -c core.autocrlf=false -c credential.helper= \
+            init --quiet --initial-branch=main "${policy_root}"
+          git -C "${policy_root}" remote add origin \
+            "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          GIT_TERMINAL_PROMPT=0 git -c core.autocrlf=false \
+            -c credential.helper= -C "${policy_root}" fetch --no-tags \
+            --no-recurse-submodules --depth=1 origin "${POLICY_SHA}"
+          git -C "${policy_root}" checkout --quiet --detach FETCH_HEAD
+          exec bash --noprofile --norc \
+            "${policy_root}/.github/scripts/run-terminal-candidate.sh" \
+            candidate-ci "${RUNNER_OS}" "${policy_root}" "${POLICY_SHA}" \
+            "${GITHUB_REPOSITORY}" "${HEAD_REPOSITORY}" \
+            "${BASE_SHA}" "${HEAD_SHA}" "${GITHUB_ENV}"
 
   results:
     name: Collect protected job results

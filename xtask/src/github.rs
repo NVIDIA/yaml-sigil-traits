@@ -231,6 +231,8 @@ enum ReleaseTrainCommand {
         #[arg(long)]
         intent: String,
         #[arg(long)]
+        intent_check_id: String,
+        #[arg(long)]
         expected_app_slug: String,
         #[arg(long)]
         expected_installation_id: String,
@@ -404,6 +406,7 @@ pub fn run(root: &Path, args: GithubArgs) -> Result<(), String> {
                 plan,
                 plan_digest,
                 intent,
+                intent_check_id,
                 expected_app_slug,
                 expected_installation_id,
             } => release_train::finalize_command(
@@ -412,6 +415,7 @@ pub fn run(root: &Path, args: GithubArgs) -> Result<(), String> {
                     plan: &plan,
                     plan_digest: &plan_digest,
                     intent: &intent,
+                    intent_check_id: &intent_check_id,
                     expected_app_slug: &expected_app_slug,
                     expected_installation_id: &expected_installation_id,
                 },

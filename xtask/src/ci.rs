@@ -3,11 +3,11 @@
 
 //! Local entry point for the repository's non-release validation sequence.
 
-use std::io;
+use std::io::{self, Write as _};
 use std::path::Path;
 use std::process::Command;
 
-use crate::{package_content, release_version};
+use crate::{bounded_process, package_content, release_version};
 
 const CARGO_MACHETE_INSTALL_COMMAND: &str = "cargo install --locked cargo-machete --version 0.9.2";
 const CARGO_DENY_INSTALL_COMMAND: &str = "cargo install --locked cargo-deny --version 0.20.2";
@@ -149,15 +149,17 @@ pub(crate) fn run(root: &Path) -> io::Result<()> {
 
 fn run_step(root: &Path, step: Step) -> io::Result<()> {
     eprintln!("+ {} (cwd {})", step.command_line(), root.display());
-    let status = Command::new(step.program)
-        .args(step.args)
-        .current_dir(root)
-        .status()
-        .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", step.label)))?;
-    if !status.success() {
+    let mut command = Command::new(step.program);
+    command.args(step.args).current_dir(root);
+    let output =
+        bounded_process::output(&mut command, bounded_process::VALIDATION_OUTPUT_LIMITS)
+            .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", step.label)))?;
+    io::stdout().write_all(&output.stdout)?;
+    io::stderr().write_all(&output.stderr)?;
+    if !output.status.success() {
         return Err(io::Error::other(format!(
-            "{} failed with {status}",
-            step.label
+            "{} failed with {}",
+            step.label, output.status
         )));
     }
     Ok(())

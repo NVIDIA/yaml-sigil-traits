@@ -67,6 +67,9 @@ POLICY_CONTROLLER = ".github/scripts/protected_pr_ci.py"
 POLICY_TESTS = ".github/scripts/test_protected_pr_ci.py"
 CHECKOUT_VERIFIER = ".github/scripts/protected_checkout.py"
 CANDIDATE_CHECKOUT_ACTION = ".github/actions/protected-candidate-checkout/action.yml"
+TERMINAL_CANDIDATE_DRIVER = ".github/scripts/terminal_candidate.py"
+TERMINAL_CANDIDATE_SHELL = ".github/scripts/run-terminal-candidate.sh"
+TERMINAL_CANDIDATE_WINDOWS = ".github/scripts/run-terminal-candidate-windows.ps1"
 POLICY_CONFIG = ".github/protected-pr-ci.json"
 RECONCILE_WORKFLOW = ".github/workflows/pr-ci-reconcile.yml"
 REUSABLE_WORKFLOW = ".github/workflows/pr-ci.yml"
@@ -169,9 +172,10 @@ def load_config(path: str) -> Mapping[str, Any]:
         "release_app",
         "expected_jobs",
         "supplemental_candidate_ci",
+        "trusted_gitlinks",
     }
     require(set(config) == required, "policy configuration keys are incomplete or ambiguous")
-    require(config["version"] == 3, "unsupported policy configuration version")
+    require(config["version"] == 4, "unsupported policy configuration version")
     validate_repository(config["repository"], "repository")
     require(
         config["repository_kind"] in {"spec", "traits", "rs"},
@@ -252,11 +256,53 @@ def load_config(path: str) -> Mapping[str, Any]:
             f"expected_jobs[{index}] is not a job identifier",
         )
 
+    trusted_gitlinks = require_sequence(config["trusted_gitlinks"], "trusted_gitlinks")
+    parsed_gitlinks = []
+    for index, value in enumerate(trusted_gitlinks):
+        item = require_mapping(value, f"trusted_gitlinks[{index}]")
+        require(
+            set(item) == {"path", "repository", "branch"},
+            f"trusted_gitlinks[{index}] keys are incomplete or ambiguous",
+        )
+        parsed_gitlinks.append(
+            {
+                "path": validate_path(item["path"], f"trusted_gitlinks[{index}].path"),
+                "repository": validate_repository(
+                    item["repository"], f"trusted_gitlinks[{index}].repository"
+                ),
+                "branch": require_string(
+                    item["branch"], f"trusted_gitlinks[{index}].branch"
+                ),
+            }
+        )
+    require(
+        len({item["path"] for item in parsed_gitlinks}) == len(parsed_gitlinks),
+        "trusted_gitlinks paths must be unique",
+    )
+    expected_gitlinks = (
+        [
+            {
+                "path": "source-spec",
+                "repository": "NVIDIA/yaml-sigil-spec",
+                "branch": "main",
+            }
+        ]
+        if config["repository_kind"] == "traits"
+        else []
+    )
+    require(
+        parsed_gitlinks == expected_gitlinks,
+        "trusted_gitlinks do not match the repository policy",
+    )
+
     protected_paths = {
         POLICY_CONTROLLER,
         POLICY_TESTS,
         CHECKOUT_VERIFIER,
         CANDIDATE_CHECKOUT_ACTION,
+        TERMINAL_CANDIDATE_DRIVER,
+        TERMINAL_CANDIDATE_SHELL,
+        TERMINAL_CANDIDATE_WINDOWS,
         POLICY_CONFIG,
         workflow_file,
         RECONCILE_WORKFLOW,
@@ -684,9 +730,14 @@ def is_sensitive_path(path: str, repository_kind: str) -> bool:
         return True
     if ".cargo" in parts or parts[0] == "xtask" or name == "releasing.md":
         return True
-    if repository_kind == "rs" and name in {"buf.yaml", "buf.lock", "buf.gen.yaml"}:
+    if repository_kind == "traits" and parts == ("source-spec",):
+        return True
+    buf_policy_names = {"buf.yaml", "buf.lock", "buf.gen.yaml"}
+    if repository_kind == "rs" and name in buf_policy_names:
         return True
     if repository_kind == "spec":
+        if parts[:1] == ("proto",) and len(parts) == 2 and name in buf_policy_names:
+            return True
         acvp_root = ("conformance", "rebuild-rs")
         if parts[: len(acvp_root)] == acvp_root and (
             parts[:4] == (*acvp_root, "vendor", "acvp")
@@ -1009,7 +1060,13 @@ def sensitive_inventory(
     require(len(paths) == len(statuses), "tree diff paths and statuses are misaligned")
     entries: list[Mapping[str, Any]] = []
     for path, status in zip(paths, statuses, strict=True):
-        if not is_sensitive_path(path, repository_kind):
+        base_leaf = base.leaves.get(path)
+        head_leaf = head.leaves.get(path)
+        gitlink_changed = any(
+            leaf is not None and leaf[:2] == ("commit", "160000")
+            for leaf in (base_leaf, head_leaf)
+        )
+        if not gitlink_changed and not is_sensitive_path(path, repository_kind):
             continue
         entries.append(
             {
@@ -1032,6 +1089,81 @@ def sensitive_inventory(
         entries=tuple(entries),
         digest=hashlib.sha256(encoded).hexdigest(),
     )
+
+
+def require_ancestor(
+    api: GitHubApi,
+    repository: str,
+    ancestor: str,
+    descendant: str,
+    label: str,
+) -> None:
+    """Require one exact commit to be in the approved descendant lineage."""
+
+    validate_sha(ancestor, f"{label} ancestor")
+    validate_sha(descendant, f"{label} descendant")
+    if ancestor == descendant:
+        return
+    comparison = require_mapping(
+        api.get(repo_api_path(repository, f"/compare/{ancestor}...{descendant}")),
+        f"{label} comparison",
+    )
+    merge_base = require_mapping(comparison.get("merge_base_commit"), f"{label} merge base")
+    base_commit = require_mapping(comparison.get("base_commit"), f"{label} base commit")
+    head_commit = require_mapping(comparison.get("head_commit"), f"{label} head commit")
+    require(
+        validate_sha(merge_base.get("sha"), f"{label} merge-base SHA") == ancestor
+        and validate_sha(base_commit.get("sha"), f"{label} base SHA") == ancestor
+        and validate_sha(head_commit.get("sha"), f"{label} head SHA") == descendant
+        and comparison.get("status") == "ahead",
+        f"{label} does not prove approved forward ancestry",
+    )
+
+
+def require_trusted_gitlink_lineage(
+    api: GitHubApi,
+    config: Mapping[str, Any],
+    base: GitTree,
+    head: GitTree,
+    paths: Sequence[str],
+) -> None:
+    """Bind every changed gitlink to its configured upstream forward lineage."""
+
+    trusted = {
+        require_string(item.get("path"), "trusted gitlink path"): item
+        for item in require_sequence(config.get("trusted_gitlinks"), "trusted_gitlinks")
+        if isinstance(item, Mapping)
+    }
+    for path in paths:
+        base_leaf = base.leaves.get(path)
+        head_leaf = head.leaves.get(path)
+        if not any(
+            leaf is not None and leaf[:2] == ("commit", "160000")
+            for leaf in (base_leaf, head_leaf)
+        ):
+            continue
+        policy = require_mapping(trusted.get(path), f"trusted lineage policy for {path}")
+        require(
+            base_leaf is not None
+            and head_leaf is not None
+            and base_leaf[:2] == ("commit", "160000")
+            and head_leaf[:2] == ("commit", "160000"),
+            f"trusted gitlink {path} must remain an exact commit gitlink",
+        )
+        upstream = validate_repository(policy.get("repository"), f"{path} upstream repository")
+        branch = require_string(policy.get("branch"), f"{path} upstream branch")
+        require(branch == "main", f"{path} upstream branch must be exact main")
+        reference = require_mapping(
+            api.get(repo_api_path(upstream, f"/git/ref/heads/{branch}")),
+            f"{path} upstream branch",
+        )
+        target = require_mapping(reference.get("object"), f"{path} upstream branch object")
+        require(target.get("type") == "commit", f"{path} upstream branch is not a commit")
+        upstream_sha = validate_sha(target.get("sha"), f"{path} upstream branch SHA")
+        base_sha = validate_sha(base_leaf[2], f"{path} base gitlink SHA")
+        head_sha = validate_sha(head_leaf[2], f"{path} candidate gitlink SHA")
+        require_ancestor(api, upstream, base_sha, head_sha, f"{path} forward update")
+        require_ancestor(api, upstream, head_sha, upstream_sha, f"{path} upstream lineage")
 
 
 def pull_commits(api: GitHubApi, repository: str, number: int, expected: int) -> list[Mapping[str, Any]]:
@@ -1508,6 +1640,7 @@ def authorize(
 
     repository_kind = require_string(config.get("repository_kind"), "repository_kind")
     inventory = sensitive_inventory(base_tree, head_tree, paths, statuses, repository_kind)
+    require_trusted_gitlink_lineage(api, config, base_tree, head_tree, paths)
 
     release_app = require_mapping(config.get("release_app"), "release_app")
     user = require_mapping(pull.get("user"), "pull request author")

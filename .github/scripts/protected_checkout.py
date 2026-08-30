@@ -247,6 +247,21 @@ def verify(
         f"candidate tree exceeds {policy.MAX_SENSITIVE_FILES} sensitive files",
     )
 
+    expected_files = {
+        path
+        for path, (entry_type, mode, _) in expected.items()
+        if entry_type == "blob" and mode in {"100644", "100755"}
+    }
+    expected_gitlinks = {
+        path: leaf
+        for path, leaf in expected.items()
+        if leaf[:2] == ("commit", "160000")
+    }
+    policy.require(
+        len(expected_files) + len(expected_gitlinks) == len(expected),
+        "sensitive tree contains an unsupported Git entry",
+    )
+
     actual_sensitive = {
         path
         for path, metadata in observed.items()
@@ -254,7 +269,7 @@ def verify(
         and (not stat.S_ISDIR(metadata.st_mode) or has_reparse_point(metadata))
     }
     policy.require(
-        actual_sensitive == set(expected),
+        actual_sensitive == expected_files,
         "candidate checkout has missing or untracked sensitive paths",
     )
 
@@ -265,8 +280,32 @@ def verify(
         "candidate checkout HEAD is not the authorized commit",
     )
 
-    for path, leaf in sorted(expected.items()):
-        entry_type, mode, blob = leaf
+    for path, (_, _, commit) in sorted(expected_gitlinks.items()):
+        metadata = observed.get(path)
+        policy.require(
+            metadata is None
+            or (stat.S_ISDIR(metadata.st_mode) and not has_reparse_point(metadata)),
+            f"sensitive gitlink {path} is not an ordinary checkout directory",
+        )
+        policy.require(
+            not any(item.startswith(f"{path}/") for item in observed),
+            f"sensitive gitlink {path} contains unverified checkout content",
+        )
+        result = trusted_git(
+            git,
+            resolved_root,
+            ["ls-tree", "-z", "--full-tree", "HEAD", "--", path],
+            text=False,
+        )
+        policy.require(result.returncode == 0, f"trusted Git could not inspect gitlink {path}")
+        expected_entry = f"160000 commit {commit}\t{path}\0".encode()
+        policy.require(
+            result.stdout == expected_entry,
+            f"sensitive gitlink {path} differs from its authorized Git entry",
+        )
+
+    for path in sorted(expected_files):
+        entry_type, mode, blob = expected[path]
         policy.require(
             entry_type == "blob" and mode in {"100644", "100755"},
             f"sensitive path {path} is not a regular Git file",

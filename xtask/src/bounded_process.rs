@@ -140,7 +140,7 @@ mod platform {
     use std::time::Instant;
 
     use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
-    use rustix::process::{Pid, Signal, kill_process_group, setpgid};
+    use rustix::process::{Pid, Signal, kill_process_group, setpgid, test_kill_process_group};
 
     struct Capture<R> {
         reader: Option<R>,
@@ -247,6 +247,21 @@ mod platform {
         if child.try_wait().ok().flatten().is_none() {
             let _ = child.kill();
         }
+    }
+
+    fn terminate_remaining_group(group: Pid) -> io::Result<()> {
+        let _ = kill_process_group(group, Signal::KILL);
+        let deadline = Instant::now() + POST_CANCEL_TIMEOUT;
+        while test_kill_process_group(group).is_ok() {
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "subprocess process group was not quiescent after direct-child exit",
+                ));
+            }
+            thread::sleep(POLL_INTERVAL);
+        }
+        Ok(())
     }
 
     fn reap_until(child: &mut Child, deadline: Instant) -> io::Result<ExitStatus> {
@@ -469,6 +484,7 @@ mod platform {
             return Err(cleanup_error(error, cleanup));
         }
 
+        terminate_remaining_group(group)?;
         Ok(Output {
             status: status.ok_or_else(|| io::Error::other("direct child was not reaped"))?,
             stdout: stdout.bytes,
@@ -1016,6 +1032,8 @@ mod tests {
     use std::fs;
     use std::io::{Cursor, Write};
     use std::path::{Path, PathBuf};
+    #[cfg(unix)]
+    use std::process::Stdio;
     use std::thread;
     use std::time::Instant;
 
@@ -1157,6 +1175,25 @@ mod tests {
         wait_for_exit(wait_for_pid(&pid_file));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn nominal_success_terminates_a_same_group_detached_descendant() {
+        let temporary = tempfile::tempdir().unwrap();
+        let pid_file = temporary.path().join("success-descendant.pid");
+        let mut command = test_command("bounded_process::tests::spawn_success_descendant");
+        command.env("YAML_SIGIL_TEST_PID_FILE", &pid_file);
+        let output = output(
+            &mut command,
+            OutputLimits {
+                stdout: 4096,
+                stderr: 4096,
+            },
+        )
+        .unwrap();
+        assert!(output.status.success());
+        wait_for_exit(wait_for_pid(&pid_file));
+    }
+
     #[test]
     fn bounded_input_is_delivered_without_changing_output_limits() {
         let temporary = tempfile::tempdir().unwrap();
@@ -1281,6 +1318,33 @@ mod tests {
         std::io::stdout().flush().unwrap();
         std::io::stderr().write_all(&bytes).unwrap();
         std::io::stderr().flush().unwrap();
+        thread::sleep(Duration::from_secs(30));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "spawned explicitly by the bounded-process regression"]
+    // This helper deliberately leaves its child in the inherited process
+    // group so a successful direct child cannot leave background work alive.
+    #[allow(clippy::zombie_processes)]
+    fn spawn_success_descendant() {
+        let mut child = test_command("bounded_process::tests::sleeping_success_descendant");
+        child.env(
+            "YAML_SIGIL_TEST_PID_FILE",
+            std::env::var_os("YAML_SIGIL_TEST_PID_FILE").unwrap(),
+        );
+        child.stdin(Stdio::null());
+        child.stdout(Stdio::null());
+        child.stderr(Stdio::null());
+        child.spawn().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "spawned explicitly by the bounded-process regression"]
+    fn sleeping_success_descendant() {
+        let pid_file = PathBuf::from(std::env::var_os("YAML_SIGIL_TEST_PID_FILE").unwrap());
+        fs::write(pid_file, std::process::id().to_string()).unwrap();
         thread::sleep(Duration::from_secs(30));
     }
 

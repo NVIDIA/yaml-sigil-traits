@@ -76,13 +76,20 @@ An authorization is invalid after any protected-policy, comment body or
 timestamp, repository identity, or writer-permission change as well. Never
 accept a late acknowledgement or job result for an invalidated binding.
 
-Candidate jobs check out the exact authorized head on GitHub-hosted workers
-without repository credentials, secrets, OIDC, write permissions, cache saves,
-or retained artifacts. Every human-authored pull-request commit must form a
-linear history from current `main`, be GitHub Verified, and contain a
-`Signed-off-by` trailer that exactly matches its Git author. The contributor's
-fork branch remains the pull-request head; a writer's command authorizes testing
-only and does not authorize integration.
+The protected parent uses a contents-read token only to fetch and verify the
+exact authorized head. Candidate-controlled processes then run as a
+purpose-created disposable operating-system identity with read-only source and
+tool inputs, a minimal environment, and no repository credential, secret,
+OIDC, write permission, cache save, or retained artifact. The runner-command
+directory is inaccessible to that identity, no trusted Action or post-step
+follows candidate execution, and the job fails unless every candidate process
+is quiescent and the identity is removed.
+
+Every human-authored pull-request commit must form a linear history from
+current `main`, be GitHub Verified, and contain a `Signed-off-by` trailer that
+exactly matches its Git author. The contributor's fork branch remains the
+pull-request head; a writer's command authorizes testing only and does not
+authorize integration.
 
 Before final authorization, fetch current upstream `main`, rebase the original
 contributor branch with `git rebase --gpg-sign <upstream>/main`, and push the

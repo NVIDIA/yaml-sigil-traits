@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -19,9 +20,12 @@ use crate::bounded_process::{self, VALIDATION_OUTPUT_LIMITS};
 use crate::crate_archive::{
     CratesIo, Registry, inspect_archive_entries, require_archive, require_clean_source,
 };
-use crate::github::consts::RepositoryKind;
+use crate::github::consts::{APP_EMAIL, APP_ID, APP_LOGIN, RepositoryKind};
 use crate::github::identity::token_signature;
 use crate::github::models::{GitObject, GitRef, Signature};
+use crate::github::release_train::{
+    ReleaseObjectIntent, ReleaseObjectPackageIntent, release_object_intent,
+};
 use crate::github::transport::{Transport, percent_encode};
 use crate::github::{ReconcileMode, git_line, is_sha, repository_policy_for_root};
 use crate::release_policy::{PackagePolicy, ReleasePolicy, detect};
@@ -48,6 +52,13 @@ pub(super) fn reconcile_command(
     require_main(github, repository, commit)?;
     let identity = token_identity(root, github)?;
     let specs = release_specs(root, release_policy, version)?;
+    let attestation = if mode == ReconcileMode::Recover {
+        let intent = release_object_intent(github, repository, commit)?;
+        intent.require_specs(repository, commit, &specs)?;
+        Some(intent)
+    } else {
+        None
+    };
     let mut registry = CratesIo::new();
     reconcile(
         root,
@@ -58,6 +69,7 @@ pub(super) fn reconcile_command(
         commit,
         mode.as_str(),
         &identity,
+        attestation.as_ref(),
     )?;
     eprintln!(
         "github: release objects passed {} reconciliation for {version}",
@@ -73,10 +85,14 @@ struct TokenIdentity {
 
 fn token_identity(root: &Path, github: &mut impl Transport) -> Result<TokenIdentity, String> {
     let signature = token_signature(github)?;
-    if git_line(root, &["config", "--local", "user.name"])? != signature.name
+    if signature.name != APP_LOGIN
+        || signature.email != APP_EMAIL
+        || git_line(root, &["config", "--local", "user.name"])? != signature.name
         || git_line(root, &["config", "--local", "user.email"])? != signature.email
     {
-        return Err("local release identity is not bound to the current GitHub token".to_string());
+        return Err(
+            "release-object recovery identity is not the configured Release App".to_string(),
+        );
     }
     Ok(TokenIdentity { signature })
 }
@@ -199,30 +215,54 @@ fn reconcile(
     commit: &str,
     mode: &str,
     identity: &TokenIdentity,
+    attestation: Option<&ReleaseObjectIntent>,
 ) -> Result<(), String> {
-    let states = inspect_objects(github, repository, specs, commit, identity)?;
+    let states = inspect_objects(github, repository, specs, commit, identity, attestation)?;
     if mode == "prepublish" {
         require_prepublish_state(root, registry, specs, &states, commit)?;
         require_main(github, repository, commit)?;
         return Ok(());
     }
 
+    let attestation =
+        attestation.ok_or_else(|| "release-object recovery lacks an App intent".to_string())?;
     let checksums = require_registry_publication(root, registry, specs, commit)?;
     for (spec, state) in specs.iter().zip(&states) {
         if !state.tag {
             require_main(github, repository, commit)?;
-            create_tag(github, repository, spec, commit, identity)?;
+            create_tag(github, repository, spec, commit, identity, attestation)?;
             require_main(github, repository, commit)?;
         }
     }
     for (spec, state) in specs.iter().zip(&states) {
         if !state.release {
             require_main(github, repository, commit)?;
+            attestation.revalidate(github, repository)?;
             create_release(github, repository, spec, commit)?;
+            if !inspect_tag(
+                github,
+                repository,
+                spec,
+                commit,
+                identity,
+                Some(attestation.package(spec.policy.package)?),
+            )? {
+                return Err(format!(
+                    "annotated tag {} disappeared during Release creation",
+                    spec.tag
+                ));
+            }
             require_main(github, repository, commit)?;
         }
     }
-    let final_state = inspect_objects(github, repository, specs, commit, identity)?;
+    let final_state = inspect_objects(
+        github,
+        repository,
+        specs,
+        commit,
+        identity,
+        Some(attestation),
+    )?;
     if final_state.iter().any(|state| !state.tag || !state.release) {
         return Err("official release objects remain incomplete".to_string());
     }
@@ -283,10 +323,17 @@ pub(super) fn require_reproduced_archive(
     spec: &ReleaseSpec<'_>,
     commit: &str,
 ) -> Result<String, String> {
-    let (checksum, published) = require_archive(registry, spec.policy, &spec.version, commit)?;
+    let (checksum, published_archive, published) =
+        require_archive(registry, spec.policy, &spec.version, commit)?;
     let archive = package_source(root, spec)?;
     let reproduced = inspect_archive_entries(&archive, spec.policy, &spec.version, commit)?;
     require_matching_archive_entries(&published, &reproduced, spec)?;
+    if published_archive != archive {
+        return Err(format!(
+            "complete compressed archive differs from published {} {}",
+            spec.policy.package, spec.version
+        ));
+    }
     Ok(checksum)
 }
 
@@ -311,7 +358,10 @@ fn require_matching_archive_entries<T: Eq>(
 }
 
 pub(super) fn package_source(root: &Path, spec: &ReleaseSpec<'_>) -> Result<Vec<u8>, String> {
-    let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let cargo = select_archive_cargo(
+        env::var_os("YAML_SIGIL_ARCHIVE_CARGO"),
+        env::var_os("CARGO"),
+    );
     let mut version_command = Command::new(&cargo);
     version_command.current_dir(root).arg("--version");
     let version = bounded_process::output(&mut version_command, VALIDATION_OUTPUT_LIMITS)
@@ -350,6 +400,10 @@ pub(super) fn package_source(root: &Path, spec: &ReleaseSpec<'_>) -> Result<Vec<
     fs::read(&archive).map_err(|error| format!("read reproduced source archive: {error}"))
 }
 
+fn select_archive_cargo(archive: Option<OsString>, build: Option<OsString>) -> OsString {
+    archive.or(build).unwrap_or_else(|| "cargo".into())
+}
+
 fn recheck_registry(
     registry: &mut impl Registry,
     specs: &[ReleaseSpec<'_>],
@@ -378,12 +432,22 @@ fn inspect_objects(
     specs: &[ReleaseSpec<'_>],
     commit: &str,
     identity: &TokenIdentity,
+    attestation: Option<&ReleaseObjectIntent>,
 ) -> Result<Vec<ObjectState>, String> {
     specs
         .iter()
         .map(|spec| {
             Ok(ObjectState {
-                tag: inspect_tag(github, repository, spec, commit, identity)?,
+                tag: inspect_tag(
+                    github,
+                    repository,
+                    spec,
+                    commit,
+                    identity,
+                    attestation
+                        .map(|intent| intent.package(spec.policy.package))
+                        .transpose()?,
+                )?,
                 release: inspect_release(github, repository, spec, commit)?,
             })
         })
@@ -395,8 +459,15 @@ struct AnnotatedTag {
     sha: String,
     tag: String,
     message: String,
-    tagger: Signature,
+    tagger: TaggerSignature,
     object: GitObject,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+struct TaggerSignature {
+    name: String,
+    email: String,
+    date: String,
 }
 
 fn inspect_tag(
@@ -405,6 +476,7 @@ fn inspect_tag(
     spec: &ReleaseSpec<'_>,
     commit: &str,
     identity: &TokenIdentity,
+    attested: Option<&ReleaseObjectPackageIntent>,
 ) -> Result<bool, String> {
     let path = format!(
         "repos/{repository}/git/ref/tags/{}",
@@ -416,6 +488,7 @@ fn inspect_tag(
     if reference.name != format!("refs/tags/{}", spec.tag)
         || reference.object.kind != "tag"
         || !is_sha(&reference.object.sha)
+        || attested.is_some_and(|intent| reference.object.sha != intent.tag_object_id)
     {
         return Err(format!("tag ref {} is not exact and annotated", spec.tag));
     }
@@ -423,7 +496,14 @@ fn inspect_tag(
         "repos/{repository}/git/tags/{}",
         reference.object.sha
     ))?;
-    validate_tag(&object, spec, commit, &reference.object.sha, identity)?;
+    validate_tag(
+        &object,
+        spec,
+        commit,
+        &reference.object.sha,
+        identity,
+        attested,
+    )?;
     Ok(true)
 }
 
@@ -433,13 +513,24 @@ fn validate_tag(
     commit: &str,
     object_sha: &str,
     identity: &TokenIdentity,
+    attested: Option<&ReleaseObjectPackageIntent>,
 ) -> Result<(), String> {
+    let identity_matches = if let Some(intent) = attested {
+        object.sha == intent.tag_object_id
+            && object.message == intent.tag_message
+            && object.tagger.name == APP_LOGIN
+            && object.tagger.email == APP_EMAIL
+            && object.tagger.date == intent.tagger_date
+    } else {
+        object.message == spec.tag_message()
+            && object.tagger.name == identity.signature.name
+            && object.tagger.email == identity.signature.email
+    };
     if object.sha != object_sha
         || object.tag != spec.tag
-        || object.message != spec.tag_message()
         || object.object.kind != "commit"
         || object.object.sha != commit
-        || object.tagger != identity.signature
+        || !identity_matches
     {
         return Err(format!("annotated tag {} has conflicting state", spec.tag));
     }
@@ -448,13 +539,24 @@ fn validate_tag(
 
 #[derive(Clone, Debug, Deserialize)]
 struct Release {
+    id: u64,
     tag_name: String,
     target_commitish: String,
     name: String,
     body: String,
     draft: bool,
     prerelease: bool,
+    immutable: bool,
+    author: ReleaseAuthor,
     assets: Vec<Value>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ReleaseAuthor {
+    login: String,
+    id: u64,
+    #[serde(rename = "type")]
+    kind: String,
 }
 
 fn inspect_release(
@@ -475,15 +577,23 @@ fn inspect_release(
 }
 
 fn validate_release(release: &Release, spec: &ReleaseSpec<'_>, commit: &str) -> Result<(), String> {
-    if release.tag_name != spec.tag
+    if release.id == 0
+        || release.tag_name != spec.tag
         || release.name != spec.tag
         || release.body != spec.body
         || release.draft
         || release.prerelease != spec.prerelease
+        || !release.immutable
+        || release.author.login != APP_LOGIN
+        || release.author.id != APP_ID
+        || release.author.kind != "Bot"
         || !release.assets.is_empty()
-        || (release.target_commitish != commit && release.target_commitish != "main")
+        || release.target_commitish != commit
     {
-        return Err(format!("GitHub Release {} has conflicting state", spec.tag));
+        return Err(format!(
+            "GitHub Release {} is not exact, immutable, and App-authored",
+            spec.tag
+        ));
     }
     Ok(())
 }
@@ -494,49 +604,99 @@ fn create_tag(
     spec: &ReleaseSpec<'_>,
     commit: &str,
     identity: &TokenIdentity,
+    attestation: &ReleaseObjectIntent,
 ) -> Result<(), String> {
-    if inspect_tag(github, repository, spec, commit, identity)? {
+    let attested = attestation.package(spec.policy.package)?;
+    if inspect_tag(github, repository, spec, commit, identity, Some(attested))? {
         return Err(format!(
             "annotated tag {} appeared before creation",
             spec.tag
         ));
     }
-    let object: AnnotatedTag = github.mutate(
-        "POST",
-        &format!("repos/{repository}/git/tags"),
-        &json!({
-            "tag": spec.tag,
-            "message": spec.tag_message(),
-            "object": commit,
-            "type": "commit",
-            "tagger": {
-                "name": identity.signature.name,
-                "email": identity.signature.email,
-            },
-        }),
-    )?;
-    if !is_sha(&object.sha) {
-        return Err(format!(
-            "GitHub did not create an exact tag object for {}",
-            spec.tag
-        ));
+    let object_path = format!("repos/{repository}/git/tags/{}", attested.tag_object_id);
+    if let Some(object) = github.get_optional::<AnnotatedTag>(&object_path)? {
+        validate_tag(
+            &object,
+            spec,
+            commit,
+            &attested.tag_object_id,
+            identity,
+            Some(attested),
+        )?;
+    } else {
+        attestation.revalidate(github, repository)?;
+        create_attested_tag_object(github, repository, spec, commit, identity, attested)?;
     }
-    validate_tag(&object, spec, commit, &object.sha, identity)?;
+    attestation.revalidate(github, repository)?;
     let mutation: Result<GitRef, String> = github.mutate(
         "POST",
         &format!("repos/{repository}/git/refs"),
-        &json!({"ref": format!("refs/tags/{}", spec.tag), "sha": object.sha}),
+        &json!({
+            "ref": format!("refs/tags/{}", spec.tag),
+            "sha": attested.tag_object_id,
+        }),
     );
-    if mutation.is_err() && !inspect_tag(github, repository, spec, commit, identity)? {
+    if mutation.is_err()
+        && !inspect_tag(github, repository, spec, commit, identity, Some(attested))?
+    {
         return Err(mutation.expect_err("checked tag-ref error"));
     }
-    if !inspect_tag(github, repository, spec, commit, identity)? {
+    if !inspect_tag(github, repository, spec, commit, identity, Some(attested))? {
         return Err(format!(
             "GitHub did not retain exact annotated tag {}",
             spec.tag
         ));
     }
     Ok(())
+}
+
+fn create_attested_tag_object(
+    github: &mut impl Transport,
+    repository: &str,
+    spec: &ReleaseSpec<'_>,
+    commit: &str,
+    identity: &TokenIdentity,
+    attested: &ReleaseObjectPackageIntent,
+) -> Result<(), String> {
+    let object_path = format!("repos/{repository}/git/tags/{}", attested.tag_object_id);
+    let mutation: Result<AnnotatedTag, String> = github.mutate(
+        "POST",
+        &format!("repos/{repository}/git/tags"),
+        &json!({
+            "tag": spec.tag,
+            "message": attested.tag_message,
+            "object": commit,
+            "type": "commit",
+            "tagger": {
+                "name": APP_LOGIN,
+                "email": APP_EMAIL,
+                "date": attested.tagger_date,
+            },
+        }),
+    );
+    let object = match mutation {
+        Ok(object) => object,
+        Err(error) => github
+            .get_optional::<AnnotatedTag>(&object_path)?
+            .ok_or(error)?,
+    };
+    validate_tag(
+        &object,
+        spec,
+        commit,
+        &attested.tag_object_id,
+        identity,
+        Some(attested),
+    )?;
+    let readback: AnnotatedTag = github.get(&object_path)?;
+    validate_tag(
+        &readback,
+        spec,
+        commit,
+        &attested.tag_object_id,
+        identity,
+        Some(attested),
+    )
 }
 
 fn create_release(
@@ -695,17 +855,42 @@ mod tests {
             prerelease: false,
         };
         let mut release = Release {
+            id: 100,
             tag_name: spec.tag.clone(),
             target_commitish: "a".repeat(40),
             name: spec.tag.clone(),
             body: spec.body.clone(),
             draft: false,
             prerelease: false,
+            immutable: true,
+            author: ReleaseAuthor {
+                login: APP_LOGIN.to_string(),
+                id: APP_ID,
+                kind: "Bot".to_string(),
+            },
             assets: vec![],
         };
         let commit = "a".repeat(40);
         assert!(validate_release(&release, &spec, &commit).is_ok());
         release.assets.push(json!({"name": "binary"}));
+        assert!(validate_release(&release, &spec, &commit).is_err());
+        release.assets.clear();
+        release.target_commitish = "main".to_string();
+        assert!(validate_release(&release, &spec, &commit).is_err());
+        release.target_commitish = commit.clone();
+        release.immutable = false;
+        assert!(validate_release(&release, &spec, &commit).is_err());
+        release.immutable = true;
+        release.id = 0;
+        assert!(validate_release(&release, &spec, &commit).is_err());
+        release.id = 100;
+        release.author.id += 1;
+        assert!(validate_release(&release, &spec, &commit).is_err());
+        release.author.id = APP_ID;
+        release.author.login = "writer".to_string();
+        assert!(validate_release(&release, &spec, &commit).is_err());
+        release.author.login = APP_LOGIN.to_string();
+        release.author.kind = "User".to_string();
         assert!(validate_release(&release, &spec, &commit).is_err());
     }
 
@@ -732,12 +917,15 @@ mod tests {
             "prerelease": false,
         });
         let exact = json!({
+            "id": 100,
             "tag_name": spec.tag,
             "target_commitish": commit,
             "name": spec.tag,
             "body": spec.body,
             "draft": false,
             "prerelease": false,
+            "immutable": true,
+            "author": {"login": APP_LOGIN, "id": APP_ID, "type": "Bot"},
             "assets": [],
         });
         let mut github = FakeTransport::new([
@@ -752,6 +940,77 @@ mod tests {
             Expected::optional(&path, exact),
         ]);
         assert!(create_release(&mut github, TRAITS_REPOSITORY, &spec, &commit).is_ok());
+        github.finish();
+    }
+
+    #[test]
+    fn missing_attested_tag_object_is_created_and_reread_exactly() {
+        let commit = "a".repeat(40);
+        let object_id = "b".repeat(40);
+        let spec = ReleaseSpec {
+            policy: &crate::release_policy::TRAITS_POLICY.packages[0],
+            version: "0.4.0".to_string(),
+            tag: "v0.4.0".to_string(),
+            body: "- Fixed.".to_string(),
+            prerelease: false,
+        };
+        let attested = ReleaseObjectPackageIntent {
+            package: spec.policy.package.to_string(),
+            version: spec.version.clone(),
+            tag: spec.tag.clone(),
+            prerelease: spec.prerelease,
+            release_body: spec.body.clone(),
+            tag_object_id: object_id.clone(),
+            tag_message: spec.tag_message(),
+            tagger_date: "2026-08-29T00:00:00+00:00".to_string(),
+        };
+        let identity = TokenIdentity {
+            signature: Signature {
+                name: APP_LOGIN.to_string(),
+                email: APP_EMAIL.to_string(),
+            },
+        };
+        let payload = json!({
+            "tag": spec.tag,
+            "message": attested.tag_message,
+            "object": commit,
+            "type": "commit",
+            "tagger": {
+                "name": APP_LOGIN,
+                "email": APP_EMAIL,
+                "date": attested.tagger_date,
+            },
+        });
+        let object = json!({
+            "sha": object_id,
+            "tag": spec.tag,
+            "message": attested.tag_message,
+            "tagger": {
+                "name": APP_LOGIN,
+                "email": APP_EMAIL,
+                "date": attested.tagger_date,
+            },
+            "object": {"type": "commit", "sha": commit},
+        });
+        let object_path = format!("repos/{TRAITS_REPOSITORY}/git/tags/{object_id}");
+        let mut github = FakeTransport::new([
+            Expected::mutation(
+                "POST",
+                &format!("repos/{TRAITS_REPOSITORY}/git/tags"),
+                payload,
+                Ok(object.clone()),
+            ),
+            Expected::json("GET", &object_path, object),
+        ]);
+        create_attested_tag_object(
+            &mut github,
+            TRAITS_REPOSITORY,
+            &spec,
+            &commit,
+            &identity,
+            &attested,
+        )
+        .unwrap();
         github.finish();
     }
 
@@ -855,5 +1114,17 @@ mod tests {
         let error =
             require_matching_archive_entries(&published, &reproduced, &release).unwrap_err();
         assert!(error.contains("exact Cargo.lock entry differs"));
+    }
+
+    #[test]
+    fn archive_cargo_is_independent_from_the_trusted_build_toolchain() {
+        assert_eq!(
+            select_archive_cargo(Some("archive-cargo".into()), Some("build-cargo".into())),
+            OsString::from("archive-cargo")
+        );
+        assert_eq!(
+            select_archive_cargo(None, Some("build-cargo".into())),
+            OsString::from("build-cargo")
+        );
     }
 }

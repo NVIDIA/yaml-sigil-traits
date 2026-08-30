@@ -82,9 +82,11 @@ class ReleaseWorkflowTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, preflight)
         self.assertIn("checks: read", preflight)
+        self.assertIn("actions: read", preflight)
         self.assertIn("contents: read", preflight)
         self.assertIn("pull-requests: read", preflight)
         self.assertIn("release_notification_preflight.py", preflight)
+        self.assertIn("release_evidence.py", preflight)
         self.assertIn("test \"${policy_sha}\" = \"${GITHUB_SHA}\"", preflight)
 
     def test_every_app_token_job_uses_protected_automation(self) -> None:
@@ -114,7 +116,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
         finalizer = job_block(self.publish, "release-finalizer")
         self.assertLess(
             finalizer.index("Recompute plan and verify protected intent"),
-            finalizer.index("Create contents-only repository token"),
+            finalizer.index("Create finalizer repository token"),
         )
         notification = job_block(self.publish, "release-notification")
         self.assertLess(
@@ -142,6 +144,25 @@ class ReleaseWorkflowTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, combined)
 
+    def test_trusted_rust_uses_stable_with_archive_cargo_scoped_separately(self) -> None:
+        for name in (
+            "release-readiness",
+            "publication",
+            "release-intent",
+            "release-finalizer",
+        ):
+            with self.subTest(job=name):
+                block = job_block(self.publish, name)
+                self.assertIn("toolchain: 1.95.0,stable", block)
+                self.assertIn("YAML_SIGIL_ARCHIVE_CARGO", block)
+                self.assertNotIn("toolchain: 1.95.0\n", block)
+        notification = job_block(self.publish, "release-notification")
+        self.assertIn("toolchain: stable", notification)
+        self.assertIn("cargo +stable build --locked --release", notification)
+        proposal = job_block(self.reusable, "proposal")
+        self.assertIn("toolchain: stable", proposal)
+        self.assertNotIn("toolchain: 1.95.0", proposal)
+
     def test_admin_setting_digest_matches_read_only_preflight_policy(self) -> None:
         repository = settings.require_string(
             json.loads(
@@ -151,27 +172,18 @@ class ReleaseWorkflowTests(unittest.TestCase):
             )["repository"],
             "test repository",
         )
-        policy = settings.POLICIES[repository]
         readiness = job_block(self.publish, "release-readiness")
         evidence = readiness.split(
             "- name: Bind repository-admin setting evidence to this run", 1
         )[1]
-        self.assertIn("'yaml-sigil-release-setting-evidence-v1'", evidence)
-        self.assertIn("'immutable-releases=true'", evidence)
-        for pattern in policy.tag_patterns:
-            self.assertIn(
-                f"'creation={pattern}:Integration:{settings.APP_ID}:always'",
-                evidence,
-            )
-            self.assertIn(f"'update-delete={pattern}:no-bypass'", evidence)
-        self.assertIn(
-            f"'forbidden-required-check={settings.INTENT_NAME}'",
-            evidence,
-        )
+        self.assertIn("release_evidence.py settings", evidence)
+        self.assertIn('--repository "${GITHUB_REPOSITORY}"', evidence)
+        self.assertIn('--release-sha "${CAPTURED_SHA}"', evidence)
+        self.assertIn('--run-id "${GITHUB_RUN_ID}"', evidence)
+        self.assertIn('--run-attempt "${GITHUB_RUN_ATTEMPT}"', evidence)
+        self.assertIn('--github-output "${GITHUB_OUTPUT}"', evidence)
         self.assertNotIn("PLAN_DIGEST", evidence)
         self.assertNotIn("LEGACY_INVENTORY_SHA256", evidence)
-        self.assertIn("release_sha=${CAPTURED_SHA}", evidence)
-        self.assertIn("digest=${evidence_digest}", evidence)
 
     def test_remote_actions_are_full_sha_pinned_with_version_comments(self) -> None:
         for workflow_name in ("publish.yml", "release-pr.yml", "release-proposal.yml"):

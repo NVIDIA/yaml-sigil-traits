@@ -63,7 +63,14 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           cache: false
-          toolchain: 1.95.0
+          toolchain: 1.95.0,stable
+
+      - name: Bind archive reproduction Cargo
+        run: |
+          archive_cargo="$(rustup which --toolchain 1.95.0 cargo)"
+          test -x "${archive_cargo}"
+          printf 'YAML_SIGIL_ARCHIVE_CARGO=%s\n' "${archive_cargo}" \
+            >>"${GITHUB_ENV}"
 
       - name: Install exact cargo-binstall
         uses: cargo-bins/cargo-binstall@732870f031d2fb36309d0deaf36abcc704a7be65 # v1.20.1
@@ -220,21 +227,13 @@ jobs:
         id: evidence
         env:
           CAPTURED_SHA: ${{ steps.capture.outputs.captured_release_sha }}
-        run: |
-          evidence_digest="$(printf '%s\0' \
-            'yaml-sigil-release-setting-evidence-v1' \
-            "${GITHUB_REPOSITORY}" \
-            "${GITHUB_RUN_ID}" \
-            "${GITHUB_RUN_ATTEMPT}" \
-            "${CAPTURED_SHA}" \
-            'immutable-releases=true' \
-            'creation=refs/tags/v*:Integration:4653064:always' \
-            'update-delete=refs/tags/v*:no-bypass' \
-            'forbidden-required-check=Release finalization intent' \
-            | sha256sum | cut -d' ' -f1)"
-          printf 'ruleset_evidence_sha256=%s\n' "${evidence_digest}" \
-            >>"${GITHUB_OUTPUT}"
-          echo "::notice title=Repository-admin release evidence::release_sha=${CAPTURED_SHA};run_id=${GITHUB_RUN_ID};run_attempt=${GITHUB_RUN_ATTEMPT};digest=${evidence_digest}"
+        run: >-
+          python3 .github/scripts/release_evidence.py settings
+          --repository "${GITHUB_REPOSITORY}"
+          --release-sha "${CAPTURED_SHA}"
+          --run-id "${GITHUB_RUN_ID}"
+          --run-attempt "${GITHUB_RUN_ATTEMPT}"
+          --github-output "${GITHUB_OUTPUT}"
 
   publication:
     name: Publish source crate
@@ -271,7 +270,14 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           cache: false
-          toolchain: 1.95.0
+          toolchain: 1.95.0,stable
+
+      - name: Bind archive reproduction Cargo
+        run: |
+          archive_cargo="$(rustup which --toolchain 1.95.0 cargo)"
+          test -x "${archive_cargo}"
+          printf 'YAML_SIGIL_ARCHIVE_CARGO=%s\n' "${archive_cargo}" \
+            >>"${GITHUB_ENV}"
 
       - name: Install exact cargo-binstall
         uses: cargo-bins/cargo-binstall@732870f031d2fb36309d0deaf36abcc704a7be65 # v1.20.1
@@ -475,7 +481,14 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           cache: false
-          toolchain: 1.95.0
+          toolchain: 1.95.0,stable
+
+      - name: Bind archive reproduction Cargo
+        run: |
+          archive_cargo="$(rustup which --toolchain 1.95.0 cargo)"
+          test -x "${archive_cargo}"
+          printf 'YAML_SIGIL_ARCHIVE_CARGO=%s\n' "${archive_cargo}" \
+            >>"${GITHUB_ENV}"
 
       - name: Recompute release plan
         env:
@@ -592,7 +605,14 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           cache: false
-          toolchain: 1.95.0
+          toolchain: 1.95.0,stable
+
+      - name: Bind archive reproduction Cargo
+        run: |
+          archive_cargo="$(rustup which --toolchain 1.95.0 cargo)"
+          test -x "${archive_cargo}"
+          printf 'YAML_SIGIL_ARCHIVE_CARGO=%s\n' "${archive_cargo}" \
+            >>"${GITHUB_ENV}"
 
       - name: Recompute plan and verify protected intent
         env:
@@ -636,7 +656,7 @@ jobs:
           test "$(sha256sum "${RUNNER_TEMP}/yaml-sigil-release-xtask" \
             | cut -d' ' -f1)" = "${binary_sha256}"
 
-      - name: Create contents-only repository token
+      - name: Create finalizer repository token
         id: app-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
@@ -644,6 +664,7 @@ jobs:
           private-key: ${{ secrets.YAML_SIGIL_RELEASE_PR_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
+          permission-checks: read
           permission-contents: write
 
       - name: Finalize exact published registry prefix
@@ -661,6 +682,7 @@ jobs:
           --plan "${PLAN}"
           --plan-digest "${PLAN_DIGEST}"
           --intent "${INTENT}"
+          --intent-check-id "${{ needs.release-intent.outputs.intent_check_id }}"
           --expected-app-slug "${{ steps.app-token.outputs.app-slug }}"
           --expected-installation-id "${{ steps.app-token.outputs.installation-id }}"
 
@@ -679,6 +701,12 @@ jobs:
     permissions:
       contents: read
     steps:
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache: false
+          toolchain: stable
+
       # Bootstrap exact attested protected source without a repository checkout,
       # compile before token minting, and require finalizer binary parity.
       - name: Compile checkout-free typed notifier
@@ -717,7 +745,7 @@ jobs:
           tar -xzf "${source_archive}" --no-same-owner --no-same-permissions \
             -C "${bootstrap}"
           source_root="${bootstrap}/${source_prefix}"
-          cargo +1.95.0 build --locked --release \
+          cargo +stable build --locked --release \
             --manifest-path "${source_root}/xtask/Cargo.toml"
           install -m 700 "${source_root}/xtask/target/release/xtask" \
             "${RUNNER_TEMP}/yaml-sigil-release-xtask"
@@ -763,6 +791,7 @@ jobs:
       ${{ github.event_name == 'repository_dispatch' &&
           github.event.action == 'official-release-published' }}
     permissions:
+      actions: read
       checks: read
       contents: read
       pull-requests: read
