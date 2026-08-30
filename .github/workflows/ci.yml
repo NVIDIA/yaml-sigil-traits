@@ -2,6 +2,11 @@ name: CI
 
 on:
   workflow_dispatch:
+    inputs:
+      terminal_probe_only:
+        description: Run only the disposable Windows terminal probe
+        type: boolean
+        default: false
   push:
     branches:
       - main
@@ -15,6 +20,7 @@ concurrency:
 
 jobs:
   workflow_lint:
+    if: ${{ !inputs.terminal_probe_only }}
     name: GitHub Actions
     runs-on: linux-amd64-cpu4
     timeout-minutes: 10
@@ -46,6 +52,7 @@ jobs:
             -s .github/scripts -p 'test_*.py'
 
   platform_verifier:
+    if: ${{ !inputs.terminal_probe_only }}
     name: Protected checkout verifier (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
@@ -80,6 +87,7 @@ jobs:
             -s .github/scripts -p 'test_protected_pr_ci.py'
 
   static_checks:
+    if: ${{ !inputs.terminal_probe_only }}
     name: Documentation
     runs-on: linux-amd64-cpu4
     timeout-minutes: 15
@@ -108,6 +116,7 @@ jobs:
           version: "0.2.54"
 
   rust:
+    if: ${{ !inputs.terminal_probe_only }}
     name: Rust (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
@@ -204,14 +213,47 @@ jobs:
       - name: Audit xtask dependencies
         run: cargo audit --file xtask/Cargo.lock
 
+  terminal_probe:
+    if: ${{ inputs.terminal_probe_only }}
+    name: Protected terminal probe (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      # The repaired script is protected policy and terminal candidate input.
+      # No repository-backed Action or post-hook follows candidate execution.
+      - name: Run protected validation with isolated stable tools
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          policy_root="$(mktemp -d)"
+          chmod 0755 "${policy_root}"
+          git -c core.autocrlf=false -c credential.helper= \
+            init --quiet --initial-branch=main "${policy_root}"
+          git -C "${policy_root}" remote add origin \
+            "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          GIT_TERMINAL_PROMPT=0 git -c core.autocrlf=false \
+            -c credential.helper= -C "${policy_root}" fetch --no-tags \
+            --no-recurse-submodules --depth=1 origin "${GITHUB_SHA}"
+          git -C "${policy_root}" checkout --quiet --detach FETCH_HEAD
+          exec bash --noprofile --norc \
+            "${policy_root}/.github/scripts/run-terminal-candidate.sh" \
+            protected-ci "${RUNNER_OS}" "${policy_root}" "${GITHUB_SHA}" \
+            "${GITHUB_REPOSITORY}" "${GITHUB_REPOSITORY}" \
+            "${GITHUB_SHA}" "${GITHUB_SHA}" "${GITHUB_ENV}"
+
   required_ci:
     name: Required CI
-    if: ${{ always() }}
+    if: ${{ !inputs.terminal_probe_only && always() }}
     needs:
       - workflow_lint
       - platform_verifier
       - static_checks
       - rust
+      - terminal_probe
     runs-on: linux-amd64-cpu4
     timeout-minutes: 5
     permissions: {}
@@ -222,6 +264,7 @@ jobs:
           DOCUMENTATION_RESULT: ${{ needs.static_checks.result }}
           PLATFORM_VERIFIER_RESULT: ${{ needs.platform_verifier.result }}
           RUST_RESULT: ${{ needs.rust.result }}
+          TERMINAL_PROBE_RESULT: ${{ needs.terminal_probe.result }}
         run: |
           require_success() {
             local job="$1"
@@ -238,3 +281,4 @@ jobs:
           require_success "Protected checkout verifier matrix" "${PLATFORM_VERIFIER_RESULT}"
           require_success "Documentation" "${DOCUMENTATION_RESULT}"
           require_success "Rust matrix" "${RUST_RESULT}"
+          require_success "Protected terminal probe" "${TERMINAL_PROBE_RESULT}"
