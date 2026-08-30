@@ -215,34 +215,26 @@ jobs:
           - name: Windows
             runner: windows-latest
     steps:
-      # This job has no repository-backed Action and therefore no registered
-      # post-hook. Protected policy prepares a distinct OS identity, then the
-      # final exec runs candidate tests as the terminal disposable workload.
-      - name: Run terminal candidate controller tests
-        env:
-          BASE_SHA: ${{ needs.authorize.outputs.base_sha }}
-          GITHUB_TOKEN: ${{ github.token }}
-          HEAD_REPOSITORY: ${{ needs.authorize.outputs.head_repository }}
-          HEAD_SHA: ${{ needs.authorize.outputs.head_sha }}
-          POLICY_SHA: ${{ needs.authorize.outputs.policy_sha }}
+      # These regressions execute only protected policy. Candidate Rust runs
+      # only in the separate Linux terminal jobs below; ordinary cross-platform
+      # Rust coverage remains in the trusted CI workflow.
+      - name: Check out protected policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          path: policy
+          persist-credentials: false
+          ref: ${{ needs.authorize.outputs.policy_sha }}
+
+      - name: Compile and test protected checkout verifier
         shell: bash
         run: |
-          set -euo pipefail
-          policy_root="$(mktemp -d)"
-          chmod 0755 "${policy_root}"
-          git -c core.autocrlf=false -c credential.helper= \
-            init --quiet --initial-branch=main "${policy_root}"
-          git -C "${policy_root}" remote add origin \
-            "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
-          GIT_TERMINAL_PROMPT=0 git -c core.autocrlf=false \
-            -c credential.helper= -C "${policy_root}" fetch --no-tags \
-            --no-recurse-submodules --depth=1 origin "${POLICY_SHA}"
-          git -C "${policy_root}" checkout --quiet --detach FETCH_HEAD
-          exec bash --noprofile --norc \
-            "${policy_root}/.github/scripts/run-terminal-candidate.sh" \
-            controller "${RUNNER_OS}" "${policy_root}" "${POLICY_SHA}" \
-            "${GITHUB_REPOSITORY}" "${HEAD_REPOSITORY}" \
-            "${BASE_SHA}" "${HEAD_SHA}" "${GITHUB_ENV}"
+          python3 -m py_compile \
+            policy/.github/scripts/protected_checkout.py \
+            policy/.github/scripts/protected_pr_ci.py \
+            policy/.github/scripts/test_protected_pr_ci.py
+          python3 -m unittest discover \
+            -s policy/.github/scripts -p 'test_protected_pr_ci.py'
 
   static_checks:
     name: Documentation
@@ -296,22 +288,12 @@ jobs:
           version: "0.2.54"
 
   rust:
-    name: Rust (${{ matrix.name }})
+    name: Rust (Linux)
     needs: authorize
-    runs-on: ${{ matrix.runner }}
+    runs-on: ubuntu-latest
     timeout-minutes: 120
     permissions:
       contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Linux
-            runner: ubuntu-latest
-          - name: macOS
-            runner: macos-latest
-          - name: Windows
-            runner: windows-latest
     steps:
       # No Action is registered in this candidate-executing job. The protected
       # validator is built before candidate execution and runs read-only source
@@ -343,23 +325,13 @@ jobs:
             "${BASE_SHA}" "${HEAD_SHA}" "${GITHUB_ENV}"
 
   candidate_ci:
-    name: Candidate cargo xtask CI (${{ matrix.name }})
+    name: Candidate cargo xtask CI (Linux)
     if: ${{ needs.authorize.outputs.candidate_ci_required == 'true' }}
     needs: authorize
-    runs-on: ${{ matrix.runner }}
+    runs-on: ubuntu-latest
     timeout-minutes: 120
     permissions:
       contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Linux
-            runner: ubuntu-latest
-          - name: macOS
-            runner: macos-latest
-          - name: Windows
-            runner: windows-latest
     steps:
       # Stable performs the complete candidate validation; the focused archive
       # contract uses its exact toolchain only for that compatibility check.

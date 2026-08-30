@@ -69,7 +69,6 @@ CHECKOUT_VERIFIER = ".github/scripts/protected_checkout.py"
 CANDIDATE_CHECKOUT_ACTION = ".github/actions/protected-candidate-checkout/action.yml"
 TERMINAL_CANDIDATE_DRIVER = ".github/scripts/terminal_candidate.py"
 TERMINAL_CANDIDATE_SHELL = ".github/scripts/run-terminal-candidate.sh"
-TERMINAL_CANDIDATE_WINDOWS = ".github/scripts/run-terminal-candidate-windows.ps1"
 POLICY_CONFIG = ".github/protected-pr-ci.json"
 RECONCILE_WORKFLOW = ".github/workflows/pr-ci-reconcile.yml"
 REUSABLE_WORKFLOW = ".github/workflows/pr-ci.yml"
@@ -302,7 +301,6 @@ def load_config(path: str) -> Mapping[str, Any]:
         CANDIDATE_CHECKOUT_ACTION,
         TERMINAL_CANDIDATE_DRIVER,
         TERMINAL_CANDIDATE_SHELL,
-        TERMINAL_CANDIDATE_WINDOWS,
         POLICY_CONFIG,
         workflow_file,
         RECONCILE_WORKFLOW,

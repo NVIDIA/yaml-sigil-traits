@@ -63,13 +63,10 @@ case "${profile}" in
     ;;
 esac
 
-case "${runner_os}" in
-  Linux | macOS | Windows) ;;
-  *)
-    echo 'terminal candidate runner OS is invalid' >&2
-    exit 2
-    ;;
-esac
+if [[ "${runner_os}" != 'Linux' ]]; then
+  echo 'terminal candidate execution requires Linux' >&2
+  exit 2
+fi
 
 case "${canonical_repository}" in
   NVIDIA/yaml-sigil-spec) repository_kind='spec' ;;
@@ -106,7 +103,6 @@ fi
 
 trusted_git="$(command -v git)"
 trusted_python_command="$(command -v python3)"
-trusted_python_name="$(basename "${trusted_python_command}")"
 trusted_cargo="$(command -v cargo)"
 trusted_rustup="$(command -v rustup)"
 trusted_env="$(command -v env)"
@@ -145,25 +141,23 @@ while IFS='=' read -r name _; do
   esac
 done < <(env)
 
-# macOS gives its per-user temporary ancestors private traversal permissions.
-# Git for Windows likewise must not resolve a candidate path through the
-# runner account's private profile. Only the new sandbox below the drive root
-# is hardened; no ancestor ACL is changed.
-if [[ "${runner_os}" == 'macOS' ]]; then
-  sandbox="$(mktemp -d /tmp/yaml-sigil-terminal.XXXXXX)"
-elif [[ "${runner_os}" == 'Windows' ]]; then
-  sandbox="$(mktemp -d /c/yaml-sigil-terminal.XXXXXX)"
-else
-  sandbox="$(mktemp -d)"
-fi
+# Resolve only the just-created trusted sandbox before forming candidate
+# paths. The protected no-follow preflight receives this physical ancestor.
+sandbox="$(mktemp -d)"
+sandbox="$(
+  cd -P -- "${sandbox}"
+  pwd -P
+)"
 chmod 0755 "${sandbox}"
 candidate_root="${sandbox}/candidate"
 candidate_home="${sandbox}/candidate-home"
+candidate_cache="${candidate_home}/.cache"
 candidate_cargo_home="${sandbox}/candidate-cargo-home"
 candidate_target="${sandbox}/candidate-target"
 candidate_temp="${sandbox}/candidate-temp"
 candidate_buf_cache="${sandbox}/candidate-buf-cache"
 candidate_pycache="${sandbox}/candidate-pycache"
+candidate_root_lockfile="${candidate_home}/Cargo.lock"
 trusted_tools="${sandbox}/trusted-tools"
 trusted_rustup_home="${sandbox}/trusted-rustup"
 setup_cargo_home="${sandbox}/setup-cargo-home"
@@ -171,7 +165,8 @@ setup_target="${sandbox}/setup-target"
 detached_pid_file="${candidate_home}/detached.pid"
 protected_validator="${trusted_cargo}"
 mkdir -p \
-  "${candidate_home}" "${candidate_cargo_home}" "${candidate_target}" \
+  "${candidate_home}" "${candidate_cache}" "${candidate_cargo_home}" \
+  "${candidate_target}" \
   "${candidate_temp}" "${candidate_buf_cache}" "${candidate_pycache}" \
   "${trusted_tools}/bin" "${trusted_rustup_home}" "${setup_cargo_home}" \
   "${setup_target}"
@@ -179,23 +174,8 @@ mkdir -p \
 # Preserve the Rustup multicall name after resolving the original executable.
 # Some installations expose rustup as a symlink to rustup-init, whose resolved
 # basename selects installer mode instead of toolchain management mode.
-rustup_name='rustup'
-[[ "${runner_os}" == 'Windows' ]] && rustup_name='rustup.exe'
-install -m 0555 "${trusted_rustup}" "${trusted_tools}/bin/${rustup_name}"
-trusted_rustup="${trusted_tools}/bin/${rustup_name}"
-
-# A Windows Python installation loads DLLs and the standard library beside
-# its executable. Stage the complete runtime before creating the candidate
-# identity so that the interpreter and everything it loads share one
-# read-only ACL boundary.
-if [[ "${runner_os}" == 'Windows' ]]; then
-  trusted_python_source="$(dirname "${trusted_python}")"
-  trusted_python_root="${trusted_tools}/python"
-  mkdir -p "${trusted_python_root}"
-  cp -R "${trusted_python_source}/." "${trusted_python_root}/"
-  trusted_python="${trusted_python_root}/${trusted_python_name}"
-  "${trusted_python}" -c 'import hashlib, json, pathlib, sys'
-fi
+install -m 0555 "${trusted_rustup}" "${trusted_tools}/bin/rustup"
+trusted_rustup="${trusted_tools}/bin/rustup"
 
 safe_path=''
 while IFS= read -r entry; do
@@ -230,8 +210,12 @@ if [[ "${profile}" != 'controller' ]]; then
   fi
 
   if [[ "${repository_kind}" == 'spec' ]]; then
-    trusted_go="$(command -v go)"
-    GOBIN="${trusted_tools}/bin" "${trusted_go}" install github.com/bufbuild/buf/cmd/buf@v1.72.0
+    # The Rust installer verifies Buf's signed upstream checksum manifest
+    # before staging the pinned official binaries in the trusted tool tree.
+    BUF_RS_CACHE_DIR="${sandbox}/trusted-buf-cache" \
+      BUF_RS_TOOLCHAIN_BIN_DIR="${trusted_tools}/bin" \
+      cargo +stable install --locked --root "${trusted_tools}" \
+      buf-toolchain --version 1.72.0
   fi
 
   if [[ "${profile}" == 'candidate-ci' ]]; then
@@ -239,21 +223,17 @@ if [[ "${profile}" != 'controller' ]]; then
   fi
 fi
 
-cargo_name='cargo'
-[[ "${runner_os}" == 'Windows' ]] && cargo_name='cargo.exe'
-install -m 0555 "${trusted_cargo}" "${trusted_tools}/bin/${cargo_name}"
-trusted_cargo="${trusted_tools}/bin/${cargo_name}"
+install -m 0555 "${trusted_cargo}" "${trusted_tools}/bin/cargo"
+trusted_cargo="${trusted_tools}/bin/cargo"
 protected_validator="${trusted_cargo}"
 
 # Cargo discovers component subcommands through PATH. An isolated Rustup home
 # contains their toolchain binaries but does not add matching Cargo-home
 # proxies, so stage only the trusted stable tools the validators invoke.
 if [[ "${profile}" != 'controller' ]]; then
-  rust_proxy_suffix=''
-  [[ "${runner_os}" == 'Windows' ]] && rust_proxy_suffix='.exe'
   for rust_proxy in cargo-clippy cargo-fmt clippy-driver rustc rustdoc rustfmt; do
     install -m 0555 "${trusted_rustup}" \
-      "${trusted_tools}/bin/${rust_proxy}${rust_proxy_suffix}"
+      "${trusted_tools}/bin/${rust_proxy}"
   done
 fi
 
@@ -265,25 +245,6 @@ git_command=(
   -c core.hooksPath=/dev/null
   -c credential.helper=
 )
-
-# Restage macOS policy below a globally traversable temporary ancestor.
-if [[ "${runner_os}" == 'macOS' ]]; then
-  policy_root="${sandbox}/protected-policy"
-  "${git_command[@]}" init --quiet --initial-branch=main "${policy_root}"
-  "${git_command[@]}" -C "${policy_root}" remote add origin \
-    "https://github.com/${canonical_repository}.git"
-  "${git_command[@]}" -C "${policy_root}" fetch --no-tags \
-    --no-recurse-submodules --depth=1 origin "${policy_sha}"
-  "${git_command[@]}" -C "${policy_root}" checkout --quiet --detach FETCH_HEAD
-  restaged_policy_sha="$(
-    "${git_command[@]}" -C "${policy_root}" \
-      rev-parse --verify 'HEAD^{commit}'
-  )"
-  if [[ "${restaged_policy_sha}" != "${policy_sha}" ]]; then
-    echo 'restaged terminal policy is not the authorized commit' >&2
-    exit 1
-  fi
-fi
 
 export GIT_TERMINAL_PROMPT=0
 "${git_command[@]}" init --quiet --initial-branch=main "${candidate_root}"
@@ -303,16 +264,10 @@ digest() {
     "$1"
 }
 
-verifier_git="${trusted_git}"
-if [[ "${runner_os}" == 'Windows' ]]; then
-  # Native Python requires the trusted executable's Windows-absolute path.
-  verifier_git="$(cygpath -w "${trusted_git}")"
-fi
-
 GITHUB_TOKEN="${github_token}" "${trusted_python}" \
   "${policy_root}/.github/scripts/protected_checkout.py" verify \
   --candidate-root "${candidate_root}" \
-  --git "${verifier_git}" \
+  --git "${trusted_git}" \
   --repository "${canonical_repository}" \
   --base-sha "${base_sha}" \
   --head-sha "${head_sha}" \
@@ -343,11 +298,6 @@ if [[ "${repository_kind}" == 'traits' && "${profile}" != 'controller' ]]; then
   fi
 fi
 
-if [[ "${repository_kind}" == 'spec' && "${profile}" == 'protected-ci' ]]; then
-  /usr/bin/bash --noprofile --norc \
-    "${policy_root}/.github/scripts/check-acvp-corpus.sh" "${candidate_root}"
-fi
-
 if [[ "${profile}" == 'protected-ci' ]]; then
   policy_manifest="${policy_root}/xtask/Cargo.toml"
   if [[ "${repository_kind}" == 'spec' ]]; then
@@ -356,44 +306,21 @@ if [[ "${profile}" == 'protected-ci' ]]; then
   export BUF_RS_CACHE_DIR="${sandbox}/trusted-buf-cache"
   mkdir -p "${BUF_RS_CACHE_DIR}"
   cargo +stable build --locked --manifest-path "${policy_manifest}"
-  validator_name='xtask'
-  [[ "${runner_os}" == 'Windows' ]] && validator_name='xtask.exe'
-  protected_validator="${trusted_tools}/bin/protected-validator${validator_name#xtask}"
-  cp "${setup_target}/debug/${validator_name}" "${protected_validator}"
+  protected_validator="${trusted_tools}/bin/protected-validator"
+  cp "${setup_target}/debug/xtask" "${protected_validator}"
   chmod 0555 "${protected_validator}"
+fi
+
+if [[ "${repository_kind}" == 'spec' && "${profile}" == 'protected-ci' ]]; then
+  "${protected_validator}" candidate-preflight \
+    --candidate-root "${candidate_root}"
 fi
 
 chmod -R a+rX,go-w "${policy_root}" "${candidate_root}" \
   "${trusted_tools}" "${trusted_rustup_home}"
 
-candidate_path="${safe_path}"
 driver="${policy_root}/.github/scripts/terminal_candidate.py"
-
-if [[ "${runner_os}" == 'Windows' ]]; then
-  command_file_windows="$(cygpath -w "${command_file}")"
-  MSYS2_ARG_CONV_EXCL='*' "$(command -v pwsh)" -NoLogo -NoProfile \
-    -File "$(cygpath -w "${policy_root}/.github/scripts/run-terminal-candidate-windows.ps1")" \
-    -CandidateProfile "${profile}" \
-    -Kind "${repository_kind}" \
-    -Sandbox "$(cygpath -w "${sandbox}")" \
-    -PolicyRoot "$(cygpath -w "${policy_root}")" \
-    -CandidateRoot "$(cygpath -w "${candidate_root}")" \
-    -Driver "$(cygpath -w "${driver}")" \
-    -Python "$(cygpath -w "${trusted_python}")" \
-    -Cargo "$(cygpath -w "${trusted_cargo}")" \
-    -ProtectedValidator "$(cygpath -w "${protected_validator}")" \
-    -CommandFile "${command_file_windows}" \
-    -CandidateHome "$(cygpath -w "${candidate_home}")" \
-    -CandidateCargoHome "$(cygpath -w "${candidate_cargo_home}")" \
-    -CandidateTarget "$(cygpath -w "${candidate_target}")" \
-    -CandidateTemp "$(cygpath -w "${candidate_temp}")" \
-    -CandidateBufCache "$(cygpath -w "${candidate_buf_cache}")" \
-    -CandidatePycache "$(cygpath -w "${candidate_pycache}")" \
-    -TrustedRustupHome "$(cygpath -w "${trusted_rustup_home}")" \
-    -TrustedPath "$(cygpath -wp "${candidate_path}")" \
-    -DetachedPidFile "$(cygpath -w "${detached_pid_file}")"
-  exit $?
-fi
+candidate_path="${safe_path}"
 
 candidate_user='yscandidate'
 candidate_user_created='false'
@@ -405,11 +332,7 @@ cleanup_candidate_user() {
   if [[ -n "${candidate_uid:-}" ]]; then
     sudo -n pkill -KILL -u "${candidate_uid}" >/dev/null 2>&1 || true
   fi
-  if [[ "${runner_os}" == 'Linux' ]]; then
-    sudo -n userdel "${candidate_user}" >/dev/null 2>&1 || true
-  else
-    sudo -n dscl . -delete "/Users/${candidate_user}" >/dev/null 2>&1 || true
-  fi
+  sudo -n userdel "${candidate_user}" >/dev/null 2>&1 || true
   if id "${candidate_user}" >/dev/null 2>&1; then
     return 1
   fi
@@ -421,28 +344,10 @@ if id "${candidate_user}" >/dev/null 2>&1; then
   echo 'disposable candidate user already exists' >&2
   exit 1
 fi
-if [[ "${runner_os}" == 'Linux' ]]; then
-  sudo -n useradd --system --user-group --no-create-home \
-    --home-dir "${candidate_home}" --shell /usr/sbin/nologin \
-    "${candidate_user}"
-  candidate_user_created='true'
-else
-  candidate_uid=550
-  while dscl . -search /Users UniqueID "${candidate_uid}" | grep -q .; do
-    candidate_uid=$((candidate_uid + 1))
-    if [[ "${candidate_uid}" -gt 599 ]]; then
-      echo 'no disposable macOS user identifier is available' >&2
-      exit 1
-    fi
-  done
-  sudo -n dscl . -create "/Users/${candidate_user}"
-  candidate_user_created='true'
-  sudo -n dscl . -create "/Users/${candidate_user}" RealName 'YamlSigil Candidate'
-  sudo -n dscl . -create "/Users/${candidate_user}" UniqueID "${candidate_uid}"
-  sudo -n dscl . -create "/Users/${candidate_user}" PrimaryGroupID 20
-  sudo -n dscl . -create "/Users/${candidate_user}" NFSHomeDirectory "${candidate_home}"
-  sudo -n dscl . -create "/Users/${candidate_user}" UserShell /usr/bin/false
-fi
+sudo -n useradd --system --user-group --no-create-home \
+  --home-dir "${candidate_home}" --shell /usr/sbin/nologin \
+  "${candidate_user}"
+candidate_user_created='true'
 candidate_uid="$(id -u "${candidate_user}")"
 if pgrep -u "${candidate_uid}" >/dev/null 2>&1; then
   echo 'new disposable candidate identity unexpectedly owns a process' >&2
@@ -452,13 +357,14 @@ fi
 chmod 0700 "${command_directory}"
 # Only elevated setup may transfer writable roots to the disposable identity.
 sudo -n chown -R "${candidate_uid}" \
-  "${candidate_home}" "${candidate_cargo_home}" "${candidate_target}" \
+  "${candidate_home}" "${candidate_cache}" "${candidate_cargo_home}" \
+  "${candidate_target}" \
   "${candidate_temp}" "${candidate_buf_cache}" "${candidate_pycache}"
 
-set +e
-sudo -n -u "${candidate_user}" -- "${trusted_env}" -i \
+candidate_environment=(
   PATH="${candidate_path}" \
   HOME="${candidate_home}" \
+  XDG_CACHE_HOME="${candidate_cache}" \
   LOGNAME="${candidate_user}" \
   USER="${candidate_user}" \
   TMPDIR="${candidate_temp}" \
@@ -467,10 +373,24 @@ sudo -n -u "${candidate_user}" -- "${trusted_env}" -i \
   RUSTUP_HOME="${trusted_rustup_home}" \
   RUSTUP_TOOLCHAIN='stable' \
   RUSTFLAGS='-D warnings' \
+  BUF_CACHE_DIR="${candidate_buf_cache}" \
   BUF_RS_CACHE_DIR="${candidate_buf_cache}" \
   PYTHONPYCACHEPREFIX="${candidate_pycache}" \
   YAML_SIGIL_PROFILE="${profile}" \
-  YAML_SIGIL_TERMINAL_CANDIDATE='1' \
+  YAML_SIGIL_TERMINAL_CANDIDATE='1'
+)
+if [[ "${repository_kind}" != 'spec' && "${profile}" != 'controller' ]]; then
+  # Current Cargo keeps its generated root lock outside the deliberately
+  # read-only candidate source. The Rust validator separately preserves each
+  # committed xtask lock for xtask-workspace commands.
+  candidate_environment+=(
+    CARGO_RESOLVER_LOCKFILE_PATH="${candidate_root_lockfile}"
+  )
+fi
+
+set +e
+sudo -n -u "${candidate_user}" -- "${trusted_env}" -i \
+  "${candidate_environment[@]}" \
   "${trusted_python}" "${driver}" run \
   --profile "${profile}" \
   --kind "${repository_kind}" \
@@ -486,7 +406,7 @@ candidate_status=$?
 set -e
 
 sudo -n pkill -KILL -u "${candidate_uid}" >/dev/null 2>&1 || true
-for _ in {1..100}; do
+for _ in {1..300}; do
   if ! pgrep -u "${candidate_uid}" >/dev/null 2>&1; then
     echo 'Terminal candidate identity is quiescent.'
     if ! cleanup_candidate_user; then
@@ -500,4 +420,5 @@ for _ in {1..100}; do
 done
 
 echo 'terminal candidate identity retained a process after cleanup' >&2
+ps -U "${candidate_uid}" -o pid=,ppid=,state=,comm= >&2 || true
 exit 1

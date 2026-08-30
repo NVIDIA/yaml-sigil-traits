@@ -25,7 +25,6 @@ MODULE_PATH = pathlib.Path(__file__).with_name("protected_pr_ci.py")
 VERIFIER_PATH = MODULE_PATH.with_name("protected_checkout.py")
 TERMINAL_DRIVER_PATH = MODULE_PATH.with_name("terminal_candidate.py")
 TERMINAL_SHELL_PATH = MODULE_PATH.with_name("run-terminal-candidate.sh")
-TERMINAL_WINDOWS_PATH = MODULE_PATH.with_name("run-terminal-candidate-windows.ps1")
 COMMIT_POLICY_PATH = MODULE_PATH.with_name("check-pull-request-commits.sh")
 POLICY_PATH = MODULE_PATH.parent.parent / "protected-pr-ci.json"
 COMMAND_WORKFLOW_PATH = MODULE_PATH.parent.parent / "workflows" / "pr-ci-command.yml"
@@ -1925,17 +1924,20 @@ class WorkflowStructureTests(unittest.TestCase):
         self.assertIn("--binding-digest", workflow)
         self.assertIn("results_json:", workflow)
 
-    def test_candidate_executing_jobs_are_terminal_and_action_free(self) -> None:
+    def test_protected_candidate_jobs_are_linux_terminal_and_action_free(
+        self,
+    ) -> None:
         workflow = REUSABLE_WORKFLOW_PATH.read_text(encoding="utf-8")
         config = json.loads(POLICY_PATH.read_text(encoding="utf-8"))
-        jobs = ["platform_verifier"]
-        jobs.extend(
+        jobs = (
             ["rebuild_rs"]
             if config["repository_kind"] == "spec"
             else ["rust", "candidate_ci"]
         )
         for name in jobs:
             block = self.job_block(workflow, name)
+            self.assertIn("runs-on: ubuntu-latest", block, name)
+            self.assertNotIn("matrix:", block, name)
             self.assertNotIn("uses:", block, name)
             self.assertEqual(
                 sum(
@@ -1949,61 +1951,138 @@ class WorkflowStructureTests(unittest.TestCase):
             self.assertIn("run-terminal-candidate.sh", block, name)
             self.assertIn('${GITHUB_ENV}', block, name)
 
+    def test_platform_verifier_uses_ordinary_cross_platform_jobs(self) -> None:
+        workflow = REUSABLE_WORKFLOW_PATH.read_text(encoding="utf-8")
+        block = self.job_block(workflow, "platform_verifier")
+        self.assertIn("runner: ubuntu-latest", block)
+        self.assertIn("runner: macos-latest", block)
+        self.assertIn("runner: windows-latest", block)
+        self.assertIn("uses: actions/checkout@", block)
+        self.assertIn("persist-credentials: false", block)
+        self.assertNotIn("run-terminal-candidate.sh", block)
+
+    def test_non_linux_jobs_never_execute_candidate_code(self) -> None:
+        workflow = REUSABLE_WORKFLOW_PATH.read_text(encoding="utf-8")
+        verifier = self.job_block(workflow, "platform_verifier")
+        self.assertNotIn("\n  compatibility:\n", workflow)
+        self.assertNotIn("protected-candidate-checkout", verifier)
+        self.assertNotIn("cargo ", verifier)
+        self.assertNotIn("candidate-root", verifier)
+        other_jobs = workflow.replace(verifier, "")
+        self.assertNotIn("runner: macos-latest", other_jobs)
+        self.assertNotIn("runner: windows-latest", other_jobs)
+
     def test_terminal_boundary_scrubs_and_separates_candidate_identity(self) -> None:
         shell = TERMINAL_SHELL_PATH.read_text(encoding="utf-8")
-        windows = TERMINAL_WINDOWS_PATH.read_text(encoding="utf-8")
         driver = TERMINAL_DRIVER_PATH.read_text(encoding="utf-8")
+        self.assertIn("terminal candidate execution requires Linux", shell)
         self.assertIn("sudo -n -u", shell)
         self.assertIn('chmod 0700 "${command_directory}"', shell)
         self.assertIn('pkill -KILL -u "${candidate_uid}"', shell)
+        self.assertIn("for _ in {1..300}", shell)
+        cleanup_tail = shell[shell.index("candidate_status=$?") :]
+        self.assertLess(
+            cleanup_tail.index('pkill -KILL -u "${candidate_uid}"'),
+            cleanup_tail.index("for _ in {1..300}"),
+        )
+        self.assertLess(
+            cleanup_tail.index("for _ in {1..300}"),
+            cleanup_tail.index("cleanup_candidate_user"),
+        )
+        self.assertIn('ps -U "${candidate_uid}"', cleanup_tail)
         for name in ("GITHUB_ENV", "GITHUB_PATH", "GITHUB_OUTPUT", "GITHUB_STEP_SUMMARY"):
             self.assertIn(name, shell)
         self.assertIn("runner command files do not share one protected directory", shell)
         self.assertIn("disposable candidate identity could not be removed", shell)
-        self.assertIn("New-LocalUser", windows)
-        self.assertIn("$startInfo.Environment.Clear()", windows)
-        self.assertIn("'/deny'", windows)
-        self.assertIn("'/inheritance:r'", windows)
-        self.assertIn("(WD,AD,WEA,WA,DE,DC,WDAC,WO)", windows)
-        self.assertIn("Stop-CandidateProcesses", windows)
-        self.assertIn("Remove-LocalUser", windows)
-        self.assertIn("identity remains after removal", windows)
+        self.assertNotIn("run-terminal-candidate-windows.ps1", shell)
+        self.assertNotIn("cygpath", shell)
+        self.assertNotIn("launchctl", shell)
+        self.assertNotIn("dscl", shell)
+        self.assertIn("terminal candidate execution requires Linux", driver)
         self.assertIn("require_command_files_inaccessible", driver)
         self.assertIn("require_parent_process_isolated", driver)
         self.assertIn("require_tree_read_only", driver)
+        self.assertIn("require_tree_readable", driver)
         self.assertIn("spawn_detached_canary", driver)
 
     def test_terminal_setup_uses_elevated_and_native_paths(self) -> None:
         shell = TERMINAL_SHELL_PATH.read_text(encoding="utf-8")
-        windows = TERMINAL_WINDOWS_PATH.read_text(encoding="utf-8")
-        self.assertIn("cygpath -w \"${trusted_git}\"", shell)
-        self.assertIn('--git "${verifier_git}"', shell)
+        self.assertIn('--git "${trusted_git}"', shell)
         self.assertIn('sudo -n chown -R "${candidate_uid}"', shell)
         self.assertNotIn('\nchown -R "${candidate_uid}"', shell)
-        self.assertIn("mktemp -d /tmp/yaml-sigil-terminal.XXXXXX", shell)
-        self.assertIn("mktemp -d /c/yaml-sigil-terminal.XXXXXX", shell)
-        self.assertIn('policy_root="${sandbox}/protected-policy"', shell)
+        self.assertIn('sandbox="$(mktemp -d)"', shell)
+        physical_sandbox = shell.index('cd -P -- "${sandbox}"')
+        candidate_root = shell.index('candidate_root="${sandbox}/candidate"')
+        self.assertIn("pwd -P", shell)
+        self.assertLess(physical_sandbox, candidate_root)
         self.assertIn('install -m 0555 "${trusted_cargo}"', shell)
         self.assertIn('protected_validator="${trusted_cargo}"', shell)
-        self.assertIn(
-            'cp -R "${trusted_python_source}/." "${trusted_python_root}/"', shell
+        self.assertIn("CARGO_RESOLVER_LOCKFILE_PATH", shell)
+        self.assertIn('if [[ "${repository_kind}" != \'spec\'', shell)
+        self.assertNotIn("trusted_bash=", shell)
+        self.assertNotIn("check-acvp-corpus.sh", shell)
+        linux_guard = shell.index("terminal candidate execution requires Linux")
+        protected_build = shell.index("cargo +stable build --locked")
+        protected_preflight = shell.index(
+            '"${protected_validator}" candidate-preflight'
         )
-        self.assertIn(
-            'trusted_python="${trusted_python_root}/${trusted_python_name}"', shell
-        )
-        self.assertIn(
-            'trusted_python_name="$(basename "${trusted_python_command}")"', shell
-        )
+        candidate_boundary = shell.index('candidate_path="${safe_path}"')
+        self.assertLess(linux_guard, protected_build)
+        self.assertLess(protected_build, protected_preflight)
+        self.assertLess(protected_preflight, candidate_boundary)
+        self.assertIn('--candidate-root "${candidate_root}"', shell)
         self.assertIn(
             'trusted_python="$(realpath "${trusted_python_command}")"', shell
         )
-        self.assertIn("-Description 'Disposable YamlSigil candidate'", windows)
-        self.assertNotIn("candidate validation identity", windows)
-        self.assertLess(
-            windows.index('"${candidateSid}:RX"'),
-            windows.index("Invoke-Icacls -Arguments @($Sandbox, '/inheritance:r'"),
+
+    def test_terminal_caches_are_candidate_owned(self) -> None:
+        shell = TERMINAL_SHELL_PATH.read_text(encoding="utf-8")
+        self.assertIn('candidate_cache="${candidate_home}/.cache"', shell)
+        self.assertIn('XDG_CACHE_HOME="${candidate_cache}"', shell)
+        self.assertIn('BUF_CACHE_DIR="${candidate_buf_cache}"', shell)
+
+    @mock.patch.object(terminal_candidate, "resolved_executable")
+    @mock.patch.object(terminal_candidate, "run_process")
+    def test_candidate_ci_separates_xtask_and_root_lockfiles(
+        self,
+        run_process: mock.Mock,
+        resolved_executable: mock.Mock,
+    ) -> None:
+        target = pathlib.Path("/candidate-target")
+        external_lock = "/candidate-home/Cargo.lock"
+        candidate_xtask = target / "debug" / "xtask"
+        resolved_executable.return_value = candidate_xtask
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "CARGO_TARGET_DIR": os.fspath(target),
+                terminal_candidate.CARGO_LOCKFILE_PATH_ENV: external_lock,
+            },
+            clear=True,
+        ):
+            terminal_candidate.run_profile(
+                "candidate-ci",
+                "traits",
+                pathlib.Path("/policy"),
+                pathlib.Path("/candidate"),
+                pathlib.Path("/trusted/cargo"),
+                pathlib.Path("/trusted/python"),
+                pathlib.Path("/trusted/validator"),
+            )
+
+        self.assertEqual(run_process.call_count, 3)
+        archive_environment = run_process.call_args_list[0].kwargs["environment"]
+        build_environment = run_process.call_args_list[1].kwargs["environment"]
+        self.assertNotIn(terminal_candidate.CARGO_LOCKFILE_PATH_ENV, archive_environment)
+        self.assertNotIn(terminal_candidate.CARGO_LOCKFILE_PATH_ENV, build_environment)
+        self.assertIn("+1.95.0", run_process.call_args_list[0].args[0])
+        self.assertIn("build", run_process.call_args_list[1].args[0])
+        self.assertEqual(
+            run_process.call_args_list[2].args[0],
+            [os.fspath(candidate_xtask), "ci"],
         )
-        self.assertNotIn("'/C'", windows)
+        self.assertNotIn("environment", run_process.call_args_list[2].kwargs)
 
     def test_terminal_driver_rejects_runner_and_preload_environment(self) -> None:
         with mock.patch.dict(
@@ -2046,6 +2125,24 @@ class WorkflowStructureTests(unittest.TestCase):
                 terminal_candidate.require_tree_read_only(root, "trusted tree")
             with self.assertRaises(terminal_candidate.IsolationError):
                 terminal_candidate.require_file_read_only(trusted_file, "trusted tool")
+
+    def test_terminal_driver_names_an_unreadable_candidate_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            unreadable = root / "blocked.txt"
+            unreadable.write_bytes(b"blocked")
+            with mock.patch.object(
+                pathlib.Path,
+                "open",
+                side_effect=PermissionError(13, "denied"),
+            ):
+                with self.assertRaisesRegex(
+                    terminal_candidate.IsolationError,
+                    r"cannot read candidate source tree entry blocked\.txt",
+                ):
+                    terminal_candidate.require_tree_readable(
+                        root, "candidate source tree"
+                    )
 
     def test_controller_token_jobs_compile_before_checks_only_tokens(self) -> None:
         command = COMMAND_WORKFLOW_PATH.read_text(encoding="utf-8")

@@ -9,7 +9,7 @@ The parent workflow prepares immutable policy and tools, removes runner control
 variables, and starts this program as a separate operating-system user.  This
 program verifies that boundary before it starts candidate-controlled code.  It
 also leaves a deliberately detached helper for the parent to terminate, which
-turns descendant cleanup into a hosted canary on every runner platform.
+turns descendant cleanup into a hosted Linux canary.
 """
 
 from __future__ import annotations
@@ -30,6 +30,7 @@ import time
 MAX_PROFILE_SECONDS = 80 * 60
 MAX_STDOUT_BYTES = 16 * 1024 * 1024
 MAX_STDERR_BYTES = 4 * 1024 * 1024
+CARGO_LOCKFILE_PATH_ENV = "CARGO_RESOLVER_LOCKFILE_PATH"
 FORBIDDEN_PREFIXES = ("ACTIONS_", "GITHUB_", "GH_", "RUNNER_")
 FORBIDDEN_NAMES = {
     "CI",
@@ -148,30 +149,43 @@ def require_tree_read_only(root: pathlib.Path, label: str) -> None:
         require_directory_read_only(pathlib.Path(directory), label)
 
 
+def require_tree_readable(root: pathlib.Path, label: str) -> None:
+    entries = 0
+
+    def walk_error(error: OSError) -> None:
+        raise IsolationError(f"cannot inspect {label}: {error}") from error
+
+    for directory, names, files in os.walk(
+        root, topdown=True, onerror=walk_error, followlinks=False
+    ):
+        names.sort()
+        files.sort()
+        for name in files:
+            entries += 1
+            require(entries <= 50_000, f"{label} contains too many files")
+            path = pathlib.Path(directory) / name
+            try:
+                if path.is_symlink():
+                    os.readlink(path)
+                else:
+                    with path.open("rb") as handle:
+                        handle.read(1)
+            except OSError as error:
+                relative = path.relative_to(root)
+                raise IsolationError(
+                    f"cannot read {label} entry {relative}: {error}"
+                ) from error
+
+
 def require_parent_process_isolated() -> None:
-    if sys.platform.startswith("linux"):
-        parent_environment = pathlib.Path(f"/proc/{os.getppid()}/environ")
-        try:
-            parent_environment.read_bytes()
-        except (FileNotFoundError, PermissionError):
-            return
-        except OSError:
-            return
-        raise IsolationError("candidate identity can read its trusted parent's environment")
-
-    if os.name == "nt":
-        import ctypes
-
-        process_vm_read = 0x0010
-        process_query_information = 0x0400
-        handle = ctypes.windll.kernel32.OpenProcess(  # type: ignore[attr-defined]
-            process_vm_read | process_query_information,
-            False,
-            os.getppid(),
-        )
-        if handle:
-            ctypes.windll.kernel32.CloseHandle(handle)  # type: ignore[attr-defined]
-            raise IsolationError("candidate identity can inspect its trusted parent process")
+    parent_environment = pathlib.Path(f"/proc/{os.getppid()}/environ")
+    try:
+        parent_environment.read_bytes()
+    except (FileNotFoundError, PermissionError):
+        return
+    except OSError:
+        return
+    raise IsolationError("candidate identity can read its trusted parent's environment")
 
 
 def require_trusted_path(trusted_cargo: pathlib.Path, trusted_python: pathlib.Path) -> None:
@@ -184,7 +198,7 @@ def require_trusted_path(trusted_cargo: pathlib.Path, trusted_python: pathlib.Pa
         require(cargo is not None, "Cargo is absent from the candidate PATH")
         require(pathlib.Path(cargo).resolve() == trusted_cargo, "candidate PATH replaced Cargo")
 
-    decoy = pathlib.Path(os.environ["HOME"]) / ("cargo.exe" if os.name == "nt" else "cargo")
+    decoy = pathlib.Path(os.environ["HOME"]) / "cargo"
     decoy.write_text("candidate path decoy\n", encoding="utf-8")
     decoy.chmod(decoy.stat().st_mode | stat.S_IXUSR)
     cargo = shutil.which("cargo")
@@ -203,16 +217,12 @@ def detached_helper(marker: pathlib.Path) -> int:
 
 def spawn_detached_canary(driver: pathlib.Path, marker: pathlib.Path) -> None:
     require(not marker.exists(), "detached canary marker already exists")
-    flags = 0
-    if os.name == "nt":
-        flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
     subprocess.Popen(
         [sys.executable, os.fspath(driver), "detached-helper", os.fspath(marker)],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
-        start_new_session=os.name != "nt",
-        creationflags=flags,
+        start_new_session=True,
         close_fds=True,
     )
     deadline = time.monotonic() + 5
@@ -226,15 +236,6 @@ def spawn_detached_canary(driver: pathlib.Path, marker: pathlib.Path) -> None:
 
 
 def terminate_group(process: subprocess.Popen[bytes]) -> None:
-    if os.name == "nt":
-        subprocess.run(
-            ["taskkill.exe", "/PID", str(process.pid), "/T", "/F"],
-            check=False,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        return
     try:
         os.killpg(process.pid, signal.SIGKILL)
     except ProcessLookupError:
@@ -248,15 +249,13 @@ def run_process(
     environment: dict[str, str] | None = None,
 ) -> None:
     print("+", " ".join(arguments), f"(cwd {cwd})", flush=True)
-    flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
     process = subprocess.Popen(
         arguments,
         cwd=cwd,
         env=environment,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        start_new_session=os.name != "nt",
-        creationflags=flags,
+        start_new_session=True,
         close_fds=True,
     )
     assert process.stdout is not None and process.stderr is not None
@@ -377,6 +376,7 @@ def run_profile(
     require(kind in {"traits", "rs"}, "candidate-ci is unsupported for this repository")
     manifest = candidate_root / "xtask" / "Cargo.toml"
     archive_environment = dict(os.environ)
+    archive_environment.pop(CARGO_LOCKFILE_PATH_ENV, None)
     archive_environment["YAML_SIGIL_REQUIRE_CARGO_1_95_ARCHIVE"] = "1"
     run_process(
         [
@@ -393,10 +393,30 @@ def run_profile(
         candidate_root,
         environment=archive_environment,
     )
+
+    # Compile the candidate xtask with its committed xtask/Cargo.lock before
+    # giving the resulting terminal workload Cargo's candidate-owned root
+    # lockfile path. This keeps the verified source tree read-only without
+    # treating the root and xtask workspaces as though they shared one lock.
+    build_environment = dict(os.environ)
+    build_environment.pop(CARGO_LOCKFILE_PATH_ENV, None)
     run_process(
-        [os.fspath(cargo), "+stable", "xtask", "ci"],
+        [
+            os.fspath(cargo),
+            "+stable",
+            "build",
+            "--locked",
+            "--manifest-path",
+            os.fspath(manifest),
+        ],
         candidate_root,
+        environment=build_environment,
     )
+    candidate_xtask = resolved_executable(
+        pathlib.Path(os.environ["CARGO_TARGET_DIR"]) / "debug" / "xtask",
+        "candidate xtask",
+    )
+    run_process([os.fspath(candidate_xtask), "ci"], candidate_root)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -425,6 +445,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "detached-helper":
         return detached_helper(pathlib.Path(args.marker))
 
+    require(
+        sys.platform.startswith("linux"),
+        "terminal candidate execution requires Linux",
+    )
     policy_root = pathlib.Path(args.policy_root).resolve(strict=True)
     candidate_root = pathlib.Path(args.candidate_root).resolve(strict=True)
     cargo = resolved_executable(args.trusted_cargo, "trusted Cargo")
@@ -441,6 +465,7 @@ def main(argv: list[str] | None = None) -> int:
     require_parent_process_isolated()
     require_tree_read_only(policy_root, "protected policy tree")
     require_tree_read_only(candidate_root, "candidate source tree")
+    require_tree_readable(candidate_root, "candidate source tree")
     require_tree_read_only(rustup_home, "trusted Rust toolchain")
     require_file_read_only(cargo, "trusted Cargo")
     require_file_read_only(python, "trusted Python")
