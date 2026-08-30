@@ -176,6 +176,14 @@ mkdir -p \
   "${trusted_tools}/bin" "${trusted_rustup_home}" "${setup_cargo_home}" \
   "${setup_target}"
 
+# Preserve the Rustup multicall name after resolving the original executable.
+# Some installations expose rustup as a symlink to rustup-init, whose resolved
+# basename selects installer mode instead of toolchain management mode.
+rustup_name='rustup'
+[[ "${runner_os}" == 'Windows' ]] && rustup_name='rustup.exe'
+install -m 0555 "${trusted_rustup}" "${trusted_tools}/bin/${rustup_name}"
+trusted_rustup="${trusted_tools}/bin/${rustup_name}"
+
 # A Windows Python installation loads DLLs and the standard library beside
 # its executable. Stage the complete runtime before creating the candidate
 # identity so that the interpreter and everything it loads share one
@@ -236,6 +244,18 @@ cargo_name='cargo'
 install -m 0555 "${trusted_cargo}" "${trusted_tools}/bin/${cargo_name}"
 trusted_cargo="${trusted_tools}/bin/${cargo_name}"
 protected_validator="${trusted_cargo}"
+
+# Cargo discovers component subcommands through PATH. An isolated Rustup home
+# contains their toolchain binaries but does not add matching Cargo-home
+# proxies, so stage only the trusted stable tools the validators invoke.
+if [[ "${profile}" != 'controller' ]]; then
+  rust_proxy_suffix=''
+  [[ "${runner_os}" == 'Windows' ]] && rust_proxy_suffix='.exe'
+  for rust_proxy in cargo-clippy cargo-fmt clippy-driver rustc rustdoc rustfmt; do
+    install -m 0555 "${trusted_rustup}" \
+      "${trusted_tools}/bin/${rust_proxy}${rust_proxy_suffix}"
+  done
+fi
 
 git_command=(
   "${trusted_git}"
