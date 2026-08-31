@@ -80,8 +80,8 @@ jobs:
       - name: Install and verify release analyzers
         run: cargo xtask release install-tools
 
-      # Preserve current trusted baseline policy across a recovery checkout.
-      - name: Stage current baseline validator
+      # Preserve current trusted release policy across a recovery checkout.
+      - name: Stage current release validator
         run: |
           cargo build --locked --manifest-path xtask/Cargo.toml
           validator="${RUNNER_TEMP}/yaml-sigil-release-xtask"
@@ -191,7 +191,9 @@ jobs:
           CAPTURED_SHA: ${{ steps.discover.outputs.captured_release_sha }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          cargo xtask github release-source authorize \
+          test "$(sha256sum "${YAML_SIGIL_RELEASE_XTASK}" | cut -d ' ' -f 1)" \
+            = "${YAML_SIGIL_RELEASE_XTASK_SHA256}"
+          "${YAML_SIGIL_RELEASE_XTASK}" github release-source authorize \
             --repository "${GITHUB_REPOSITORY}" \
             --commit "${CAPTURED_SHA}" \
             --baseline-version "${{ steps.baseline.outputs.version }}" \
@@ -221,12 +223,14 @@ jobs:
         env:
           CAPTURED_SHA: ${{ steps.discover.outputs.captured_release_sha }}
           GH_TOKEN: ${{ github.token }}
-        run: >-
-          cargo xtask github release-train capture
-          --repository "${GITHUB_REPOSITORY}"
-          --commit "${CAPTURED_SHA}"
-          --baseline-version "${{ steps.baseline.outputs.version }}"
-          --baseline-commit "${{ steps.baseline.outputs.commit }}"
+        run: |
+          test "$(sha256sum "${YAML_SIGIL_RELEASE_XTASK}" | cut -d ' ' -f 1)" \
+            = "${YAML_SIGIL_RELEASE_XTASK_SHA256}"
+          "${YAML_SIGIL_RELEASE_XTASK}" github release-train capture \
+            --repository "${GITHUB_REPOSITORY}" \
+            --commit "${CAPTURED_SHA}" \
+            --baseline-version "${{ steps.baseline.outputs.version }}" \
+            --baseline-commit "${{ steps.baseline.outputs.commit }}"
 
       - name: Verify pinned historical source-only Releases
         id: legacy
@@ -303,8 +307,8 @@ jobs:
       - name: Install and verify release analyzers
         run: cargo xtask release install-tools
 
-      # Preserve current trusted baseline policy across a recovery checkout.
-      - name: Stage current baseline validator
+      # Preserve current trusted release policy across a recovery checkout.
+      - name: Stage current release validator
         run: |
           cargo build --locked --manifest-path xtask/Cargo.toml
           validator="${RUNNER_TEMP}/yaml-sigil-release-xtask"
@@ -392,7 +396,9 @@ jobs:
             --intent "${intent}"
           cargo xtask release check-packages yaml-sigil-traits
           cargo package
-          cargo xtask github release-source authorize \
+          test "$(sha256sum "${YAML_SIGIL_RELEASE_XTASK}" | cut -d ' ' -f 1)" \
+            = "${YAML_SIGIL_RELEASE_XTASK_SHA256}"
+          "${YAML_SIGIL_RELEASE_XTASK}" github release-source authorize \
             --repository "${GITHUB_REPOSITORY}" \
             --commit "${CAPTURED_SHA}" \
             --baseline-version "${{ steps.baseline.outputs.version }}" \
@@ -417,7 +423,9 @@ jobs:
               --fetch-url "https://github.com/${GITHUB_REPOSITORY}"
           fi
           test "$(git rev-parse HEAD)" = "${CAPTURED_SHA}"
-          cargo xtask github release-train capture \
+          test "$(sha256sum "${YAML_SIGIL_RELEASE_XTASK}" | cut -d ' ' -f 1)" \
+            = "${YAML_SIGIL_RELEASE_XTASK_SHA256}"
+          "${YAML_SIGIL_RELEASE_XTASK}" github release-train capture \
             --repository "${GITHUB_REPOSITORY}" \
             --commit "${CAPTURED_SHA}" \
             --baseline-version "${{ steps.baseline.outputs.version }}" \
@@ -465,7 +473,9 @@ jobs:
               exit 1
               ;;
           esac
-          cargo xtask github release-train wait \
+          test "$(sha256sum "${YAML_SIGIL_RELEASE_XTASK}" | cut -d ' ' -f 1)" \
+            = "${YAML_SIGIL_RELEASE_XTASK_SHA256}"
+          "${YAML_SIGIL_RELEASE_XTASK}" github release-train wait \
             --repository "${GITHUB_REPOSITORY}" \
             --plan "${PLAN}" \
             --plan-digest "${PLAN_DIGEST}"

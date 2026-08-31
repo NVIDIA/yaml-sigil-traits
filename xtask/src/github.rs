@@ -21,7 +21,8 @@ use std::process::{Command, Output};
 
 use crate::bounded_process::{self, OutputLimits};
 use clap::{Args, Subcommand, ValueEnum};
-use transport::GhCli;
+use serde::Deserialize;
+use transport::{GhCli, Transport};
 
 use consts::RepositoryPolicy;
 pub(crate) use consts::{
@@ -505,6 +506,36 @@ pub(super) fn is_positive_integer(value: &str) -> bool {
     !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) && !value.starts_with('0')
 }
 
+pub(super) fn require_captured_ancestry(
+    github: &mut impl Transport,
+    repository: &str,
+    release_sha: &str,
+) -> Result<(), String> {
+    #[derive(Deserialize)]
+    struct Comparison {
+        status: String,
+        base_commit: CommitIdentity,
+        merge_base_commit: CommitIdentity,
+    }
+    #[derive(Deserialize)]
+    struct CommitIdentity {
+        sha: String,
+    }
+
+    if !is_sha(release_sha) {
+        return Err("captured release SHA is invalid".to_string());
+    }
+    let comparison: Comparison =
+        github.get(&format!("repos/{repository}/compare/{release_sha}...main"))?;
+    if !matches!(comparison.status.as_str(), "ahead" | "identical")
+        || comparison.base_commit.sha != release_sha
+        || comparison.merge_base_commit.sha != release_sha
+    {
+        return Err("captured release SHA is no longer protected-main ancestry".to_string());
+    }
+    Ok(())
+}
+
 pub(super) fn append_outputs(values: &[(&str, &str)]) -> Result<(), String> {
     let path = PathBuf::from(env_required("GITHUB_OUTPUT")?);
     let mut output = OpenOptions::new()
@@ -596,6 +627,8 @@ pub(super) fn validate_ref_component(value: &str, label: &str) -> Result<(), Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::github::transport::fake::{Expected, FakeTransport};
+    use serde_json::json;
 
     #[test]
     fn exact_identifiers_are_strict() {
@@ -605,5 +638,44 @@ mod tests {
         assert!(!is_positive_integer("0"));
         assert!(validate_ref_component("release-plz-next", "branch").is_ok());
         assert!(validate_ref_component("../main", "branch").is_err());
+    }
+
+    #[test]
+    fn captured_source_accepts_current_or_ancestor_main() {
+        let release_sha = "a".repeat(40);
+        let path = format!("repos/example/project/compare/{release_sha}...main");
+        for status in ["identical", "ahead"] {
+            let mut github = FakeTransport::new([Expected::json(
+                "GET",
+                &path,
+                json!({
+                    "status": status,
+                    "base_commit": {"sha": release_sha},
+                    "merge_base_commit": {"sha": release_sha},
+                }),
+            )]);
+            require_captured_ancestry(&mut github, "example/project", &release_sha).unwrap();
+            github.finish();
+        }
+    }
+
+    #[test]
+    fn captured_source_rejects_nonancestor_compare_binding() {
+        let release_sha = "a".repeat(40);
+        let path = format!("repos/example/project/compare/{release_sha}...main");
+        let mut github = FakeTransport::new([Expected::json(
+            "GET",
+            &path,
+            json!({
+                "status": "diverged",
+                "base_commit": {"sha": release_sha},
+                "merge_base_commit": {"sha": "b".repeat(40)},
+            }),
+        )]);
+        assert_eq!(
+            require_captured_ancestry(&mut github, "example/project", &release_sha).unwrap_err(),
+            "captured release SHA is no longer protected-main ancestry"
+        );
+        github.finish();
     }
 }
