@@ -1,1 +1,2 @@
 YamlSigil protected contributor CI final canary.
+Head-change invalidation phase.
