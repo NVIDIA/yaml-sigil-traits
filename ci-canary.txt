@@ -1,0 +1,1 @@
+YamlSigil protected contributor CI final canary.
