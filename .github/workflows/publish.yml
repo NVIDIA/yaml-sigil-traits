@@ -91,6 +91,22 @@ jobs:
             >>"${GITHUB_ENV}"
           printf 'YAML_SIGIL_RELEASE_XTASK_SHA256=%s\n' "${validator_sha256}" \
             >>"${GITHUB_ENV}"
+          evidence="${RUNNER_TEMP}/yaml-sigil-release-evidence.py"
+          install -m 500 .github/scripts/release_evidence.py "${evidence}"
+          evidence_sha256="$(sha256sum "${evidence}" | cut -d ' ' -f 1)"
+          printf 'YAML_SIGIL_RELEASE_EVIDENCE=%s\n' "${evidence}" \
+            >>"${GITHUB_ENV}"
+          printf 'YAML_SIGIL_RELEASE_EVIDENCE_SHA256=%s\n' "${evidence_sha256}" \
+            >>"${GITHUB_ENV}"
+
+      - name: Verify pinned historical source-only Releases
+        id: legacy
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python3 .github/scripts/legacy_release_preflight.py
+          --inventory .github/legacy-release-inventory.json
+          --github-output "${GITHUB_OUTPUT}"
 
       - name: Configure read-only forge identity
         env:
@@ -244,17 +260,11 @@ jobs:
           "${YAML_SIGIL_RELEASE_XTASK}" github release-train capture \
             --repository "${GITHUB_REPOSITORY}" \
             --commit "${CAPTURED_SHA}" \
+            --policy-commit "${GITHUB_SHA}" \
+            --legacy-inventory-sha256 \
+              "${{ steps.legacy.outputs.legacy_inventory_digest }}" \
             --baseline-version "${{ steps.baseline.outputs.version }}" \
             --baseline-commit "${{ steps.baseline.outputs.commit }}"
-
-      - name: Verify pinned historical source-only Releases
-        id: legacy
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: >-
-          python3 .github/scripts/legacy_release_preflight.py
-          --inventory .github/legacy-release-inventory.json
-          --github-output "${GITHUB_OUTPUT}"
 
       # The protected-environment reviewer performs the fresh repository-admin
       # setting readback for this exact run and confirms this displayed digest.
@@ -262,13 +272,15 @@ jobs:
         id: evidence
         env:
           CAPTURED_SHA: ${{ steps.capture.outputs.captured_release_sha }}
-        run: >-
-          python3 .github/scripts/release_evidence.py settings
-          --repository "${GITHUB_REPOSITORY}"
-          --release-sha "${CAPTURED_SHA}"
-          --run-id "${GITHUB_RUN_ID}"
-          --run-attempt "${GITHUB_RUN_ATTEMPT}"
-          --github-output "${GITHUB_OUTPUT}"
+        run: |
+          test "$(sha256sum "${YAML_SIGIL_RELEASE_EVIDENCE}" | cut -d ' ' -f 1)" \
+            = "${YAML_SIGIL_RELEASE_EVIDENCE_SHA256}"
+          python3 "${YAML_SIGIL_RELEASE_EVIDENCE}" settings \
+            --repository "${GITHUB_REPOSITORY}" \
+            --release-sha "${CAPTURED_SHA}" \
+            --run-id "${GITHUB_RUN_ID}" \
+            --run-attempt "${GITHUB_RUN_ATTEMPT}" \
+            --github-output "${GITHUB_OUTPUT}"
 
   publication:
     name: Publish source crate
@@ -287,6 +299,7 @@ jobs:
       baseline_commit: ${{ steps.baseline.outputs.commit }}
       baseline_version: ${{ steps.baseline.outputs.version }}
       captured_release_sha: ${{ steps.capture.outputs.captured_release_sha }}
+      policy_commit: ${{ steps.capture.outputs.policy_commit }}
       existing_intent: ${{ steps.capture.outputs.existing_intent }}
       existing_intent_check_id: ${{ steps.capture.outputs.existing_intent_check_id }}
       existing_intent_digest: ${{ steps.capture.outputs.existing_intent_digest }}
@@ -333,6 +346,15 @@ jobs:
             >>"${GITHUB_ENV}"
           printf 'YAML_SIGIL_RELEASE_XTASK_SHA256=%s\n' "${validator_sha256}" \
             >>"${GITHUB_ENV}"
+
+      - name: Recheck pinned historical source-only Releases
+        id: legacy
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python3 .github/scripts/legacy_release_preflight.py
+          --inventory .github/legacy-release-inventory.json
+          --github-output "${GITHUB_OUTPUT}"
 
       - name: Configure protected publication forge identity
         env:
@@ -457,17 +479,12 @@ jobs:
           "${YAML_SIGIL_RELEASE_XTASK}" github release-train capture \
             --repository "${GITHUB_REPOSITORY}" \
             --commit "${CAPTURED_SHA}" \
+            --policy-commit "${GITHUB_SHA}" \
+            --legacy-inventory-sha256 \
+              "${{ steps.legacy.outputs.legacy_inventory_digest }}" \
             --baseline-version "${{ steps.baseline.outputs.version }}" \
             --baseline-commit "${{ steps.baseline.outputs.commit }}"
           test "$(git rev-parse HEAD)" = "${CAPTURED_SHA}"
-
-      - name: Recheck pinned historical source-only Releases
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: >-
-          python3 .github/scripts/legacy_release_preflight.py
-          --inventory .github/legacy-release-inventory.json
-          --github-output "${GITHUB_OUTPUT}"
 
       - name: Publish missing source package and await exact registry state
         id: publish
@@ -537,6 +554,35 @@ jobs:
       intent_digest: ${{ steps.create.outputs.intent_digest }}
       intent_external_id: ${{ steps.create.outputs.intent_external_id }}
     steps:
+      - name: Check out protected release policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ needs.publication.outputs.policy_commit }}
+
+      - name: Verify exact policy checkout
+        env:
+          POLICY_COMMIT: ${{ needs.publication.outputs.policy_commit }}
+        run: test "$(git rev-parse HEAD)" = "${POLICY_COMMIT}"
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache: false
+          toolchain: 1.95.0,stable
+
+      - name: Stage protected typed intent attestor
+        run: |
+          cargo build --locked --release --manifest-path xtask/Cargo.toml
+          validator="${RUNNER_TEMP}/yaml-sigil-release-xtask"
+          install -m 700 xtask/target/release/xtask "${validator}"
+          validator_sha256="$(sha256sum "${validator}" | cut -d' ' -f1)"
+          printf 'YAML_SIGIL_RELEASE_XTASK=%s\n' "${validator}" \
+            >>"${GITHUB_ENV}"
+          printf 'YAML_SIGIL_RELEASE_XTASK_SHA256=%s\n' "${validator_sha256}" \
+            >>"${GITHUB_ENV}"
+
       - name: Check out captured trusted source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -548,12 +594,6 @@ jobs:
         env:
           CAPTURED_SHA: ${{ needs.publication.outputs.captured_release_sha }}
         run: test "$(git rev-parse HEAD)" = "${CAPTURED_SHA}"
-
-      - name: Set up Rust
-        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
-        with:
-          cache: false
-          toolchain: 1.95.0,stable
 
       - name: Bind archive reproduction Cargo
         run: |
@@ -567,15 +607,17 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PLAN: ${{ needs.publication.outputs.plan }}
           PLAN_DIGEST: ${{ needs.publication.outputs.plan_digest }}
-        run: >-
-          cargo xtask github release-train verify
-          --repository "${GITHUB_REPOSITORY}"
-          --plan "${PLAN}"
-          --plan-digest "${PLAN_DIGEST}"
-          --baseline-version "${{ needs.publication.outputs.baseline_version }}"
-          --baseline-commit "${{ needs.publication.outputs.baseline_commit }}"
+        run: |
+          test "$(sha256sum "${YAML_SIGIL_RELEASE_XTASK}" | cut -d' ' -f1)" \
+            = "${YAML_SIGIL_RELEASE_XTASK_SHA256}"
+          "${YAML_SIGIL_RELEASE_XTASK}" github release-train verify \
+            --repository "${GITHUB_REPOSITORY}" \
+            --plan "${PLAN}" \
+            --plan-digest "${PLAN_DIGEST}" \
+            --baseline-version "${{ needs.publication.outputs.baseline_version }}" \
+            --baseline-commit "${{ needs.publication.outputs.baseline_commit }}"
 
-      - name: Compile and bind typed intent attestor
+      - name: Bind typed intent attestation
         id: compile
         env:
           EXISTING_INTENT: ${{ needs.publication.outputs.existing_intent }}
@@ -585,16 +627,13 @@ jobs:
           PLAN_DIGEST: ${{ needs.publication.outputs.plan_digest }}
           RULESET_EVIDENCE_SHA256: ${{ needs.release-readiness.outputs.ruleset_evidence_sha256 }}
         run: |
-          cargo build --locked --release --manifest-path xtask/Cargo.toml
-          install -m 700 xtask/target/release/xtask \
-            "${RUNNER_TEMP}/yaml-sigil-release-xtask"
-          binary_sha256="$(sha256sum "${RUNNER_TEMP}/yaml-sigil-release-xtask" \
-            | cut -d' ' -f1)"
+          binary_sha256="$(sha256sum "${YAML_SIGIL_RELEASE_XTASK}" | cut -d' ' -f1)"
+          test "${binary_sha256}" = "${YAML_SIGIL_RELEASE_XTASK_SHA256}"
           printf 'binary_sha256=%s\n' "${binary_sha256}" >>"${GITHUB_OUTPUT}"
           # Preserve a durable original intent; otherwise create this run's intent.
           case "${EXISTING_INTENT}" in
             '')
-              "${RUNNER_TEMP}/yaml-sigil-release-xtask" \
+              "${YAML_SIGIL_RELEASE_XTASK}" \
                 github release-train prepare-intent \
                 --plan "${PLAN}" \
                 --plan-digest "${PLAN_DIGEST}" \
@@ -612,8 +651,8 @@ jobs:
           esac
           rm -rf "${GITHUB_WORKSPACE}"
           mkdir -m 700 "${GITHUB_WORKSPACE}"
-          test "$(sha256sum "${RUNNER_TEMP}/yaml-sigil-release-xtask" \
-            | cut -d' ' -f1)" = "${binary_sha256}"
+          test "$(sha256sum "${YAML_SIGIL_RELEASE_XTASK}" | cut -d' ' -f1)" \
+            = "${binary_sha256}"
 
       - name: Create checks-only repository token
         id: app-token
@@ -634,7 +673,7 @@ jobs:
           PLAN: ${{ needs.publication.outputs.plan }}
           PLAN_DIGEST: ${{ needs.publication.outputs.plan_digest }}
         run: >-
-          "${RUNNER_TEMP}/yaml-sigil-release-xtask"
+          "${YAML_SIGIL_RELEASE_XTASK}"
           github release-train create-intent
           --repository "${GITHUB_REPOSITORY}"
           --plan "${PLAN}"
@@ -660,7 +699,45 @@ jobs:
       binary_sha256: ${{ steps.compile.outputs.binary_sha256 }}
       complete: ${{ steps.finalize.outputs.complete }}
       finalized_entries: ${{ steps.finalize.outputs.finalized_entries }}
+      notification_required: ${{ steps.finalize.outputs.notification_required }}
     steps:
+      - name: Check out protected release policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ needs.publication.outputs.policy_commit }}
+
+      - name: Verify exact policy checkout
+        env:
+          POLICY_COMMIT: ${{ needs.publication.outputs.policy_commit }}
+        run: test "$(git rev-parse HEAD)" = "${POLICY_COMMIT}"
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache: false
+          toolchain: 1.95.0,stable
+
+      - name: Recheck pinned historical source-only Releases
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python3 .github/scripts/legacy_release_preflight.py
+          --inventory .github/legacy-release-inventory.json
+          --github-output "${GITHUB_OUTPUT}"
+
+      - name: Stage protected checkout-independent finalizer
+        run: |
+          cargo build --locked --release --manifest-path xtask/Cargo.toml
+          validator="${RUNNER_TEMP}/yaml-sigil-release-xtask"
+          install -m 700 xtask/target/release/xtask "${validator}"
+          validator_sha256="$(sha256sum "${validator}" | cut -d' ' -f1)"
+          printf 'YAML_SIGIL_RELEASE_XTASK=%s\n' "${validator}" \
+            >>"${GITHUB_ENV}"
+          printf 'YAML_SIGIL_RELEASE_XTASK_SHA256=%s\n' "${validator_sha256}" \
+            >>"${GITHUB_ENV}"
+
       - name: Check out captured trusted source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -672,12 +749,6 @@ jobs:
         env:
           CAPTURED_SHA: ${{ needs.publication.outputs.captured_release_sha }}
         run: test "$(git rev-parse HEAD)" = "${CAPTURED_SHA}"
-
-      - name: Set up Rust
-        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
-        with:
-          cache: false
-          toolchain: 1.95.0,stable
 
       - name: Bind archive reproduction Cargo
         run: |
@@ -693,40 +764,31 @@ jobs:
           PLAN: ${{ needs.publication.outputs.plan }}
           PLAN_DIGEST: ${{ needs.publication.outputs.plan_digest }}
         run: |
-          cargo xtask github release-train verify \
+          test "$(sha256sum "${YAML_SIGIL_RELEASE_XTASK}" | cut -d' ' -f1)" \
+            = "${YAML_SIGIL_RELEASE_XTASK_SHA256}"
+          "${YAML_SIGIL_RELEASE_XTASK}" github release-train verify \
             --repository "${GITHUB_REPOSITORY}" \
             --plan "${PLAN}" \
             --plan-digest "${PLAN_DIGEST}" \
             --baseline-version "${{ needs.publication.outputs.baseline_version }}" \
             --baseline-commit "${{ needs.publication.outputs.baseline_commit }}"
-          cargo xtask github release-train verify-intent \
+          "${YAML_SIGIL_RELEASE_XTASK}" github release-train verify-intent \
             --repository "${GITHUB_REPOSITORY}" \
             --plan "${PLAN}" \
             --plan-digest "${PLAN_DIGEST}" \
             --intent "${INTENT}" \
             --check-id "${{ needs.release-intent.outputs.intent_check_id }}"
 
-      - name: Recheck pinned historical source-only Releases
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: >-
-          python3 .github/scripts/legacy_release_preflight.py
-          --inventory .github/legacy-release-inventory.json
-          --github-output "${GITHUB_OUTPUT}"
-
-      - name: Compile and bind checkout-independent finalizer
+      - name: Bind checkout-independent finalizer
         id: compile
         run: |
-          cargo build --locked --release --manifest-path xtask/Cargo.toml
-          install -m 700 xtask/target/release/xtask \
-            "${RUNNER_TEMP}/yaml-sigil-release-xtask"
-          binary_sha256="$(sha256sum "${RUNNER_TEMP}/yaml-sigil-release-xtask" \
-            | cut -d' ' -f1)"
+          binary_sha256="$(sha256sum "${YAML_SIGIL_RELEASE_XTASK}" | cut -d' ' -f1)"
+          test "${binary_sha256}" = "${YAML_SIGIL_RELEASE_XTASK_SHA256}"
           printf 'binary_sha256=%s\n' "${binary_sha256}" >>"${GITHUB_OUTPUT}"
           rm -rf "${GITHUB_WORKSPACE}"
           mkdir -m 700 "${GITHUB_WORKSPACE}"
-          test "$(sha256sum "${RUNNER_TEMP}/yaml-sigil-release-xtask" \
-            | cut -d' ' -f1)" = "${binary_sha256}"
+          test "$(sha256sum "${YAML_SIGIL_RELEASE_XTASK}" | cut -d' ' -f1)" \
+            = "${binary_sha256}"
 
       - name: Create finalizer repository token
         id: app-token
@@ -748,7 +810,7 @@ jobs:
           PLAN: ${{ needs.publication.outputs.plan }}
           PLAN_DIGEST: ${{ needs.publication.outputs.plan_digest }}
         run: >-
-          "${RUNNER_TEMP}/yaml-sigil-release-xtask"
+          "${YAML_SIGIL_RELEASE_XTASK}"
           github release-train finalize
           --repository "${GITHUB_REPOSITORY}"
           --plan "${PLAN}"
@@ -762,7 +824,8 @@ jobs:
     name: Emit complete release train notification
     if: >-
       ${{ needs.release-finalizer.result == 'success' &&
-          needs.release-finalizer.outputs.complete == 'true' }}
+          needs.release-finalizer.outputs.complete == 'true' &&
+          needs.release-finalizer.outputs.notification_required == 'true' }}
     needs:
       - publication
       - release-intent
@@ -779,19 +842,19 @@ jobs:
           cache: false
           toolchain: stable
 
-      # Bootstrap exact attested protected source without a repository checkout,
-      # compile before token minting, and require finalizer binary parity.
+      # Bootstrap exact protected release policy without a repository checkout
+      # and compile the typed notifier before token minting.
       - name: Compile checkout-free typed notifier
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_SHA: ${{ needs.publication.outputs.captured_release_sha }}
+          POLICY_SHA: ${{ needs.publication.outputs.policy_commit }}
         run: |
           set -euo pipefail
           source_archive="${RUNNER_TEMP}/yaml-sigil-release-source.tar.gz"
           gh api \
             -H 'Accept: application/vnd.github+json' \
             -H 'X-GitHub-Api-Version: 2026-03-10' \
-            "repos/${GITHUB_REPOSITORY}/tarball/${RELEASE_SHA}" \
+            "repos/${GITHUB_REPOSITORY}/tarball/${POLICY_SHA}" \
             >"${source_archive}"
           test "$(wc -c <"${source_archive}")" -gt 0
           test "$(wc -c <"${source_archive}")" -le 33554432
@@ -800,7 +863,7 @@ jobs:
           test "$(wc -l <"${inventory}")" -le 10000
           source_prefix="$(head -n 1 "${inventory}" | cut -d/ -f1)"
           test "${source_prefix}" = \
-            "NVIDIA-yaml-sigil-traits-${RELEASE_SHA:0:7}"
+            "NVIDIA-yaml-sigil-traits-${POLICY_SHA:0:7}"
           while IFS= read -r path; do
             # Every archive member must remain under the one GitHub source root.
             case "${path}" in
