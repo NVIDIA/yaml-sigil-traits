@@ -176,7 +176,16 @@ class ReleaseWorkflowTests(unittest.TestCase):
         evidence = readiness.split(
             "- name: Bind repository-admin setting evidence to this run", 1
         )[1]
-        self.assertIn("release_evidence.py settings", evidence)
+        self.assertIn(
+            'test "$(sha256sum "${YAML_SIGIL_RELEASE_EVIDENCE}"', evidence
+        )
+        self.assertIn('= "${YAML_SIGIL_RELEASE_EVIDENCE_SHA256}"', evidence)
+        self.assertIn(
+            'python3 "${YAML_SIGIL_RELEASE_EVIDENCE}" settings', evidence
+        )
+        self.assertNotIn(
+            "python3 .github/scripts/release_evidence.py settings", evidence
+        )
         self.assertIn('--repository "${GITHUB_REPOSITORY}"', evidence)
         self.assertIn('--release-sha "${CAPTURED_SHA}"', evidence)
         self.assertIn('--run-id "${GITHUB_RUN_ID}"', evidence)

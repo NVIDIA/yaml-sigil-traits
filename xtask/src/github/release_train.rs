@@ -26,21 +26,24 @@ use crate::github::{
     require_captured_ancestry,
 };
 use crate::release_policy::detect;
-use crate::safe_file::TrustedRoot;
-
-const PLAN_SCHEMA: u64 = 1;
+const PLAN_SCHEMA: u64 = 2;
 const INTENT_SCHEMA: u64 = 1;
 const NOTIFICATION_SCHEMA: u64 = 1;
 const MAX_PLAN_BYTES: usize = 48 * 1024;
 const MAX_INTENT_BYTES: usize = 64 * 1024;
 const MAX_NOTIFICATION_BYTES: usize = 8 * 1024;
+const MAX_POLICY_FILE_BYTES: usize = 256 * 1024;
 const MAX_RELEASE_PACKAGES: usize = 8;
 const MAX_RELEASE_BODY_BYTES: usize = 16 * 1024;
+const MAX_LEGACY_RELEASES: usize = 64;
 const REGISTRY_POLL_COUNT: usize = 60;
 const REGISTRY_POLL_SECONDS: u64 = 20;
 const APP_PUBLIC_ID: u64 = 4_653_064;
 const INTENT_NAME: &str = "Release finalization intent";
 const RELEASE_PLZ_VERSION: &str = "0.3.160";
+const GITHUB_API_VERSION: &str = "2026-03-10";
+const LEGACY_AUTHOR_ID: u64 = 41_898_282;
+const LEGACY_AUTHOR_LOGIN: &str = "github-actions[bot]";
 const TRAITS_TAG_PATTERNS: &[&str] = &["refs/tags/v*"];
 const RS_TAG_PATTERNS: &[&str] = &[
     "refs/tags/yaml-sigil-core-v*",
@@ -55,6 +58,15 @@ pub(super) struct PrepareIntentInput<'a> {
     pub(super) origin_run_id: &'a str,
     pub(super) origin_run_attempt: &'a str,
     pub(super) ruleset_evidence_sha256: &'a str,
+}
+
+pub(super) struct CaptureInput<'a> {
+    pub(super) repository: &'a str,
+    pub(super) commit: &'a str,
+    pub(super) policy_commit: &'a str,
+    pub(super) legacy_inventory_sha256: &'a str,
+    pub(super) baseline_version: &'a str,
+    pub(super) baseline_commit: &'a str,
 }
 
 pub(super) struct CreateIntentInput<'a> {
@@ -168,29 +180,32 @@ pub(super) struct ReleasePlan {
     schema_version: u64,
     repository: String,
     release_sha: String,
+    policy_commit: String,
     authorization: PlanAuthorization,
     release_plz_version: String,
     release_config_sha256: String,
-    publish_workflow_sha256: String,
-    proposal_workflow_sha256: String,
+    legacy_inventory_sha256: String,
     tagger_epoch: u64,
     tagger_date: String,
     packages: Vec<PlanPackage>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct PlanAuthorization {
-    pull_request: u64,
-    proposal_commit: String,
-    base_commit: String,
-    owner_id: u64,
-    merger_id: u64,
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum PlanAuthorization {
+    Proposal {
+        pull_request: u64,
+        proposal_commit: String,
+        base_commit: String,
+        owner_id: u64,
+        merger_id: u64,
+    },
+    LegacyInventory,
 }
 
 impl From<SourceAuthorization> for PlanAuthorization {
     fn from(value: SourceAuthorization) -> Self {
-        Self {
+        Self::Proposal {
             pull_request: value.pull_request,
             proposal_commit: value.proposal_commit,
             base_commit: value.base_commit,
@@ -212,6 +227,7 @@ struct PlanPackage {
     release_body: String,
     release_body_sha256: String,
     registry: RegistryBaseline,
+    release_objects: ReleaseObjectBaseline,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -226,6 +242,72 @@ struct RegistryBaseline {
 enum RegistryState {
     Absent,
     Present,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "state", rename_all = "lowercase", deny_unknown_fields)]
+enum ReleaseObjectBaseline {
+    Absent,
+    Legacy {
+        release_id: u64,
+        tag_object_sha: String,
+    },
+}
+
+#[derive(Debug)]
+struct PolicySnapshot {
+    commit: String,
+    release_config_sha256: String,
+    legacy_inventory_sha256: String,
+    legacy_inventory: LegacyInventory,
+}
+
+struct PlanCaptureInput<'a> {
+    root: &'a Path,
+    repository: &'a str,
+    commit: &'a str,
+    policy: &'a PolicySnapshot,
+    baseline_version: &'a str,
+    baseline_commit: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyInventory {
+    schema_version: u64,
+    api_version: String,
+    repository: String,
+    legacy_author: LegacyAuthor,
+    prospective_author: LegacyAuthor,
+    entries: Vec<LegacyEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyAuthor {
+    id: u64,
+    login: String,
+    #[serde(rename = "type")]
+    kind: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyEntry {
+    release_id: u64,
+    package: String,
+    version: String,
+    tag: String,
+    tag_object_sha: String,
+    peeled_commit_sha: String,
+    target_commitish: String,
+    draft: bool,
+    prerelease: bool,
+    immutable: bool,
+    asset_count: u64,
+    body_sha256: String,
+    source_archive_sha256: String,
+    path_in_vcs: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -266,25 +348,56 @@ pub(super) struct FinalizedEntry {
 
 pub(super) fn capture_command(
     root: &Path,
-    repository: &str,
-    commit: &str,
-    baseline_version: &str,
-    baseline_commit: &str,
+    input: CaptureInput<'_>,
     github: &mut impl Transport,
 ) -> Result<(), String> {
-    let mut registry = CratesIo::new();
-    let observed = capture_plan(
-        root,
+    let CaptureInput {
         repository,
         commit,
+        policy_commit,
+        legacy_inventory_sha256,
         baseline_version,
         baseline_commit,
+    } = input;
+    if !is_sha(commit) {
+        return Err("release plan commit must be one lowercase full SHA".to_string());
+    }
+    let recovered = recover_existing_intent(github, repository, commit)?;
+    let current_policy = load_policy_snapshot(
+        root,
+        repository,
+        policy_commit,
+        Some(legacy_inventory_sha256),
+        github,
+    )?;
+    let recovered_policy;
+    let policy = if let Some((_, _, record)) = &recovered {
+        recovered_policy = load_policy_snapshot(
+            root,
+            repository,
+            &record.plan.policy_commit,
+            Some(&record.plan.legacy_inventory_sha256),
+            github,
+        )?;
+        &recovered_policy
+    } else {
+        &current_policy
+    };
+    let mut registry = CratesIo::new();
+    let observed = capture_plan(
+        PlanCaptureInput {
+            root,
+            repository,
+            commit,
+            policy,
+            baseline_version,
+            baseline_commit,
+        },
         github,
         &mut registry,
     )?;
-    let recovered = recover_existing_intent(github, repository, &observed)?;
     if recovered.is_none() {
-        require_new_train_objects_absent(github, repository, &observed)?;
+        require_initial_release_objects(github, repository, &observed)?;
     }
     let plan = if let Some((_, _, record)) = &recovered {
         require_static_plan_match(&record.plan, &observed)?;
@@ -315,6 +428,7 @@ pub(super) fn capture_command(
         .unwrap_or(("", String::new(), String::new()));
     append_outputs(&[
         ("captured_release_sha", &plan.release_sha),
+        ("policy_commit", &plan.policy_commit),
         ("plan", &body),
         ("plan_digest", &digest),
         ("registry_state", registry_state),
@@ -324,25 +438,32 @@ pub(super) fn capture_command(
     ])
 }
 
-fn require_new_train_objects_absent(
+fn require_initial_release_objects(
     github: &mut impl Transport,
     repository: &str,
     plan: &ReleasePlan,
 ) -> Result<(), String> {
     for package in &plan.packages {
-        let reference = github.get_optional::<crate::github::models::GitRef>(&format!(
-            "repos/{repository}/git/ref/tags/{}",
-            percent_encode(&package.tag)
-        ))?;
-        let release = github.get_optional::<Release>(&format!(
-            "repos/{repository}/releases/tags/{}",
-            percent_encode(&package.tag)
-        ))?;
-        if reference.is_some() || release.is_some() {
-            return Err(format!(
-                "new release train tag or Release {} already exists without App intent",
-                package.tag
-            ));
+        match &package.release_objects {
+            ReleaseObjectBaseline::Absent => {
+                let reference = github.get_optional::<crate::github::models::GitRef>(&format!(
+                    "repos/{repository}/git/ref/tags/{}",
+                    percent_encode(&package.tag)
+                ))?;
+                let release = github.get_optional::<Release>(&format!(
+                    "repos/{repository}/releases/tags/{}",
+                    percent_encode(&package.tag)
+                ))?;
+                if reference.is_some() || release.is_some() {
+                    return Err(format!(
+                        "new release train tag or Release {} already exists without App intent",
+                        package.tag
+                    ));
+                }
+            }
+            ReleaseObjectBaseline::Legacy { .. } => {
+                require_legacy_release_objects(github, repository, plan, package)?;
+            }
         }
     }
     Ok(())
@@ -351,11 +472,11 @@ fn require_new_train_objects_absent(
 fn recover_existing_intent(
     github: &mut impl Transport,
     repository: &str,
-    observed: &ReleasePlan,
+    release_sha: &str,
 ) -> Result<Option<(CheckRun, String, IntentRecord)>, String> {
     let path = format!(
         "repos/{repository}/commits/{}/check-runs?check_name={}&filter=all&per_page=100",
-        observed.release_sha,
+        release_sha,
         percent_encode(INTENT_NAME)
     );
     let checks: CheckRuns = github.get(&path)?;
@@ -365,7 +486,7 @@ fn recover_existing_intent(
     let mut recovered = Vec::new();
     for check in checks.check_runs {
         if check.name != INTENT_NAME
-            || check.head_sha != observed.release_sha
+            || check.head_sha != release_sha
             || check.app.id != APP_PUBLIC_ID
             || check.app.slug != APP_SLUG
         {
@@ -386,8 +507,9 @@ fn recover_existing_intent(
         }
         let record = decode_intent(&body, &record.plan, &record.plan_digest)?;
         validate_intent_check(&check, &record, &body)?;
-        require_static_plan_match(&record.plan, observed)?;
-        require_registry_transition(&record.plan, observed)?;
+        if record.repository != repository || record.release_sha != release_sha {
+            return Err("existing release intent source is wrong".to_string());
+        }
         recovered.push((check, body, record));
     }
     if recovered.len() > 1 {
@@ -406,18 +528,36 @@ pub(super) fn verify_command(
     github: &mut impl Transport,
 ) -> Result<(), String> {
     let expected = decode_plan(plan_text, plan_digest)?;
-    let mut registry = CratesIo::new();
-    let actual = capture_plan(
+    let policy = load_policy_snapshot(
         root,
         repository,
-        &expected.release_sha,
-        baseline_version,
-        baseline_commit,
+        &expected.policy_commit,
+        Some(&expected.legacy_inventory_sha256),
+        github,
+    )?;
+    let mut registry = CratesIo::new();
+    let actual = capture_plan(
+        PlanCaptureInput {
+            root,
+            repository,
+            commit: &expected.release_sha,
+            policy: &policy,
+            baseline_version,
+            baseline_commit,
+        },
         github,
         &mut registry,
     )?;
     require_static_plan_match(&expected, &actual)?;
     require_registry_transition(&expected, &actual)?;
+    for package in &expected.packages {
+        if matches!(
+            package.release_objects,
+            ReleaseObjectBaseline::Legacy { .. }
+        ) {
+            require_legacy_release_objects(github, repository, &expected, package)?;
+        }
+    }
     append_outputs(&[("captured_release_sha", &expected.release_sha)])
 }
 
@@ -520,15 +660,194 @@ fn observe_registry(
     Ok(!missing && inspected.iter().all(|value| *value))
 }
 
-fn capture_plan(
+fn load_policy_snapshot(
     root: &Path,
     repository: &str,
     commit: &str,
-    baseline_version: &str,
-    baseline_commit: &str,
+    expected_legacy_inventory_sha256: Option<&str>,
+    github: &mut impl Transport,
+) -> Result<PolicySnapshot, String> {
+    if !is_sha(commit) || expected_legacy_inventory_sha256.is_some_and(|digest| !is_digest(digest))
+    {
+        return Err("release policy binding is invalid".to_string());
+    }
+    repository_policy_for_root(root, repository)?;
+    require_captured_ancestry(github, repository, commit)?;
+    let config = read_policy_blob(root, commit, ".release-plz.toml")?;
+    let inventory_text = read_policy_blob(root, commit, ".github/legacy-release-inventory.json")?;
+    let inventory_digest = sha256(inventory_text.as_bytes());
+    if expected_legacy_inventory_sha256.is_some_and(|expected| expected != inventory_digest) {
+        return Err("legacy Release inventory digest differs from protected policy".to_string());
+    }
+    let inventory: LegacyInventory = serde_json::from_str(&inventory_text)
+        .map_err(|error| format!("parse legacy Release inventory: {error}"))?;
+    validate_legacy_inventory(repository, &inventory)?;
+    Ok(PolicySnapshot {
+        commit: commit.to_string(),
+        release_config_sha256: sha256(config.as_bytes()),
+        legacy_inventory_sha256: inventory_digest,
+        legacy_inventory: inventory,
+    })
+}
+
+fn read_policy_blob(root: &Path, commit: &str, path: &str) -> Result<String, String> {
+    let entry = git_output(root, &["ls-tree", "-z", "--full-tree", commit, "--", path])?;
+    let suffix = format!("\t{path}\0");
+    let metadata = entry
+        .strip_suffix(&suffix)
+        .ok_or_else(|| format!("protected policy lacks one exact regular file {path}"))?;
+    let mut fields = metadata.split(' ');
+    let mode = fields.next();
+    let kind = fields.next();
+    let object = fields.next();
+    if mode != Some("100644")
+        || kind != Some("blob")
+        || object.is_none_or(|sha| !is_sha(sha))
+        || fields.next().is_some()
+    {
+        return Err(format!(
+            "protected policy file {path} is not one regular blob"
+        ));
+    }
+    let object_spec = format!("{commit}:{path}");
+    let body = git_output(root, &["show", &object_spec])?;
+    if body.is_empty()
+        || body.len() > MAX_POLICY_FILE_BYTES
+        || body.contains('\0')
+        || !body.ends_with('\n')
+    {
+        return Err(format!(
+            "protected policy file {path} is empty or noncanonical"
+        ));
+    }
+    Ok(body)
+}
+
+fn validate_legacy_inventory(repository: &str, inventory: &LegacyInventory) -> Result<(), String> {
+    let release_policy = release_policy_for_repository(repository)?;
+    if inventory.schema_version != 1
+        || inventory.api_version != GITHUB_API_VERSION
+        || inventory.repository != repository
+        || inventory.legacy_author.id != LEGACY_AUTHOR_ID
+        || inventory.legacy_author.login != LEGACY_AUTHOR_LOGIN
+        || inventory.legacy_author.kind != "Bot"
+        || inventory.prospective_author.id != APP_ID
+        || inventory.prospective_author.login != APP_LOGIN
+        || inventory.prospective_author.kind != "Bot"
+        || inventory.entries.is_empty()
+        || inventory.entries.len() > MAX_LEGACY_RELEASES
+    {
+        return Err("legacy Release inventory binding is invalid".to_string());
+    }
+    let mut ids = BTreeSet::new();
+    let mut tags = BTreeSet::new();
+    let mut versions = BTreeSet::new();
+    for entry in &inventory.entries {
+        let version = semver::Version::parse(&entry.version)
+            .map_err(|_| "legacy Release version is invalid".to_string())?;
+        let package_policy = release_policy
+            .packages
+            .iter()
+            .find(|policy| policy.package == entry.package)
+            .ok_or_else(|| "legacy Release package is outside repository policy".to_string())?;
+        if entry.release_id == 0
+            || entry.package.is_empty()
+            || entry.package.len() > 128
+            || entry.version.len() > 128
+            || version.to_string() != entry.version
+            || entry.tag != package_policy.tag(&entry.version)
+            || entry.tag.len() > 256
+            || entry.tag.contains(['\0', '\r', '\n'])
+            || !is_sha(&entry.tag_object_sha)
+            || !is_sha(&entry.peeled_commit_sha)
+            || entry.target_commitish != "main"
+            || entry.draft
+            || entry.prerelease != !version.pre.is_empty()
+            || entry.immutable
+            || entry.asset_count != 0
+            || !is_digest(&entry.body_sha256)
+            || !is_digest(&entry.source_archive_sha256)
+            || entry.path_in_vcs != package_policy.path_in_vcs
+            || entry.path_in_vcs.len() > 256
+            || entry.path_in_vcs.contains(['\0', '\r', '\n', '\\'])
+            || !ids.insert(entry.release_id)
+            || !tags.insert(entry.tag.clone())
+            || !versions.insert((entry.package.clone(), entry.version.clone()))
+        {
+            return Err("legacy Release inventory entry is invalid".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn require_source_only_config_for_specs(
+    root: &Path,
+    policy_commit: &str,
+    specs: &[ReleaseSpec<'_>],
+    expected_digest: &str,
+) -> Result<(), String> {
+    let config = read_policy_blob(root, policy_commit, ".release-plz.toml")?;
+    if sha256(config.as_bytes()) != expected_digest {
+        return Err("release-plz policy changed during plan capture".to_string());
+    }
+    require_source_only_config(&config, specs)
+}
+
+fn legacy_release_entry<'a>(
+    inventory: &'a LegacyInventory,
+    spec: &ReleaseSpec<'_>,
+    commit: &str,
+    registry_checksum: &str,
+) -> Result<Option<&'a LegacyEntry>, String> {
+    let release_body_sha256 = sha256(spec.body.as_bytes());
+    let mut matches = inventory.entries.iter().filter(|entry| {
+        entry.package == spec.policy.package
+            && entry.version == spec.version
+            && entry.tag == spec.tag
+            && entry.peeled_commit_sha == commit
+            && entry.prerelease == spec.prerelease
+            && entry.body_sha256 == release_body_sha256
+            && entry.source_archive_sha256 == registry_checksum
+            && entry.path_in_vcs == spec.policy.path_in_vcs
+    });
+    let Some(entry) = matches.next() else {
+        return Ok(None);
+    };
+    if matches.next().is_some() {
+        return Err("legacy Release inventory matches one package more than once".to_string());
+    }
+    Ok(Some(entry))
+}
+
+fn require_uniform_legacy_train(packages: &[PlanPackage]) -> Result<(), String> {
+    let legacy = packages
+        .iter()
+        .filter(|package| {
+            matches!(
+                package.release_objects,
+                ReleaseObjectBaseline::Legacy { .. }
+            )
+        })
+        .count();
+    if legacy != 0 && legacy != packages.len() {
+        return Err("release train mixes legacy and prospective objects".to_string());
+    }
+    Ok(())
+}
+
+fn capture_plan(
+    input: PlanCaptureInput<'_>,
     github: &mut impl Transport,
     registry: &mut impl Registry,
 ) -> Result<ReleasePlan, String> {
+    let PlanCaptureInput {
+        root,
+        repository,
+        commit,
+        policy: policy_snapshot,
+        baseline_version,
+        baseline_commit,
+    } = input;
     if !is_sha(commit) {
         return Err("release plan commit must be one lowercase full SHA".to_string());
     }
@@ -540,49 +859,108 @@ fn capture_plan(
     if specs.is_empty() || specs.len() > MAX_RELEASE_PACKAGES {
         return Err("release plan package count is outside its bound".to_string());
     }
-    let trusted = TrustedRoot::open(root).map_err(|error| format!("open release root: {error}"))?;
-    let config = trusted
-        .read_manifest(Path::new(".release-plz.toml"))
-        .map_err(|error| format!("read release-plz config: {error}"))?;
-    require_source_only_config(&config, &specs)?;
-    let publish = trusted
-        .read_manifest(Path::new(".github/workflows/publish.yml"))
-        .map_err(|error| format!("read publication workflow: {error}"))?;
-    let proposal = trusted
-        .read_manifest(Path::new(".github/workflows/release-proposal.yml"))
-        .map_err(|error| format!("read proposal workflow: {error}"))?;
+    require_source_only_config_for_specs(
+        root,
+        &policy_snapshot.commit,
+        &specs,
+        &policy_snapshot.release_config_sha256,
+    )?;
     let (tagger_epoch, tagger_date) = commit_timestamp(root, commit)?;
     let mut packages = Vec::with_capacity(specs.len());
     for spec in &specs {
-        let archive = package_source(root, spec)?;
-        let source_archive_sha256 = sha256(&archive);
-        let archive_entries = crate::crate_archive::inspect_archive_entries(
-            &archive,
-            spec.policy,
-            &spec.version,
-            commit,
-        )?;
-        let package_inventory_sha256 = archive_inventory_sha256(&archive_entries);
         let record = registry.exact_version(spec.policy.package, &spec.version)?;
-        let registry = match record {
-            None => RegistryBaseline {
-                state: RegistryState::Absent,
-                checksum: None,
-            },
-            Some(record) => {
-                let checksum = require_reproduced_archive(root, registry, spec, commit)?;
-                if checksum != record.checksum {
-                    return Err(format!(
-                        "{} registry checksum changed during plan capture",
-                        spec.policy.package
-                    ));
+        let (source_archive_sha256, package_inventory_sha256, registry, release_objects) =
+            match record {
+                None => {
+                    let archive = package_source(root, spec)?;
+                    let source_archive_sha256 = sha256(&archive);
+                    let archive_entries = crate::crate_archive::inspect_archive_entries(
+                        &archive,
+                        spec.policy,
+                        &spec.version,
+                        commit,
+                    )?;
+                    (
+                        source_archive_sha256,
+                        archive_inventory_sha256(&archive_entries),
+                        RegistryBaseline {
+                            state: RegistryState::Absent,
+                            checksum: None,
+                        },
+                        ReleaseObjectBaseline::Absent,
+                    )
                 }
-                RegistryBaseline {
-                    state: RegistryState::Present,
-                    checksum: Some(checksum),
+                Some(record) => {
+                    if record.num != spec.version
+                        || record.yanked
+                        || !crate::crate_archive::is_checksum(&record.checksum)
+                    {
+                        return Err(format!(
+                            "{} registry state is not one exact non-yanked version",
+                            spec.policy.package
+                        ));
+                    }
+                    if let Some(legacy) = legacy_release_entry(
+                        &policy_snapshot.legacy_inventory,
+                        spec,
+                        commit,
+                        &record.checksum,
+                    )? {
+                        // A closed historical inventory is grandfathered state,
+                        // not a prospective archive-reproduction exception.
+                        let archive = registry.download(spec.policy.package, &spec.version)?;
+                        if sha256(&archive) != record.checksum {
+                            return Err(format!(
+                                "{} legacy registry archive checksum drifted",
+                                spec.policy.package
+                            ));
+                        }
+                        let archive_entries = crate::crate_archive::inspect_archive_entries(
+                            &archive,
+                            spec.policy,
+                            &spec.version,
+                            commit,
+                        )?;
+                        (
+                            record.checksum.clone(),
+                            archive_inventory_sha256(&archive_entries),
+                            RegistryBaseline {
+                                state: RegistryState::Present,
+                                checksum: Some(record.checksum.clone()),
+                            },
+                            ReleaseObjectBaseline::Legacy {
+                                release_id: legacy.release_id,
+                                tag_object_sha: legacy.tag_object_sha.clone(),
+                            },
+                        )
+                    } else {
+                        let checksum = require_reproduced_archive(root, registry, spec, commit)?;
+                        if checksum != record.checksum {
+                            return Err(format!(
+                                "{} registry checksum changed during plan capture",
+                                spec.policy.package
+                            ));
+                        }
+                        let archive = package_source(root, spec)?;
+                        let source_archive_sha256 = sha256(&archive);
+                        let archive_entries = crate::crate_archive::inspect_archive_entries(
+                            &archive,
+                            spec.policy,
+                            &spec.version,
+                            commit,
+                        )?;
+                        (
+                            source_archive_sha256,
+                            archive_inventory_sha256(&archive_entries),
+                            RegistryBaseline {
+                                state: RegistryState::Present,
+                                checksum: Some(checksum),
+                            },
+                            ReleaseObjectBaseline::Absent,
+                        )
+                    }
                 }
-            }
-        };
+            };
         packages.push(PlanPackage {
             package: spec.policy.package.to_string(),
             version: spec.version.clone(),
@@ -593,28 +971,40 @@ fn capture_plan(
             release_body: spec.body.clone(),
             release_body_sha256: sha256(spec.body.as_bytes()),
             registry,
+            release_objects,
         });
     }
     require_registry_prefix(&packages)?;
-    let main_requirement = main_requirement(&packages);
-    let authorization = authorize_source(
-        github,
-        repository,
-        commit,
-        root,
-        baseline_version,
-        baseline_commit,
-        main_requirement,
-    )?;
+    require_uniform_legacy_train(&packages)?;
+    let authorization = if packages.iter().all(|package| {
+        matches!(
+            package.release_objects,
+            ReleaseObjectBaseline::Legacy { .. }
+        )
+    }) {
+        PlanAuthorization::LegacyInventory
+    } else {
+        let main_requirement = main_requirement(&packages);
+        authorize_source(
+            github,
+            repository,
+            commit,
+            root,
+            baseline_version,
+            baseline_commit,
+            main_requirement,
+        )?
+        .into()
+    };
     Ok(ReleasePlan {
         schema_version: PLAN_SCHEMA,
         repository: repository.to_string(),
         release_sha: commit.to_string(),
-        authorization: authorization.into(),
+        policy_commit: policy_snapshot.commit.clone(),
+        authorization,
         release_plz_version: RELEASE_PLZ_VERSION.to_string(),
-        release_config_sha256: sha256(config.as_bytes()),
-        publish_workflow_sha256: sha256(publish.as_bytes()),
-        proposal_workflow_sha256: sha256(proposal.as_bytes()),
+        release_config_sha256: policy_snapshot.release_config_sha256.clone(),
+        legacy_inventory_sha256: policy_snapshot.legacy_inventory_sha256.clone(),
         tagger_epoch,
         tagger_date,
         packages,
@@ -726,21 +1116,17 @@ fn decode_plan(body: &str, digest: &str) -> Result<ReleasePlan, String> {
 fn validate_plan(plan: &ReleasePlan) -> Result<(), String> {
     if plan.schema_version != PLAN_SCHEMA
         || !is_sha(&plan.release_sha)
+        || !is_sha(&plan.policy_commit)
         || plan.repository.is_empty()
         || plan.release_plz_version != RELEASE_PLZ_VERSION
         || !is_digest(&plan.release_config_sha256)
-        || !is_digest(&plan.publish_workflow_sha256)
-        || !is_digest(&plan.proposal_workflow_sha256)
+        || !is_digest(&plan.legacy_inventory_sha256)
         || plan.tagger_epoch == 0
         || plan.tagger_date.is_empty()
         || plan.tagger_date.len() > 64
         || plan.packages.is_empty()
         || plan.packages.len() > MAX_RELEASE_PACKAGES
-        || plan.authorization.pull_request == 0
-        || !is_sha(&plan.authorization.proposal_commit)
-        || !is_sha(&plan.authorization.base_commit)
-        || plan.authorization.owner_id == 0
-        || plan.authorization.merger_id == 0
+        || !valid_plan_authorization(&plan.authorization)
     {
         return Err("release plan binding is invalid".to_string());
     }
@@ -766,11 +1152,54 @@ fn validate_plan(plan: &ReleasePlan) -> Result<(), String> {
                     .checksum
                     .as_deref()
                     .is_none_or(|checksum| !is_digest(checksum)))
+            || matches!(
+                package.release_objects,
+                ReleaseObjectBaseline::Legacy { release_id: 0, .. }
+            )
+            || matches!(
+                &package.release_objects,
+                ReleaseObjectBaseline::Legacy { tag_object_sha, .. }
+                    if !is_sha(tag_object_sha)
+            )
+            || (matches!(
+                package.release_objects,
+                ReleaseObjectBaseline::Legacy { .. }
+            ) && package.registry.state != RegistryState::Present)
         {
             return Err("release plan package binding is invalid".to_string());
         }
     }
-    require_registry_prefix(&plan.packages)
+    require_registry_prefix(&plan.packages)?;
+    require_uniform_legacy_train(&plan.packages)?;
+    let all_legacy = plan.packages.iter().all(|package| {
+        matches!(
+            package.release_objects,
+            ReleaseObjectBaseline::Legacy { .. }
+        )
+    });
+    if matches!(plan.authorization, PlanAuthorization::LegacyInventory) != all_legacy {
+        return Err("release plan authorization does not match its object baseline".to_string());
+    }
+    Ok(())
+}
+
+fn valid_plan_authorization(authorization: &PlanAuthorization) -> bool {
+    match authorization {
+        PlanAuthorization::Proposal {
+            pull_request,
+            proposal_commit,
+            base_commit,
+            owner_id,
+            merger_id,
+        } => {
+            *pull_request != 0
+                && is_sha(proposal_commit)
+                && is_sha(base_commit)
+                && *owner_id != 0
+                && *merger_id != 0
+        }
+        PlanAuthorization::LegacyInventory => true,
+    }
 }
 
 fn require_registry_prefix(packages: &[PlanPackage]) -> Result<(), String> {
@@ -899,12 +1328,20 @@ fn build_intent(
     );
     let mut tags = Vec::with_capacity(plan.packages.len());
     for package in &plan.packages {
-        let tag_message = format!(
-            "chore: Release package {} version {}",
-            package.package, package.version
-        );
-        let payload = annotated_tag_payload(plan, &package.tag, &tag_message)?;
-        let object_id = hash_git_object(root, "tag", payload.as_bytes())?;
+        let (tag_message, object_id) = match &package.release_objects {
+            ReleaseObjectBaseline::Absent => {
+                let tag_message = format!(
+                    "chore: Release package {} version {}",
+                    package.package, package.version
+                );
+                let payload = annotated_tag_payload(plan, &package.tag, &tag_message)?;
+                let object_id = hash_git_object(root, "tag", payload.as_bytes())?;
+                (tag_message, object_id)
+            }
+            ReleaseObjectBaseline::Legacy { tag_object_sha, .. } => {
+                (String::new(), tag_object_sha.clone())
+            }
+        };
         tags.push(TagIntent {
             package: package.package.clone(),
             tag: package.tag.clone(),
@@ -1135,15 +1572,18 @@ fn decode_intent(
         );
     }
     for ((tag, package), index) in record.tags.iter().zip(&plan.packages).zip(0..) {
+        let expected_message = match package.release_objects {
+            ReleaseObjectBaseline::Absent => format!(
+                "chore: Release package {} version {}",
+                package.package, package.version
+            ),
+            ReleaseObjectBaseline::Legacy { .. } => String::new(),
+        };
         if tag.package != package.package
             || tag.tag != package.tag
             || !is_sha(&tag.tag_object_id)
             || tag.release_body_sha256 != package.release_body_sha256
-            || tag.tag_message
-                != format!(
-                    "chore: Release package {} version {}",
-                    package.package, package.version
-                )
+            || tag.tag_message != expected_message
         {
             return Err(format!("release intent tag {index} is not canonical"));
         }
@@ -1232,22 +1672,31 @@ pub(super) fn finalize_command(
     };
     let mut entries = Vec::with_capacity(present);
     for (package, tag_intent) in plan.packages.iter().zip(&intent.tags).take(present) {
-        let tag_object_id = reconcile_tag(
-            github,
-            input.repository,
-            &plan,
-            package,
-            tag_intent,
-            &finalizer_intent,
-        )?;
-        let release = reconcile_release(
-            github,
-            input.repository,
-            &plan,
-            package,
-            tag_intent,
-            &finalizer_intent,
-        )?;
+        let (tag_object_id, release) = match &package.release_objects {
+            ReleaseObjectBaseline::Absent => {
+                let tag_object_id = reconcile_tag(
+                    github,
+                    input.repository,
+                    &plan,
+                    package,
+                    tag_intent,
+                    &finalizer_intent,
+                )?;
+                let release = reconcile_release(
+                    github,
+                    input.repository,
+                    &plan,
+                    package,
+                    tag_intent,
+                    &finalizer_intent,
+                )?;
+                (tag_object_id, release)
+            }
+            ReleaseObjectBaseline::Legacy { tag_object_sha, .. } => (
+                tag_object_sha.clone(),
+                require_legacy_release_objects(github, input.repository, &plan, package)?,
+            ),
+        };
         entries.push(FinalizedEntry {
             package: package.package.clone(),
             version: package.version.clone(),
@@ -1263,6 +1712,19 @@ pub(super) fn finalize_command(
         (
             "complete",
             if present == plan.packages.len() {
+                "true"
+            } else {
+                "false"
+            },
+        ),
+        (
+            "notification_required",
+            if present == plan.packages.len()
+                && plan
+                    .packages
+                    .iter()
+                    .all(|package| matches!(package.release_objects, ReleaseObjectBaseline::Absent))
+            {
                 "true"
             } else {
                 "false"
@@ -1466,6 +1928,64 @@ struct FinalizerIntent<'a> {
     check_id: u64,
     record: &'a IntentRecord,
     body: &'a str,
+}
+
+fn require_legacy_release_objects(
+    github: &mut impl Transport,
+    repository: &str,
+    plan: &ReleasePlan,
+    package: &PlanPackage,
+) -> Result<Release, String> {
+    let ReleaseObjectBaseline::Legacy {
+        release_id,
+        tag_object_sha,
+    } = &package.release_objects
+    else {
+        return Err("legacy Release verification requires a legacy plan entry".to_string());
+    };
+    let ref_path = format!(
+        "repos/{repository}/git/ref/tags/{}",
+        percent_encode(&package.tag)
+    );
+    let reference: crate::github::models::GitRef = github.get(&ref_path)?;
+    if reference.name != format!("refs/tags/{}", package.tag)
+        || reference.object.kind != "tag"
+        || reference.object.sha != *tag_object_sha
+    {
+        return Err(format!("legacy annotated tag {} drifted", package.tag));
+    }
+    let object: AnnotatedTag =
+        github.get(&format!("repos/{repository}/git/tags/{tag_object_sha}"))?;
+    if object.sha != *tag_object_sha
+        || object.tag != package.tag
+        || object.object.kind != "commit"
+        || object.object.sha != plan.release_sha
+    {
+        return Err(format!(
+            "legacy annotated tag {} object drifted",
+            package.tag
+        ));
+    }
+    let release: Release = github.get(&format!(
+        "repos/{repository}/releases/tags/{}",
+        percent_encode(&package.tag)
+    ))?;
+    if release.id != *release_id
+        || release.tag_name != package.tag
+        || release.target_commitish != "main"
+        || release.body != package.release_body
+        || sha256(release.body.as_bytes()) != package.release_body_sha256
+        || release.draft
+        || release.prerelease != package.prerelease
+        || release.immutable
+        || release.author.login != LEGACY_AUTHOR_LOGIN
+        || release.author.id != LEGACY_AUTHOR_ID
+        || release.author.kind != "Bot"
+        || !release.assets.is_empty()
+    {
+        return Err(format!("legacy GitHub Release {} drifted", package.tag));
+    }
+    Ok(release)
 }
 
 fn reconcile_tag(
@@ -1914,6 +2434,7 @@ fn sha256(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::github::transport::fake::{Expected, FakeTransport};
+    use std::fs;
 
     struct MissingRegistry {
         reads: usize,
@@ -1939,7 +2460,8 @@ mod tests {
             schema_version: PLAN_SCHEMA,
             repository: "NVIDIA/yaml-sigil-traits".to_string(),
             release_sha: "a".repeat(40),
-            authorization: PlanAuthorization {
+            policy_commit: "9".repeat(40),
+            authorization: PlanAuthorization::Proposal {
                 pull_request: 50,
                 proposal_commit: "b".repeat(40),
                 base_commit: "c".repeat(40),
@@ -1948,8 +2470,7 @@ mod tests {
             },
             release_plz_version: RELEASE_PLZ_VERSION.to_string(),
             release_config_sha256: "d".repeat(64),
-            publish_workflow_sha256: "e".repeat(64),
-            proposal_workflow_sha256: "f".repeat(64),
+            legacy_inventory_sha256: "e".repeat(64),
             tagger_epoch: 1_777_777_777,
             tagger_date: "2026-05-02T00:29:37+00:00".to_string(),
             packages: vec![PlanPackage {
@@ -1965,8 +2486,201 @@ mod tests {
                     state: RegistryState::Absent,
                     checksum: None,
                 },
+                release_objects: ReleaseObjectBaseline::Absent,
             }],
         }
+    }
+
+    fn run_git(root: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .current_dir(root)
+            .args(args)
+            .output()
+            .expect("run fixture Git command");
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .expect("fixture Git output is UTF-8")
+            .trim()
+            .to_string()
+    }
+
+    #[test]
+    fn protected_policy_blob_is_read_from_its_commit_not_historical_head() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        run_git(root, &["init", "--quiet"]);
+        run_git(root, &["config", "core.autocrlf", "false"]);
+        run_git(root, &["config", "user.name", "Fixture"]);
+        run_git(root, &["config", "user.email", "fixture@example.invalid"]);
+        fs::write(root.join(".release-plz.toml"), "historical = true\n").unwrap();
+        run_git(root, &["add", ".release-plz.toml"]);
+        run_git(
+            root,
+            &["commit", "--quiet", "--no-gpg-sign", "-m", "historical"],
+        );
+        let historical = run_git(root, &["rev-parse", "HEAD"]);
+        fs::write(root.join(".release-plz.toml"), "protected = true\n").unwrap();
+        run_git(root, &["add", ".release-plz.toml"]);
+        run_git(
+            root,
+            &["commit", "--quiet", "--no-gpg-sign", "-m", "protected"],
+        );
+        let policy = run_git(root, &["rev-parse", "HEAD"]);
+        run_git(root, &["checkout", "--quiet", "--detach", &historical]);
+        assert_eq!(
+            read_policy_blob(root, &policy, ".release-plz.toml").unwrap(),
+            "protected = true\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join(".release-plz.toml")).unwrap(),
+            "historical = true\n"
+        );
+    }
+
+    #[test]
+    fn exact_legacy_objects_are_grandfathered_read_only() {
+        let mut plan = plan();
+        plan.packages[0].registry = RegistryBaseline {
+            state: RegistryState::Present,
+            checksum: Some("1".repeat(64)),
+        };
+        plan.packages[0].release_objects = ReleaseObjectBaseline::Legacy {
+            release_id: 42,
+            tag_object_sha: "8".repeat(40),
+        };
+        plan.authorization = PlanAuthorization::LegacyInventory;
+        let package = &plan.packages[0];
+        let ref_path = format!(
+            "repos/{}/git/ref/tags/{}",
+            plan.repository,
+            percent_encode(&package.tag)
+        );
+        let object_path = format!("repos/{}/git/tags/{}", plan.repository, "8".repeat(40));
+        let release_path = format!(
+            "repos/{}/releases/tags/{}",
+            plan.repository,
+            percent_encode(&package.tag)
+        );
+        let expectations = |release_body: &str| {
+            [
+                Expected::json(
+                    "GET",
+                    &ref_path,
+                    json!({
+                        "ref": format!("refs/tags/{}", package.tag),
+                        "object": {"type": "tag", "sha": "8".repeat(40)},
+                    }),
+                ),
+                Expected::json(
+                    "GET",
+                    &object_path,
+                    json!({
+                        "sha": "8".repeat(40),
+                        "tag": package.tag,
+                        "message": "historical",
+                        "tagger": {"name": "historical", "email": "old@example.invalid", "date": "2025-01-01T00:00:00Z"},
+                        "object": {"type": "commit", "sha": plan.release_sha},
+                    }),
+                ),
+                Expected::json(
+                    "GET",
+                    &release_path,
+                    json!({
+                        "id": 42,
+                        "tag_name": package.tag,
+                        "target_commitish": "main",
+                        "name": "historical name is outside the closed contract",
+                        "body": release_body,
+                        "draft": false,
+                        "prerelease": package.prerelease,
+                        "immutable": false,
+                        "author": {"login": LEGACY_AUTHOR_LOGIN, "id": LEGACY_AUTHOR_ID, "type": "Bot"},
+                        "assets": [],
+                    }),
+                ),
+            ]
+        };
+        let mut github = FakeTransport::new(expectations(&package.release_body));
+        let release =
+            require_legacy_release_objects(&mut github, &plan.repository, &plan, package).unwrap();
+        assert_eq!(release.id, 42);
+        github.finish();
+
+        let digest = settings_evidence_sha256(&plan.repository, &plan.release_sha, 100, 1).unwrap();
+        let (_, plan_digest) = encode_plan(&plan).unwrap();
+        let intent = build_intent(Path::new("."), &plan, &plan_digest, 100, 1, &digest).unwrap();
+        assert_eq!(intent.tags[0].tag_object_id, "8".repeat(40));
+        assert!(intent.tags[0].tag_message.is_empty());
+
+        let mut github = FakeTransport::new(expectations("drifted historical body"));
+        assert!(
+            require_legacy_release_objects(&mut github, &plan.repository, &plan, package)
+                .unwrap_err()
+                .contains("drifted")
+        );
+        github.finish();
+    }
+
+    #[test]
+    fn only_exact_closed_inventory_uses_the_historical_archive() {
+        let policy = &crate::release_policy::TRAITS_POLICY.packages[0];
+        let spec = ReleaseSpec {
+            policy,
+            version: "0.4.0-rc.2".to_string(),
+            tag: "v0.4.0-rc.2".to_string(),
+            body: "historical notes".to_string(),
+            prerelease: true,
+        };
+        let commit = "a".repeat(40);
+        let checksum = "b".repeat(64);
+        let inventory = LegacyInventory {
+            schema_version: 1,
+            api_version: GITHUB_API_VERSION.to_string(),
+            repository: "NVIDIA/yaml-sigil-traits".to_string(),
+            legacy_author: LegacyAuthor {
+                id: LEGACY_AUTHOR_ID,
+                login: LEGACY_AUTHOR_LOGIN.to_string(),
+                kind: "Bot".to_string(),
+            },
+            prospective_author: LegacyAuthor {
+                id: APP_ID,
+                login: APP_LOGIN.to_string(),
+                kind: "Bot".to_string(),
+            },
+            entries: vec![LegacyEntry {
+                release_id: 42,
+                package: policy.package.to_string(),
+                version: spec.version.clone(),
+                tag: spec.tag.clone(),
+                tag_object_sha: "c".repeat(40),
+                peeled_commit_sha: commit.clone(),
+                target_commitish: "main".to_string(),
+                draft: false,
+                prerelease: true,
+                immutable: false,
+                asset_count: 0,
+                body_sha256: sha256(spec.body.as_bytes()),
+                source_archive_sha256: checksum.clone(),
+                path_in_vcs: policy.path_in_vcs.to_string(),
+            }],
+        };
+        assert_eq!(
+            legacy_release_entry(&inventory, &spec, &commit, &checksum)
+                .unwrap()
+                .unwrap()
+                .release_id,
+            42
+        );
+        assert!(
+            legacy_release_entry(&inventory, &spec, &commit, &"d".repeat(64))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -2316,5 +3030,24 @@ mod tests {
             "unknown": true,
         });
         assert!(serde_json::from_value::<ClosedPayload>(unknown).is_err());
+    }
+
+    #[test]
+    fn legacy_authorization_cannot_cover_prospective_objects() {
+        let mut plan = plan();
+        plan.authorization = PlanAuthorization::LegacyInventory;
+        let (body, digest) = encode_plan(&plan).unwrap();
+        assert!(decode_plan(&body, &digest).is_err());
+
+        plan.packages[0].registry = RegistryBaseline {
+            state: RegistryState::Present,
+            checksum: Some("1".repeat(64)),
+        };
+        plan.packages[0].release_objects = ReleaseObjectBaseline::Legacy {
+            release_id: 42,
+            tag_object_sha: "8".repeat(40),
+        };
+        let (body, digest) = encode_plan(&plan).unwrap();
+        assert_eq!(decode_plan(&body, &digest).unwrap(), plan);
     }
 }

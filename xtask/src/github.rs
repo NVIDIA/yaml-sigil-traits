@@ -154,6 +154,10 @@ enum ReleaseTrainCommand {
         #[arg(long)]
         commit: String,
         #[arg(long)]
+        policy_commit: String,
+        #[arg(long)]
+        legacy_inventory_sha256: String,
+        #[arg(long)]
         baseline_version: String,
         #[arg(long)]
         baseline_commit: String,
@@ -324,14 +328,20 @@ pub fn run(root: &Path, args: GithubArgs) -> Result<(), String> {
             ReleaseTrainCommand::Capture {
                 repository,
                 commit,
+                policy_commit,
+                legacy_inventory_sha256,
                 baseline_version,
                 baseline_commit,
             } => release_train::capture_command(
                 root,
-                &repository,
-                &commit,
-                &baseline_version,
-                &baseline_commit,
+                release_train::CaptureInput {
+                    repository: &repository,
+                    commit: &commit,
+                    policy_commit: &policy_commit,
+                    legacy_inventory_sha256: &legacy_inventory_sha256,
+                    baseline_version: &baseline_version,
+                    baseline_commit: &baseline_commit,
+                },
                 &mut github,
             ),
             ReleaseTrainCommand::Verify {
