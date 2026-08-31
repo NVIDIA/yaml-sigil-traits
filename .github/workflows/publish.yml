@@ -114,8 +114,22 @@ jobs:
           persist-credentials: false
           ref: ${{ steps.discover.outputs.captured_release_sha }}
 
-      # This is the first command after a recovery checkout and binds it to the
-      # archive-discovered protected-main ancestor before project execution.
+      # Verify the checkout before changing only local branch metadata. The
+      # branch is never pushed; it supplies pinned release-plz's upstream.
+      - name: Attach exact source to a local release branch
+        env:
+          CAPTURED_SHA: ${{ steps.discover.outputs.captured_release_sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "${CAPTURED_SHA}"
+          # Pinned release-plz requires a branch with a configured upstream.
+          git switch --force-create release-plz-source "${CAPTURED_SHA}"
+          git branch --set-upstream-to=origin/main release-plz-source
+          test "$(git rev-parse HEAD)" = "${CAPTURED_SHA}"
+          test "$(git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}')" \
+            = "origin/main"
+
+      # Recheck the archive-discovered protected-main ancestor before project
+      # execution.
       - name: Verify captured source identity
         env:
           CAPTURED_SHA: ${{ steps.discover.outputs.captured_release_sha }}
@@ -214,6 +228,7 @@ jobs:
           release-plz release \
             --dry-run \
             --forge github \
+            --repo-url "https://github.com/${GITHUB_REPOSITORY}" \
             --config "${RUNNER_TEMP}/release-plz-publication.toml" \
             --manifest-path Cargo.toml
           test "$(git rev-parse HEAD)" = "${CAPTURED_SHA}"
@@ -341,6 +356,20 @@ jobs:
           persist-credentials: false
           ref: ${{ steps.discover.outputs.captured_release_sha }}
 
+      # Verify the checkout before changing only local branch metadata. The
+      # branch is never pushed; it supplies pinned release-plz's upstream.
+      - name: Attach exact source to a local release branch
+        env:
+          CAPTURED_SHA: ${{ steps.discover.outputs.captured_release_sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "${CAPTURED_SHA}"
+          # Pinned release-plz requires a branch with a configured upstream.
+          git switch --force-create release-plz-source "${CAPTURED_SHA}"
+          git branch --set-upstream-to=origin/main release-plz-source
+          test "$(git rev-parse HEAD)" = "${CAPTURED_SHA}"
+          test "$(git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}')" \
+            = "origin/main"
+
       - name: Recheck captured source and committed version
         env:
           CAPTURED_SHA: ${{ steps.discover.outputs.captured_release_sha }}
@@ -462,6 +491,7 @@ jobs:
               # Pinned release-plz has source-crate publication authority only.
               release-plz release \
                 --forge github \
+                --repo-url "https://github.com/${GITHUB_REPOSITORY}" \
                 --config "${RUNNER_TEMP}/release-plz-publication.toml" \
                 --manifest-path Cargo.toml
               publisher_status="$?"
