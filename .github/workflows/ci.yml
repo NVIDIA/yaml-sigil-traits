@@ -46,7 +46,7 @@ jobs:
             -s .github/scripts -p 'test_*.py'
 
   platform_verifier:
-    name: Protected checkout verifier (${{ matrix.name }})
+    name: Protected policy verifier tests (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
     permissions:
