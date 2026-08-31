@@ -340,6 +340,9 @@ jobs:
             --head "${GITHUB_SHA}" \
             --inventory "${{ steps.baseline.outputs.inventory }}" \
             --expected-fetch-url "https://github.com/${GITHUB_REPOSITORY}"
+          cargo xtask release require-current-main \
+            --head "${GITHUB_SHA}" \
+            --fetch-url "https://github.com/${GITHUB_REPOSITORY}"
 
       - name: Create repository-scoped proposal token
         id: app-token

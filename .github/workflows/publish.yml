@@ -80,6 +80,18 @@ jobs:
       - name: Install and verify release analyzers
         run: cargo xtask release install-tools
 
+      # Preserve current trusted baseline policy across a recovery checkout.
+      - name: Stage current baseline validator
+        run: |
+          cargo build --locked --manifest-path xtask/Cargo.toml
+          validator="${RUNNER_TEMP}/yaml-sigil-release-xtask"
+          install -m 700 xtask/target/debug/xtask "${validator}"
+          validator_sha256="$(sha256sum "${validator}" | cut -d ' ' -f 1)"
+          printf 'YAML_SIGIL_RELEASE_XTASK=%s\n' "${validator}" \
+            >>"${GITHUB_ENV}"
+          printf 'YAML_SIGIL_RELEASE_XTASK_SHA256=%s\n' "${validator_sha256}" \
+            >>"${GITHUB_ENV}"
+
       - name: Configure read-only forge identity
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -132,12 +144,16 @@ jobs:
         run: |
           current_version="$(cargo xtask release-version show)"
           result="${RUNNER_TEMP}/baseline-result.json"
-          cargo xtask release baseline prepare \
+          test "$(sha256sum "${YAML_SIGIL_RELEASE_XTASK}" | cut -d ' ' -f 1)" \
+            = "${YAML_SIGIL_RELEASE_XTASK_SHA256}"
+          "${YAML_SIGIL_RELEASE_XTASK}" release baseline prepare \
+            --source-root "${GITHUB_WORKSPACE}" \
             --head "${CAPTURED_SHA}" \
             --exclude-version "${current_version}" \
             --output "${RUNNER_TEMP}/official-release-baseline" \
             --result "${result}" \
-            --expected-fetch-url "https://github.com/${GITHUB_REPOSITORY}"
+            --expected-fetch-url "https://github.com/${GITHUB_REPOSITORY}" \
+            --expected-push-url "${GIT_CONFIG_VALUE_0}"
           jq --raw-output \
             '"commit=\(.commit)",
              "manifest=\(.manifest)",
@@ -287,6 +303,18 @@ jobs:
       - name: Install and verify release analyzers
         run: cargo xtask release install-tools
 
+      # Preserve current trusted baseline policy across a recovery checkout.
+      - name: Stage current baseline validator
+        run: |
+          cargo build --locked --manifest-path xtask/Cargo.toml
+          validator="${RUNNER_TEMP}/yaml-sigil-release-xtask"
+          install -m 700 xtask/target/debug/xtask "${validator}"
+          validator_sha256="$(sha256sum "${validator}" | cut -d ' ' -f 1)"
+          printf 'YAML_SIGIL_RELEASE_XTASK=%s\n' "${validator}" \
+            >>"${GITHUB_ENV}"
+          printf 'YAML_SIGIL_RELEASE_XTASK_SHA256=%s\n' "${validator_sha256}" \
+            >>"${GITHUB_ENV}"
+
       - name: Configure protected publication forge identity
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -327,12 +355,16 @@ jobs:
         run: |
           current_version="$(cargo xtask release-version show)"
           result="${RUNNER_TEMP}/baseline-result.json"
-          cargo xtask release baseline prepare \
+          test "$(sha256sum "${YAML_SIGIL_RELEASE_XTASK}" | cut -d ' ' -f 1)" \
+            = "${YAML_SIGIL_RELEASE_XTASK_SHA256}"
+          "${YAML_SIGIL_RELEASE_XTASK}" release baseline prepare \
+            --source-root "${GITHUB_WORKSPACE}" \
             --head "${CAPTURED_SHA}" \
             --exclude-version "${current_version}" \
             --output "${RUNNER_TEMP}/official-release-baseline" \
             --result "${result}" \
-            --expected-fetch-url "https://github.com/${GITHUB_REPOSITORY}"
+            --expected-fetch-url "https://github.com/${GITHUB_REPOSITORY}" \
+            --expected-push-url "${GIT_CONFIG_VALUE_0}"
           jq --raw-output \
             '"commit=\(.commit)",
              "manifest=\(.manifest)",

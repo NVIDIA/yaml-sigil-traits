@@ -264,6 +264,9 @@ GIT_CONFIG_VALUE_0=disabled://yaml-sigil-release-proposal \
     --head "$(git rev-parse HEAD)" \
     --inventory "${inventory_path}" \
     --expected-fetch-url "${fetch_url}"
+cargo xtask release require-current-main \
+  --head "$(git rev-parse HEAD)" \
+  --fetch-url "${fetch_url}"
 ```
 
 The direct compatibility check converts the selected bump into Cargo's
