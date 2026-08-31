@@ -19,10 +19,11 @@ use crate::github::consts::{APP_EMAIL, APP_ID, APP_LOGIN, APP_SLUG};
 use crate::github::release_objects::{
     ReleaseSpec, manifest_version, package_source, release_specs, require_reproduced_archive,
 };
-use crate::github::source::{SourceAuthorization, authorize_source};
+use crate::github::source::{MainRequirement, SourceAuthorization, authorize_source};
 use crate::github::transport::{Transport, percent_encode};
 use crate::github::{
     append_outputs, git_output, is_positive_integer, is_sha, repository_policy_for_root,
+    require_captured_ancestry,
 };
 use crate::release_policy::detect;
 use crate::safe_file::TrustedRoot;
@@ -534,14 +535,6 @@ fn capture_plan(
     let repository_policy = repository_policy_for_root(root, repository)?;
     crate::crate_archive::require_clean_source(root, commit)?;
     let version = manifest_version(root, repository_policy.kind)?;
-    let authorization = authorize_source(
-        github,
-        repository,
-        commit,
-        root,
-        baseline_version,
-        baseline_commit,
-    )?;
     let policy = detect(root)?;
     let specs = release_specs(root, policy, &version)?;
     if specs.is_empty() || specs.len() > MAX_RELEASE_PACKAGES {
@@ -603,6 +596,16 @@ fn capture_plan(
         });
     }
     require_registry_prefix(&packages)?;
+    let main_requirement = main_requirement(&packages);
+    let authorization = authorize_source(
+        github,
+        repository,
+        commit,
+        root,
+        baseline_version,
+        baseline_commit,
+        main_requirement,
+    )?;
     Ok(ReleasePlan {
         schema_version: PLAN_SCHEMA,
         repository: repository.to_string(),
@@ -616,6 +619,17 @@ fn capture_plan(
         tagger_date,
         packages,
     })
+}
+
+fn main_requirement(packages: &[PlanPackage]) -> MainRequirement {
+    if packages
+        .iter()
+        .all(|package| package.registry.state == RegistryState::Absent)
+    {
+        MainRequirement::Exact
+    } else {
+        MainRequirement::Ancestry
+    }
 }
 
 fn require_source_only_config(config: &str, specs: &[ReleaseSpec<'_>]) -> Result<(), String> {
@@ -1425,32 +1439,6 @@ fn release_policy_for_repository(
     }
 }
 
-fn require_captured_ancestry(
-    github: &mut impl Transport,
-    repository: &str,
-    release_sha: &str,
-) -> Result<(), String> {
-    #[derive(Deserialize)]
-    struct Comparison {
-        status: String,
-        base_commit: CommitIdentity,
-        merge_base_commit: CommitIdentity,
-    }
-    #[derive(Deserialize)]
-    struct CommitIdentity {
-        sha: String,
-    }
-    let comparison: Comparison =
-        github.get(&format!("repos/{repository}/compare/{release_sha}...main"))?;
-    if !matches!(comparison.status.as_str(), "ahead" | "identical")
-        || comparison.base_commit.sha != release_sha
-        || comparison.merge_base_commit.sha != release_sha
-    {
-        return Err("captured release SHA is no longer protected-main ancestry".to_string());
-    }
-    Ok(())
-}
-
 #[derive(Debug, Deserialize)]
 struct AnnotatedTag {
     sha: String,
@@ -1979,6 +1967,14 @@ mod tests {
                 },
             }],
         }
+    }
+
+    #[test]
+    fn source_requires_current_main_until_registry_recovery_exists() {
+        let mut plan = plan();
+        assert_eq!(main_requirement(&plan.packages), MainRequirement::Exact);
+        plan.packages[0].registry.state = RegistryState::Present;
+        assert_eq!(main_requirement(&plan.packages), MainRequirement::Ancestry);
     }
 
     fn intent_fixture() -> (ReleasePlan, IntentRecord, String) {
