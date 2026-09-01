@@ -300,7 +300,10 @@ def crate_inventory_sha256(
 
 
 def append_output(path: Path, name: str, value: str) -> None:
-    require(re.fullmatch(r"[a-z_]+", name) is not None, "workflow output name is invalid")
+    require(
+        re.fullmatch(r"[a-z_][a-z0-9_]*", name) is not None,
+        "workflow output name is invalid",
+    )
     require(not any(character in value for character in "\0\r\n"), "workflow output value is invalid")
     with path.open("a", encoding="utf-8", newline="\n") as handle:
         handle.write(f"{name}={value}\n")
