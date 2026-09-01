@@ -276,6 +276,34 @@ fn resolve_update_replay_key(
     Err("release proposal branch is not the exact abandoned replay".to_string())
 }
 
+pub(super) fn notification_replay_state(
+    github: &mut impl Transport,
+    repository: &str,
+    key: &str,
+) -> Result<&'static str, String> {
+    if !is_digest(key) {
+        return Err("release notification replay key is invalid".to_string());
+    }
+    let bot = require_bot(github)?;
+    let (target, ahead, marker) = inspect_target(github, repository, &bot)?;
+    let pull = inspect_open_pull(github, repository, target.as_ref(), &bot)?;
+    let resolved = resolve_update_replay_key(
+        Some(key),
+        target.is_some(),
+        ahead,
+        marker.as_deref(),
+        pull.as_ref(),
+    )?;
+    if resolved.as_deref() != Some(key) {
+        return Err("release notification replay state lost its exact key".to_string());
+    }
+    Ok(if target.is_none() || ahead == 0 {
+        "new"
+    } else {
+        "recover"
+    })
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct Bot {
     pub(super) login: String,

@@ -22,7 +22,7 @@ use crate::github::release_objects::{
 use crate::github::source::{MainRequirement, SourceAuthorization, authorize_source};
 use crate::github::transport::{Transport, percent_encode};
 use crate::github::{
-    append_outputs, git_output, is_positive_integer, is_sha, repository_policy_for_root,
+    append_outputs, git_line, git_output, is_positive_integer, is_sha, repository_policy_for_root,
     require_captured_ancestry,
 };
 use crate::release_policy::detect;
@@ -32,14 +32,15 @@ const NOTIFICATION_SCHEMA: u64 = 1;
 const MAX_PLAN_BYTES: usize = 48 * 1024;
 const MAX_INTENT_BYTES: usize = 64 * 1024;
 const MAX_NOTIFICATION_BYTES: usize = 8 * 1024;
+const MAX_EVENT_BYTES: usize = 128 * 1024;
 const MAX_POLICY_FILE_BYTES: usize = 256 * 1024;
 const MAX_RELEASE_PACKAGES: usize = 8;
 const MAX_RELEASE_BODY_BYTES: usize = 16 * 1024;
 const MAX_LEGACY_RELEASES: usize = 64;
 const REGISTRY_POLL_COUNT: usize = 60;
 const REGISTRY_POLL_SECONDS: u64 = 20;
-const APP_PUBLIC_ID: u64 = 4_653_064;
-const INTENT_NAME: &str = "Release finalization intent";
+pub(super) const APP_PUBLIC_ID: u64 = 4_653_064;
+pub(super) const INTENT_NAME: &str = "Release finalization intent";
 const RELEASE_PLZ_VERSION: &str = "0.3.160";
 const GITHUB_API_VERSION: &str = "2026-03-10";
 const LEGACY_AUTHOR_ID: u64 = 41_898_282;
@@ -97,6 +98,21 @@ pub(super) struct NotifyInput<'a> {
     pub(super) finalized_entries: &'a str,
     pub(super) expected_app_slug: &'a str,
     pub(super) expected_installation_id: &'a str,
+}
+
+pub(super) struct ReceiveInput<'a> {
+    pub(super) event: &'a Path,
+    pub(super) repository: &'a str,
+    pub(super) policy_commit: &'a str,
+}
+
+struct ReceiveResult {
+    replay_key: String,
+    replay_state: &'static str,
+    captured_release_sha: String,
+    release_plan_digest: String,
+    intent_check_id: u64,
+    policy_sha: String,
 }
 
 pub(super) fn discover_command(
@@ -576,6 +592,589 @@ pub(super) fn wait_command(
         thread::sleep(Duration::from_secs(REGISTRY_POLL_SECONDS))
     })?;
     append_outputs(&[("complete", "true")])
+}
+
+pub(super) fn settings_evidence_command(
+    root: &Path,
+    repository: &str,
+    release_sha: &str,
+    run_id: &str,
+    run_attempt: &str,
+) -> Result<(), String> {
+    repository_policy_for_root(root, repository)?;
+    let digest = settings_evidence_sha256(
+        repository,
+        release_sha,
+        positive(run_id, "workflow run ID")?,
+        positive(run_attempt, "workflow run attempt")?,
+    )?;
+    append_outputs(&[("ruleset_evidence_sha256", &digest)])
+}
+
+pub(super) fn verify_legacy_command(
+    root: &Path,
+    repository: &str,
+    policy_commit: &str,
+    github: &mut impl Transport,
+) -> Result<(), String> {
+    require_current_policy_source(root, repository, policy_commit, github)?;
+    let snapshot = load_policy_snapshot(root, repository, policy_commit, None, github)?;
+    let mut registry = CratesIo::new();
+    verify_live_legacy_inventory(
+        github,
+        &mut registry,
+        repository,
+        &snapshot.legacy_inventory,
+    )?;
+    append_outputs(&[("legacy_inventory_digest", &snapshot.legacy_inventory_sha256)])
+}
+
+fn require_current_policy_source(
+    root: &Path,
+    repository: &str,
+    policy_commit: &str,
+    github: &mut impl Transport,
+) -> Result<(), String> {
+    repository_policy_for_root(root, repository)?;
+    if !is_sha(policy_commit) || git_line(root, &["rev-parse", "HEAD"])? != policy_commit {
+        return Err("protected release policy is not the exact checked-out commit".to_string());
+    }
+    let reference: crate::github::models::GitRef =
+        github.get(&format!("repos/{repository}/git/ref/heads/main"))?;
+    if reference.name != "refs/heads/main"
+        || reference.object.kind != "commit"
+        || reference.object.sha != policy_commit
+    {
+        return Err("protected release policy is not exact current main".to_string());
+    }
+    Ok(())
+}
+
+fn verify_live_legacy_inventory(
+    github: &mut impl Transport,
+    registry: &mut impl Registry,
+    repository: &str,
+    inventory: &LegacyInventory,
+) -> Result<(), String> {
+    let releases: Vec<Release> = github.paginate(&format!("repos/{repository}/releases"))?;
+    if releases.len() >= 100 {
+        return Err("GitHub Release inventory is invalid or truncated".to_string());
+    }
+    let mut listed = BTreeSet::new();
+    for release in &releases {
+        if release.id == 0 || !listed.insert(release.id) {
+            return Err("GitHub listed an invalid or duplicate Release".to_string());
+        }
+        if let Some(entry) = inventory
+            .entries
+            .iter()
+            .find(|entry| entry.release_id == release.id)
+        {
+            if release.tag_name != entry.tag {
+                return Err("listed legacy Release tag drifted".to_string());
+            }
+        } else if release.author.id != inventory.prospective_author.id
+            || release.author.login != inventory.prospective_author.login
+            || release.author.kind != inventory.prospective_author.kind
+            || !release.immutable
+            || release.draft
+            || release.target_commitish != "main"
+            || !release.assets.is_empty()
+        {
+            return Err("an unpinned mutable, draft, or non-App Release exists".to_string());
+        }
+    }
+    if inventory
+        .entries
+        .iter()
+        .any(|entry| !listed.contains(&entry.release_id))
+    {
+        return Err("a pinned legacy Release is missing".to_string());
+    }
+
+    let policy = release_policy_for_repository(repository)?;
+    for entry in &inventory.entries {
+        let package_policy = policy
+            .packages
+            .iter()
+            .find(|package| package.package == entry.package)
+            .ok_or_else(|| "legacy Release package is outside repository policy".to_string())?;
+        let release: Release =
+            github.get(&format!("repos/{repository}/releases/{}", entry.release_id))?;
+        if release.id != entry.release_id
+            || release.tag_name != entry.tag
+            || release.target_commitish != entry.target_commitish
+            || release.draft != entry.draft
+            || release.prerelease != entry.prerelease
+            || release.immutable != entry.immutable
+            || release.author.id != inventory.legacy_author.id
+            || release.author.login != inventory.legacy_author.login
+            || release.author.kind != inventory.legacy_author.kind
+            || release.assets.len() as u64 != entry.asset_count
+            || sha256(release.body.as_bytes()) != entry.body_sha256
+        {
+            return Err(format!("legacy Release {} drifted", entry.release_id));
+        }
+        let reference: crate::github::models::GitRef = github.get(&format!(
+            "repos/{repository}/git/ref/tags/{}",
+            percent_encode(&entry.tag)
+        ))?;
+        if reference.name != format!("refs/tags/{}", entry.tag)
+            || reference.object.kind != "tag"
+            || reference.object.sha != entry.tag_object_sha
+        {
+            return Err("legacy annotated tag ref drifted".to_string());
+        }
+        let tag: AnnotatedTag = github.get(&format!(
+            "repos/{repository}/git/tags/{}",
+            entry.tag_object_sha
+        ))?;
+        if tag.sha != entry.tag_object_sha
+            || tag.tag != entry.tag
+            || tag.object.kind != "commit"
+            || tag.object.sha != entry.peeled_commit_sha
+        {
+            return Err("legacy annotated tag object drifted".to_string());
+        }
+        let record = registry
+            .exact_version(&entry.package, &entry.version)?
+            .ok_or_else(|| "legacy registry record is missing".to_string())?;
+        if record.num != entry.version
+            || record.yanked
+            || record.checksum != entry.source_archive_sha256
+        {
+            return Err("legacy registry record drifted".to_string());
+        }
+        let archive = registry.download(&entry.package, &entry.version)?;
+        if sha256(&archive) != entry.source_archive_sha256 {
+            return Err("legacy source archive checksum drifted".to_string());
+        }
+        crate::crate_archive::inspect_archive_entries(
+            &archive,
+            package_policy,
+            &entry.version,
+            &entry.peeled_commit_sha,
+        )?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct DispatchEvent {
+    action: String,
+    sender: DispatchActor,
+    repository: DispatchRepository,
+    client_payload: ReleaseNotification,
+}
+
+#[derive(Debug, Deserialize)]
+struct DispatchActor {
+    id: u64,
+    login: String,
+    #[serde(rename = "type")]
+    kind: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DispatchRepository {
+    full_name: String,
+    default_branch: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ReleaseNotification {
+    schema_version: u64,
+    repository: String,
+    captured_sha: String,
+    release_plan_digest: String,
+    intent_check_id: u64,
+    intent_external_id: String,
+    releases: Vec<FinalizedEntry>,
+}
+
+#[derive(Serialize)]
+struct RepositoryDispatch<'a> {
+    event_type: &'static str,
+    client_payload: &'a ReleaseNotification,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkflowRun {
+    id: u64,
+    run_attempt: u64,
+    head_sha: String,
+    head_branch: String,
+    event: String,
+    path: String,
+    status: String,
+    conclusion: Option<String>,
+    repository: DispatchRepositoryName,
+}
+
+#[derive(Debug, Deserialize)]
+struct DispatchRepositoryName {
+    full_name: String,
+}
+
+#[derive(Serialize)]
+struct ReplayDocument<'a> {
+    schema_version: u64,
+    repository: &'a str,
+    release_ids: Vec<u64>,
+    tags: Vec<&'a str>,
+    captured_sha: &'a str,
+    release_plan_digest: &'a str,
+    intent_check_id: u64,
+}
+
+pub(super) fn receive_command(
+    root: &Path,
+    input: ReceiveInput<'_>,
+    github: &mut impl Transport,
+) -> Result<(), String> {
+    let mut registry = CratesIo::new();
+    let result = receive_with_registry(root, input, github, &mut registry)?;
+    let intent_check_id = result.intent_check_id.to_string();
+    append_outputs(&[
+        ("authorized", "true"),
+        ("replay_key", &result.replay_key),
+        ("replay_state", result.replay_state),
+        ("captured_release_sha", &result.captured_release_sha),
+        ("release_plan_digest", &result.release_plan_digest),
+        ("intent_check_id", &intent_check_id),
+        ("policy_sha", &result.policy_sha),
+    ])
+}
+
+fn receive_with_registry(
+    root: &Path,
+    input: ReceiveInput<'_>,
+    github: &mut impl Transport,
+    registry: &mut impl Registry,
+) -> Result<ReceiveResult, String> {
+    require_current_policy_source(root, input.repository, input.policy_commit, github)?;
+    let event = read_dispatch_event(input.event)?;
+    require_notification_size(&event.client_payload)?;
+    validate_notification_shape(input.repository, &event.client_payload)?;
+    validate_dispatch_identity(&event, input.repository, input.policy_commit, github)?;
+    let payload = event.client_payload;
+
+    let check: CheckRun = github.get(&format!(
+        "repos/{}/check-runs/{}",
+        input.repository, payload.intent_check_id
+    ))?;
+    let intent_body = check
+        .output
+        .summary
+        .clone()
+        .ok_or_else(|| "release intent Check summary is absent".to_string())?;
+    let preliminary: IntentRecord = serde_json::from_str(&intent_body)
+        .map_err(|error| format!("release intent schema is invalid: {error}"))?;
+    let (plan_body, plan_digest) = encode_plan(&preliminary.plan)?;
+    if plan_digest != payload.release_plan_digest {
+        return Err("release notification plan digest is wrong".to_string());
+    }
+    let plan = decode_plan(&plan_body, &plan_digest)?;
+    let intent = decode_intent(&intent_body, &plan, &plan_digest)?;
+    if check.id != payload.intent_check_id
+        || check.external_id != payload.intent_external_id
+        || intent.external_id != payload.intent_external_id
+    {
+        return Err("release notification intent identity is wrong".to_string());
+    }
+    validate_intent_check(&check, &intent, &intent_body)?;
+    validate_notification_bindings(input.repository, input.policy_commit, &payload, &intent)?;
+    validate_origin_run(input.repository, &intent, github)?;
+
+    let policy = release_policy_for_repository(input.repository)?;
+    let mut inspected = vec![false; plan.packages.len()];
+    if !observe_registry(&plan, policy, registry, &mut inspected, true)? {
+        return Err("crates.io does not contain the complete release train".to_string());
+    }
+    validate_notification_releases(input.repository, &payload, &intent, github)?;
+
+    let replay = ReplayDocument {
+        schema_version: 1,
+        repository: input.repository,
+        release_ids: payload
+            .releases
+            .iter()
+            .map(|entry| entry.release_id)
+            .collect(),
+        tags: payload
+            .releases
+            .iter()
+            .map(|entry| entry.tag.as_str())
+            .collect(),
+        captured_sha: &payload.captured_sha,
+        release_plan_digest: &payload.release_plan_digest,
+        intent_check_id: payload.intent_check_id,
+    };
+    let replay_body = serde_json::to_vec(&replay)
+        .map_err(|error| format!("encode release replay document: {error}"))?;
+    let replay_key = sha256(&replay_body);
+    let replay_state = crate::github::release_pr::notification_replay_state(
+        github,
+        input.repository,
+        &replay_key,
+    )?;
+    Ok(ReceiveResult {
+        replay_key,
+        replay_state,
+        captured_release_sha: payload.captured_sha,
+        release_plan_digest: payload.release_plan_digest,
+        intent_check_id: payload.intent_check_id,
+        policy_sha: input.policy_commit.to_string(),
+    })
+}
+
+fn read_dispatch_event(path: &Path) -> Result<DispatchEvent, String> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .ok_or_else(|| "repository dispatch event path has no file name".to_string())?;
+    let body = crate::safe_file::TrustedRoot::open(parent)
+        .and_then(|root| root.read_utf8(Path::new(name), MAX_EVENT_BYTES))
+        .map_err(|error| format!("read repository dispatch event: {error}"))?;
+    if body.is_empty() {
+        return Err("repository dispatch event is empty".to_string());
+    }
+    serde_json::from_str(&body)
+        .map_err(|error| format!("repository dispatch event is invalid JSON: {error}"))
+}
+
+fn validate_dispatch_identity(
+    event: &DispatchEvent,
+    repository: &str,
+    policy_commit: &str,
+    github: &mut impl Transport,
+) -> Result<(), String> {
+    if event.action != "official-release-published"
+        || event.sender.id != APP_ID
+        || event.sender.login != APP_LOGIN
+        || event.sender.kind != "Bot"
+        || event.repository.full_name != repository
+        || event.repository.default_branch != "main"
+    {
+        return Err("repository dispatch identity is wrong".to_string());
+    }
+    let live: DispatchRepository = github.get(&format!("repos/{repository}"))?;
+    if live.full_name != repository || live.default_branch != "main" {
+        return Err("live repository identity is wrong".to_string());
+    }
+    let sender: DispatchActor = github.get(&format!("users/{}", percent_encode(APP_LOGIN)))?;
+    if sender.id != APP_ID || sender.login != APP_LOGIN || sender.kind != "Bot" {
+        return Err("live release sender identity is wrong".to_string());
+    }
+    let reference: crate::github::models::GitRef =
+        github.get(&format!("repos/{repository}/git/ref/heads/main"))?;
+    if reference.object.sha != policy_commit {
+        return Err("release receiver policy changed during authentication".to_string());
+    }
+    Ok(())
+}
+
+fn canonical_release_version(value: &str) -> bool {
+    let Ok(version) = semver::Version::parse(value) else {
+        return false;
+    };
+    if version.to_string() != value || !version.build.is_empty() {
+        return false;
+    }
+    if version.pre.is_empty() {
+        return true;
+    }
+    let Some(number) = version.pre.as_str().strip_prefix("rc.") else {
+        return false;
+    };
+    !number.is_empty()
+        && number.as_bytes()[0] != b'0'
+        && number.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn require_notification_size(payload: &ReleaseNotification) -> Result<(), String> {
+    let bytes = serde_json::to_vec(payload)
+        .map_err(|error| format!("encode release notification: {error}"))?;
+    if bytes.len() > MAX_NOTIFICATION_BYTES {
+        return Err("release notification exceeds its byte bound".to_string());
+    }
+    Ok(())
+}
+
+fn validate_notification_shape(
+    repository: &str,
+    payload: &ReleaseNotification,
+) -> Result<(), String> {
+    let policy = release_policy_for_repository(repository)?;
+    if payload.schema_version != NOTIFICATION_SCHEMA
+        || payload.repository != repository
+        || !is_sha(&payload.captured_sha)
+        || !is_digest(&payload.release_plan_digest)
+        || payload.intent_check_id == 0
+        || payload.intent_check_id > i64::MAX as u64
+        || !is_digest(&payload.intent_external_id)
+        || payload.releases.len() != policy.packages.len()
+    {
+        return Err("release notification binding is invalid".to_string());
+    }
+    let mut ids = BTreeSet::new();
+    let mut tags = BTreeSet::new();
+    for (entry, package) in payload.releases.iter().zip(policy.packages) {
+        if entry.package != package.package
+            || !canonical_release_version(&entry.version)
+            || entry.tag != package.tag(&entry.version)
+            || entry.release_id == 0
+            || entry.release_id > i64::MAX as u64
+            || !is_sha(&entry.tag_object_id)
+            || !is_digest(&entry.release_body_sha256)
+            || !ids.insert(entry.release_id)
+            || !tags.insert(entry.tag.as_str())
+        {
+            return Err("release notification entry is invalid or noncanonical".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn validate_notification_bindings(
+    repository: &str,
+    policy_commit: &str,
+    payload: &ReleaseNotification,
+    intent: &IntentRecord,
+) -> Result<(), String> {
+    let plan = &intent.plan;
+    let policy = release_policy_for_repository(repository)?;
+    if plan.repository != repository
+        || plan.release_sha != payload.captured_sha
+        || plan.policy_commit != policy_commit
+        || plan.packages.len() != policy.packages.len()
+        || intent.tags.len() != policy.packages.len()
+        || payload.releases.len() != policy.packages.len()
+        || plan
+            .packages
+            .iter()
+            .any(|package| !matches!(package.release_objects, ReleaseObjectBaseline::Absent))
+    {
+        return Err("release notification package family or policy binding is wrong".to_string());
+    }
+    let mut ids = BTreeSet::new();
+    let mut tags = BTreeSet::new();
+    for (((entry, package), tag), package_policy) in payload
+        .releases
+        .iter()
+        .zip(&plan.packages)
+        .zip(&intent.tags)
+        .zip(policy.packages)
+    {
+        if !canonical_release_version(&entry.version)
+            || entry.package != package_policy.package
+            || entry.package != package.package
+            || entry.package != tag.package
+            || entry.version != package.version
+            || entry.tag != package_policy.tag(&entry.version)
+            || entry.tag != package.tag
+            || entry.tag != tag.tag
+            || entry.release_id == 0
+            || entry.tag_object_id != tag.tag_object_id
+            || entry.release_body_sha256 != package.release_body_sha256
+            || entry.release_body_sha256 != tag.release_body_sha256
+            || package.prerelease != entry.version.contains('-')
+            || !ids.insert(entry.release_id)
+            || !tags.insert(entry.tag.as_str())
+        {
+            return Err("release notification entry differs from current policy".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn validate_origin_run(
+    repository: &str,
+    intent: &IntentRecord,
+    github: &mut impl Transport,
+) -> Result<(), String> {
+    let run: WorkflowRun = github.get(&format!(
+        "repos/{repository}/actions/runs/{}",
+        intent.origin_run_id
+    ))?;
+    if run.id != intent.origin_run_id
+        || run.run_attempt != intent.origin_run_attempt
+        || run.head_sha != intent.release_sha
+        || run.head_branch != "main"
+        || run.event != "workflow_dispatch"
+        || run.path != ".github/workflows/publish.yml"
+        || !matches!(
+            run.status.as_str(),
+            "queued" | "in_progress" | "waiting" | "completed"
+        )
+        || run
+            .conclusion
+            .as_deref()
+            .is_some_and(|conclusion| conclusion != "success")
+        || run.repository.full_name != repository
+    {
+        return Err(
+            "originating workflow identity, source, attempt, or state is wrong".to_string(),
+        );
+    }
+    let expected = settings_evidence_sha256(
+        repository,
+        &intent.release_sha,
+        intent.origin_run_id,
+        intent.origin_run_attempt,
+    )?;
+    if intent.ruleset_evidence_sha256 != expected {
+        return Err("ruleset evidence does not bind the originating workflow".to_string());
+    }
+    Ok(())
+}
+
+fn validate_notification_releases(
+    repository: &str,
+    payload: &ReleaseNotification,
+    intent: &IntentRecord,
+    github: &mut impl Transport,
+) -> Result<(), String> {
+    for ((entry, package), tag_intent) in payload
+        .releases
+        .iter()
+        .zip(&intent.plan.packages)
+        .zip(&intent.tags)
+    {
+        let release: Release =
+            github.get(&format!("repos/{repository}/releases/{}", entry.release_id))?;
+        if release.id != entry.release_id {
+            return Err("GitHub Release ID differs from the notification".to_string());
+        }
+        validate_release(&release, package)?;
+        let by_tag: Release = github.get(&format!(
+            "repos/{repository}/releases/tags/{}",
+            percent_encode(&entry.tag)
+        ))?;
+        if by_tag.id != entry.release_id {
+            return Err("GitHub Release tag lookup disagrees".to_string());
+        }
+        let reference: crate::github::models::GitRef = github.get(&format!(
+            "repos/{repository}/git/ref/tags/{}",
+            percent_encode(&entry.tag)
+        ))?;
+        if reference.name != format!("refs/tags/{}", entry.tag)
+            || reference.object.kind != "tag"
+            || reference.object.sha != entry.tag_object_id
+        {
+            return Err("annotated tag ref differs from the notification".to_string());
+        }
+        let tag: AnnotatedTag = github.get(&format!(
+            "repos/{repository}/git/tags/{}",
+            entry.tag_object_id
+        ))?;
+        validate_tag_object(&tag, &intent.plan, package, tag_intent)?;
+    }
+    Ok(())
 }
 
 fn wait_for_registry(
@@ -2247,23 +2846,21 @@ pub(super) fn notify_command(
             return Err("finalized entry differs from the attested release train".to_string());
         }
     }
-    let payload = json!({
-        "event_type": "official-release-published",
-        "client_payload": {
-            "schema_version": NOTIFICATION_SCHEMA,
-            "repository": input.repository,
-            "captured_sha": plan.release_sha,
-            "release_plan_digest": input.plan_digest,
-            "intent_check_id": check_id,
-            "intent_external_id": intent.external_id,
-            "releases": entries,
-        }
-    });
-    let bytes = serde_json::to_vec(&payload)
-        .map_err(|error| format!("encode release notification: {error}"))?;
-    if bytes.len() > MAX_NOTIFICATION_BYTES {
-        return Err("release notification exceeds its byte bound".to_string());
-    }
+    let notification = ReleaseNotification {
+        schema_version: NOTIFICATION_SCHEMA,
+        repository: input.repository.to_string(),
+        captured_sha: plan.release_sha,
+        release_plan_digest: input.plan_digest.to_string(),
+        intent_check_id: check_id,
+        intent_external_id: intent.external_id,
+        releases: entries,
+    };
+    require_notification_size(&notification)?;
+    validate_notification_shape(input.repository, &notification)?;
+    let payload = RepositoryDispatch {
+        event_type: "official-release-published",
+        client_payload: &notification,
+    };
     github.mutate_empty(
         "POST",
         &format!("repos/{}/dispatches", input.repository),
@@ -2369,7 +2966,9 @@ fn is_digest(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
-fn settings_evidence_tag_patterns(repository: &str) -> Result<&'static [&'static str], String> {
+pub(super) fn settings_evidence_tag_patterns(
+    repository: &str,
+) -> Result<&'static [&'static str], String> {
     match repository {
         "NVIDIA/yaml-sigil-traits" => Ok(TRAITS_TAG_PATTERNS),
         "NVIDIA/yaml-sigil-rs" => Ok(RS_TAG_PATTERNS),
@@ -2382,7 +2981,7 @@ fn update_settings_evidence_digest(digest: &mut Sha256, value: &str) {
     digest.update(b"\0");
 }
 
-fn settings_evidence_sha256(
+pub(super) fn settings_evidence_sha256(
     repository: &str,
     release_sha: &str,
     run_id: u64,
@@ -2433,7 +3032,10 @@ fn sha256(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::github::RELEASE_BRANCH;
     use crate::github::transport::fake::{Expected, FakeTransport};
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
     use std::fs;
 
     struct MissingRegistry {
@@ -2452,6 +3054,33 @@ mod tests {
 
         fn download(&mut self, _package: &str, _version: &str) -> Result<Vec<u8>, String> {
             panic!("an absent registry package must not be downloaded")
+        }
+    }
+
+    struct FixtureRegistry {
+        record: crate::crate_archive::RegistryVersion,
+        archive: Vec<u8>,
+        downloads: usize,
+    }
+
+    impl Registry for FixtureRegistry {
+        fn exact_version(
+            &mut self,
+            package: &str,
+            version: &str,
+        ) -> Result<Option<crate::crate_archive::RegistryVersion>, String> {
+            if package != "yaml-sigil-traits" || version != "0.4.0" {
+                return Err("unexpected fixture registry identity".to_string());
+            }
+            Ok(Some(self.record.clone()))
+        }
+
+        fn download(&mut self, package: &str, version: &str) -> Result<Vec<u8>, String> {
+            if package != "yaml-sigil-traits" || version != "0.4.0" {
+                return Err("unexpected fixture archive identity".to_string());
+            }
+            self.downloads += 1;
+            Ok(self.archive.clone())
         }
     }
 
@@ -2507,6 +3136,57 @@ mod tests {
             .expect("fixture Git output is UTF-8")
             .trim()
             .to_string()
+    }
+
+    fn protected_traits_root() -> (tempfile::TempDir, String) {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        fs::create_dir(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"yaml-sigil-traits\"\nversion = \"0.4.0\"\nedition = \"2024\"\npublish = [\"crates-io\"]\n\n[lib]\npath = \"src/lib.rs\"\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/lib.rs"), "pub trait Fixture {}\n").unwrap();
+        run_git(root, &["init", "--quiet"]);
+        run_git(root, &["config", "user.name", "Fixture"]);
+        run_git(root, &["config", "user.email", "fixture@example.invalid"]);
+        run_git(root, &["add", "Cargo.toml", "src/lib.rs"]);
+        run_git(
+            root,
+            &["commit", "--quiet", "--no-gpg-sign", "-m", "fixture"],
+        );
+        let commit = run_git(root, &["rev-parse", "HEAD"]);
+        (temporary, commit)
+    }
+
+    fn fixture_archive(commit: &str) -> Vec<u8> {
+        let prefix = "yaml-sigil-traits-0.4.0";
+        let vcs = serde_json::to_vec(&json!({
+            "git": {"sha1": commit},
+            "path_in_vcs": "",
+        }))
+        .unwrap();
+        let encoder = GzEncoder::new(Vec::new(), Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::file());
+        header.set_mode(0o644);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_mtime(crate::crate_archive::CARGO_ARCHIVE_MTIME);
+        header.set_username("").unwrap();
+        header.set_groupname("").unwrap();
+        header.set_size(vcs.len() as u64);
+        header.set_cksum();
+        builder
+            .append_data(
+                &mut header,
+                format!("{prefix}/.cargo_vcs_info.json"),
+                vcs.as_slice(),
+            )
+            .unwrap();
+        builder.into_inner().unwrap().finish().unwrap()
     }
 
     #[test]
@@ -2734,6 +3414,27 @@ mod tests {
         })
     }
 
+    fn notification_fixture() -> ReleaseNotification {
+        let (plan, intent, _) = intent_fixture();
+        let package = &plan.packages[0];
+        ReleaseNotification {
+            schema_version: NOTIFICATION_SCHEMA,
+            repository: plan.repository.clone(),
+            captured_sha: plan.release_sha.clone(),
+            release_plan_digest: intent.plan_digest,
+            intent_check_id: 900,
+            intent_external_id: intent.external_id,
+            releases: vec![FinalizedEntry {
+                package: package.package.clone(),
+                version: package.version.clone(),
+                release_id: 1_000,
+                tag: package.tag.clone(),
+                tag_object_id: intent.tags[0].tag_object_id.clone(),
+                release_body_sha256: package.release_body_sha256.clone(),
+            }],
+        }
+    }
+
     #[test]
     fn release_plan_rejects_unknown_noncanonical_and_wrong_digest_inputs() {
         let plan = plan();
@@ -2743,6 +3444,10 @@ mod tests {
         assert!(decode_plan(&body, &"0".repeat(64)).is_err());
         let unknown = body.replacen('{', "{\"unknown\":true,", 1);
         assert!(decode_plan(&unknown, &sha256(unknown.as_bytes())).is_err());
+        let mut legacy = plan;
+        legacy.schema_version = PLAN_SCHEMA - 1;
+        let (body, digest) = encode_plan(&legacy).unwrap();
+        assert!(decode_plan(&body, &digest).is_err());
     }
 
     #[test]
@@ -2980,56 +3685,521 @@ mod tests {
     }
 
     #[test]
-    fn notification_schema_rejects_unknown_and_legacy_payloads() {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct ClosedPayload {
-            schema_version: u64,
-            repository: String,
-            captured_sha: String,
-            release_plan_digest: String,
-            intent_check_id: u64,
-            intent_external_id: String,
-            releases: Vec<FinalizedEntry>,
-        }
-        let canonical = json!({
-            "schema_version": 1,
-            "repository": "NVIDIA/yaml-sigil-traits",
-            "captured_sha": "a".repeat(40),
-            "release_plan_digest": "b".repeat(64),
-            "intent_check_id": 1,
-            "intent_external_id": "c".repeat(64),
-            "releases": [],
-        });
-        let ClosedPayload {
-            schema_version,
-            repository,
-            captured_sha,
-            release_plan_digest,
-            intent_check_id,
-            intent_external_id,
-            releases,
-        } = serde_json::from_value(canonical).unwrap();
-        assert_eq!(schema_version, 1);
-        assert_eq!(repository, "NVIDIA/yaml-sigil-traits");
-        assert_eq!(captured_sha, "a".repeat(40));
-        assert_eq!(release_plan_digest, "b".repeat(64));
-        assert_eq!(intent_check_id, 1);
-        assert_eq!(intent_external_id, "c".repeat(64));
-        assert!(releases.is_empty());
+    fn notification_sender_and_receiver_share_one_closed_schema() {
+        let notification = notification_fixture();
+        require_notification_size(&notification).unwrap();
+        validate_notification_shape(&notification.repository, &notification).unwrap();
+
+        let dispatch = RepositoryDispatch {
+            event_type: "official-release-published",
+            client_payload: &notification,
+        };
+        let dispatch = serde_json::to_value(dispatch).unwrap();
+        let event: DispatchEvent = serde_json::from_value(json!({
+            "action": dispatch["event_type"],
+            "sender": {"id": APP_ID, "login": APP_LOGIN, "type": "Bot"},
+            "repository": {
+                "full_name": notification.repository,
+                "default_branch": "main",
+            },
+            "client_payload": dispatch["client_payload"],
+        }))
+        .unwrap();
+        assert_eq!(event.client_payload, notification);
+    }
+
+    #[test]
+    fn notification_schema_rejects_legacy_incomplete_unknown_and_duplicate_fields() {
+        let notification = notification_fixture();
         let legacy = json!({"version": "0.4.0"});
-        assert!(serde_json::from_value::<ClosedPayload>(legacy).is_err());
-        let unknown = json!({
-            "schema_version": 1,
-            "repository": "NVIDIA/yaml-sigil-traits",
-            "captured_sha": "a".repeat(40),
-            "release_plan_digest": "b".repeat(64),
-            "intent_check_id": 1,
-            "intent_external_id": "c".repeat(64),
-            "releases": [],
-            "unknown": true,
+        assert!(serde_json::from_value::<ReleaseNotification>(legacy).is_err());
+
+        let mut incomplete = serde_json::to_value(&notification).unwrap();
+        incomplete.as_object_mut().unwrap().remove("releases");
+        assert!(serde_json::from_value::<ReleaseNotification>(incomplete).is_err());
+
+        let mut unknown = serde_json::to_value(&notification).unwrap();
+        unknown["unknown"] = Value::Bool(true);
+        assert!(serde_json::from_value::<ReleaseNotification>(unknown).is_err());
+
+        let canonical = serde_json::to_string(&notification).unwrap();
+        let duplicate = canonical.replacen(
+            "\"schema_version\":1",
+            "\"schema_version\":1,\"schema_version\":1",
+            1,
+        );
+        assert!(serde_json::from_str::<ReleaseNotification>(&duplicate).is_err());
+    }
+
+    #[test]
+    fn notification_rejects_wrong_version_oversize_and_noncanonical_values() {
+        let notification = notification_fixture();
+
+        let mut wrong_version = notification.clone();
+        wrong_version.schema_version = NOTIFICATION_SCHEMA + 1;
+        assert!(validate_notification_shape(&wrong_version.repository, &wrong_version).is_err());
+
+        let mut incomplete = notification.clone();
+        incomplete.releases.clear();
+        assert!(validate_notification_shape(&incomplete.repository, &incomplete).is_err());
+
+        let mut noncanonical = notification.clone();
+        noncanonical.releases[0].version = "0.4.0+metadata".to_string();
+        noncanonical.releases[0].tag = "v0.4.0+metadata".to_string();
+        assert!(validate_notification_shape(&noncanonical.repository, &noncanonical).is_err());
+
+        let mut oversized = notification.clone();
+        oversized.releases[0].package = "x".repeat(MAX_NOTIFICATION_BYTES);
+        assert!(require_notification_size(&oversized).is_err());
+
+        let mut out_of_range = notification;
+        out_of_range.intent_check_id = i64::MAX as u64 + 1;
+        assert!(validate_notification_shape(&out_of_range.repository, &out_of_range).is_err());
+    }
+
+    #[test]
+    fn dispatch_event_read_is_bounded_before_parsing() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("event.json");
+        fs::write(&path, vec![b' '; MAX_EVENT_BYTES + 1]).unwrap();
+        assert!(
+            read_dispatch_event(&path)
+                .unwrap_err()
+                .contains("exceeds its")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dispatch_event_read_never_follows_a_symlink() {
+        let temporary = tempfile::tempdir().unwrap();
+        let target = temporary.path().join("target.json");
+        let path = temporary.path().join("event.json");
+        fs::write(&target, "{}").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(read_dispatch_event(&path).is_err());
+    }
+
+    #[test]
+    fn current_notification_and_plan_schema_pass_the_complete_receiver() {
+        let (temporary, policy_commit) = protected_traits_root();
+        let root = temporary.path();
+        let mut plan = plan();
+        plan.policy_commit = policy_commit.clone();
+
+        let archive = fixture_archive(&plan.release_sha);
+        let package_policy = &crate::release_policy::TRAITS_POLICY.packages[0];
+        let archive_entries = crate::crate_archive::inspect_archive_entries(
+            &archive,
+            package_policy,
+            &plan.packages[0].version,
+            &plan.release_sha,
+        )
+        .unwrap();
+        let archive_digest = sha256(&archive);
+        plan.packages[0].source_archive_sha256 = archive_digest.clone();
+        plan.packages[0].package_inventory_sha256 = archive_inventory_sha256(&archive_entries);
+
+        let (plan_body, plan_digest) = encode_plan(&plan).unwrap();
+        let ruleset_evidence =
+            settings_evidence_sha256(&plan.repository, &plan.release_sha, 100, 1).unwrap();
+        let intent = build_intent(root, &plan, &plan_digest, 100, 1, &ruleset_evidence).unwrap();
+        let intent_body = canonical_intent(&intent).unwrap();
+        let notification = ReleaseNotification {
+            schema_version: NOTIFICATION_SCHEMA,
+            repository: plan.repository.clone(),
+            captured_sha: plan.release_sha.clone(),
+            release_plan_digest: plan_digest.clone(),
+            intent_check_id: 900,
+            intent_external_id: intent.external_id.clone(),
+            releases: vec![FinalizedEntry {
+                package: plan.packages[0].package.clone(),
+                version: plan.packages[0].version.clone(),
+                release_id: 1_000,
+                tag: plan.packages[0].tag.clone(),
+                tag_object_id: intent.tags[0].tag_object_id.clone(),
+                release_body_sha256: plan.packages[0].release_body_sha256.clone(),
+            }],
+        };
+        let event_path = root.join("event.json");
+        fs::write(
+            &event_path,
+            serde_json::to_vec(&json!({
+                "action": "official-release-published",
+                "sender": {"id": APP_ID, "login": APP_LOGIN, "type": "Bot"},
+                "repository": {
+                    "full_name": plan.repository,
+                    "default_branch": "main",
+                },
+                "client_payload": notification,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let repository = plan.repository.clone();
+        let main_ref = json!({
+            "ref": "refs/heads/main",
+            "object": {"type": "commit", "sha": policy_commit},
         });
-        assert!(serde_json::from_value::<ClosedPayload>(unknown).is_err());
+        let repository_identity = json!({
+            "full_name": repository,
+            "default_branch": "main",
+        });
+        let sender = json!({"id": APP_ID, "login": APP_LOGIN, "type": "Bot"});
+        let release = json!({
+            "id": 1_000,
+            "tag_name": plan.packages[0].tag,
+            "target_commitish": "main",
+            "name": plan.packages[0].tag,
+            "body": plan.packages[0].release_body,
+            "draft": false,
+            "prerelease": plan.packages[0].prerelease,
+            "immutable": true,
+            "author": {"id": APP_ID, "login": APP_LOGIN, "type": "Bot"},
+            "assets": [],
+        });
+        let tag = json!({
+            "sha": intent.tags[0].tag_object_id,
+            "tag": plan.packages[0].tag,
+            "message": intent.tags[0].tag_message,
+            "tagger": {
+                "name": APP_LOGIN,
+                "email": APP_EMAIL,
+                "date": plan.tagger_date,
+            },
+            "object": {"type": "commit", "sha": plan.release_sha},
+        });
+        let ref_path = format!(
+            "repos/{repository}/git/ref/tags/{}",
+            percent_encode(&plan.packages[0].tag)
+        );
+        let tag_path = format!(
+            "repos/{repository}/git/tags/{}",
+            intent.tags[0].tag_object_id
+        );
+        let release_by_tag_path = format!(
+            "repos/{repository}/releases/tags/{}",
+            percent_encode(&plan.packages[0].tag)
+        );
+        let release_branch = percent_encode(&format!("NVIDIA:{RELEASE_BRANCH}"));
+        let mut github = FakeTransport::new([
+            Expected::json(
+                "GET",
+                &format!("repos/{repository}/git/ref/heads/main"),
+                main_ref.clone(),
+            ),
+            Expected::json("GET", &format!("repos/{repository}"), repository_identity),
+            Expected::json(
+                "GET",
+                &format!("users/{}", percent_encode(APP_LOGIN)),
+                sender.clone(),
+            ),
+            Expected::json(
+                "GET",
+                &format!("repos/{repository}/git/ref/heads/main"),
+                main_ref,
+            ),
+            Expected::json(
+                "GET",
+                &format!("repos/{repository}/check-runs/900"),
+                intent_check(&intent, &intent_body, 900, "success"),
+            ),
+            Expected::json(
+                "GET",
+                &format!("repos/{repository}/actions/runs/100"),
+                json!({
+                    "id": 100,
+                    "run_attempt": 1,
+                    "head_sha": plan.release_sha,
+                    "head_branch": "main",
+                    "event": "workflow_dispatch",
+                    "path": ".github/workflows/publish.yml",
+                    "status": "completed",
+                    "conclusion": "success",
+                    "repository": {"full_name": repository},
+                }),
+            ),
+            Expected::json(
+                "GET",
+                &format!("repos/{repository}/releases/1000"),
+                release.clone(),
+            ),
+            Expected::json("GET", &release_by_tag_path, release),
+            Expected::json(
+                "GET",
+                &ref_path,
+                json!({
+                    "ref": format!("refs/tags/{}", plan.packages[0].tag),
+                    "object": {"type": "tag", "sha": intent.tags[0].tag_object_id},
+                }),
+            ),
+            Expected::json("GET", &tag_path, tag),
+            Expected::json(
+                "GET",
+                &format!("users/{}", percent_encode(APP_LOGIN)),
+                sender,
+            ),
+            Expected::json(
+                "GET",
+                &format!(
+                    "repos/{repository}/git/matching-refs/heads/{}",
+                    percent_encode(RELEASE_BRANCH)
+                ),
+                json!([]),
+            ),
+            Expected::json(
+                "PAGINATE",
+                &format!("repos/{repository}/pulls?state=open&head={release_branch}"),
+                json!([]),
+            ),
+        ]);
+        let mut registry = FixtureRegistry {
+            record: crate::crate_archive::RegistryVersion {
+                num: "0.4.0".to_string(),
+                yanked: false,
+                checksum: archive_digest,
+            },
+            archive,
+            downloads: 0,
+        };
+        let result = receive_with_registry(
+            root,
+            ReceiveInput {
+                event: &event_path,
+                repository: &repository,
+                policy_commit: &policy_commit,
+            },
+            &mut github,
+            &mut registry,
+        )
+        .unwrap();
+        assert_eq!(result.replay_state, "new");
+        assert_eq!(result.captured_release_sha, plan.release_sha);
+        assert_eq!(result.release_plan_digest, plan_digest);
+        assert_eq!(result.intent_check_id, 900);
+        assert_eq!(result.policy_sha, policy_commit);
+        assert!(is_digest(&result.replay_key));
+        assert_eq!(registry.downloads, 1);
+        github.finish();
+        assert_eq!(decode_plan(&plan_body, &plan_digest).unwrap(), plan);
+    }
+
+    #[test]
+    fn notification_shape_rejects_reordered_and_duplicate_rs_release_sets() {
+        let mut notification = ReleaseNotification {
+            schema_version: NOTIFICATION_SCHEMA,
+            repository: "NVIDIA/yaml-sigil-rs".to_string(),
+            captured_sha: "a".repeat(40),
+            release_plan_digest: "b".repeat(64),
+            intent_check_id: 900,
+            intent_external_id: "c".repeat(64),
+            releases: crate::release_policy::RUST_POLICY
+                .packages
+                .iter()
+                .enumerate()
+                .map(|(index, package)| FinalizedEntry {
+                    package: package.package.to_string(),
+                    version: "0.4.0".to_string(),
+                    release_id: 1_000 + index as u64,
+                    tag: package.tag("0.4.0"),
+                    tag_object_id: format!("{index:040x}"),
+                    release_body_sha256: format!("{index:064x}"),
+                })
+                .collect(),
+        };
+        validate_notification_shape(&notification.repository, &notification).unwrap();
+
+        notification.releases.swap(0, 1);
+        assert!(validate_notification_shape(&notification.repository, &notification).is_err());
+        notification.releases.swap(0, 1);
+        notification.releases[1].release_id = notification.releases[0].release_id;
+        assert!(validate_notification_shape(&notification.repository, &notification).is_err());
+    }
+
+    #[test]
+    fn wrong_dispatch_sender_is_rejected_before_live_reads() {
+        let notification = notification_fixture();
+        let event = DispatchEvent {
+            action: "official-release-published".to_string(),
+            sender: DispatchActor {
+                id: APP_ID + 1,
+                login: APP_LOGIN.to_string(),
+                kind: "Bot".to_string(),
+            },
+            repository: DispatchRepository {
+                full_name: notification.repository.clone(),
+                default_branch: "main".to_string(),
+            },
+            client_payload: notification,
+        };
+        let mut github = FakeTransport::new([]);
+        assert!(
+            validate_dispatch_identity(
+                &event,
+                &event.repository.full_name,
+                &"a".repeat(40),
+                &mut github
+            )
+            .is_err()
+        );
+        github.finish();
+    }
+
+    #[test]
+    fn release_and_intent_app_identity_remain_exact() {
+        let (plan, intent, body) = intent_fixture();
+        let mut check: CheckRun =
+            serde_json::from_value(intent_check(&intent, &body, 900, "success")).unwrap();
+        validate_intent_check(&check, &intent, &body).unwrap();
+        check.app.id += 1;
+        assert!(validate_intent_check(&check, &intent, &body).is_err());
+
+        let mut release: Release = serde_json::from_value(json!({
+            "id": 1_000,
+            "tag_name": plan.packages[0].tag,
+            "target_commitish": "main",
+            "name": plan.packages[0].tag,
+            "body": plan.packages[0].release_body,
+            "draft": false,
+            "prerelease": plan.packages[0].prerelease,
+            "immutable": true,
+            "author": {"id": APP_ID, "login": APP_LOGIN, "type": "Bot"},
+            "assets": [],
+        }))
+        .unwrap();
+        validate_release(&release, &plan.packages[0]).unwrap();
+        release.immutable = false;
+        assert!(validate_release(&release, &plan.packages[0]).is_err());
+        release.immutable = true;
+        release.assets.push(json!({"id": 1}));
+        assert!(validate_release(&release, &plan.packages[0]).is_err());
+    }
+
+    #[test]
+    fn exact_legacy_inventory_uses_the_shared_archive_validator() {
+        let plan = plan();
+        let archive = fixture_archive(&plan.release_sha);
+        let checksum = sha256(&archive);
+        let release_id = 42;
+        let tag_object_sha = "8".repeat(40);
+        let body = "historical notes";
+        let inventory = LegacyInventory {
+            schema_version: 1,
+            api_version: GITHUB_API_VERSION.to_string(),
+            repository: plan.repository.clone(),
+            legacy_author: LegacyAuthor {
+                id: LEGACY_AUTHOR_ID,
+                login: LEGACY_AUTHOR_LOGIN.to_string(),
+                kind: "Bot".to_string(),
+            },
+            prospective_author: LegacyAuthor {
+                id: APP_ID,
+                login: APP_LOGIN.to_string(),
+                kind: "Bot".to_string(),
+            },
+            entries: vec![LegacyEntry {
+                release_id,
+                package: plan.packages[0].package.clone(),
+                version: plan.packages[0].version.clone(),
+                tag: plan.packages[0].tag.clone(),
+                tag_object_sha: tag_object_sha.clone(),
+                peeled_commit_sha: plan.release_sha.clone(),
+                target_commitish: "main".to_string(),
+                draft: false,
+                prerelease: false,
+                immutable: false,
+                asset_count: 0,
+                body_sha256: sha256(body.as_bytes()),
+                source_archive_sha256: checksum.clone(),
+                path_in_vcs: "".to_string(),
+            }],
+        };
+        validate_legacy_inventory(&plan.repository, &inventory).unwrap();
+        let release = json!({
+            "id": release_id,
+            "tag_name": plan.packages[0].tag,
+            "target_commitish": "main",
+            "name": plan.packages[0].tag,
+            "body": body,
+            "draft": false,
+            "prerelease": false,
+            "immutable": false,
+            "author": {"id": LEGACY_AUTHOR_ID, "login": LEGACY_AUTHOR_LOGIN, "type": "Bot"},
+            "assets": [],
+        });
+        let mut github = FakeTransport::new([
+            Expected::json(
+                "PAGINATE",
+                &format!("repos/{}/releases", plan.repository),
+                json!([release.clone()]),
+            ),
+            Expected::json(
+                "GET",
+                &format!("repos/{}/releases/{release_id}", plan.repository),
+                release,
+            ),
+            Expected::json(
+                "GET",
+                &format!(
+                    "repos/{}/git/ref/tags/{}",
+                    plan.repository,
+                    percent_encode(&plan.packages[0].tag)
+                ),
+                json!({"ref": format!("refs/tags/{}", plan.packages[0].tag), "object": {"type": "tag", "sha": tag_object_sha}}),
+            ),
+            Expected::json(
+                "GET",
+                &format!("repos/{}/git/tags/{}", plan.repository, tag_object_sha),
+                json!({
+                    "sha": tag_object_sha,
+                    "tag": plan.packages[0].tag,
+                    "message": "historical",
+                    "tagger": {
+                        "name": LEGACY_AUTHOR_LOGIN,
+                        "email": "historical@example.invalid",
+                        "date": "2025-01-01T00:00:00Z",
+                    },
+                    "object": {"type": "commit", "sha": plan.release_sha},
+                }),
+            ),
+        ]);
+        let mut registry = FixtureRegistry {
+            record: crate::crate_archive::RegistryVersion {
+                num: "0.4.0".to_string(),
+                yanked: false,
+                checksum,
+            },
+            archive,
+            downloads: 0,
+        };
+        verify_live_legacy_inventory(&mut github, &mut registry, &plan.repository, &inventory)
+            .unwrap();
+        assert_eq!(registry.downloads, 1);
+        github.finish();
+
+        let unexpected = json!({
+            "id": 99,
+            "tag_name": "v9.9.9",
+            "target_commitish": "main",
+            "name": "v9.9.9",
+            "body": "unexpected",
+            "draft": false,
+            "prerelease": false,
+            "immutable": false,
+            "author": {"id": APP_ID, "login": APP_LOGIN, "type": "Bot"},
+            "assets": [],
+        });
+        let mut github = FakeTransport::new([Expected::json(
+            "PAGINATE",
+            &format!("repos/{}/releases", plan.repository),
+            json!([unexpected]),
+        )]);
+        assert!(
+            verify_live_legacy_inventory(&mut github, &mut registry, &plan.repository, &inventory,)
+                .is_err()
+        );
+        github.finish();
     }
 
     #[test]

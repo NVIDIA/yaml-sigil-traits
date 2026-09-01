@@ -39,9 +39,22 @@ jobs:
       replay_state: ${{ steps.verify.outputs.replay_state }}
       policy_sha: ${{ steps.verify.outputs.policy_sha }}
     steps:
-      # The receiver executes no checkout or candidate code. Fetch the bounded
-      # verifier and policy from exact current main and verify each Git blob.
-      - name: Stage and run protected notification verifier
+      # Repository dispatch always loads this workflow from protected default
+      # branch; check out only that exact policy and never notification source.
+      - name: Check out exact protected release policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache: false
+          toolchain: stable
+
+      - name: Compile and run protected notification verifier
         id: verify
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -50,90 +63,14 @@ jobs:
           set -euo pipefail
           test "${SOURCE_EVENT}" = "repository_dispatch"
           test "${GITHUB_EVENT_NAME}" = "repository_dispatch"
-
-          trusted_gh="$(command -v gh)"
-          trusted_jq="$(command -v jq)"
-          trusted_base64="$(command -v base64)"
-          trusted_git="$(command -v git)"
-          trusted_python="$(command -v python3)"
-          test -x "${trusted_gh}"
-          test -x "${trusted_jq}"
-          test -x "${trusted_base64}"
-          test -x "${trusted_git}"
-          test -x "${trusted_python}"
-
-          repository_json="$(${trusted_gh} api \
-            -H 'Accept: application/vnd.github+json' \
-            -H 'X-GitHub-Api-Version: 2026-03-10' \
-            "repos/${GITHUB_REPOSITORY}")"
-          test "$(printf '%s' "${repository_json}" | wc -c)" -le 2097152
-          test "$(printf '%s' "${repository_json}" | ${trusted_jq} -r '.full_name')" \
-            = "${GITHUB_REPOSITORY}"
-          test "$(printf '%s' "${repository_json}" | ${trusted_jq} -r '.default_branch')" \
-            = "main"
-
-          main_ref="$(${trusted_gh} api \
-            -H 'Accept: application/vnd.github+json' \
-            -H 'X-GitHub-Api-Version: 2026-03-10' \
-            "repos/${GITHUB_REPOSITORY}/git/ref/heads/main")"
-          test "$(printf '%s' "${main_ref}" | wc -c)" -le 2097152
-          policy_sha="$(printf '%s' "${main_ref}" | ${trusted_jq} -r \
-            'select(.ref == "refs/heads/main" and .object.type == "commit") | .object.sha')"
-          [[ "${policy_sha}" =~ ^[0-9a-f]{40}$ ]]
-          # The call-only workflow must itself be the exact current-main policy.
-          test "${policy_sha}" = "${GITHUB_SHA}"
-
-          protected_root="${RUNNER_TEMP}/yaml-sigil-release-notification"
-          mkdir -m 700 "${protected_root}"
-
-          fetch_protected_file() {
-            source_path="$1"
-            destination="$2"
-            maximum="$3"
-            response="$(${trusted_gh} api \
-              -H 'Accept: application/vnd.github+json' \
-              -H 'X-GitHub-Api-Version: 2026-03-10' \
-              "repos/${GITHUB_REPOSITORY}/contents/${source_path}?ref=${policy_sha}")"
-            test "$(printf '%s' "${response}" | wc -c)" -le 2097152
-            declared_size="$(printf '%s' "${response}" | ${trusted_jq} -r \
-              'select(.type == "file" and .encoding == "base64") | .size')"
-            blob_sha="$(printf '%s' "${response}" | ${trusted_jq} -r \
-              'select(.type == "file" and .encoding == "base64") | .sha')"
-            [[ "${declared_size}" =~ ^[0-9]+$ ]]
-            test "${declared_size}" -gt 0
-            test "${declared_size}" -le "${maximum}"
-            [[ "${blob_sha}" =~ ^[0-9a-f]{40}$ ]]
-            printf '%s' "${response}" | ${trusted_jq} -r '.content' \
-              | ${trusted_base64} --decode >"${destination}"
-            test "$(wc -c <"${destination}")" = "${declared_size}"
-            test "$(${trusted_git} hash-object "${destination}")" = "${blob_sha}"
-            chmod 600 "${destination}"
-          }
-
-          fetch_protected_file \
-            ".github/scripts/release_notification_preflight.py" \
-            "${protected_root}/preflight.py" 131072
-          fetch_protected_file \
-            ".github/scripts/release_evidence.py" \
-            "${protected_root}/release_evidence.py" 131072
-          fetch_protected_file \
-            ".github/release-notification-policy.json" \
-            "${protected_root}/policy.json" 65536
-
-          env PATH=/usr/local/bin:/usr/bin:/bin PYTHONDONTWRITEBYTECODE=1 \
-            PYTHONPATH="${protected_root}" "${trusted_python}" -m py_compile \
-            "${protected_root}/preflight.py" \
-            "${protected_root}/release_evidence.py"
-          env PATH=/usr/local/bin:/usr/bin:/bin PYTHONDONTWRITEBYTECODE=1 \
-            PYTHONPATH="${protected_root}" \
-            GITHUB_TOKEN="${GITHUB_TOKEN}" \
-            "${trusted_python}" "${protected_root}/preflight.py" \
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
+          cargo +stable build --locked --release --manifest-path xtask/Cargo.toml
+          validator="${RUNNER_TEMP}/yaml-sigil-release-xtask"
+          install -m 700 xtask/target/release/xtask "${validator}"
+          "${validator}" github release-train receive \
             --event "${GITHUB_EVENT_PATH}" \
-            --config "${protected_root}/policy.json" \
-            --github-output "${GITHUB_OUTPUT}" \
             --repository "${GITHUB_REPOSITORY}" \
-            --policy-sha "${policy_sha}"
-          printf 'policy_sha=%s\n' "${policy_sha}" >>"${GITHUB_OUTPUT}"
+            --policy-commit "${GITHUB_SHA}"
 
   trusted-event-preflight:
     name: Authorize trusted proposal event
@@ -220,7 +157,7 @@ jobs:
       - name: Bind repository and workflow identity
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: cargo xtask github git-identity configure
+        run: cargo +stable xtask github git-identity configure
 
       - name: Install exact cargo-binstall
         uses: cargo-bins/cargo-binstall@732870f031d2fb36309d0deaf36abcc704a7be65 # v1.20.1
@@ -228,7 +165,7 @@ jobs:
           version: 1.20.1
 
       - name: Install and verify release analyzers
-        run: cargo xtask release install-tools
+        run: cargo +stable xtask release install-tools
 
       - name: Require current main
         run: |
@@ -253,10 +190,10 @@ jobs:
       - name: Require the current source version on crates.io
         id: published
         run: |
-          version="$(cargo xtask release-version show)"
+          version="$(cargo +stable xtask release-version show)"
           echo "version=${version}" >>"${GITHUB_OUTPUT}"
           # Exact absence is an ordered wait state; other failures stop.
-          if cargo xtask release verify-registry \
+          if cargo +stable xtask release verify-registry \
             --check-version "${version}" yaml-sigil-traits; then
             echo "available=true" >>"${GITHUB_OUTPUT}"
           else
@@ -277,7 +214,7 @@ jobs:
           MANUAL_DISPATCH: ${{ inputs.source-event == 'workflow_dispatch' }}
           REQUESTED_BUMP: ${{ inputs.bump }}
           REQUESTED_MODE: ${{ inputs.mode }}
-        run: cargo xtask github release-pr resolve-intent
+        run: cargo +stable xtask github release-pr resolve-intent
 
       - name: Prepare the official tagged baseline
         id: baseline
@@ -290,7 +227,7 @@ jobs:
           GIT_CONFIG_VALUE_0: disabled://yaml-sigil-release-proposal
         run: |
           result="${RUNNER_TEMP}/baseline-result.json"
-          cargo xtask release baseline prepare \
+          cargo +stable xtask release baseline prepare \
             --version "${{ steps.published.outputs.version }}" \
             --head "${GITHUB_SHA}" \
             --output "${RUNNER_TEMP}/official-release-baseline" \
@@ -316,7 +253,7 @@ jobs:
           GIT_CONFIG_VALUE_0: disabled://yaml-sigil-release-proposal
         run: |
           result="${RUNNER_TEMP}/proposal-result.json"
-          cargo xtask release proposal generate \
+          cargo +stable xtask release proposal generate \
             --mode "${{ steps.intent.outputs.mode }}" \
             --bump "${{ steps.intent.outputs.bump }}" \
             --published-version "${{ steps.published.outputs.version }}" \
@@ -336,11 +273,11 @@ jobs:
           GIT_CONFIG_KEY_0: remote.origin.pushurl
           GIT_CONFIG_VALUE_0: disabled://yaml-sigil-release-proposal
         run: |
-          cargo xtask release baseline verify \
+          cargo +stable xtask release baseline verify \
             --head "${GITHUB_SHA}" \
             --inventory "${{ steps.baseline.outputs.inventory }}" \
             --expected-fetch-url "https://github.com/${GITHUB_REPOSITORY}"
-          cargo xtask release require-current-main \
+          cargo +stable xtask release require-current-main \
             --head "${GITHUB_SHA}" \
             --fetch-url "https://github.com/${GITHUB_REPOSITORY}"
 
@@ -372,7 +309,7 @@ jobs:
           RELEASE_REPLAY_KEY: ${{ needs.release-notification-preflight.outputs.replay_key }}
           RELEASE_SUBSTANTIVE: ${{ steps.generate.outputs.substantive }}
           RELEASE_TARGET: ${{ steps.generate.outputs.target }}
-        run: cargo xtask github release-pr apply --phase update
+        run: cargo +stable xtask github release-pr apply --phase update
 
       - name: Check out generated Verified commit
         if: >-
@@ -410,9 +347,9 @@ jobs:
           CARGO_REGISTRIES_CRATES_IO_INDEX: https://github.com/rust-lang/crates.io-index
           GIT_TOKEN: ${{ github.token }}
         run: |
-          cargo xtask release-version check
+          cargo +stable xtask release-version check
           test -z "$(git status --porcelain --untracked-files=no)"
-          cargo metadata --no-deps --format-version 1 >/dev/null
+          cargo +stable metadata --no-deps --format-version 1 >/dev/null
           # Read-only dry-run validates package selection without publication.
           release-plz release \
             --dry-run \
@@ -436,4 +373,4 @@ jobs:
           RELEASE_REPLAY_KEY: ${{ steps.release-pr.outputs.release_replay_key }}
           RELEASE_SUBSTANTIVE: ${{ steps.generate.outputs.substantive }}
           RELEASE_TARGET: ${{ steps.generate.outputs.target }}
-        run: cargo xtask github release-pr apply --phase finalize
+        run: cargo +stable xtask github release-pr apply --phase finalize
