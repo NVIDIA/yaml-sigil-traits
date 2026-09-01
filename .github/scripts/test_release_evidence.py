@@ -10,7 +10,10 @@ import gzip
 import io
 import json
 import tarfile
+import tempfile
 import unittest
+from pathlib import Path
+from unittest import mock
 
 import release_evidence as evidence
 
@@ -62,6 +65,44 @@ def alter_second_header(mutator: object) -> bytes:
 
 
 class EvidenceTests(unittest.TestCase):
+    def test_settings_command_writes_digit_suffixed_output_name(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "github-output"
+            with mock.patch(
+                "sys.argv",
+                [
+                    "release_evidence.py",
+                    "settings",
+                    "--repository",
+                    "NVIDIA/yaml-sigil-traits",
+                    "--release-sha",
+                    COMMIT,
+                    "--run-id",
+                    "123",
+                    "--run-attempt",
+                    "1",
+                    "--github-output",
+                    str(output),
+                ],
+            ):
+                self.assertEqual(evidence.main(), 0)
+
+            digest = evidence.settings_evidence_sha256(
+                "NVIDIA/yaml-sigil-traits", COMMIT, 123, 1
+            )
+            self.assertEqual(
+                output.read_text(encoding="utf-8"),
+                f"ruleset_evidence_sha256={digest}\n",
+            )
+
+    def test_workflow_output_names_remain_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "github-output"
+            for name in ("1leading", "Upper", "has-dash"):
+                with self.subTest(name=name):
+                    with self.assertRaisesRegex(evidence.EvidenceError, "output name"):
+                        evidence.append_output(output, name, "value")
+
     def test_inventory_encoding_matches_the_cross_language_vector(self) -> None:
         entry = evidence.ArchiveEntry(
             "file",
