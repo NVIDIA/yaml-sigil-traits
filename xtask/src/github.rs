@@ -334,6 +334,24 @@ pub fn run(root: &Path, args: GithubArgs) -> Result<(), String> {
     {
         return local_validation::run(root, manifest);
     }
+    if let GithubCommand::ReleaseTrain(ReleaseTrainArgs {
+        command:
+            ReleaseTrainCommand::SettingsEvidence {
+                repository,
+                release_sha,
+                run_id,
+                run_attempt,
+            },
+    }) = &args.command
+    {
+        return release_train::settings_evidence_command(
+            root,
+            repository,
+            release_sha,
+            run_id,
+            run_attempt,
+        );
+    }
     require_token()?;
     let mut github = GhCli::new()?;
     match args.command {
@@ -667,7 +685,7 @@ fn append_outputs_to(path: &Path, values: &[(&str, &str)]) -> Result<(), String>
         if name.is_empty()
             || !name
                 .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
             || !names.insert(*name)
             || value.contains(['\0', '\r', '\n'])
             || bytes > MAX_FILE_BYTES as usize
@@ -814,14 +832,82 @@ mod tests {
     fn workflow_output_is_exact_and_rejects_the_whole_invalid_batch() {
         let temporary = tempfile::tempdir().unwrap();
         let path = temporary.path().join("github-output");
-        append_outputs_to(&path, &[("alpha", "one"), ("beta_value", "two")]).unwrap();
+        append_outputs_to(&path, &[("alpha", "one"), ("beta_value2", "two")]).unwrap();
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
-            "alpha=one\nbeta_value=two\n"
+            "alpha=one\nbeta_value2=two\n"
         );
         let original = std::fs::read(&path).unwrap();
         assert!(append_outputs_to(&path, &[("valid", "value"), ("INVALID", "value")]).is_err());
         assert!(append_outputs_to(&path, &[("same", "one"), ("same", "two")]).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn settings_evidence_does_not_require_github_credentials() {
+        let temporary = tempfile::tempdir().unwrap();
+        let output_path = temporary.path().join("github-output");
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "github::tests::settings_evidence_without_github_credentials_child",
+                "--nocapture",
+                "--quiet",
+            ])
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .env("GITHUB_OUTPUT", &output_path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "credential-free settings evidence failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let root = test_root();
+        let repository = test_repository(&root);
+        let digest =
+            release_train::settings_evidence_sha256(repository, &"a".repeat(40), 42, 3).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(output_path).unwrap(),
+            format!("ruleset_evidence_sha256={digest}\n")
+        );
+    }
+
+    #[test]
+    #[ignore = "spawned explicitly by the credential-free settings-evidence regression"]
+    fn settings_evidence_without_github_credentials_child() {
+        assert!(env::var_os("GH_TOKEN").is_none());
+        assert!(env::var_os("GITHUB_TOKEN").is_none());
+        let root = test_root();
+        let repository = test_repository(&root).to_string();
+        run(
+            &root,
+            GithubArgs {
+                command: GithubCommand::ReleaseTrain(ReleaseTrainArgs {
+                    command: ReleaseTrainCommand::SettingsEvidence {
+                        repository,
+                        release_sha: "a".repeat(40),
+                        run_id: "42".to_string(),
+                        run_attempt: "3".to_string(),
+                    },
+                }),
+            },
+        )
+        .unwrap();
+    }
+
+    fn test_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .to_path_buf()
+    }
+
+    fn test_repository(root: &Path) -> &'static str {
+        let family = crate::release_policy::detect(root).unwrap().family;
+        consts::repository_for_family(family).unwrap().full_name
     }
 }
