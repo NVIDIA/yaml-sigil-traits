@@ -46,7 +46,7 @@ jobs:
             -s .github/scripts -p 'test_*.py'
 
   platform_verifier:
-    name: Protected checkout verifier (${{ matrix.name }})
+    name: Protected policy verifier tests (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
     permissions:
@@ -67,9 +67,9 @@ jobs:
         with:
           persist-credentials: false
 
-      # Exercise the checkout verifier on each supported host, including a
+      # Exercise the protected policy verifier on each supported host, including a
       # real Windows directory junction rather than a mocked reparse point.
-      - name: Compile and test protected checkout verifier
+      - name: Compile and run protected policy verifier tests
         shell: bash
         run: |
           python3 -m py_compile \
@@ -235,6 +235,6 @@ jobs:
           }
 
           require_success "GitHub Actions" "${GITHUB_ACTIONS_RESULT}"
-          require_success "Protected checkout verifier matrix" "${PLATFORM_VERIFIER_RESULT}"
+          require_success "Protected policy verifier matrix" "${PLATFORM_VERIFIER_RESULT}"
           require_success "Documentation" "${DOCUMENTATION_RESULT}"
           require_success "Rust matrix" "${RUST_RESULT}"

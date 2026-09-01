@@ -198,7 +198,7 @@ jobs:
             -s policy/.github/scripts -p 'test_protected_pr_ci.py'
 
   platform_verifier:
-    name: Protected checkout verifier (${{ matrix.name }})
+    name: Protected policy verifier tests (${{ matrix.name }})
     needs: authorize
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
@@ -226,7 +226,7 @@ jobs:
           persist-credentials: false
           ref: ${{ needs.authorize.outputs.policy_sha }}
 
-      - name: Compile and test protected checkout verifier
+      - name: Compile and run protected policy verifier tests
         shell: bash
         run: |
           python3 -m py_compile \

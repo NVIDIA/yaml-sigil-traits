@@ -17,7 +17,7 @@ pub(crate) const MAX_ERROR_BYTES: usize = 64 * 1024;
 const MAX_PAGES: usize = 20;
 const PAGE_SIZE: usize = 100;
 const READ_ATTEMPTS: usize = 3;
-const GITHUB_API_VERSION: &str = "2026-03-10";
+pub(crate) const GITHUB_API_VERSION: &str = "2026-03-10";
 const GITHUB_JSON_MEDIA_TYPE: &str = "application/vnd.github+json";
 
 pub(crate) trait Transport {

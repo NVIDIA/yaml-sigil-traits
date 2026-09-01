@@ -424,7 +424,7 @@ four values displayed by the selected readiness run:
 
 ```shell
 GH_TOKEN="$(gh auth token)" \
-python3 .github/scripts/release_settings_preflight.py \
+cargo +stable xtask github release-train settings-preflight \
   --repository NVIDIA/yaml-sigil-traits \
   --release-sha <release-sha> \
   --run-id <run-id> \

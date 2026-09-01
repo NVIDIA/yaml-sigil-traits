@@ -193,6 +193,21 @@ cargo xtask ci --candidate-root PATH
 The command still builds and runs the xtask from the current checkout; only
 the repository content being validated comes from `PATH`.
 
+After a release-path change is committed, exercise the maintained current and
+historical source harness from the exact clean checkout:
+
+```shell
+cargo +stable xtask github release-train local-validate --manifest PATH
+```
+
+`PATH` is a repository-relative, bounded JSON manifest containing the exact
+current and representative historical commit SHAs, the exact repository name,
+and an absolute regular-file path to release-plz `0.3.160`. The harness stages
+the current Rust validator, attaches local branches for release-plz, checks the
+current and historical sources, and runs release-plz only with `--dry-run` and
+a disabled push URL. Supply one read-capable forge token through `GIT_TOKEN`;
+the harness removes registry and OIDC credentials and performs no publication.
+
 The command runs these checks in order:
 
 ```shell

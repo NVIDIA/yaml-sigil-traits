@@ -25,6 +25,7 @@ use crate::safe_file;
 const REGISTRY_USER_AGENT: &str = "yaml-sigil-release-workflow/1.0";
 const REGISTRY_ATTEMPTS: usize = 30;
 const REGISTRY_RETRY_SECONDS: u64 = 10;
+const COMPILED_RELEASE_CONFIG: &str = include_str!("../../.release-plz.toml");
 const TRAITS_PACKAGE: &str = TRAITS_POLICY.packages[0].package;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -64,6 +65,7 @@ enum ReleaseCommand {
     },
     /// Prepare a checkout-bound release-plz publication config.
     PreparePublicationConfig {
+        /// Reviewed source configuration. Defaults to the compiled policy.
         #[arg(long)]
         source: Option<PathBuf>,
         #[arg(long)]
@@ -98,8 +100,7 @@ pub fn run(root: &Path, args: ReleaseArgs) -> Result<Outcome, String> {
             Ok(Outcome::Success)
         }
         ReleaseCommand::PreparePublicationConfig { source, output } => {
-            let source = source.unwrap_or_else(|| root.join(".release-plz.toml"));
-            prepare_publication_config(root, &source, &output)?;
+            prepare_publication_config(root, source.as_deref(), &output)?;
             Ok(Outcome::Success)
         }
         ReleaseCommand::Baseline(args) => {
@@ -760,8 +761,11 @@ fn source_newline(body: &str) -> Result<&'static str, String> {
     }
 }
 
-fn prepare_publication_config(root: &Path, source: &Path, output: &Path) -> Result<(), String> {
-    let source_relative = release_config_relative(root, source)?;
+fn prepare_publication_config(
+    root: &Path,
+    source: Option<&Path>,
+    output: &Path,
+) -> Result<(), String> {
     let output = resolve_path(root, output);
     if output.exists() {
         return Err(format!(
@@ -769,20 +773,27 @@ fn prepare_publication_config(root: &Path, source: &Path, output: &Path) -> Resu
             output.display()
         ));
     }
-    let body = safe_file::TrustedRoot::open(root)
-        .and_then(|trusted| trusted.read_manifest(&source_relative))
-        .map_err(|error| {
-            format!(
-                "could not read release config {}: {error}",
-                source.display()
-            )
-        })?;
-    let original: DocumentMut = body.parse().map_err(|error| {
-        format!(
-            "could not parse release config {}: {error}",
-            source.display()
-        )
-    })?;
+    let (body, source_label) = match source {
+        Some(source) => {
+            let source_relative = release_config_relative(root, source)?;
+            let body = safe_file::TrustedRoot::open(root)
+                .and_then(|trusted| trusted.read_manifest(&source_relative))
+                .map_err(|error| {
+                    format!(
+                        "could not read release config {}: {error}",
+                        source.display()
+                    )
+                })?;
+            (body, source.display().to_string())
+        }
+        None => (
+            COMPILED_RELEASE_CONFIG.to_string(),
+            "compiled release policy".to_string(),
+        ),
+    };
+    let original: DocumentMut = body
+        .parse()
+        .map_err(|error| format!("could not parse release config {source_label}: {error}"))?;
     require_publication_fields(&original, false, None)?;
 
     let mut valid_ref_command = Command::new("git");
@@ -1856,7 +1867,7 @@ mod tests {
             .join(newline);
             fs::write(&source, &body).unwrap();
 
-            prepare_publication_config(temporary.path(), &source, &output).unwrap();
+            prepare_publication_config(temporary.path(), Some(&source), &output).unwrap();
             let marker = format!("[workspace]{newline}");
             let expected = body
                 .replacen(
@@ -1866,9 +1877,31 @@ mod tests {
                 )
                 .replacen("release_always = false", "release_always = true", 1);
             assert_eq!(fs::read_to_string(&output).unwrap(), expected);
-            assert!(prepare_publication_config(temporary.path(), &source, &output).is_err());
+            assert!(prepare_publication_config(temporary.path(), Some(&source), &output).is_err());
             assert_eq!(fs::read_to_string(&output).unwrap(), expected);
         }
+    }
+
+    #[test]
+    fn default_publication_config_uses_compiled_policy_across_checkout() {
+        let temporary = TestDirectory::new("compiled-publication-config");
+        let historical =
+            COMPILED_RELEASE_CONFIG.replace("git_tag_enable = false", "git_tag_enable = true");
+        fs::write(temporary.path().join(".release-plz.toml"), historical).unwrap();
+        let output = temporary.path().join("publication.toml");
+
+        prepare_publication_config(temporary.path(), None, &output).unwrap();
+
+        let newline = source_newline(COMPILED_RELEASE_CONFIG).unwrap();
+        let expected = COMPILED_RELEASE_CONFIG
+            .replacen(
+                &format!("[workspace]{newline}"),
+                &format!("[workspace]{newline}pr_branch_prefix = \":\"{newline}"),
+                1,
+            )
+            .replacen("release_always = false", "release_always = true", 1);
+        assert_eq!(fs::read_to_string(&output).unwrap(), expected);
+        assert!(!expected.contains("git_tag_enable = true"));
     }
 
     #[test]
@@ -1897,7 +1930,7 @@ mod tests {
             let source = temporary.path().join("release-plz.toml");
             let output = temporary.path().join("publication.toml");
             fs::write(&source, body).unwrap();
-            assert!(prepare_publication_config(temporary.path(), &source, &output).is_err());
+            assert!(prepare_publication_config(temporary.path(), Some(&source), &output).is_err());
             assert!(!output.exists());
         }
     }
@@ -1912,11 +1945,14 @@ mod tests {
         )
         .unwrap();
 
-        assert!(prepare_publication_config(temporary.path(), &source, &source).is_err());
+        assert!(prepare_publication_config(temporary.path(), Some(&source), &source).is_err());
         let blocking_file = temporary.path().join("blocking-file");
         fs::write(&blocking_file, "preserve\n").unwrap();
         let impossible_output = blocking_file.join("publication.toml");
-        assert!(prepare_publication_config(temporary.path(), &source, &impossible_output).is_err());
+        assert!(
+            prepare_publication_config(temporary.path(), Some(&source), &impossible_output)
+                .is_err()
+        );
         assert_eq!(fs::read_to_string(&blocking_file).unwrap(), "preserve\n");
     }
 
@@ -1937,7 +1973,7 @@ mod tests {
         fs::write(&target, "preserve\n").unwrap();
         symlink(&target, &output).unwrap();
 
-        assert!(prepare_publication_config(temporary.path(), &source, &output).is_err());
+        assert!(prepare_publication_config(temporary.path(), Some(&source), &output).is_err());
         assert_eq!(fs::read_to_string(&target).unwrap(), "preserve\n");
     }
 }

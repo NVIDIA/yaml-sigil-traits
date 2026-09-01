@@ -6,13 +6,16 @@
 mod consts;
 mod identity;
 mod intent;
+mod local_validation;
 mod models;
 mod release_objects;
 mod release_pr;
+mod release_settings;
 mod release_train;
 mod source;
 mod transport;
 
+use std::collections::BTreeSet;
 use std::env;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -184,6 +187,52 @@ enum ReleaseTrainCommand {
         #[arg(long)]
         plan_digest: String,
     },
+    /// Verify the exact protected historical Release inventory.
+    VerifyLegacy {
+        #[arg(long)]
+        repository: String,
+        #[arg(long)]
+        policy_commit: String,
+    },
+    /// Emit canonical repository-setting evidence for one workflow run.
+    SettingsEvidence {
+        #[arg(long)]
+        repository: String,
+        #[arg(long)]
+        release_sha: String,
+        #[arg(long)]
+        run_id: String,
+        #[arg(long)]
+        run_attempt: String,
+    },
+    /// Re-read and validate release settings for one active workflow run.
+    SettingsPreflight {
+        #[arg(long)]
+        repository: String,
+        #[arg(long)]
+        release_sha: String,
+        #[arg(long)]
+        run_id: String,
+        #[arg(long)]
+        run_attempt: String,
+        #[arg(long)]
+        expected_evidence_sha256: String,
+    },
+    /// Authenticate and validate one complete release-train notification.
+    Receive {
+        #[arg(long)]
+        event: PathBuf,
+        #[arg(long)]
+        repository: String,
+        #[arg(long)]
+        policy_commit: String,
+    },
+    /// Exercise the complete local validation-only release path.
+    LocalValidate {
+        /// Repository-relative, bounded validation manifest.
+        #[arg(long)]
+        manifest: PathBuf,
+    },
     /// Prepare the canonical release-train intent before token minting.
     PrepareIntent {
         #[arg(long)]
@@ -279,6 +328,12 @@ impl ReconcileMode {
 }
 
 pub fn run(root: &Path, args: GithubArgs) -> Result<(), String> {
+    if let GithubCommand::ReleaseTrain(ReleaseTrainArgs {
+        command: ReleaseTrainCommand::LocalValidate { manifest },
+    }) = &args.command
+    {
+        return local_validation::run(root, manifest);
+    }
     require_token()?;
     let mut github = GhCli::new()?;
     match args.command {
@@ -364,6 +419,55 @@ pub fn run(root: &Path, args: GithubArgs) -> Result<(), String> {
                 plan,
                 plan_digest,
             } => release_train::wait_command(&repository, &plan, &plan_digest),
+            ReleaseTrainCommand::VerifyLegacy {
+                repository,
+                policy_commit,
+            } => {
+                release_train::verify_legacy_command(root, &repository, &policy_commit, &mut github)
+            }
+            ReleaseTrainCommand::SettingsEvidence {
+                repository,
+                release_sha,
+                run_id,
+                run_attempt,
+            } => release_train::settings_evidence_command(
+                root,
+                &repository,
+                &release_sha,
+                &run_id,
+                &run_attempt,
+            ),
+            ReleaseTrainCommand::SettingsPreflight {
+                repository,
+                release_sha,
+                run_id,
+                run_attempt,
+                expected_evidence_sha256,
+            } => release_settings::preflight_command(
+                root,
+                &repository,
+                &release_sha,
+                &run_id,
+                &run_attempt,
+                &expected_evidence_sha256,
+                &mut github,
+            ),
+            ReleaseTrainCommand::Receive {
+                event,
+                repository,
+                policy_commit,
+            } => release_train::receive_command(
+                root,
+                release_train::ReceiveInput {
+                    event: &event,
+                    repository: &repository,
+                    policy_commit: &policy_commit,
+                },
+                &mut github,
+            ),
+            ReleaseTrainCommand::LocalValidate { manifest } => {
+                local_validation::run(root, &manifest)
+            }
             ReleaseTrainCommand::PrepareIntent {
                 plan,
                 plan_digest,
@@ -548,20 +652,37 @@ pub(super) fn require_captured_ancestry(
 
 pub(super) fn append_outputs(values: &[(&str, &str)]) -> Result<(), String> {
     let path = PathBuf::from(env_required("GITHUB_OUTPUT")?);
-    let mut output = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .map_err(|error| format!("open workflow output {}: {error}", path.display()))?;
+    append_outputs_to(&path, values)
+}
+
+fn append_outputs_to(path: &Path, values: &[(&str, &str)]) -> Result<(), String> {
+    let mut names = BTreeSet::new();
+    let mut bytes = 0_usize;
     for (name, value) in values {
+        bytes = bytes
+            .checked_add(name.len())
+            .and_then(|size| size.checked_add(value.len()))
+            .and_then(|size| size.checked_add(2))
+            .ok_or_else(|| "workflow output byte count overflowed".to_string())?;
         if name.is_empty()
             || !name
                 .bytes()
                 .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+            || !names.insert(*name)
             || value.contains(['\0', '\r', '\n'])
+            || bytes > MAX_FILE_BYTES as usize
         {
-            return Err("workflow output contains an invalid name or value".to_string());
+            return Err(
+                "workflow output contains an invalid, duplicate, or oversized entry".to_string(),
+            );
         }
+    }
+    let mut output = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| format!("open workflow output {}: {error}", path.display()))?;
+    for (name, value) in values {
         writeln!(output, "{name}={value}")
             .map_err(|error| format!("write workflow output {}: {error}", path.display()))?;
     }
@@ -687,5 +808,20 @@ mod tests {
             "captured release SHA is no longer protected-main ancestry"
         );
         github.finish();
+    }
+
+    #[test]
+    fn workflow_output_is_exact_and_rejects_the_whole_invalid_batch() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("github-output");
+        append_outputs_to(&path, &[("alpha", "one"), ("beta_value", "two")]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "alpha=one\nbeta_value=two\n"
+        );
+        let original = std::fs::read(&path).unwrap();
+        assert!(append_outputs_to(&path, &[("valid", "value"), ("INVALID", "value")]).is_err());
+        assert!(append_outputs_to(&path, &[("same", "one"), ("same", "two")]).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
     }
 }

@@ -6,12 +6,9 @@
 
 from __future__ import annotations
 
-import json
 import re
 import unittest
 from pathlib import Path
-
-import release_settings_preflight as settings
 
 
 ROOT = Path(__file__).parents[2]
@@ -68,26 +65,33 @@ class ReleaseWorkflowTests(unittest.TestCase):
         )
         self.assertNotIn("permission-contents: write", publication)
 
-    def test_dispatch_preflight_is_checkout_free_and_secretless(self) -> None:
+    def test_dispatch_preflight_uses_exact_current_rust_and_is_secretless(self) -> None:
         preflight = job_block(self.reusable, "release-notification-preflight")
         for forbidden in (
             "environment:",
             "secrets.",
             "id-token:",
-            "actions/checkout@",
             "create-github-app-token@",
             "release-plz",
-            "cargo ",
             "actions/cache@",
+            "python3",
+            "base64",
+            "tar -",
+            "gh api",
         ):
             self.assertNotIn(forbidden, preflight)
         self.assertIn("checks: read", preflight)
         self.assertIn("actions: read", preflight)
         self.assertIn("contents: read", preflight)
         self.assertIn("pull-requests: read", preflight)
-        self.assertIn("release_notification_preflight.py", preflight)
-        self.assertIn("release_evidence.py", preflight)
-        self.assertIn("test \"${policy_sha}\" = \"${GITHUB_SHA}\"", preflight)
+        self.assertIn("actions/checkout@", preflight)
+        self.assertIn("persist-credentials: false", preflight)
+        self.assertIn("ref: ${{ github.sha }}", preflight)
+        self.assertIn("toolchain: stable", preflight)
+        self.assertIn("cargo +stable build --locked --release", preflight)
+        self.assertIn("github release-train receive", preflight)
+        self.assertIn('--event "${GITHUB_EVENT_PATH}"', preflight)
+        self.assertIn('--policy-commit "${GITHUB_SHA}"', preflight)
 
     def test_every_app_token_job_uses_protected_automation(self) -> None:
         protected = [
@@ -102,7 +106,9 @@ class ReleaseWorkflowTests(unittest.TestCase):
                 self.assertIn("environment: protected-automation", block)
                 self.assertIn("create-github-app-token@", block)
         notification = job_block(self.publish, "release-notification")
-        self.assertNotIn("actions/checkout@", notification)
+        self.assertIn("actions/checkout@", notification)
+        self.assertIn("persist-credentials: false", notification)
+        self.assertIn("ref: ${{ needs.publication.outputs.policy_commit }}", notification)
         self.assertIn("permission-contents: write", notification)
 
     def test_tokens_are_minted_after_their_read_only_preflights(self) -> None:
@@ -120,7 +126,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
         )
         notification = job_block(self.publish, "release-notification")
         self.assertLess(
-            notification.index("Compile checkout-free typed notifier"),
+            notification.index("Compile protected typed notifier"),
             notification.index("Create notification-only repository token"),
         )
 
@@ -163,36 +169,82 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("toolchain: stable", proposal)
         self.assertNotIn("toolchain: 1.95.0", proposal)
 
-    def test_admin_setting_digest_matches_read_only_preflight_policy(self) -> None:
-        repository = settings.require_string(
-            json.loads(
-                (ROOT / ".github" / "release-notification-policy.json").read_text(
-                    encoding="utf-8"
+    def test_trusted_release_cargo_is_explicitly_stable(self) -> None:
+        for workflow_name in ("publish.yml", "release-proposal.yml"):
+            for line in read(workflow_name).splitlines():
+                if re.search(r"\bcargo\s", line):
+                    with self.subTest(workflow=workflow_name, line=line):
+                        self.assertIn("cargo +stable ", line)
+
+    def test_recovered_source_uses_staged_current_release_policy(self) -> None:
+        for name in ("release-readiness", "publication"):
+            with self.subTest(job=name):
+                block = job_block(self.publish, name)
+                recovered = block.split(
+                    "- name: Check out captured release source", 1
+                )[1]
+                self.assertNotRegex(
+                    recovered,
+                    r"\bcargo(?:\s+\+\S+)?\s+xtask(?:\s|$)",
                 )
-            )["repository"],
-            "test repository",
-        )
+                for command in (
+                    "release-version check",
+                    "release-version show",
+                    "release-version intent",
+                    "release-version check-compatibility",
+                ):
+                    self.assertIn(
+                        f'"${{YAML_SIGIL_RELEASE_XTASK}}" {command}',
+                        recovered,
+                    )
+                for command in (
+                    "require-current-main",
+                    "baseline prepare",
+                    "verify-registry",
+                    "check-packages",
+                    "prepare-publication-config",
+                ):
+                    self.assertIn(
+                        f'"${{YAML_SIGIL_RELEASE_XTASK}}" release {command}',
+                        recovered,
+                    )
+
+    def test_admin_setting_digest_matches_read_only_preflight_policy(self) -> None:
         readiness = job_block(self.publish, "release-readiness")
         evidence = readiness.split(
             "- name: Bind repository-admin setting evidence to this run", 1
         )[1]
-        self.assertIn(
-            'test "$(sha256sum "${YAML_SIGIL_RELEASE_EVIDENCE}"', evidence
-        )
-        self.assertIn('= "${YAML_SIGIL_RELEASE_EVIDENCE_SHA256}"', evidence)
-        self.assertIn(
-            'python3 "${YAML_SIGIL_RELEASE_EVIDENCE}" settings', evidence
-        )
-        self.assertNotIn(
-            "python3 .github/scripts/release_evidence.py settings", evidence
-        )
+        self.assertIn('test "$(sha256sum "${YAML_SIGIL_RELEASE_XTASK}"', evidence)
+        self.assertIn('= "${YAML_SIGIL_RELEASE_XTASK_SHA256}"', evidence)
+        self.assertIn("github release-train settings-evidence", evidence)
         self.assertIn('--repository "${GITHUB_REPOSITORY}"', evidence)
         self.assertIn('--release-sha "${CAPTURED_SHA}"', evidence)
         self.assertIn('--run-id "${GITHUB_RUN_ID}"', evidence)
         self.assertIn('--run-attempt "${GITHUB_RUN_ATTEMPT}"', evidence)
-        self.assertIn('--github-output "${GITHUB_OUTPUT}"', evidence)
         self.assertNotIn("PLAN_DIGEST", evidence)
         self.assertNotIn("LEGACY_INVENTORY_SHA256", evidence)
+
+    def test_release_domain_preflights_use_typed_rust(self) -> None:
+        combined = self.publish + self.reusable
+        self.assertNotIn("legacy_release_preflight.py", combined)
+        self.assertNotIn("release_notification_preflight.py", combined)
+        self.assertNotIn("release_evidence.py", combined)
+        self.assertGreaterEqual(
+            combined.count("github release-train verify-legacy"), 3
+        )
+        for obsolete in (
+            ".github/release-notification-policy.json",
+            ".github/scripts/legacy_release_preflight.py",
+            ".github/scripts/release_evidence.py",
+            ".github/scripts/release_notification_preflight.py",
+            ".github/scripts/release_settings_preflight.py",
+        ):
+            self.assertFalse((ROOT / obsolete).exists(), obsolete)
+        releasing = (ROOT / "RELEASING.md").read_text(encoding="utf-8")
+        self.assertIn(
+            "cargo +stable xtask github release-train settings-preflight",
+            releasing,
+        )
 
     def test_remote_actions_are_full_sha_pinned_with_version_comments(self) -> None:
         for workflow_name in ("publish.yml", "release-pr.yml", "release-proposal.yml"):
