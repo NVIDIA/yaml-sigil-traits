@@ -480,6 +480,18 @@ def fresh_process_environment(
         if os.path.lexists(seed_entry):
             require(seed_entry.is_dir() and not seed_entry.is_symlink(), f"invalid Cargo seed {name}")
             (cargo_home / name).symlink_to(seed_entry, target_is_directory=True)
+    seed_config = seed / "config.toml"
+    require(os.path.lexists(seed_config), "candidate Cargo seed config.toml is absent")
+    seed_config_metadata = seed_config.lstat()
+    require(
+        stat.S_ISREG(seed_config_metadata.st_mode) and not seed_config.is_symlink(),
+        "invalid Cargo seed config.toml",
+    )
+    require(
+        seed_config_metadata.st_mode & 0o222 == 0,
+        "candidate Cargo seed config.toml is writable",
+    )
+    (cargo_home / "config.toml").symlink_to(seed_config)
 
     for name in tuple(source):
         if name.startswith("CARGO_ALIAS_") or name.startswith("CARGO_TARGET_"):

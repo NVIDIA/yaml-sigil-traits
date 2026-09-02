@@ -1905,6 +1905,8 @@ class ProtectedCheckoutTests(unittest.TestCase):
 
     def test_sensitive_symlink_and_reparse_point_fail_closed(self) -> None:
         workflow = self.repository / ".github" / "workflows" / "ci.yml"
+        # The helper executes only in the Linux candidate runner. Other hosts
+        # retain the structural assertions below without emulating Bash policy.
         if os.name != "nt":
             workflow.unlink()
             workflow.symlink_to(self.repository / ".git" / "HEAD")
@@ -2153,7 +2155,9 @@ class WorkflowStructureTests(unittest.TestCase):
         self.assertNotIn("trusted_bash=", shell)
         self.assertNotIn("check-acvp-corpus.sh", shell)
         linux_guard = shell.index("terminal candidate execution requires Linux")
-        protected_build = shell.index('cargo +"${trusted_toolchain}" build --locked')
+        protected_build = shell.index(
+            'cargo +"${trusted_toolchain}" "${policy_cargo_options[@]}" build --locked'
+        )
         protected_preflight = shell.index(
             '"${protected_validator}" candidate-preflight'
         )
@@ -2169,6 +2173,24 @@ class WorkflowStructureTests(unittest.TestCase):
         )
         self.assertIn("trusted_toolchain='1.98.0'", shell)
         self.assertIn("cargo_audit_version='0.22.2'", shell)
+        self.assertIn('trusted_linker="$(realpath /usr/bin/cc)"', shell)
+        self.assertIn('trusted_archiver="$(realpath /usr/bin/ar)"', shell)
+        self.assertIn('trusted_ranlib="$(realpath /usr/bin/ranlib)"', shell)
+        self.assertIn("trusted native tool path is not canonical", shell)
+        self.assertIn(
+            'require_trusted_native_tool "${trusted_native_tool}"', shell
+        )
+        self.assertIn("/usr/bin/stat -c '%u:%a'", shell)
+        self.assertIn("^0:([0-7]{3,4})$", shell)
+        self.assertIn("8#${mode} & 8#022", shell)
+        self.assertIn(
+            "trusted native tool parent is not a direct directory", shell
+        )
+        self.assertIn('linker = "%s"', shell)
+        self.assertIn(
+            'sudo -n install -o 0 -g 0 -m 0444 "${protected_cargo_config}"',
+            shell,
+        )
         self.assertIn(
             'cargo-audit --version "${cargo_audit_version}"',
             shell,
@@ -2182,6 +2204,59 @@ class WorkflowStructureTests(unittest.TestCase):
         advisory_fetch = shell.index('https://github.com/RustSec/advisory-db.git')
         self.assertLess(advisory_fetch, candidate_boundary)
         self.assertIn('/cargo-seed/advisory-db', shell)
+        self.assertIn("buf_version='1.72.0'", shell)
+        self.assertIn('BUF=/trusted-tools/bin/buf', shell)
+        self.assertIn(
+            "trusted Buf is not a direct executable regular file", shell
+        )
+        self.assertIn(
+            "protected Cargo configuration is not a root-owned read-only regular file",
+            shell,
+        )
+        link_probe = shell.index(
+            '/trusted-tools/bin/cargo "+${trusted_toolchain}" build --locked --offline'
+        )
+        linked_binary = shell.index(
+            '/state/link-probe/target/debug/yaml-sigil-protected-link-probe'
+        )
+        self.assertLess(link_probe, linked_binary)
+        self.assertLess(linked_binary, candidate_boundary)
+
+    def test_terminal_native_tools_are_immutable_and_boundary_bound(
+        self,
+    ) -> None:
+        shell = TERMINAL_SHELL_PATH.read_text(encoding="utf-8")
+        driver = TERMINAL_DRIVER_PATH.read_text(encoding="utf-8")
+        function_name = "require_root_owned_nonwritable_metadata"
+        function_start = shell.index(f"{function_name}() {{")
+        function_end = shell.index("\n}\n", function_start) + len("\n}\n")
+        function_source = shell[function_start:function_end]
+        command = (
+            "set -euo pipefail\n"
+            f"{function_source}\n"
+            f'{function_name} "$1" "trusted fixture"'
+        )
+        if os.name != "nt":
+            for metadata, accepted in (
+                ("0:755", True),
+                ("0:555", True),
+                ("1000:755", False),
+                ("0:775", False),
+                ("0:757", False),
+                ("not-metadata", False),
+            ):
+                with self.subTest(metadata=metadata):
+                    completed = subprocess.run(
+                        ["bash", "-c", command, "native-tool-policy", metadata],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertEqual(completed.returncode == 0, accepted)
+        self.assertIn('--name "${link_probe_container}" --rm --network none', shell)
+        self.assertIn('src=/usr,dst=/usr,readonly', shell)
+        self.assertIn('dst=/trusted-tools,readonly', shell)
+        self.assertNotIn('type=bind,src=/etc,dst=/etc', shell)
         self.assertNotIn("toolchain install stable", shell)
         self.assertNotIn("cargo +stable", shell)
         self.assertIn('f"+{TRUSTED_TOOLCHAIN}"', driver)
@@ -2343,6 +2418,10 @@ class WorkflowStructureTests(unittest.TestCase):
             state.mkdir()
             for name in ("registry", "git", "advisory-db"):
                 (seed / name).mkdir()
+            (seed / "config.toml").write_text(
+                "[net]\noffline = true\n", encoding="utf-8"
+            )
+            (seed / "config.toml").chmod(0o444)
             environment = {
                 terminal_candidate.CARGO_SEED_ENV: os.fspath(seed),
                 terminal_candidate.CARGO_STATE_ROOT_ENV: os.fspath(state),
@@ -2355,7 +2434,14 @@ class WorkflowStructureTests(unittest.TestCase):
             self.assertNotIn("CARGO_ALIAS_AUDIT", first)
             self.assertNotIn("CARGO_TARGET_FAKE_RUNNER", first)
             self.assertNotIn("RUSTC_WRAPPER", first)
-            pathlib.Path(first["CARGO_HOME"]).joinpath("config.toml").write_text(
+            first_config = pathlib.Path(first["CARGO_HOME"]).joinpath("config.toml")
+            self.assertTrue(first_config.is_symlink())
+            self.assertEqual(
+                first_config.read_text(encoding="utf-8"),
+                "[net]\noffline = true\n",
+            )
+            first_config.unlink()
+            first_config.write_text(
                 "[alias]\naudit='version'\n", encoding="utf-8"
             )
             pathlib.Path(first["CARGO_TARGET_DIR"]).joinpath("forged").write_bytes(b"x")
@@ -2364,9 +2450,53 @@ class WorkflowStructureTests(unittest.TestCase):
             second, second_phase = terminal_candidate.fresh_process_environment(environment)
             assert second is not None and second_phase is not None
             self.assertNotEqual(first["CARGO_HOME"], second["CARGO_HOME"])
-            self.assertFalse(pathlib.Path(second["CARGO_HOME"]).joinpath("config.toml").exists())
+            second_config = pathlib.Path(second["CARGO_HOME"]).joinpath("config.toml")
+            self.assertTrue(second_config.is_symlink())
+            self.assertEqual(
+                second_config.read_text(encoding="utf-8"),
+                "[net]\noffline = true\n",
+            )
             self.assertFalse(pathlib.Path(second["CARGO_TARGET_DIR"]).joinpath("forged").exists())
             terminal_candidate.remove_phase_state(second_phase)
+
+    def test_terminal_driver_rejects_linked_seed_configuration(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            seed = root / "seed"
+            state = root / "state"
+            seed.mkdir()
+            state.mkdir()
+            (root / "outside.toml").write_text(
+                "[net]\noffline = true\n", encoding="utf-8"
+            )
+            (seed / "config.toml").symlink_to(root / "outside.toml")
+            environment = {
+                terminal_candidate.CARGO_SEED_ENV: os.fspath(seed),
+                terminal_candidate.CARGO_STATE_ROOT_ENV: os.fspath(state),
+            }
+            with self.assertRaises(terminal_candidate.IsolationError):
+                terminal_candidate.fresh_process_environment(environment)
+
+    def test_terminal_driver_rejects_missing_or_mutable_seed_configuration(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            seed = root / "seed"
+            state = root / "state"
+            seed.mkdir()
+            state.mkdir()
+            environment = {
+                terminal_candidate.CARGO_SEED_ENV: os.fspath(seed),
+                terminal_candidate.CARGO_STATE_ROOT_ENV: os.fspath(state),
+            }
+            with self.assertRaises(terminal_candidate.IsolationError):
+                terminal_candidate.fresh_process_environment(environment)
+            (seed / "config.toml").write_text(
+                "[net]\noffline = true\n", encoding="utf-8"
+            )
+            with self.assertRaises(terminal_candidate.IsolationError):
+                terminal_candidate.fresh_process_environment(environment)
 
     def test_terminal_driver_requires_adopted_cargo_configuration(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

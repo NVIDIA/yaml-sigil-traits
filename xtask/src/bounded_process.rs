@@ -104,6 +104,8 @@ impl FreshCargoState {
 
 #[cfg(unix)]
 fn link_seed_entries(seed: &Path, cargo_home: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
     for name in ["registry", "git", "advisory-db"] {
         let entry = seed.join(name);
         if entry.try_exists()? {
@@ -116,6 +118,28 @@ fn link_seed_entries(seed: &Path, cargo_home: &Path) -> io::Result<()> {
             }
             std::os::unix::fs::symlink(&entry, cargo_home.join(name))?;
         }
+    }
+    let config = seed.join("config.toml");
+    match std::fs::symlink_metadata(&config) {
+        Ok(metadata) => {
+            if !metadata.is_file()
+                || metadata.file_type().is_symlink()
+                || metadata.permissions().mode() & 0o222 != 0
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "protected Cargo seed config.toml is absent, linked, or writable",
+                ));
+            }
+            std::os::unix::fs::symlink(&config, cargo_home.join("config.toml"))?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "protected Cargo seed config.toml is absent",
+            ));
+        }
+        Err(error) => return Err(error),
     }
     Ok(())
 }
@@ -1419,6 +1443,12 @@ mod tests {
         for name in ["registry", "git", "advisory-db"] {
             fs::create_dir(seed.path().join(name)).unwrap();
         }
+        fs::write(seed.path().join("config.toml"), b"[net]\noffline = true\n").unwrap();
+        let mut permissions = fs::metadata(seed.path().join("config.toml"))
+            .unwrap()
+            .permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(seed.path().join("config.toml"), permissions).unwrap();
         let root = tempfile::tempdir().unwrap();
         let limits = OutputLimits {
             stdout: 4096,
@@ -1428,7 +1458,7 @@ mod tests {
         let mut first = Command::new("/bin/sh");
         first
             .arg("-c")
-            .arg("mkdir -p \"$CARGO_HOME/bin\"; printf poison > \"$CARGO_HOME/config.toml\"; printf poison > \"$CARGO_HOME/bin/cargo-audit\"; printf poison > \"$CARGO_TARGET_DIR/forged\"")
+            .arg("mkdir -p \"$CARGO_HOME/bin\"; test -L \"$CARGO_HOME/config.toml\"; rm \"$CARGO_HOME/config.toml\"; printf poison > \"$CARGO_HOME/config.toml\"; printf poison > \"$CARGO_HOME/bin/cargo-audit\"; printf poison > \"$CARGO_TARGET_DIR/forged\"")
             .env("RUSTC_WRAPPER", "/candidate/wrapper")
             .env("CARGO_ALIAS_AUDIT", "version");
         let first_state = FreshCargoState::prepare(&mut first, seed.path(), root.path()).unwrap();
@@ -1443,7 +1473,7 @@ mod tests {
         let marker = root.path().join("clean");
         let mut second = Command::new("/bin/sh");
         second.arg("-c").arg(format!(
-            "test ! -e \"$CARGO_HOME/config.toml\" && test ! -e \"$CARGO_HOME/bin/cargo-audit\" && test ! -e \"$CARGO_TARGET_DIR/forged\" && test -z \"${{RUSTC_WRAPPER-}}\" && test -z \"${{CARGO_ALIAS_AUDIT-}}\" && printf clean > {}",
+            "test -L \"$CARGO_HOME/config.toml\" && grep -Fxq 'offline = true' \"$CARGO_HOME/config.toml\" && test ! -e \"$CARGO_HOME/bin/cargo-audit\" && test ! -e \"$CARGO_TARGET_DIR/forged\" && test -z \"${{RUSTC_WRAPPER-}}\" && test -z \"${{CARGO_ALIAS_AUDIT-}}\" && printf clean > {}",
             marker.display()
         ));
         let second_state = FreshCargoState::prepare(&mut second, seed.path(), root.path()).unwrap();
@@ -1455,6 +1485,33 @@ mod tests {
         );
         second_state.cleanup().unwrap();
         assert_eq!(fs::read(marker).unwrap(), b"clean");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fresh_state_rejects_linked_seed_configuration() {
+        let seed = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::os::unix::fs::symlink(outside.path(), seed.path().join("config.toml")).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let mut command = Command::new("/bin/true");
+
+        let error = FreshCargoState::prepare(&mut command, seed.path(), root.path()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fresh_state_rejects_missing_or_mutable_seed_configuration() {
+        let seed = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let mut command = Command::new("/bin/true");
+        let missing = FreshCargoState::prepare(&mut command, seed.path(), root.path()).unwrap_err();
+        assert_eq!(missing.kind(), io::ErrorKind::InvalidData);
+
+        fs::write(seed.path().join("config.toml"), b"[net]\noffline = true\n").unwrap();
+        let mutable = FreshCargoState::prepare(&mut command, seed.path(), root.path()).unwrap_err();
+        assert_eq!(mutable.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]

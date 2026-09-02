@@ -27,6 +27,80 @@ head_sha="$8"
 command_file="$9"
 trusted_toolchain='1.98.0'
 cargo_audit_version='0.22.2'
+buf_version='1.72.0'
+
+# GitHub-hosted Ubuntu images install the native system toolchain as UID 0.
+# Check the immutable byte owner and every containing directory before exposing
+# a resolved tool to candidate execution; a trusted-looking pathname alone is
+# not sufficient when another identity could replace its target.
+require_root_owned_nonwritable_metadata() {
+  local metadata="$1"
+  local description="$2"
+  local mode
+
+  if [[ ! "${metadata}" =~ ^0:([0-7]{3,4})$ ]]; then
+    echo "${description} does not have trusted owner UID 0" >&2
+    return 1
+  fi
+  mode="${BASH_REMATCH[1]}"
+  if (( (8#${mode} & 8#022) != 0 )); then
+    echo "${description} is group- or other-writable" >&2
+    return 1
+  fi
+}
+
+require_trusted_native_tool() {
+  local trusted_native_tool="$1"
+  local trusted_native_metadata
+  local trusted_native_parent
+
+  if [[ ! "${trusted_native_tool}" =~ ^/usr/(bin|lib|libexec)/[A-Za-z0-9_./:+-]+$ ]]; then
+    echo 'trusted native tool path is not canonical' >&2
+    return 1
+  fi
+  case "${trusted_native_tool}" in
+    /usr/bin/* | /usr/lib/* | /usr/libexec/*) ;;
+    *)
+      echo 'trusted native tool resolved outside the read-only system toolchain' >&2
+      return 1
+      ;;
+  esac
+  if [[ ! -f "${trusted_native_tool}" || -L "${trusted_native_tool}" || \
+    ! -x "${trusted_native_tool}" ]]; then
+    echo 'trusted native tool is not a direct executable regular file' >&2
+    return 1
+  fi
+  if ! trusted_native_metadata="$(/usr/bin/stat -c '%u:%a' -- "${trusted_native_tool}")"; then
+    echo 'trusted native tool metadata is unavailable' >&2
+    return 1
+  fi
+  require_root_owned_nonwritable_metadata \
+    "${trusted_native_metadata}" 'trusted native tool'
+
+  trusted_native_parent="${trusted_native_tool%/*}"
+  while [[ "${trusted_native_parent}" == '/usr' || \
+    "${trusted_native_parent}" == /usr/* ]]; do
+    if [[ ! -d "${trusted_native_parent}" || -L "${trusted_native_parent}" ]]; then
+      echo 'trusted native tool parent is not a direct directory' >&2
+      return 1
+    fi
+    if ! trusted_native_metadata="$(
+      /usr/bin/stat -c '%u:%a' -- "${trusted_native_parent}"
+    )"; then
+      echo 'trusted native tool parent metadata is unavailable' >&2
+      return 1
+    fi
+    require_root_owned_nonwritable_metadata \
+      "${trusted_native_metadata}" 'trusted native tool parent'
+    if [[ "${trusted_native_parent}" == '/usr' ]]; then
+      return 0
+    fi
+    trusted_native_parent="${trusted_native_parent%/*}"
+  done
+
+  echo 'trusted native tool parent escaped the system toolchain' >&2
+  return 1
+}
 
 runner_command_files=()
 for command_name in GITHUB_ENV GITHUB_PATH GITHUB_OUTPUT GITHUB_STEP_SUMMARY; do
@@ -107,10 +181,17 @@ trusted_git="$(command -v git)"
 trusted_python_command='/usr/bin/python3'
 trusted_cargo="$(command -v cargo)"
 trusted_rustup="$(command -v rustup)"
+trusted_linker="$(realpath /usr/bin/cc)"
+trusted_archiver="$(realpath /usr/bin/ar)"
+trusted_ranlib="$(realpath /usr/bin/ranlib)"
 trusted_git="$(realpath "${trusted_git}")"
 trusted_python="$(realpath "${trusted_python_command}")"
 trusted_cargo="$(realpath "${trusted_cargo}")"
 trusted_rustup="$(realpath "${trusted_rustup}")"
+
+for trusted_native_tool in "${trusted_linker}" "${trusted_archiver}" "${trusted_ranlib}"; do
+  require_trusted_native_tool "${trusted_native_tool}"
+done
 
 if [[ "$("${trusted_git}" -C "${policy_root}" rev-parse --verify 'HEAD^{commit}')" != "${policy_sha}" ]]; then
   echo 'terminal policy checkout is not the authorized commit' >&2
@@ -159,6 +240,11 @@ candidate_prefetch_target="${candidate_state}/prefetch-target"
 candidate_temp="${candidate_state}/temp"
 candidate_buf_cache="${candidate_state}/buf-cache"
 candidate_pycache="${candidate_state}/pycache"
+link_probe_state="${candidate_state}/link-probe"
+link_probe_cargo_home="${link_probe_state}/cargo-home"
+link_probe_target="${link_probe_state}/target"
+link_probe_root="${sandbox}/link-probe"
+protected_cargo_config="${sandbox}/protected-cargo-config.toml"
 prefetch_root_lockfile="${candidate_home}/Cargo.lock"
 candidate_root_lockfile="${sandbox}/candidate-root.Cargo.lock"
 trusted_tools="${sandbox}/trusted-tools"
@@ -170,8 +256,27 @@ mkdir -p \
   "${candidate_home}" "${candidate_cache}" "${candidate_cargo_seed}" \
   "${candidate_cargo_states}" "${candidate_prefetch_target}" \
   "${candidate_temp}" "${candidate_buf_cache}" "${candidate_pycache}" \
+  "${link_probe_cargo_home}" "${link_probe_target}" "${link_probe_root}/src" \
   "${trusted_tools}/bin" "${trusted_rustup_home}" "${setup_cargo_home}" \
   "${setup_target}"
+
+printf '%s\n' \
+  '[package]' \
+  'name = "yaml-sigil-protected-link-probe"' \
+  'version = "0.0.0"' \
+  'edition = "2024"' \
+  'publish = false' \
+  >"${link_probe_root}/Cargo.toml"
+printf '%s\n' 'fn main() {}' >"${link_probe_root}/src/main.rs"
+printf '%s\n' \
+  'version = 4' \
+  '' \
+  '[[package]]' \
+  'name = "yaml-sigil-protected-link-probe"' \
+  'version = "0.0.0"' \
+  >"${link_probe_root}/Cargo.lock"
+printf '%s\n' '[net]' 'offline = true' >"${protected_cargo_config}"
+ln -s /cargo-seed/config.toml "${link_probe_cargo_home}/config.toml"
 
 # Preserve the Rustup multicall name after resolving the original executable.
 # Some installations expose rustup as a symlink to rustup-init, whose resolved
@@ -219,6 +324,18 @@ if [[ "${profile}" != 'controller' ]]; then
       exit 1
       ;;
   esac
+  trusted_host="$("${trusted_rustup}" run "${trusted_toolchain}" rustc -vV | sed -n 's/^host: //p')"
+  if [[ ! "${trusted_host}" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+    echo 'installed Rust host triple is invalid' >&2
+    exit 1
+  fi
+  {
+    if [[ "${repository_kind}" == 'rs' ]]; then
+      printf '%s\n\n' 'paths = ["/policy/.github/trusted-cargo/buf-tools"]'
+    fi
+    printf '[net]\noffline = true\n\n[target.%s]\nlinker = "%s"\n' \
+      "${trusted_host}" "${trusted_linker}"
+  } >"${protected_cargo_config}"
   cargo +"${trusted_toolchain}" install --locked --root "${trusted_tools}" rumdl --version 0.2.54
   cargo +"${trusted_toolchain}" install --locked --root "${trusted_tools}" \
     cargo-audit --version "${cargo_audit_version}"
@@ -233,13 +350,22 @@ if [[ "${profile}" != 'controller' ]]; then
     cargo +"${trusted_toolchain}" install --locked --root "${trusted_tools}" cargo-deny --version 0.20.2
   fi
 
-  if [[ "${repository_kind}" == 'spec' ]]; then
+  if [[ "${repository_kind}" == 'spec' || "${repository_kind}" == 'rs' ]]; then
     # The Rust installer verifies Buf's signed upstream checksum manifest
     # before staging the pinned official binaries in the trusted tool tree.
     BUF_RS_CACHE_DIR="${sandbox}/trusted-buf-cache" \
       BUF_RS_TOOLCHAIN_BIN_DIR="${trusted_tools}/bin" \
       cargo +"${trusted_toolchain}" install --locked --root "${trusted_tools}" \
-        buf-toolchain --version 1.72.0
+        buf-toolchain --version "${buf_version}"
+    if [[ ! -f "${trusted_tools}/bin/buf" || \
+      -L "${trusted_tools}/bin/buf" || ! -x "${trusted_tools}/bin/buf" ]]; then
+      echo 'trusted Buf is not a direct executable regular file' >&2
+      exit 1
+    fi
+    if [[ "$("${trusted_tools}/bin/buf" --version)" != "${buf_version}" ]]; then
+      echo 'installed Buf version differs from protected policy' >&2
+      exit 1
+    fi
   fi
 
   if [[ "${profile}" == 'candidate-ci' ]]; then
@@ -337,7 +463,14 @@ if [[ "${profile}" == 'protected-ci' ]]; then
   fi
   export BUF_RS_CACHE_DIR="${sandbox}/trusted-buf-cache"
   mkdir -p "${BUF_RS_CACHE_DIR}"
-  cargo +"${trusted_toolchain}" build --locked --manifest-path "${policy_manifest}"
+  policy_cargo_options=()
+  if [[ "${repository_kind}" == 'rs' ]]; then
+    policy_cargo_options+=(
+      --config "paths=[\"${policy_root}/.github/trusted-cargo/buf-tools\"]"
+    )
+  fi
+  cargo +"${trusted_toolchain}" "${policy_cargo_options[@]}" build --locked \
+    --manifest-path "${policy_manifest}"
   protected_validator="${trusted_tools}/bin/protected-validator"
   cp "${setup_target}/debug/xtask" "${protected_validator}"
   chmod 0555 "${protected_validator}"
@@ -349,12 +482,13 @@ if [[ "${repository_kind}" == 'spec' && "${profile}" == 'protected-ci' ]]; then
 fi
 
 chmod -R a+rX,go-w "${policy_root}" "${candidate_root}" \
-  "${trusted_tools}" "${trusted_rustup_home}"
+  "${trusted_tools}" "${trusted_rustup_home}" "${link_probe_root}"
 
 candidate_user='yscandidate'
 candidate_user_created='false'
 candidate_container="yaml-sigil-candidate-${head_sha}-$$"
 fetch_container="${candidate_container}-fetch"
+link_probe_container="${candidate_container}-link-probe"
 candidate_image="yaml-sigil-candidate:${head_sha}-${profile}-$$"
 candidate_image_created='false'
 trusted_docker=''
@@ -378,7 +512,8 @@ cleanup_candidate_container() {
   if [[ -z "${trusted_docker}" ]]; then
     return
   fi
-  for container in "${candidate_container}" "${fetch_container}"; do
+  for container in "${candidate_container}" "${fetch_container}" \
+    "${link_probe_container}"; do
     if "${trusted_docker}" container inspect "${container}" >/dev/null 2>&1; then
       "${trusted_docker}" container rm --force "${container}" >/dev/null 2>&1 || failed='true'
     fi
@@ -500,10 +635,21 @@ container_environment=(
   --env 'RUSTUP_HOME=/trusted-rustup'
   --env "RUSTUP_TOOLCHAIN=${trusted_toolchain}"
   --env 'RUSTFLAGS=-D warnings'
+  --env "CC=${trusted_linker}"
+  --env "AR=${trusted_archiver}"
+  --env "RANLIB=${trusted_ranlib}"
   --env 'BUF_CACHE_DIR=/state/buf-cache'
-  --env 'BUF_RS_CACHE_DIR=/state/buf-cache'
   --env 'PYTHONPYCACHEPREFIX=/state/pycache'
 )
+if [[ "${repository_kind}" == 'spec' || "${repository_kind}" == 'rs' ]]; then
+  container_environment+=(--env 'BUF=/trusted-tools/bin/buf')
+fi
+container_cargo_options=()
+if [[ "${repository_kind}" == 'rs' ]]; then
+  container_cargo_options+=(
+    --config 'paths=["/policy/.github/trusted-cargo/buf-tools"]'
+  )
+fi
 
 # Dependency acquisition runs without credentials inside the same filesystem
 # and PID boundary later used for validation. No candidate program is built or
@@ -518,7 +664,8 @@ if [[ "${profile}" != 'controller' ]]; then
     --env 'CARGO_TARGET_DIR=/state/prefetch-target' \
     --env 'CARGO_RESOLVER_LOCKFILE_PATH=/state/home/Cargo.lock' \
     "${candidate_image}" \
-    /trusted-tools/bin/cargo "+${trusted_toolchain}" fetch \
+    /trusted-tools/bin/cargo "+${trusted_toolchain}" \
+    "${container_cargo_options[@]}" fetch \
     --manifest-path /candidate/Cargo.toml
   "${trusted_docker}" run --name "${fetch_container}" --rm --network bridge \
     "${container_security[@]}" "${container_system_mounts[@]}" \
@@ -528,7 +675,8 @@ if [[ "${profile}" != 'controller' ]]; then
     --env 'CARGO_HOME=/cargo-seed' \
     --env 'CARGO_TARGET_DIR=/state/prefetch-target' \
     "${candidate_image}" \
-    /trusted-tools/bin/cargo "+${trusted_toolchain}" fetch --locked \
+    /trusted-tools/bin/cargo "+${trusted_toolchain}" \
+    "${container_cargo_options[@]}" fetch --locked \
     --manifest-path /candidate/xtask/Cargo.toml
   "${trusted_docker}" run --name "${fetch_container}" --rm --network bridge \
     "${container_security[@]}" "${container_system_mounts[@]}" \
@@ -549,7 +697,52 @@ fi
 # Prefetch runs as the disposable candidate identity. Transfer the complete
 # seed to trusted ownership before the read-only validation mount.
 sudo -n chown -R --no-dereference 0:0 -- "${candidate_cargo_seed}"
+sudo -n install -o 0 -g 0 -m 0444 "${protected_cargo_config}" \
+  "${candidate_cargo_seed}/config.toml"
+if [[ ! -f "${candidate_cargo_seed}/config.toml" || \
+  -L "${candidate_cargo_seed}/config.toml" || \
+  "$(stat -c '%u:%a' -- "${candidate_cargo_seed}/config.toml")" != '0:444' ]]; then
+  echo 'protected Cargo configuration is not a root-owned read-only regular file' >&2
+  exit 1
+fi
 sudo -n chmod -R a+rX,go-w -- "${candidate_cargo_seed}"
+
+# Compile and execute a real Rust binary under the final read-only, offline
+# mount set. This catches an unavailable compiler driver or any missing
+# assembler, linker, startup object, or system library before candidate code.
+if [[ "${profile}" != 'controller' ]]; then
+  "${trusted_docker}" run --name "${link_probe_container}" --rm --network none \
+    "${container_security[@]}" "${container_system_mounts[@]}" \
+    "${container_inputs[@]}" \
+    --mount "type=bind,src=${link_probe_root},dst=/link-probe,readonly" \
+    --mount "type=bind,src=${candidate_cargo_seed},dst=/cargo-seed,readonly" \
+    "${container_environment[@]}" \
+    --env 'CARGO_HOME=/state/link-probe/cargo-home' \
+    --env 'CARGO_TARGET_DIR=/state/link-probe/target' \
+    --env 'CARGO_NET_OFFLINE=true' \
+    "${candidate_image}" \
+    /trusted-tools/bin/cargo "+${trusted_toolchain}" build --locked --offline \
+    --manifest-path /link-probe/Cargo.toml
+  "${trusted_docker}" run --name "${link_probe_container}" --rm --network none \
+    "${container_security[@]}" "${container_system_mounts[@]}" \
+    "${container_inputs[@]}" \
+    "${container_environment[@]}" \
+    "${candidate_image}" \
+    /state/link-probe/target/debug/yaml-sigil-protected-link-probe
+  if [[ "${repository_kind}" == 'spec' || "${repository_kind}" == 'rs' ]]; then
+    container_buf_version="$(
+      "${trusted_docker}" run --name "${link_probe_container}" --rm --network none \
+        "${container_security[@]}" "${container_system_mounts[@]}" \
+        "${container_inputs[@]}" \
+        "${container_environment[@]}" \
+        "${candidate_image}" /trusted-tools/bin/buf --version
+    )"
+    if [[ "${container_buf_version}" != "${buf_version}" ]]; then
+      echo 'trusted Buf is unavailable in the final candidate sandbox' >&2
+      exit 1
+    fi
+  fi
+fi
 
 # The terminal validation container has no runner home, host PID namespace,
 # Docker socket, credentials, or outbound network. Authenticated source and

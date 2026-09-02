@@ -382,6 +382,37 @@ executable WebAssembly, installers, containers, retained CI or build outputs,
 GitHub Release assets, or separately generated source archives. Local and
 ephemeral compilation remains permitted for validation.
 
+## Coordinated Buf upgrades
+
+Publishing a new `buf-tools` or `buf-toolchain` release does not automatically
+update this repository. `yaml-sigil-traits` currently has no independent Buf
+product dependency, `bufbuild/buf-action` use, or Buf module lockfile. Its only
+applicable surfaces are the shared protected-runner logic in
+`.github/scripts/run-terminal-candidate.sh` and the corresponding policy
+assertions in `.github/scripts/test_protected_pr_ci.py`. Keep those surfaces
+intentionally uniform with the other YamlSigil repositories.
+
+The shared runner uses `buf-toolchain` to install and verify a standalone
+trusted Buf executable for repository kinds that need it. Confirm the
+published mapping between the selected `buf-toolchain` and Buf CLI releases;
+do not assume their version strings match. `buf-tools` is a distinct Rust
+build dependency in `yaml-sigil-rs`, and its version may include a suffix such
+as `-hotfix.N`. Do not derive that version from the CLI version or add the
+dependency here merely to align names. If `bufbuild/buf-action` is introduced,
+treat its immutable Action SHA and Buf CLI `version` input as separate controls
+and report an omitted `version` as a consistency gap. A future `buf.lock` would
+lock BSR or module dependencies, not the installed CLI, and must not change
+solely for a CLI or Rust helper upgrade.
+
+For each future coordinated upgrade, review the selected Buf, `buf-tools`, and
+`buf-toolchain` releases; update every applicable cross-repository pin in one
+coordinated change; and regenerate only Cargo lockfiles that are already
+committed. Confirm that no unplanned protobuf-generated output changed. Run
+the local Cargo and protected-policy suites, ShellCheck or Shuck, actionlint,
+and Markdown checks. Require successful ordinary and App-owned protected CI at
+the exact reviewed heads, and confirm that the protected sandbox used the
+intended authenticated Buf binary and retained no artifacts.
+
 ## Async Traits
 
 Async traits use native AFIT/RPITIT with explicit `+ Send` returned-future
