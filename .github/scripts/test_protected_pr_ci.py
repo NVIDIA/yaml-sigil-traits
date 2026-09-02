@@ -2192,6 +2192,25 @@ class WorkflowStructureTests(unittest.TestCase):
         self.assertIn("XDG_CACHE_HOME=/state/cache", shell)
         self.assertIn("BUF_CACHE_DIR=/state/buf-cache", shell)
 
+    def test_prefetched_cargo_seed_is_trusted_before_validation(self) -> None:
+        shell = TERMINAL_SHELL_PATH.read_text(encoding="utf-8")
+        prefetch = shell.index('https://github.com/RustSec/advisory-db.git')
+        owner_handoff = shell.index(
+            'sudo -n chown -R --no-dereference 0:0 -- "${candidate_cargo_seed}"'
+        )
+        read_only = shell.index(
+            'sudo -n chmod -R a+rX,go-w -- "${candidate_cargo_seed}"'
+        )
+        validation_mount = shell.index(
+            '--mount "type=bind,src=${candidate_cargo_seed},dst=/cargo-seed,readonly"'
+        )
+        self.assertLess(prefetch, owner_handoff)
+        self.assertLess(owner_handoff, read_only)
+        self.assertLess(read_only, validation_mount)
+        self.assertNotIn(
+            '\nchmod -R a+rX,go-w "${candidate_cargo_seed}"', shell
+        )
+
     def test_terminal_container_excludes_runner_control_plane(self) -> None:
         shell = TERMINAL_SHELL_PATH.read_text(encoding="utf-8")
         self.assertIn("Runner control-plane probe", shell)
