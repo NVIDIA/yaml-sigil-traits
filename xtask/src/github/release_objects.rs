@@ -31,6 +31,8 @@ use crate::github::{ReconcileMode, git_line, is_sha, repository_policy_for_root}
 use crate::release_policy::{PackagePolicy, ReleasePolicy, detect};
 use crate::safe_file;
 
+const MAX_CHANGELOG_BYTES: usize = 1024 * 1024;
+
 pub(super) fn reconcile_command(
     root: &Path,
     mode: ReconcileMode,
@@ -121,6 +123,8 @@ pub(super) fn release_specs<'a>(
     version: &str,
 ) -> Result<Vec<ReleaseSpec<'a>>, String> {
     let prerelease = !parse_version(version)?.pre.is_empty();
+    let trusted = safe_file::TrustedRoot::open(root)
+        .map_err(|error| format!("open release source root: {error}"))?;
     policy
         .packages
         .iter()
@@ -129,15 +133,20 @@ pub(super) fn release_specs<'a>(
                 policy: package,
                 version: version.to_string(),
                 tag: package.tag(version),
-                body: changelog_body(&root.join(package.changelog), version)?,
+                body: changelog_body(&trusted, Path::new(package.changelog), version)?,
                 prerelease,
             })
         })
         .collect()
 }
 
-fn changelog_body(path: &Path, version: &str) -> Result<String, String> {
-    let body = fs::read_to_string(path)
+fn changelog_body(
+    trusted: &safe_file::TrustedRoot,
+    path: &Path,
+    version: &str,
+) -> Result<String, String> {
+    let body = trusted
+        .read_utf8(path, MAX_CHANGELOG_BYTES)
         .map_err(|error| format!("read release changelog {}: {error}", path.display()))?;
     let lines: Vec<_> = body.lines().collect();
     let matches: Vec<_> = lines
@@ -800,8 +809,45 @@ mod tests {
             "# Changelog\n\n## [0.4.0](https://example.invalid/v0.4.0) - 2026-08-25\n\n- Fixed.\n\n## [0.3.0] - 2026-08-01\n\n- Older.\n",
         )
         .unwrap();
-        assert_eq!(changelog_body(&path, "0.4.0").unwrap(), "- Fixed.");
-        assert!(changelog_body(&path, "0.5.0").is_err());
+        let trusted = safe_file::TrustedRoot::open(temporary.path()).unwrap();
+        assert_eq!(
+            changelog_body(&trusted, Path::new("CHANGELOG.md"), "0.4.0").unwrap(),
+            "- Fixed."
+        );
+        assert!(changelog_body(&trusted, Path::new("CHANGELOG.md"), "0.5.0").is_err());
+    }
+
+    #[test]
+    fn changelog_read_is_bounded_before_utf8_and_line_processing() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("CHANGELOG.md");
+        let prefix = b"# Changelog\n\n## [1.0.0] - 2026-09-02\n\n- Fixed.\n";
+        let trusted = safe_file::TrustedRoot::open(temporary.path()).unwrap();
+
+        let mut exact = prefix.to_vec();
+        exact.resize(MAX_CHANGELOG_BYTES, b'x');
+        fs::write(&path, &exact).unwrap();
+        assert!(
+            changelog_body(&trusted, Path::new("CHANGELOG.md"), "1.0.0").is_ok(),
+            "an exact-limit changelog must remain valid"
+        );
+
+        let mut oversized = exact;
+        oversized.push(b'x');
+        fs::write(&path, oversized).unwrap();
+        let error = changelog_body(&trusted, Path::new("CHANGELOG.md"), "1.0.0").unwrap_err();
+        assert!(error.contains("exceeds its 1048576-byte limit"), "{error}");
+
+        fs::write(&path, [prefix.as_slice(), b"\xff"].concat()).unwrap();
+        let error = changelog_body(&trusted, Path::new("CHANGELOG.md"), "1.0.0").unwrap_err();
+        assert!(error.contains("not valid UTF-8"), "{error}");
+
+        let mut many_lines = prefix.to_vec();
+        for _ in 0..20_000 {
+            many_lines.extend_from_slice(b"- x\n");
+        }
+        fs::write(&path, many_lines).unwrap();
+        assert!(changelog_body(&trusted, Path::new("CHANGELOG.md"), "1.0.0").is_ok());
     }
 
     #[test]

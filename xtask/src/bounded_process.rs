@@ -4,13 +4,148 @@
 //! Bounded subprocess-tree execution for release-reachable validation.
 
 use std::io::{self, Read};
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 const PIPE_CLOSE_GRACE: Duration = Duration::from_millis(250);
 const POST_CANCEL_TIMEOUT: Duration = Duration::from_secs(2);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_INPUT_BYTES: usize = 4 * 1024 * 1024;
+const CARGO_SEED_ENV: &str = "YAML_SIGIL_CARGO_SEED";
+const CARGO_STATE_ROOT_ENV: &str = "YAML_SIGIL_CARGO_STATE_ROOT";
+static CARGO_STATE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug)]
+struct FreshCargoState {
+    phase: PathBuf,
+}
+
+impl FreshCargoState {
+    fn from_environment(command: &mut Command) -> io::Result<Option<Self>> {
+        let seed = std::env::var_os(CARGO_SEED_ENV);
+        let state_root = std::env::var_os(CARGO_STATE_ROOT_ENV);
+        match (seed, state_root) {
+            (None, None) => Ok(None),
+            (Some(seed), Some(state_root)) => {
+                Self::prepare(command, Path::new(&seed), Path::new(&state_root)).map(Some)
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "incomplete protected Cargo state boundary",
+            )),
+        }
+    }
+
+    fn prepare(command: &mut Command, seed: &Path, state_root: &Path) -> io::Result<Self> {
+        let seed = seed.canonicalize()?;
+        let state_root = state_root.canonicalize()?;
+        if !seed.is_dir() || !state_root.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "protected Cargo seed and state root must be directories",
+            ));
+        }
+
+        let sequence = CARGO_STATE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let phase = state_root.join(format!("rust-phase-{}-{sequence}", std::process::id()));
+        std::fs::create_dir(&phase)?;
+        let cargo_home = phase.join("cargo-home");
+        let target = phase.join("target");
+        std::fs::create_dir(&cargo_home)?;
+        std::fs::create_dir(&target)?;
+
+        link_seed_entries(&seed, &cargo_home)?;
+
+        let mut inherited = std::env::vars_os()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>();
+        inherited.extend(command.get_envs().map(|(name, _)| name.to_os_string()));
+        for name in inherited {
+            let text = name.to_string_lossy();
+            if text.starts_with("CARGO_ALIAS_") || text.starts_with("CARGO_TARGET_") {
+                command.env_remove(name);
+            }
+        }
+        for name in [
+            "CARGO_BUILD_RUSTC",
+            "CARGO_BUILD_RUSTC_WRAPPER",
+            "CARGO_BUILD_RUSTDOC",
+            "CARGO_BUILD_TARGET",
+            "CARGO_ENCODED_RUSTFLAGS",
+            "RUSTC",
+            "RUSTC_WRAPPER",
+            "RUSTC_WORKSPACE_WRAPPER",
+            "RUSTDOC",
+            "RUSTDOCFLAGS",
+        ] {
+            command.env_remove(name);
+        }
+        command
+            .env("CARGO_HOME", cargo_home)
+            .env("CARGO_TARGET_DIR", target)
+            .env("CARGO_NET_OFFLINE", "true");
+        Ok(Self { phase })
+    }
+
+    fn cleanup(self) -> io::Result<()> {
+        std::fs::remove_dir_all(&self.phase).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "remove disposable Cargo state {}: {error}",
+                    self.phase.display()
+                ),
+            )
+        })
+    }
+}
+
+#[cfg(unix)]
+fn link_seed_entries(seed: &Path, cargo_home: &Path) -> io::Result<()> {
+    for name in ["registry", "git", "advisory-db"] {
+        let entry = seed.join(name);
+        if entry.try_exists()? {
+            let metadata = std::fs::symlink_metadata(&entry)?;
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("protected Cargo seed {name} is not a direct directory"),
+                ));
+            }
+            std::os::unix::fs::symlink(&entry, cargo_home.join(name))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn link_seed_entries(_seed: &Path, _cargo_home: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "protected Cargo state isolation is Linux-only",
+    ))
+}
+
+fn finish_with_fresh_state<T>(
+    result: io::Result<T>,
+    state: Option<FreshCargoState>,
+) -> io::Result<T> {
+    let cleanup = match state {
+        Some(state) => state.cleanup(),
+        None => Ok(()),
+    };
+    match (result, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
+        (Err(error), Err(cleanup_error)) => Err(io::Error::new(
+            error.kind(),
+            format!("{error}; Cargo state cleanup failed: {cleanup_error}"),
+        )),
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct OutputLimits {
@@ -114,7 +249,8 @@ pub(crate) fn require_within_limit(bytes: &[u8], limit: usize, label: &str) -> i
 /// more than each configured limit plus one sentinel byte.
 pub(crate) fn output(command: &mut Command, limits: OutputLimits) -> io::Result<Output> {
     validate_limits(limits, None)?;
-    platform::output(command, limits, None)
+    let state = FreshCargoState::from_environment(command)?;
+    finish_with_fresh_state(platform::output(command, limits, None), state)
 }
 
 /// Write bounded input and capture both bounded output streams under the same
@@ -125,22 +261,157 @@ pub(crate) fn output_with_input(
     limits: OutputLimits,
 ) -> io::Result<Output> {
     validate_limits(limits, Some(input))?;
-    platform::output(command, limits, Some(input))
+    let state = FreshCargoState::from_environment(command)?;
+    finish_with_fresh_state(platform::output(command, limits, Some(input)), state)
 }
 
 #[cfg(unix)]
 mod platform {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    use std::collections::BTreeSet;
     use std::io::Write;
     use std::os::fd::AsFd;
     use std::os::unix::process::CommandExt;
     use std::process::{Child, ChildStdin, Stdio};
+    #[cfg(target_os = "linux")]
+    use std::sync::{Mutex, MutexGuard, OnceLock};
     use std::thread;
     use std::time::Instant;
 
     use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
-    use rustix::process::{Pid, Signal, kill_process_group, setpgid, test_kill_process_group};
+    #[cfg(target_os = "linux")]
+    use rustix::process::getpgid;
+    #[cfg(not(target_os = "linux"))]
+    use rustix::process::test_kill_process_group;
+    use rustix::process::{Pid, Signal, kill_process_group, setpgid};
+    #[cfg(target_os = "linux")]
+    use rustix::process::{WaitOptions, kill_process, set_child_subreaper, waitpid};
+
+    #[cfg(target_os = "linux")]
+    static SUBREAPER_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    #[cfg(target_os = "linux")]
+    struct SubreaperScope {
+        baseline: BTreeSet<i32>,
+        caller_group: Pid,
+        was_enabled: bool,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl SubreaperScope {
+        fn enter() -> io::Result<Self> {
+            let lock = SUBREAPER_LOCK
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                .map_err(|_| io::Error::other("bounded-process subreaper lock was poisoned"))?;
+            let was_enabled = rustix::process::child_subreaper()?.is_some();
+            if !was_enabled {
+                set_child_subreaper(Pid::from_raw(1))?;
+            }
+            Ok(Self {
+                baseline: direct_children()?,
+                caller_group: getpgid(None)?,
+                was_enabled,
+                _lock: lock,
+            })
+        }
+
+        fn terminate_and_reap(&self) -> io::Result<()> {
+            let deadline = Instant::now() + POST_CANCEL_TIMEOUT;
+            loop {
+                let adopted = direct_children()?
+                    .difference(&self.baseline)
+                    .copied()
+                    // The test harness and a future concurrent caller may
+                    // have unrelated direct children in the caller's process
+                    // group. Descendants launched by this module begin in a
+                    // dedicated group; a setsid escape necessarily has a
+                    // different group too. Leave unrelated children alone.
+                    .filter(|raw| {
+                        Pid::from_raw(*raw).is_some_and(|pid| {
+                            getpgid(Some(pid)).is_ok_and(|group| group != self.caller_group)
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                if adopted.is_empty() {
+                    return Ok(());
+                }
+                for raw in &adopted {
+                    if let Some(pid) = Pid::from_raw(*raw) {
+                        let _ = kill_process(pid, Signal::KILL);
+                    }
+                }
+                for raw in adopted {
+                    if let Some(pid) = Pid::from_raw(raw) {
+                        match waitpid(Some(pid), WaitOptions::NOHANG) {
+                            Ok(_) | Err(rustix::io::Errno::CHILD) => {}
+                            Err(error) => return Err(error.into()),
+                        }
+                    }
+                }
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "subprocess descendants were not quiescent after direct-child exit",
+                    ));
+                }
+                thread::sleep(POLL_INTERVAL);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for SubreaperScope {
+        fn drop(&mut self) {
+            if !self.was_enabled {
+                let _ = set_child_subreaper(None);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn direct_children() -> io::Result<BTreeSet<i32>> {
+        let own_pid = i32::try_from(std::process::id())
+            .map_err(|_| io::Error::other("current process ID is out of range"))?;
+        let mut children = BTreeSet::new();
+        for entry in std::fs::read_dir("/proc")? {
+            let entry = entry?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Ok(pid) = name.parse::<i32>() else {
+                continue;
+            };
+            let stat = match std::fs::read_to_string(entry.path().join("stat")) {
+                Ok(value) => value,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            let (_, fields) = stat.rsplit_once(") ").ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "malformed /proc process stat")
+            })?;
+            let parent = fields
+                .split_whitespace()
+                .nth(1)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "truncated /proc process stat")
+                })?
+                .parse::<i32>()
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid /proc parent process ID",
+                    )
+                })?;
+            if parent == own_pid {
+                children.insert(pid);
+            }
+        }
+        Ok(children)
+    }
 
     struct Capture<R> {
         reader: Option<R>,
@@ -249,6 +520,16 @@ mod platform {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    fn terminate_remaining_group(group: Pid) -> io::Result<()> {
+        let _ = kill_process_group(group, Signal::KILL);
+        // Group members become direct children of the active subreaper. The
+        // enclosing scope reaps them before this operation can return; polling
+        // the group here would wait forever on those unreaped zombies.
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
     fn terminate_remaining_group(group: Pid) -> io::Result<()> {
         let _ = kill_process_group(group, Signal::KILL);
         let deadline = Instant::now() + POST_CANCEL_TIMEOUT;
@@ -339,6 +620,29 @@ mod platform {
         limits: OutputLimits,
         input: Option<&[u8]>,
         mut poll: impl FnMut(&mut Child) -> io::Result<Option<ExitStatus>>,
+    ) -> io::Result<Output> {
+        #[cfg(target_os = "linux")]
+        let scope = SubreaperScope::enter()?;
+        let result = output_inner(command, limits, input, &mut poll);
+        #[cfg(target_os = "linux")]
+        let cleanup = scope.terminate_and_reap();
+        #[cfg(not(target_os = "linux"))]
+        let cleanup: io::Result<()> = Ok(());
+        match (result, cleanup) {
+            (Ok(output), Ok(())) => Ok(output),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Err(error), Err(cleanup)) => Err(io::Error::other(format!(
+                "{error}; descendant cleanup failed: {cleanup}"
+            ))),
+        }
+    }
+
+    fn output_inner(
+        command: &mut Command,
+        limits: OutputLimits,
+        input: Option<&[u8]>,
+        poll: &mut impl FnMut(&mut Child) -> io::Result<Option<ExitStatus>>,
     ) -> io::Result<Output> {
         let program = command.get_program().to_string_lossy().into_owned();
         prepare(command);
@@ -1108,6 +1412,51 @@ mod tests {
         assert_eq!(oversized.position(), 9);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fresh_state_discards_alias_wrapper_and_target_poison() {
+        let seed = tempfile::tempdir().unwrap();
+        for name in ["registry", "git", "advisory-db"] {
+            fs::create_dir(seed.path().join(name)).unwrap();
+        }
+        let root = tempfile::tempdir().unwrap();
+        let limits = OutputLimits {
+            stdout: 4096,
+            stderr: 4096,
+        };
+
+        let mut first = Command::new("/bin/sh");
+        first
+            .arg("-c")
+            .arg("mkdir -p \"$CARGO_HOME/bin\"; printf poison > \"$CARGO_HOME/config.toml\"; printf poison > \"$CARGO_HOME/bin/cargo-audit\"; printf poison > \"$CARGO_TARGET_DIR/forged\"")
+            .env("RUSTC_WRAPPER", "/candidate/wrapper")
+            .env("CARGO_ALIAS_AUDIT", "version");
+        let first_state = FreshCargoState::prepare(&mut first, seed.path(), root.path()).unwrap();
+        assert!(
+            platform::output(&mut first, limits, None)
+                .unwrap()
+                .status
+                .success()
+        );
+        first_state.cleanup().unwrap();
+
+        let marker = root.path().join("clean");
+        let mut second = Command::new("/bin/sh");
+        second.arg("-c").arg(format!(
+            "test ! -e \"$CARGO_HOME/config.toml\" && test ! -e \"$CARGO_HOME/bin/cargo-audit\" && test ! -e \"$CARGO_TARGET_DIR/forged\" && test -z \"${{RUSTC_WRAPPER-}}\" && test -z \"${{CARGO_ALIAS_AUDIT-}}\" && printf clean > {}",
+            marker.display()
+        ));
+        let second_state = FreshCargoState::prepare(&mut second, seed.path(), root.path()).unwrap();
+        assert!(
+            platform::output(&mut second, limits, None)
+                .unwrap()
+                .status
+                .success()
+        );
+        second_state.cleanup().unwrap();
+        assert_eq!(fs::read(marker).unwrap(), b"clean");
+    }
+
     #[test]
     fn status_poll_failure_terminates_and_reaps_the_process_tree() {
         let temporary = tempfile::tempdir().unwrap();
@@ -1213,34 +1562,70 @@ mod tests {
         assert_eq!(fs::read(output_file).unwrap(), b"bounded input");
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
-    fn escaped_session_cannot_hold_the_validator_open() {
+    fn nominal_success_terminates_a_silent_session_escapee() {
         let temporary = tempfile::tempdir().unwrap();
         let pid_file = temporary.path().join("escapee.pid");
         let mut command = test_command("bounded_process::tests::spawn_session_escapee");
         command.env("YAML_SIGIL_TEST_PID_FILE", &pid_file);
         let started = Instant::now();
-        let error = output(
+        let result = output(
             &mut command,
             OutputLimits {
                 stdout: 4096,
                 stderr: 4096,
             },
         )
-        .unwrap_err()
-        .to_string();
+        .unwrap();
 
-        assert!(error.contains("retained output pipes"), "{error}");
+        assert!(result.status.success());
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "escaped descendant held the validator open"
         );
 
+        wait_for_exit(wait_for_pid(&pid_file));
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    #[test]
+    fn nominal_success_returns_before_a_silent_session_escapee_and_test_cleans_up() {
+        let temporary = tempfile::tempdir().unwrap();
+        let pid_file = temporary.path().join("escapee.pid");
+        let mut command = test_command("bounded_process::tests::spawn_session_escapee");
+        command.env("YAML_SIGIL_TEST_PID_FILE", &pid_file);
+        let started = Instant::now();
+        let result = output(
+            &mut command,
+            OutputLimits {
+                stdout: 4096,
+                stderr: 4096,
+            },
+        );
+        let elapsed = started.elapsed();
+
+        // Non-Linux Unix has no subreaper guarantee here. Record that the
+        // new-session descendant survived process-group cleanup, then kill it
+        // explicitly before making assertions so a failed test leaves no
+        // background process behind.
         let pid = wait_for_pid(&pid_file);
+        let survived_group_cleanup = process_exists(pid);
         if let Some(pid) = rustix::process::Pid::from_raw(pid as i32) {
             let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
         }
+        wait_for_exit(pid);
+
+        let result = result.unwrap();
+        assert!(result.status.success());
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "escaped descendant held the validator open"
+        );
+        assert!(
+            survived_group_cleanup,
+            "new-session descendant unexpectedly exited before explicit test cleanup"
+        );
     }
 
     #[cfg(windows)]
@@ -1364,17 +1749,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     #[ignore = "spawned explicitly by the bounded-process regression"]
-    // This helper deliberately orphans a new-session child so the parent
-    // regression can prove that timeout cleanup finds process-tree escapees.
+    // This helper deliberately orphans a new-session child so each platform
+    // regression can exercise its documented descendant boundary.
     #[allow(clippy::zombie_processes)]
     fn spawn_session_escapee() {
         use std::os::unix::process::CommandExt;
 
+        let pid_file = PathBuf::from(std::env::var_os("YAML_SIGIL_TEST_PID_FILE").unwrap());
         let mut child = test_command("bounded_process::tests::sleeping_escapee");
-        child.env(
-            "YAML_SIGIL_TEST_PID_FILE",
-            std::env::var_os("YAML_SIGIL_TEST_PID_FILE").unwrap(),
-        );
+        child.env("YAML_SIGIL_TEST_PID_FILE", &pid_file);
         // SAFETY: the post-fork hook performs only the async-signal-safe
         // setsid system call and returns its operating-system error.
         unsafe {
@@ -1383,7 +1766,11 @@ mod tests {
                 Ok(())
             });
         }
+        child.stdin(Stdio::null());
+        child.stdout(Stdio::null());
+        child.stderr(Stdio::null());
         child.spawn().unwrap();
+        wait_for_pid(&pid_file);
     }
 
     #[cfg(unix)]

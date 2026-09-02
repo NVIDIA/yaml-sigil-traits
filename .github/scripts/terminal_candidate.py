@@ -15,6 +15,7 @@ turns descendant cleanup into a hosted Linux canary.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import errno
 import os
 import pathlib
@@ -23,6 +24,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -30,6 +32,11 @@ import time
 MAX_PROFILE_SECONDS = 80 * 60
 MAX_STDOUT_BYTES = 16 * 1024 * 1024
 MAX_STDERR_BYTES = 4 * 1024 * 1024
+MAX_CARGO_CONFIG_BYTES = 64 * 1024
+TRUSTED_TOOLCHAIN = "1.98.0"
+PR_SET_CHILD_SUBREAPER = 36
+CARGO_SEED_ENV = "YAML_SIGIL_CARGO_SEED"
+CARGO_STATE_ROOT_ENV = "YAML_SIGIL_CARGO_STATE_ROOT"
 CARGO_LOCKFILE_PATH_ENV = "CARGO_RESOLVER_LOCKFILE_PATH"
 FORBIDDEN_PREFIXES = ("ACTIONS_", "GITHUB_", "GH_", "RUNNER_")
 FORBIDDEN_NAMES = {
@@ -40,7 +47,10 @@ FORBIDDEN_NAMES = {
     "LD_LIBRARY_PATH",
     "LD_PRELOAD",
     "PYTHONPATH",
+    "RUSTC",
     "RUSTC_WRAPPER",
+    "RUSTC_WORKSPACE_WRAPPER",
+    "RUSTDOC",
     "RUSTDOCFLAGS",
 }
 
@@ -177,6 +187,56 @@ def require_tree_readable(root: pathlib.Path, label: str) -> None:
                 ) from error
 
 
+def read_regular_file_bounded(path: pathlib.Path, limit: int, label: str) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        metadata = os.fstat(descriptor)
+        require(stat.S_ISREG(metadata.st_mode), f"{label} is not a regular file")
+        require(metadata.st_size <= limit, f"{label} exceeds its {limit}-byte limit")
+        chunks: list[bytes] = []
+        total = 0
+        while total <= limit:
+            chunk = os.read(descriptor, min(8192, limit + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        require(total <= limit, f"{label} exceeds its {limit}-byte limit")
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+def cargo_config_inventory(
+    root: pathlib.Path, kind: str
+) -> dict[pathlib.PurePosixPath, bytes]:
+    inventory: dict[pathlib.PurePosixPath, bytes] = {}
+    cargo_roots = [pathlib.PurePosixPath(".")]
+    if kind == "spec":
+        cargo_roots.append(pathlib.PurePosixPath("conformance/rebuild-rs"))
+    for cargo_root in cargo_roots:
+        for name in ("config", "config.toml"):
+            relative = cargo_root / ".cargo" / name
+            path = root / relative
+            if not os.path.lexists(path):
+                continue
+            inventory[relative] = read_regular_file_bounded(
+                path, MAX_CARGO_CONFIG_BYTES, f"Cargo configuration {relative}"
+            )
+    return inventory
+
+
+def require_cargo_configuration_adopted(
+    policy_root: pathlib.Path, candidate_root: pathlib.Path, kind: str
+) -> None:
+    policy = cargo_config_inventory(policy_root, kind)
+    candidate = cargo_config_inventory(candidate_root, kind)
+    require(candidate.keys() == policy.keys(), "candidate Cargo configuration inventory is not adopted")
+    for path, expected in policy.items():
+        require(candidate[path] == expected, f"candidate Cargo configuration is not adopted: {path}")
+
+
 def require_parent_process_isolated() -> None:
     parent_environment = pathlib.Path(f"/proc/{os.getppid()}/environ")
     try:
@@ -186,6 +246,15 @@ def require_parent_process_isolated() -> None:
     except OSError:
         return
     raise IsolationError("candidate identity can read its trusted parent's environment")
+
+
+def require_host_paths_absent(paths: list[pathlib.Path]) -> None:
+    """Prove that host control-plane paths are outside this filesystem view."""
+
+    require(paths, "runner control-plane path inventory is empty")
+    for path in paths:
+        require(path.is_absolute() and path != pathlib.Path("/"), "invalid host path probe")
+        require(not os.path.lexists(path), f"host control-plane path is mounted: {path}")
 
 
 def require_trusted_path(trusted_cargo: pathlib.Path, trusted_python: pathlib.Path) -> None:
@@ -242,7 +311,66 @@ def terminate_group(process: subprocess.Popen[bytes]) -> None:
         pass
 
 
-def run_process(
+def enable_child_subreaper() -> None:
+    """Adopt orphaned candidate descendants so every step can reap them."""
+
+    library = ctypes.CDLL(None, use_errno=True)
+    if library.prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
+        error = ctypes.get_errno()
+        raise IsolationError(f"cannot enable child subreaper: {os.strerror(error)}")
+
+
+def direct_children() -> set[int]:
+    own_pid = os.getpid()
+    children: set[int] = set()
+    try:
+        entries = list(pathlib.Path("/proc").iterdir())
+    except OSError as error:
+        raise IsolationError(f"cannot enumerate process state: {error}") from error
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            value = (entry / "stat").read_text(encoding="ascii")
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise IsolationError(f"cannot inspect process {entry.name}: {error}") from error
+        separator = value.rfind(") ")
+        require(separator >= 0, f"process {entry.name} has malformed status")
+        fields = value[separator + 2 :].split()
+        require(len(fields) >= 2, f"process {entry.name} has truncated status")
+        try:
+            parent = int(fields[1])
+        except ValueError as error:
+            raise IsolationError(f"process {entry.name} has an invalid parent") from error
+        if parent == own_pid:
+            children.add(int(entry.name))
+    return children
+
+
+def terminate_adopted_children(baseline: set[int]) -> None:
+    deadline = time.monotonic() + 10
+    while True:
+        adopted = direct_children() - baseline
+        if not adopted:
+            return
+        for process_id in adopted:
+            try:
+                os.kill(process_id, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        for process_id in adopted:
+            try:
+                os.waitpid(process_id, os.WNOHANG)
+            except (ChildProcessError, ProcessLookupError):
+                pass
+        if time.monotonic() >= deadline:
+            raise IsolationError("candidate descendants were not quiescent between profile steps")
+        time.sleep(0.05)
+
+
+def _run_process(
     arguments: list[str],
     cwd: pathlib.Path,
     *,
@@ -314,6 +442,8 @@ def run_process(
     terminate_group(process)
     stdout_thread.join(timeout=5)
     stderr_thread.join(timeout=5)
+    process.stdout.close()
+    process.stderr.close()
     require(
         not stdout_thread.is_alive() and not stderr_thread.is_alive(),
         "candidate descendants retained validation output pipes",
@@ -321,6 +451,143 @@ def run_process(
     with failure_lock:
         require(not failures, failures[0] if failures else "candidate output capture failed")
     require(status == 0, f"candidate validation exited with status {status}")
+
+
+def fresh_process_environment(
+    environment: dict[str, str] | None,
+) -> tuple[dict[str, str] | None, pathlib.Path | None]:
+    """Create one disposable Cargo and target domain for a candidate phase."""
+
+    source = dict(os.environ if environment is None else environment)
+    seed_value = source.get(CARGO_SEED_ENV)
+    state_root_value = source.get(CARGO_STATE_ROOT_ENV)
+    if seed_value is None and state_root_value is None:
+        return environment, None
+    require(seed_value is not None and state_root_value is not None, "incomplete Cargo state boundary")
+
+    seed = pathlib.Path(seed_value).resolve(strict=True)
+    state_root = pathlib.Path(state_root_value).resolve(strict=True)
+    require(seed.is_dir(), "candidate Cargo seed is not a directory")
+    require(state_root.is_dir(), "candidate Cargo state root is not a directory")
+
+    phase = pathlib.Path(tempfile.mkdtemp(prefix="phase-", dir=state_root))
+    cargo_home = phase / "cargo-home"
+    target = phase / "target"
+    cargo_home.mkdir()
+    target.mkdir()
+    for name in ("registry", "git", "advisory-db"):
+        seed_entry = seed / name
+        if os.path.lexists(seed_entry):
+            require(seed_entry.is_dir() and not seed_entry.is_symlink(), f"invalid Cargo seed {name}")
+            (cargo_home / name).symlink_to(seed_entry, target_is_directory=True)
+
+    for name in tuple(source):
+        if name.startswith("CARGO_ALIAS_") or name.startswith("CARGO_TARGET_"):
+            source.pop(name)
+    for name in (
+        "CARGO_BUILD_RUSTC",
+        "CARGO_BUILD_RUSTC_WRAPPER",
+        "CARGO_BUILD_RUSTDOC",
+        "CARGO_BUILD_TARGET",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "RUSTC",
+        "RUSTC_WRAPPER",
+        "RUSTC_WORKSPACE_WRAPPER",
+        "RUSTDOC",
+        "RUSTDOCFLAGS",
+    ):
+        source.pop(name, None)
+    source["CARGO_HOME"] = os.fspath(cargo_home)
+    source["CARGO_TARGET_DIR"] = os.fspath(target)
+    source["CARGO_NET_OFFLINE"] = "true"
+    return source, phase
+
+
+def remove_phase_state(phase: pathlib.Path | None) -> None:
+    if phase is None:
+        return
+    try:
+        shutil.rmtree(phase)
+    except OSError as error:
+        raise IsolationError(f"cannot remove disposable candidate state: {error}") from error
+
+
+def run_prepared_process(
+    arguments: list[str],
+    cwd: pathlib.Path,
+    *,
+    environment: dict[str, str] | None,
+) -> None:
+    baseline = direct_children()
+    try:
+        _run_process(arguments, cwd, environment=environment)
+    except BaseException as error:
+        try:
+            terminate_adopted_children(baseline)
+        except IsolationError as cleanup_error:
+            raise IsolationError(f"{error}; descendant cleanup failed: {cleanup_error}") from error
+        raise
+    terminate_adopted_children(baseline)
+
+
+def run_process(
+    arguments: list[str],
+    cwd: pathlib.Path,
+    *,
+    environment: dict[str, str] | None = None,
+) -> None:
+    process_environment, phase = fresh_process_environment(environment)
+    try:
+        run_prepared_process(arguments, cwd, environment=process_environment)
+    except BaseException as error:
+        try:
+            remove_phase_state(phase)
+        except IsolationError as cleanup_error:
+            raise IsolationError(f"{error}; Cargo state cleanup failed: {cleanup_error}") from error
+        raise
+    remove_phase_state(phase)
+
+
+def run_candidate_xtask(
+    cargo: pathlib.Path, manifest: pathlib.Path, candidate_root: pathlib.Path
+) -> None:
+    build_environment = dict(os.environ)
+    build_environment.pop(CARGO_LOCKFILE_PATH_ENV, None)
+    process_environment, phase = fresh_process_environment(build_environment)
+    require(process_environment is not None and phase is not None, "candidate Cargo state is absent")
+    try:
+        run_prepared_process(
+            [
+                os.fspath(cargo),
+                f"+{TRUSTED_TOOLCHAIN}",
+                "build",
+                "--locked",
+                "--manifest-path",
+                os.fspath(manifest),
+            ],
+            candidate_root,
+            environment=process_environment,
+        )
+        candidate_xtask = resolved_executable(
+            pathlib.Path(process_environment["CARGO_TARGET_DIR"]) / "debug" / "xtask",
+            "candidate xtask",
+        )
+        execution_environment = dict(process_environment)
+        root_lock = os.environ.get(CARGO_LOCKFILE_PATH_ENV)
+        if root_lock is not None:
+            execution_environment[CARGO_LOCKFILE_PATH_ENV] = root_lock
+        run_prepared_process(
+            [os.fspath(candidate_xtask), "ci"],
+            candidate_root,
+            environment=execution_environment,
+        )
+    except BaseException as error:
+        try:
+            remove_phase_state(phase)
+        except IsolationError as cleanup_error:
+            raise IsolationError(f"{error}; Cargo state cleanup failed: {cleanup_error}") from error
+        raise
+    remove_phase_state(phase)
 
 
 def run_profile(
@@ -394,29 +661,10 @@ def run_profile(
         environment=archive_environment,
     )
 
-    # Compile the candidate xtask with its committed xtask/Cargo.lock before
-    # giving the resulting terminal workload Cargo's candidate-owned root
-    # lockfile path. This keeps the verified source tree read-only without
-    # treating the root and xtask workspaces as though they shared one lock.
-    build_environment = dict(os.environ)
-    build_environment.pop(CARGO_LOCKFILE_PATH_ENV, None)
-    run_process(
-        [
-            os.fspath(cargo),
-            "+stable",
-            "build",
-            "--locked",
-            "--manifest-path",
-            os.fspath(manifest),
-        ],
-        candidate_root,
-        environment=build_environment,
-    )
-    candidate_xtask = resolved_executable(
-        pathlib.Path(os.environ["CARGO_TARGET_DIR"]) / "debug" / "xtask",
-        "candidate xtask",
-    )
-    run_process([os.fspath(candidate_xtask), "ci"], candidate_root)
+    # Build and execute the candidate xtask inside one candidate-only phase.
+    # Its target is never consumed by a protected-policy decision and is
+    # destroyed before terminal validation returns.
+    run_candidate_xtask(cargo, manifest, candidate_root)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -434,6 +682,12 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--protected-validator", required=True)
     run.add_argument("--command-file", required=True)
     run.add_argument("--detached-pid-file", required=True)
+    run.add_argument("--host-control-path", action="append", required=True)
+
+    config = subparsers.add_parser("cargo-config-preflight")
+    config.add_argument("--kind", choices=("spec", "traits", "rs"), required=True)
+    config.add_argument("--policy-root", required=True)
+    config.add_argument("--candidate-root", required=True)
 
     helper = subparsers.add_parser("detached-helper")
     helper.add_argument("marker")
@@ -444,6 +698,12 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "detached-helper":
         return detached_helper(pathlib.Path(args.marker))
+    if args.command == "cargo-config-preflight":
+        policy_root = pathlib.Path(args.policy_root).resolve(strict=True)
+        candidate_root = pathlib.Path(args.candidate_root).resolve(strict=True)
+        require_cargo_configuration_adopted(policy_root, candidate_root, args.kind)
+        print("Candidate Cargo configuration matches protected policy.")
+        return 0
 
     require(
         sys.platform.startswith("linux"),
@@ -459,19 +719,23 @@ def main(argv: list[str] | None = None) -> int:
     )
     command_file = pathlib.Path(args.command_file)
     marker = pathlib.Path(args.detached_pid_file)
+    cargo_seed = pathlib.Path(os.environ[CARGO_SEED_ENV]).resolve(strict=True)
 
     require_minimal_environment()
     require_command_files_inaccessible(command_file)
     require_parent_process_isolated()
+    require_host_paths_absent([pathlib.Path(value) for value in args.host_control_path])
     require_tree_read_only(policy_root, "protected policy tree")
     require_tree_read_only(candidate_root, "candidate source tree")
     require_tree_readable(candidate_root, "candidate source tree")
+    require_cargo_configuration_adopted(policy_root, candidate_root, args.kind)
     require_tree_read_only(rustup_home, "trusted Rust toolchain")
+    require_tree_read_only(cargo_seed, "candidate Cargo seed")
     require_file_read_only(cargo, "trusted Cargo")
     require_file_read_only(python, "trusted Python")
     require_file_read_only(protected_validator, "protected validator")
     require_trusted_path(cargo, python)
-    spawn_detached_canary(pathlib.Path(__file__).resolve(strict=True), marker)
+    enable_child_subreaper()
     run_profile(
         args.profile,
         args.kind,
@@ -481,6 +745,7 @@ def main(argv: list[str] | None = None) -> int:
         python,
         protected_validator,
     )
+    spawn_detached_canary(pathlib.Path(__file__).resolve(strict=True), marker)
     print("Terminal candidate profile completed; parent cleanup remains required.")
     return 0
 

@@ -741,8 +741,7 @@ def is_sensitive_path(path: str, repository_kind: str) -> bool:
             parts[:4] == (*acvp_root, "vendor", "acvp")
             or parts[:3] == (*acvp_root, "pinned-dir")
             or parts[:3] == (*acvp_root, "xtask")
-            or parts == (*acvp_root, "src", "acvp.rs")
-            or parts == (*acvp_root, "src", "alg_ecdsa.rs")
+            or parts[:3] == (*acvp_root, "src")
         ):
             return True
     return False
@@ -2195,6 +2194,52 @@ def finish_check(
         if failed:
             details = ", ".join(f"{job}={result}" for job, result in failed)
             raise PolicyError(f"required candidate jobs did not all succeed: {details}")
+
+        current = authorize_call(
+            event,
+            config,
+            auth_api,
+            environment,
+            repository=external.repository,
+            pull_number=external.pull_number,
+            head_sha=external.head_sha,
+            base_sha=external.base_sha,
+            policy_sha=external.policy_sha,
+            comment_id=comment_id,
+            run_id=external.run_id,
+            run_attempt=external.run_attempt,
+        )
+        require(
+            current.binding_digest == external.binding_digest,
+            "authorization binding changed immediately before success",
+        )
+        branch = require_string(config.get("default_branch"), "default_branch")
+        require_live_authorization_state(
+            auth_api,
+            external.repository,
+            branch,
+            external.pull_number,
+            external.base_sha,
+            external.head_sha,
+            current.head_repository,
+            current.head_ref,
+            phase="pre-success authorization",
+        )
+        require_comment_unchanged(
+            auth_api,
+            external.repository,
+            external.pull_number,
+            CommentBinding(
+                comment_id=current.comment_id,
+                body=current.comment_body,
+                created_at=current.comment_created_at,
+                updated_at=current.comment_updated_at,
+                user_id=current.commenter_id,
+                user_login=current.commenter,
+                user_type=current.commenter_type,
+            ),
+            "pre-success authorization",
+        )
     except PolicyError as caught:
         error = caught
 
@@ -2216,7 +2261,6 @@ def finish_check(
             # branch and pull-request refs. Narrow that unavoidable window by
             # checking the exact state again after success is visible. Strict
             # up-to-date branch protection remains the merge-time backstop.
-            branch = require_string(config.get("default_branch"), "default_branch")
             require_live_authorization_state(
                 auth_api,
                 external.repository,

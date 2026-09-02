@@ -43,7 +43,7 @@ fn relative_components(path: &Path) -> io::Result<Vec<OsString>> {
     Ok(components)
 }
 
-fn read_utf8_bounded(mut file: File, limit: usize, label: &Path) -> io::Result<String> {
+fn read_bounded(mut file: File, limit: usize, label: &Path) -> io::Result<Vec<u8>> {
     let sentinel = limit
         .checked_add(1)
         .ok_or_else(|| invalid_input("safe file limit is invalid"))?;
@@ -57,7 +57,11 @@ fn read_utf8_bounded(mut file: File, limit: usize, label: &Path) -> io::Result<S
             format!("{} exceeds its {limit}-byte limit", label.display()),
         ));
     }
-    String::from_utf8(bytes).map_err(|error| {
+    Ok(bytes)
+}
+
+fn read_utf8_bounded(file: File, limit: usize, label: &Path) -> io::Result<String> {
+    String::from_utf8(read_bounded(file, limit, label)?).map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("{} is not valid UTF-8: {error}", label.display()),
@@ -80,6 +84,12 @@ impl TrustedRoot {
         let components = relative_components(path)?;
         let file = self.platform.open_file(&components)?;
         read_utf8_bounded(file, limit, path)
+    }
+
+    pub(crate) fn read_bytes(&self, path: &Path, limit: usize) -> io::Result<Vec<u8>> {
+        let components = relative_components(path)?;
+        let file = self.platform.open_file(&components)?;
+        read_bounded(file, limit, path)
     }
 
     pub(crate) fn read_manifest(&self, path: &Path) -> io::Result<String> {

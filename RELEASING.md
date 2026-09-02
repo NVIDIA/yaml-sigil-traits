@@ -93,8 +93,11 @@ release intent in pull-request text.
 Proposal mutation, release intent, finalization, and notification enter
 `protected-automation` only when they need the narrowly scoped App credential.
 Official source-crate publication enters `crates-io`, whose configured approval
-gates the OIDC-enabled publication job. Validation and readiness enter neither
-environment and receive no OIDC permission.
+gates the OIDC-enabled publication job. Readiness receives no OIDC permission
+and enters neither environment. Validation may require the repository-admin
+evidence command plus a non-publishing `crates-io` approval solely to test the
+authority chain; its authority job has no OIDC, registry, tag, or Release
+mutation capability.
 
 ### Bound workflow activation
 
@@ -391,11 +394,19 @@ gh workflow run publish.yml --repo NVIDIA/yaml-sigil-traits \
 
 Validation compares the candidate with the detached last official tagged
 source using cargo-semver-checks before it runs ordinary `cargo package` and a
-release-plz dry run. It has no OIDC permission, uploads nothing, and does not
-enter the publication environment. The readiness job also verifies the pinned
-legacy Release inventory and prints a digest binding the captured release SHA,
-run ID, run attempt, and required repository settings. It does not read or
-change administrator-only settings.
+release-plz dry run. The readiness job has no OIDC permission, uploads nothing,
+verifies the pinned legacy Release inventory, and captures the exact release
+source and policy plan. It neither reads administrator-only settings nor enters
+the publication environment.
+
+After readiness, the validation-only authority job and `release-intent` run
+concurrently. The authority job pauses at the existing `crates-io` environment;
+use the exact administrator command and commented approval procedure under
+"Publish an official release" below. This exercises the production settings,
+reviewer, intent, and final authority handshake, but grants no OIDC permission
+and invokes no publishing, tag, or Release command. It retains no artifact. A
+later publication is a different run and requires its own fresh per-release
+evidence and approval.
 
 If validation fails or publication will not begin immediately, disable
 `publish.yml` before investigating. When an authorized publication follows the
@@ -413,39 +424,47 @@ gh workflow run publish.yml --repo NVIDIA/yaml-sigil-traits \
 
 The validation job runs first. The publication job starts only after
 validation succeeds and the `crates-io` environment is approved. Only that job
-receives `id-token: write`; it retains `contents: read` and
-`pull-requests: read`. Release-plz exchanges the job identity for a short-lived
-crates.io credential and publishes only the source package. It cannot create a
-tag or GitHub Release.
+receives `id-token: write`; it retains only the read permissions needed for
+source, pull-request, and final Check verification. Release-plz exchanges the
+job identity for a short-lived crates.io credential and publishes only the
+source package. It cannot create a tag or GitHub Release.
 
 Before approving the pending deployment, a repository administrator must run
-the tracked read-only preflight from the exact current `main` checkout with the
-four values displayed by the selected readiness run:
+the exact read-only command displayed by the concurrent `release-intent` job.
+Run it from a clean checkout whose `HEAD` is the displayed policy commit. The
+command uses the administrator's existing `gh` identity; do not substitute a
+workflow token, PAT, or App credential:
 
 ```shell
-GH_TOKEN="$(gh auth token)" \
+GH_TOKEN="$(gh auth token --hostname github.com)" \
 cargo +stable xtask github release-train settings-preflight \
   --repository NVIDIA/yaml-sigil-traits \
-  --release-sha <release-sha> \
+  --policy-commit <policy-commit> \
   --run-id <run-id> \
-  --run-attempt <run-attempt> \
-  --expected-evidence-sha256 <readiness-digest>
+  --run-attempt <run-attempt>
 ```
 
-The preflight must report `repository_admin_settings=valid`, reproduce the
-workflow evidence digest, and bind its readback to the active exact-SHA run. It
-verifies immutable Releases, the exact main and release-tag rulesets, the
-Release App bypass, and absence of a required-check name collision. It performs
-no mutation. Approve the `crates-io` deployment before the printed
-`approve_before_utc` deadline, at most five minutes after the readback. Any run,
-attempt, head, workflow, setting, or deadline change requires a fresh readback.
+The preflight must report `repository_admin_settings=valid`. It verifies
+immutable Releases, every main-applicable control, the exact release-tag
+rulesets, the Release App bypass, and absence of a required-check name
+collision. It performs no mutation. Copy the complete value printed after
+`approval_comment=` into the pending `crates-io` deployment approval comment,
+then approve before the printed `approve_before_utc` deadline, at most five
+minutes after the readback. Do not edit, wrap, or reuse that value.
 
 Approve only the pending `crates-io` deployment on the selected exact-SHA run.
 Use `gh run view <run-id> --web` to open it, confirm the readiness job passed,
 the run still identifies current `main`, and the fresh administrator readback
-remains inside its deadline, then record the environment approval. An earlier
-authorization or a deployment for another run is not a substitute for this
-per-run gate.
+remains inside its deadline, then record the environment approval with that
+exact comment. The workflow rejects missing, stale, duplicate, malformed, or
+cross-run evidence and rechecks the reviewer's current repository-admin
+permission. An earlier authorization or another run's deployment is not a
+substitute for this per-release gate.
+
+This repository-admin readback and commented deployment approval are ordinary
+per-release operator steps. They require no source or workflow patch, new
+repository or organization setting, GitHub App permission or installation
+change, or additional credential provision.
 
 Both validation and publication independently require exact current `main` to
 be the merge result of one reviewed App proposal or the documented signed

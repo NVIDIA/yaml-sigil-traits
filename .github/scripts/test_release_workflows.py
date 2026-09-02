@@ -52,6 +52,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
     def test_dispatch_cannot_enter_publication_or_oidc(self) -> None:
         readiness = job_block(self.publish, "release-readiness")
         publication = job_block(self.publish, "publication")
+        authority_validation = job_block(self.publish, "authority-validation")
         self.assertIn("github.event_name == 'workflow_dispatch'", readiness)
         self.assertIn("github.event_name == 'workflow_dispatch'", publication)
         self.assertNotIn("repository_dispatch", readiness)
@@ -61,9 +62,21 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertNotIn("secrets.", readiness)
         self.assertRegex(
             publication,
-            r"permissions:\n      contents: read\n      pull-requests: read\n      id-token: write",
+            r"permissions:\n      checks: read\n      contents: read\n"
+            r"      pull-requests: read\n      id-token: write",
         )
         self.assertNotIn("permission-contents: write", publication)
+        self.assertIn("inputs.operation == 'validate'", authority_validation)
+        self.assertIn("environment: crates-io", authority_validation)
+        self.assertIn("release-train await-release-authority", authority_validation)
+        executable = "\n".join(
+            line for line in authority_validation.splitlines()
+            if not line.lstrip().startswith("#")
+        )
+        self.assertNotIn("id-token:", executable)
+        self.assertNotIn("release-plz", executable)
+        self.assertNotIn("cargo publish", executable)
+        self.assertNotIn("cargo yank", executable)
 
     def test_dispatch_preflight_uses_exact_current_rust_and_is_secretless(self) -> None:
         preflight = job_block(self.reusable, "release-notification-preflight")
@@ -121,7 +134,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertLess(intent.index("Recompute release plan"), intent.index("Create checks-only repository token"))
         finalizer = job_block(self.publish, "release-finalizer")
         self.assertLess(
-            finalizer.index("Recompute plan and verify protected intent"),
+            finalizer.index("Recompute plan and verify both App authorities"),
             finalizer.index("Create finalizer repository token"),
         )
         notification = job_block(self.publish, "release-notification")
@@ -168,6 +181,9 @@ class ReleaseWorkflowTests(unittest.TestCase):
         proposal = job_block(self.reusable, "proposal")
         self.assertIn("toolchain: stable", proposal)
         self.assertNotIn("toolchain: 1.95.0", proposal)
+        authority_validation = job_block(self.publish, "authority-validation")
+        self.assertIn("toolchain: stable", authority_validation)
+        self.assertNotIn("toolchain: 1.95.0", authority_validation)
 
     def test_trusted_release_cargo_is_explicitly_stable(self) -> None:
         for workflow_name in ("publish.yml", "release-proposal.yml"):
@@ -209,20 +225,32 @@ class ReleaseWorkflowTests(unittest.TestCase):
                         recovered,
                     )
 
-    def test_admin_setting_digest_matches_read_only_preflight_policy(self) -> None:
-        readiness = job_block(self.publish, "release-readiness")
-        evidence = readiness.split(
-            "- name: Bind repository-admin setting evidence to this run", 1
-        )[1]
-        self.assertIn('test "$(sha256sum "${YAML_SIGIL_RELEASE_XTASK}"', evidence)
-        self.assertIn('= "${YAML_SIGIL_RELEASE_XTASK_SHA256}"', evidence)
-        self.assertIn("github release-train settings-evidence", evidence)
-        self.assertIn('--repository "${GITHUB_REPOSITORY}"', evidence)
-        self.assertIn('--release-sha "${CAPTURED_SHA}"', evidence)
-        self.assertIn('--run-id "${GITHUB_RUN_ID}"', evidence)
-        self.assertIn('--run-attempt "${GITHUB_RUN_ATTEMPT}"', evidence)
-        self.assertNotIn("PLAN_DIGEST", evidence)
-        self.assertNotIn("LEGACY_INVENTORY_SHA256", evidence)
+    def test_admin_settings_read_is_operator_attested(self) -> None:
+        intent = job_block(self.publish, "release-intent")
+        request = intent.split(
+            "- name: Display repository-admin settings evidence request", 1
+        )[1].split("- name: Authenticate the exact crates.io approval", 1)[0]
+        review = intent.split(
+            "- name: Authenticate the exact crates.io approval", 1
+        )[1].split("- name: Check out captured trusted source", 1)[0]
+
+        self.assertIn("deployments: read", intent)
+        self.assertIn("github release-train settings-request", request)
+        self.assertIn('--repository "${GITHUB_REPOSITORY}"', request)
+        self.assertIn('--policy-commit "${POLICY_COMMIT}"', request)
+        self.assertIn('--run-id "${GITHUB_RUN_ID}"', request)
+        self.assertIn('--run-attempt "${GITHUB_RUN_ATTEMPT}"', request)
+        self.assertNotIn("settings-preflight", request)
+        self.assertNotIn("GH_TOKEN", request)
+        self.assertNotIn("github.token", request)
+
+        self.assertIn("github release-train await-settings-review", review)
+        self.assertIn("GH_TOKEN: ${{ github.token }}", review)
+        self.assertIn('--repository "${GITHUB_REPOSITORY}"', review)
+        self.assertIn('--policy-commit "${POLICY_COMMIT}"', review)
+        self.assertIn('--run-id "${GITHUB_RUN_ID}"', review)
+        self.assertIn('--run-attempt "${GITHUB_RUN_ATTEMPT}"', review)
+        self.assertNotIn("github release-train settings-preflight", self.publish)
 
     def test_release_domain_preflights_use_typed_rust(self) -> None:
         combined = self.publish + self.reusable
@@ -245,6 +273,9 @@ class ReleaseWorkflowTests(unittest.TestCase):
             "cargo +stable xtask github release-train settings-preflight",
             releasing,
         )
+        self.assertIn("--policy-commit <policy-commit>", releasing)
+        self.assertIn("approval_comment=", releasing)
+        self.assertNotIn("--expected-evidence-sha256", releasing)
 
     def test_remote_actions_are_full_sha_pinned_with_version_comments(self) -> None:
         for workflow_name in ("publish.yml", "release-pr.yml", "release-proposal.yml"):

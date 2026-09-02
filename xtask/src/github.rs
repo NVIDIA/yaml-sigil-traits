@@ -40,6 +40,9 @@ pub struct GithubArgs {
 }
 
 #[derive(Subcommand)]
+// This one-shot CLI keeps its typed security-sensitive subcommands intact;
+// heap indirection would not improve its bounded lifetime or authority model.
+#[allow(clippy::large_enum_variant)]
 enum GithubCommand {
     /// Configure a token-derived repository-local Git identity.
     GitIdentity(GitIdentityArgs),
@@ -194,12 +197,12 @@ enum ReleaseTrainCommand {
         #[arg(long)]
         policy_commit: String,
     },
-    /// Emit canonical repository-setting evidence for one workflow run.
-    SettingsEvidence {
+    /// Display the exact repository-admin settings-evidence request.
+    SettingsRequest {
         #[arg(long)]
         repository: String,
         #[arg(long)]
-        release_sha: String,
+        policy_commit: String,
         #[arg(long)]
         run_id: String,
         #[arg(long)]
@@ -210,13 +213,22 @@ enum ReleaseTrainCommand {
         #[arg(long)]
         repository: String,
         #[arg(long)]
-        release_sha: String,
+        policy_commit: String,
         #[arg(long)]
         run_id: String,
         #[arg(long)]
         run_attempt: String,
+    },
+    /// Await and authenticate this run's repository-admin settings review.
+    AwaitSettingsReview {
         #[arg(long)]
-        expected_evidence_sha256: String,
+        repository: String,
+        #[arg(long)]
+        policy_commit: String,
+        #[arg(long)]
+        run_id: String,
+        #[arg(long)]
+        run_attempt: String,
     },
     /// Authenticate and validate one complete release-train notification.
     Receive {
@@ -232,6 +244,12 @@ enum ReleaseTrainCommand {
         /// Repository-relative, bounded validation manifest.
         #[arg(long)]
         manifest: PathBuf,
+        /// Caller-selected reviewed release-plz executable outside the checkout.
+        #[arg(long, value_name = "PATH")]
+        release_plz: PathBuf,
+        /// SHA-256 of the reviewed release-plz executable bytes.
+        #[arg(long, value_name = "SHA256")]
+        release_plz_sha256: String,
     },
     /// Prepare the canonical release-train intent before token minting.
     PrepareIntent {
@@ -244,7 +262,91 @@ enum ReleaseTrainCommand {
         #[arg(long)]
         origin_run_attempt: String,
         #[arg(long)]
-        ruleset_evidence_sha256: String,
+        settings_evidence: String,
+        #[arg(long)]
+        settings_review_id: String,
+        #[arg(long)]
+        settings_reviewer_id: String,
+        #[arg(long)]
+        settings_reviewer_login: String,
+    },
+    /// Prepare one run-scoped authorization from reviewed live settings.
+    PrepareSettingsAuthorization {
+        #[arg(long)]
+        repository: String,
+        #[arg(long)]
+        plan: String,
+        #[arg(long)]
+        plan_digest: String,
+        #[arg(long)]
+        policy_commit: String,
+        #[arg(long)]
+        run_id: String,
+        #[arg(long)]
+        run_attempt: String,
+        #[arg(long)]
+        settings_evidence: String,
+        #[arg(long)]
+        settings_review_id: String,
+        #[arg(long)]
+        settings_reviewer_id: String,
+        #[arg(long)]
+        settings_reviewer_login: String,
+    },
+    /// Create or verify the App-authored settings authorization Check.
+    CreateSettingsAuthorization {
+        #[arg(long)]
+        repository: String,
+        #[arg(long)]
+        plan: String,
+        #[arg(long)]
+        plan_digest: String,
+        #[arg(long)]
+        policy_commit: String,
+        #[arg(long)]
+        run_id: String,
+        #[arg(long)]
+        run_attempt: String,
+        #[arg(long)]
+        authorization: String,
+        #[arg(long)]
+        expected_app_slug: String,
+        #[arg(long)]
+        expected_installation_id: String,
+    },
+    /// Re-read and verify one fresh App-owned settings authorization.
+    VerifySettingsAuthorization {
+        #[arg(long)]
+        repository: String,
+        #[arg(long)]
+        plan: String,
+        #[arg(long)]
+        plan_digest: String,
+        #[arg(long)]
+        policy_commit: String,
+        #[arg(long)]
+        run_id: String,
+        #[arg(long)]
+        run_attempt: String,
+        #[arg(long)]
+        authorization: String,
+        #[arg(long)]
+        check_id: String,
+    },
+    /// Wait for the original intent and this run's fresh settings authority.
+    AwaitReleaseAuthority {
+        #[arg(long)]
+        repository: String,
+        #[arg(long)]
+        plan: String,
+        #[arg(long)]
+        plan_digest: String,
+        #[arg(long)]
+        policy_commit: String,
+        #[arg(long)]
+        run_id: String,
+        #[arg(long)]
+        run_attempt: String,
     },
     /// Create or verify the App-authored release-train intent Check.
     CreateIntent {
@@ -283,9 +385,19 @@ enum ReleaseTrainCommand {
         #[arg(long)]
         plan_digest: String,
         #[arg(long)]
+        policy_commit: String,
+        #[arg(long)]
+        run_id: String,
+        #[arg(long)]
+        run_attempt: String,
+        #[arg(long)]
         intent: String,
         #[arg(long)]
         intent_check_id: String,
+        #[arg(long)]
+        settings_authorization: String,
+        #[arg(long)]
+        settings_authorization_check_id: String,
         #[arg(long)]
         expected_app_slug: String,
         #[arg(long)]
@@ -300,9 +412,19 @@ enum ReleaseTrainCommand {
         #[arg(long)]
         plan_digest: String,
         #[arg(long)]
+        policy_commit: String,
+        #[arg(long)]
+        run_id: String,
+        #[arg(long)]
+        run_attempt: String,
+        #[arg(long)]
         intent: String,
         #[arg(long)]
         intent_check_id: String,
+        #[arg(long)]
+        settings_authorization: String,
+        #[arg(long)]
+        settings_authorization_check_id: String,
         #[arg(long)]
         finalized_entries: String,
         #[arg(long)]
@@ -328,29 +450,80 @@ impl ReconcileMode {
 }
 
 pub fn run(root: &Path, args: GithubArgs) -> Result<(), String> {
-    if let GithubCommand::ReleaseTrain(ReleaseTrainArgs {
-        command: ReleaseTrainCommand::LocalValidate { manifest },
-    }) = &args.command
-    {
-        return local_validation::run(root, manifest);
-    }
-    if let GithubCommand::ReleaseTrain(ReleaseTrainArgs {
-        command:
-            ReleaseTrainCommand::SettingsEvidence {
+    if let GithubCommand::ReleaseTrain(args) = &args.command {
+        match &args.command {
+            ReleaseTrainCommand::LocalValidate {
+                manifest,
+                release_plz,
+                release_plz_sha256,
+            } => return local_validation::run(root, manifest, release_plz, release_plz_sha256),
+            ReleaseTrainCommand::PrepareIntent {
+                plan,
+                plan_digest,
+                origin_run_id,
+                origin_run_attempt,
+                settings_evidence,
+                settings_review_id,
+                settings_reviewer_id,
+                settings_reviewer_login,
+            } => {
+                return release_train::prepare_intent_command(
+                    root,
+                    release_train::PrepareIntentInput {
+                        plan,
+                        plan_digest,
+                        origin_run_id,
+                        origin_run_attempt,
+                        settings_evidence,
+                        settings_review_id,
+                        settings_reviewer_id,
+                        settings_reviewer_login,
+                    },
+                );
+            }
+            ReleaseTrainCommand::PrepareSettingsAuthorization {
                 repository,
-                release_sha,
+                plan,
+                plan_digest,
+                policy_commit,
                 run_id,
                 run_attempt,
-            },
-    }) = &args.command
-    {
-        return release_train::settings_evidence_command(
-            root,
-            repository,
-            release_sha,
-            run_id,
-            run_attempt,
-        );
+                settings_evidence,
+                settings_review_id,
+                settings_reviewer_id,
+                settings_reviewer_login,
+            } => {
+                return release_train::prepare_settings_authorization_command(
+                    release_train::PrepareSettingsAuthorizationInput {
+                        repository,
+                        plan,
+                        plan_digest,
+                        policy_commit,
+                        run_id,
+                        run_attempt,
+                        settings_evidence,
+                        settings_review_id,
+                        settings_reviewer_id,
+                        settings_reviewer_login,
+                    },
+                );
+            }
+            ReleaseTrainCommand::SettingsRequest {
+                repository,
+                policy_commit,
+                run_id,
+                run_attempt,
+            } => {
+                return release_settings::request_command(
+                    root,
+                    repository,
+                    policy_commit,
+                    run_id,
+                    run_attempt,
+                );
+            }
+            _ => {}
+        }
     }
     require_token()?;
     let mut github = GhCli::new()?;
@@ -443,31 +616,33 @@ pub fn run(root: &Path, args: GithubArgs) -> Result<(), String> {
             } => {
                 release_train::verify_legacy_command(root, &repository, &policy_commit, &mut github)
             }
-            ReleaseTrainCommand::SettingsEvidence {
-                repository,
-                release_sha,
-                run_id,
-                run_attempt,
-            } => release_train::settings_evidence_command(
-                root,
-                &repository,
-                &release_sha,
-                &run_id,
-                &run_attempt,
-            ),
             ReleaseTrainCommand::SettingsPreflight {
                 repository,
-                release_sha,
+                policy_commit,
                 run_id,
                 run_attempt,
-                expected_evidence_sha256,
             } => release_settings::preflight_command(
                 root,
                 &repository,
-                &release_sha,
+                &policy_commit,
                 &run_id,
                 &run_attempt,
-                &expected_evidence_sha256,
+                &mut github,
+            ),
+            ReleaseTrainCommand::SettingsRequest { .. } => {
+                unreachable!("settings request is handled before credential selection")
+            }
+            ReleaseTrainCommand::AwaitSettingsReview {
+                repository,
+                policy_commit,
+                run_id,
+                run_attempt,
+            } => release_settings::await_review_command(
+                root,
+                &repository,
+                &policy_commit,
+                &run_id,
+                &run_attempt,
                 &mut github,
             ),
             ReleaseTrainCommand::Receive {
@@ -483,15 +658,20 @@ pub fn run(root: &Path, args: GithubArgs) -> Result<(), String> {
                 },
                 &mut github,
             ),
-            ReleaseTrainCommand::LocalValidate { manifest } => {
-                local_validation::run(root, &manifest)
-            }
+            ReleaseTrainCommand::LocalValidate {
+                manifest,
+                release_plz,
+                release_plz_sha256,
+            } => local_validation::run(root, &manifest, &release_plz, &release_plz_sha256),
             ReleaseTrainCommand::PrepareIntent {
                 plan,
                 plan_digest,
                 origin_run_id,
                 origin_run_attempt,
-                ruleset_evidence_sha256,
+                settings_evidence,
+                settings_review_id,
+                settings_reviewer_id,
+                settings_reviewer_login,
             } => release_train::prepare_intent_command(
                 root,
                 release_train::PrepareIntentInput {
@@ -499,8 +679,101 @@ pub fn run(root: &Path, args: GithubArgs) -> Result<(), String> {
                     plan_digest: &plan_digest,
                     origin_run_id: &origin_run_id,
                     origin_run_attempt: &origin_run_attempt,
-                    ruleset_evidence_sha256: &ruleset_evidence_sha256,
+                    settings_evidence: &settings_evidence,
+                    settings_review_id: &settings_review_id,
+                    settings_reviewer_id: &settings_reviewer_id,
+                    settings_reviewer_login: &settings_reviewer_login,
                 },
+            ),
+            ReleaseTrainCommand::PrepareSettingsAuthorization {
+                repository,
+                plan,
+                plan_digest,
+                policy_commit,
+                run_id,
+                run_attempt,
+                settings_evidence,
+                settings_review_id,
+                settings_reviewer_id,
+                settings_reviewer_login,
+            } => release_train::prepare_settings_authorization_command(
+                release_train::PrepareSettingsAuthorizationInput {
+                    repository: &repository,
+                    plan: &plan,
+                    plan_digest: &plan_digest,
+                    policy_commit: &policy_commit,
+                    run_id: &run_id,
+                    run_attempt: &run_attempt,
+                    settings_evidence: &settings_evidence,
+                    settings_review_id: &settings_review_id,
+                    settings_reviewer_id: &settings_reviewer_id,
+                    settings_reviewer_login: &settings_reviewer_login,
+                },
+            ),
+            ReleaseTrainCommand::CreateSettingsAuthorization {
+                repository,
+                plan,
+                plan_digest,
+                policy_commit,
+                run_id,
+                run_attempt,
+                authorization,
+                expected_app_slug,
+                expected_installation_id,
+            } => release_train::create_settings_authorization_command(
+                release_train::CreateSettingsAuthorizationInput {
+                    repository: &repository,
+                    plan: &plan,
+                    plan_digest: &plan_digest,
+                    policy_commit: &policy_commit,
+                    run_id: &run_id,
+                    run_attempt: &run_attempt,
+                    authorization: &authorization,
+                    expected_app_slug: &expected_app_slug,
+                    expected_installation_id: &expected_installation_id,
+                },
+                &mut github,
+            ),
+            ReleaseTrainCommand::VerifySettingsAuthorization {
+                repository,
+                plan,
+                plan_digest,
+                policy_commit,
+                run_id,
+                run_attempt,
+                authorization,
+                check_id,
+            } => release_train::verify_settings_authorization_command(
+                release_train::VerifySettingsAuthorizationInput {
+                    repository: &repository,
+                    plan: &plan,
+                    plan_digest: &plan_digest,
+                    policy_commit: &policy_commit,
+                    run_id: &run_id,
+                    run_attempt: &run_attempt,
+                    authorization: &authorization,
+                    check_id: &check_id,
+                },
+                &mut github,
+            ),
+            ReleaseTrainCommand::AwaitReleaseAuthority {
+                repository,
+                plan,
+                plan_digest,
+                policy_commit,
+                run_id,
+                run_attempt,
+            } => release_train::await_release_authority_command(
+                root,
+                release_train::AwaitReleaseAuthorityInput {
+                    repository: &repository,
+                    plan: &plan,
+                    plan_digest: &plan_digest,
+                    policy_commit: &policy_commit,
+                    run_id: &run_id,
+                    run_attempt: &run_attempt,
+                },
+                &mut github,
             ),
             ReleaseTrainCommand::CreateIntent {
                 repository,
@@ -538,8 +811,13 @@ pub fn run(root: &Path, args: GithubArgs) -> Result<(), String> {
                 repository,
                 plan,
                 plan_digest,
+                policy_commit,
+                run_id,
+                run_attempt,
                 intent,
                 intent_check_id,
+                settings_authorization,
+                settings_authorization_check_id,
                 expected_app_slug,
                 expected_installation_id,
             } => release_train::finalize_command(
@@ -547,8 +825,13 @@ pub fn run(root: &Path, args: GithubArgs) -> Result<(), String> {
                     repository: &repository,
                     plan: &plan,
                     plan_digest: &plan_digest,
+                    policy_commit: &policy_commit,
+                    run_id: &run_id,
+                    run_attempt: &run_attempt,
                     intent: &intent,
                     intent_check_id: &intent_check_id,
+                    settings_authorization: &settings_authorization,
+                    settings_authorization_check_id: &settings_authorization_check_id,
                     expected_app_slug: &expected_app_slug,
                     expected_installation_id: &expected_installation_id,
                 },
@@ -558,8 +841,13 @@ pub fn run(root: &Path, args: GithubArgs) -> Result<(), String> {
                 repository,
                 plan,
                 plan_digest,
+                policy_commit,
+                run_id,
+                run_attempt,
                 intent,
                 intent_check_id,
+                settings_authorization,
+                settings_authorization_check_id,
                 finalized_entries,
                 expected_app_slug,
                 expected_installation_id,
@@ -568,8 +856,13 @@ pub fn run(root: &Path, args: GithubArgs) -> Result<(), String> {
                     repository: &repository,
                     plan: &plan,
                     plan_digest: &plan_digest,
+                    policy_commit: &policy_commit,
+                    run_id: &run_id,
+                    run_attempt: &run_attempt,
                     intent: &intent,
                     intent_check_id: &intent_check_id,
+                    settings_authorization: &settings_authorization,
+                    settings_authorization_check_id: &settings_authorization_check_id,
                     finalized_entries: &finalized_entries,
                     expected_app_slug: &expected_app_slug,
                     expected_installation_id: &expected_installation_id,
@@ -843,62 +1136,6 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), original);
     }
 
-    #[test]
-    fn settings_evidence_does_not_require_github_credentials() {
-        let temporary = tempfile::tempdir().unwrap();
-        let output_path = temporary.path().join("github-output");
-        let output = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--ignored",
-                "--exact",
-                "github::tests::settings_evidence_without_github_credentials_child",
-                "--nocapture",
-                "--quiet",
-            ])
-            .env_remove("GH_TOKEN")
-            .env_remove("GITHUB_TOKEN")
-            .env("GITHUB_OUTPUT", &output_path)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "credential-free settings evidence failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-
-        let root = test_root();
-        let repository = test_repository(&root);
-        let digest =
-            release_train::settings_evidence_sha256(repository, &"a".repeat(40), 42, 3).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(output_path).unwrap(),
-            format!("ruleset_evidence_sha256={digest}\n")
-        );
-    }
-
-    #[test]
-    #[ignore = "spawned explicitly by the credential-free settings-evidence regression"]
-    fn settings_evidence_without_github_credentials_child() {
-        assert!(env::var_os("GH_TOKEN").is_none());
-        assert!(env::var_os("GITHUB_TOKEN").is_none());
-        let root = test_root();
-        let repository = test_repository(&root).to_string();
-        run(
-            &root,
-            GithubArgs {
-                command: GithubCommand::ReleaseTrain(ReleaseTrainArgs {
-                    command: ReleaseTrainCommand::SettingsEvidence {
-                        repository,
-                        release_sha: "a".repeat(40),
-                        run_id: "42".to_string(),
-                        run_attempt: "3".to_string(),
-                    },
-                }),
-            },
-        )
-        .unwrap();
-    }
-
     fn test_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -909,5 +1146,50 @@ mod tests {
     fn test_repository(root: &Path) -> &'static str {
         let family = crate::release_policy::detect(root).unwrap().family;
         consts::repository_for_family(family).unwrap().full_name
+    }
+
+    #[test]
+    fn settings_request_does_not_require_github_credentials() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "github::tests::settings_request_without_github_credentials_child",
+                "--nocapture",
+                "--quiet",
+            ])
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "credential-free settings request failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "spawned explicitly by the credential-free settings-request regression"]
+    fn settings_request_without_github_credentials_child() {
+        assert!(std::env::var_os("GH_TOKEN").is_none());
+        assert!(std::env::var_os("GITHUB_TOKEN").is_none());
+        let root = test_root();
+        let repository = test_repository(&root).to_string();
+        let policy_commit = git_line(&root, &["rev-parse", "HEAD"]).unwrap();
+        run(
+            &root,
+            GithubArgs {
+                command: GithubCommand::ReleaseTrain(ReleaseTrainArgs {
+                    command: ReleaseTrainCommand::SettingsRequest {
+                        repository,
+                        policy_commit,
+                        run_id: "123456".to_string(),
+                        run_attempt: "2".to_string(),
+                    },
+                }),
+            },
+        )
+        .unwrap();
     }
 }

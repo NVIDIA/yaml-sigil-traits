@@ -583,6 +583,20 @@ class AuthorizationTests(unittest.TestCase):
                 "conformance/rebuild-rs/xtask/src/main.rs", "spec"
             )
         )
+        for path in (
+            "conformance/rebuild-rs/src/p256.rs",
+            "conformance/rebuild-rs/src/util.rs",
+            "conformance/rebuild-rs/src/wire.rs",
+            "conformance/rebuild-rs/src/main.rs",
+            "conformance/rebuild-rs/src/future/nested.rs",
+        ):
+            with self.subTest(spec_rebuilder_source=path):
+                self.assertTrue(controller.is_sensitive_path(path, "spec"))
+        self.assertFalse(
+            controller.is_sensitive_path(
+                "conformance/rebuild-rs/docs/design.md", "spec"
+            )
+        )
         self.assertTrue(
             controller.is_sensitive_path("crates/core/buf.yaml", "rs")
         )
@@ -1640,6 +1654,7 @@ class ProtectedCheckoutTests(unittest.TestCase):
         assert discovered_git is not None
         self.git = os.path.realpath(discovered_git)
         self.run_git("init", "--quiet", "--initial-branch=main")
+        self.run_git("config", "core.autocrlf", "false")
         self.run_git("config", "user.name", "Verifier Test")
         self.run_git("config", "user.email", "verifier@example.invalid")
         workflow = self.repository / ".github" / "workflows" / "ci.yml"
@@ -1682,6 +1697,57 @@ class ProtectedCheckoutTests(unittest.TestCase):
             check=True,
         )
 
+    def refresh_head_tree(self) -> None:
+        completed = subprocess.run(
+            [self.git, "ls-tree", "-rz", "--full-tree", "HEAD"],
+            cwd=self.repository,
+            capture_output=True,
+            check=True,
+        )
+        paths: set[str] = set()
+        leaves: dict[str, tuple[str, str, str]] = {}
+        for record in completed.stdout.split(b"\0"):
+            if not record:
+                continue
+            metadata, encoded_path = record.split(b"\t", 1)
+            mode, entry_type, blob = metadata.decode("ascii").split(" ")
+            path = encoded_path.decode("utf-8")
+            leaves[path] = (entry_type, mode, blob)
+            components = path.split("/")
+            for length in range(1, len(components) + 1):
+                paths.add("/".join(components[:length]))
+        self.head_sha = self.run_git("rev-parse", "HEAD").stdout.strip()
+        self.head_tree = controller.GitTree(paths=frozenset(paths), leaves=leaves)
+
+    def commit_entries(
+        self,
+        *,
+        files: dict[str, str] | None = None,
+        links: dict[str, str] | None = None,
+    ) -> None:
+        for path, value in (files or {}).items():
+            destination = self.repository / path
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(value, encoding="utf-8")
+            self.run_git("add", "--", path)
+        for path, target in (links or {}).items():
+            destination = self.repository / path
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if os.name == "nt":
+                destination.write_text(target, encoding="utf-8")
+            else:
+                destination.symlink_to(target)
+            blob = subprocess.run(
+                [self.git, "hash-object", "-w", "--stdin"],
+                cwd=self.repository,
+                input=target.encode("utf-8"),
+                capture_output=True,
+                check=True,
+            ).stdout.decode("ascii").strip()
+            self.run_git("update-index", "--add", "--cacheinfo", "120000", blob, path)
+        self.run_git("commit", "--quiet", "-m", "test: add authenticated entries")
+        self.refresh_head_tree()
+
     def verify(self) -> None:
         with mock.patch.object(
             verifier.policy,
@@ -1700,6 +1766,68 @@ class ProtectedCheckoutTests(unittest.TestCase):
 
     def test_exact_sensitive_blob_and_head_are_accepted(self) -> None:
         self.verify()
+
+    def test_authenticated_internal_links_are_accepted(self) -> None:
+        self.commit_entries(
+            files={
+                "AGENTS.md": "repository guidance\n",
+                "CONTRIBUTING.md": "contributor guidance\n",
+            },
+            links={
+                "MAINTAINERS.md": "AGENTS.md",
+                "crates/example/CONTRIBUTING.md": "../../CONTRIBUTING.md",
+            },
+        )
+        self.verify()
+
+    def test_external_escaping_broken_directory_and_cyclic_links_fail_closed(self) -> None:
+        cases = (
+            ("external.md", "/dev/null", {}, "portable relative"),
+            ("escape.md", "../../outside.md", {}, "escapes the candidate root"),
+            ("broken.md", "missing.md", {}, "broken or directory target"),
+            (
+                "directory.md",
+                "docs",
+                {"docs/readme.md": "documentation\n"},
+                "broken or directory target",
+            ),
+        )
+        for link, target, files, message in cases:
+            with self.subTest(link=link):
+                temporary = tempfile.TemporaryDirectory()
+                self.addCleanup(temporary.cleanup)
+                previous_repository = self.repository
+                previous_head = self.head_sha
+                previous_tree = self.head_tree
+                try:
+                    clone = pathlib.Path(temporary.name) / "repository"
+                    subprocess.run(
+                        [
+                            self.git,
+                            "-c",
+                            "core.autocrlf=false",
+                            "clone",
+                            "--quiet",
+                            os.fspath(previous_repository),
+                            os.fspath(clone),
+                        ],
+                        check=True,
+                    )
+                    self.repository = clone
+                    self.run_git("config", "core.autocrlf", "false")
+                    self.run_git("config", "user.name", "Verifier Test")
+                    self.run_git("config", "user.email", "verifier@example.invalid")
+                    self.commit_entries(files=files, links={link: target})
+                    with self.assertRaisesRegex(controller.PolicyError, message):
+                        self.verify()
+                finally:
+                    self.repository = previous_repository
+                    self.head_sha = previous_head
+                    self.head_tree = previous_tree
+
+        self.commit_entries(links={"a.md": "b.md", "b.md": "a.md"})
+        with self.assertRaisesRegex(controller.PolicyError, "contains a cycle"):
+            self.verify()
 
     def test_exact_sensitive_gitlink_is_verified_from_the_index(self) -> None:
         source_sha = "6" * 40
@@ -1764,7 +1892,7 @@ class ProtectedCheckoutTests(unittest.TestCase):
         self.assertTrue(os.path.isabs(outputs["python"]))
         self.assertTrue(os.path.isabs(outputs["git"]))
 
-    def test_modified_or_untracked_sensitive_file_fails_closed(self) -> None:
+    def test_modified_or_untracked_candidate_file_fails_closed(self) -> None:
         workflow = self.repository / ".github" / "workflows" / "ci.yml"
         workflow.write_text("name: tampered\n", encoding="utf-8")
         with self.assertRaisesRegex(controller.PolicyError, "authorized Git blob"):
@@ -1772,7 +1900,7 @@ class ProtectedCheckoutTests(unittest.TestCase):
 
         self.run_git("checkout", "--quiet", "--", ".github/workflows/ci.yml")
         (self.repository / "Cargo.toml").write_text("[package]\n", encoding="utf-8")
-        with self.assertRaisesRegex(controller.PolicyError, "untracked sensitive"):
+        with self.assertRaisesRegex(controller.PolicyError, "missing or untracked paths"):
             self.verify()
 
     def test_sensitive_symlink_and_reparse_point_fail_closed(self) -> None:
@@ -1824,7 +1952,8 @@ class ProtectedCheckoutTests(unittest.TestCase):
         self.addCleanup(os.rmdir, workflows)
 
         with self.assertRaisesRegex(
-            controller.PolicyError, "missing or untracked sensitive paths"
+            controller.PolicyError,
+            "missing or untracked paths or unsupported working-tree entries",
         ):
             self.verify()
 
@@ -1976,7 +2105,7 @@ class WorkflowStructureTests(unittest.TestCase):
         shell = TERMINAL_SHELL_PATH.read_text(encoding="utf-8")
         driver = TERMINAL_DRIVER_PATH.read_text(encoding="utf-8")
         self.assertIn("terminal candidate execution requires Linux", shell)
-        self.assertIn("sudo -n -u", shell)
+        self.assertIn('--user "${candidate_uid}:${candidate_gid}"', shell)
         self.assertIn('chmod 0700 "${command_directory}"', shell)
         self.assertIn('pkill -KILL -u "${candidate_uid}"', shell)
         self.assertIn("for _ in {1..300}", shell)
@@ -1987,13 +2116,13 @@ class WorkflowStructureTests(unittest.TestCase):
         )
         self.assertLess(
             cleanup_tail.index("for _ in {1..300}"),
-            cleanup_tail.index("cleanup_candidate_user"),
+            cleanup_tail.index("cleanup_all"),
         )
         self.assertIn('ps -U "${candidate_uid}"', cleanup_tail)
         for name in ("GITHUB_ENV", "GITHUB_PATH", "GITHUB_OUTPUT", "GITHUB_STEP_SUMMARY"):
             self.assertIn(name, shell)
         self.assertIn("runner command files do not share one protected directory", shell)
-        self.assertIn("disposable candidate identity could not be removed", shell)
+        self.assertIn("candidate container or disposable identity could not be removed", shell)
         self.assertNotIn("run-terminal-candidate-windows.ps1", shell)
         self.assertNotIn("cygpath", shell)
         self.assertNotIn("launchctl", shell)
@@ -2001,12 +2130,14 @@ class WorkflowStructureTests(unittest.TestCase):
         self.assertIn("terminal candidate execution requires Linux", driver)
         self.assertIn("require_command_files_inaccessible", driver)
         self.assertIn("require_parent_process_isolated", driver)
+        self.assertIn("require_host_paths_absent", driver)
         self.assertIn("require_tree_read_only", driver)
         self.assertIn("require_tree_readable", driver)
         self.assertIn("spawn_detached_canary", driver)
 
     def test_terminal_setup_uses_elevated_and_native_paths(self) -> None:
         shell = TERMINAL_SHELL_PATH.read_text(encoding="utf-8")
+        driver = TERMINAL_DRIVER_PATH.read_text(encoding="utf-8")
         self.assertIn('--git "${trusted_git}"', shell)
         self.assertIn('sudo -n chown -R "${candidate_uid}"', shell)
         self.assertNotIn('\nchown -R "${candidate_uid}"', shell)
@@ -2022,11 +2153,13 @@ class WorkflowStructureTests(unittest.TestCase):
         self.assertNotIn("trusted_bash=", shell)
         self.assertNotIn("check-acvp-corpus.sh", shell)
         linux_guard = shell.index("terminal candidate execution requires Linux")
-        protected_build = shell.index("cargo +stable build --locked")
+        protected_build = shell.index('cargo +"${trusted_toolchain}" build --locked')
         protected_preflight = shell.index(
             '"${protected_validator}" candidate-preflight'
         )
-        candidate_boundary = shell.index('candidate_path="${safe_path}"')
+        candidate_boundary = shell.index(
+            '"${trusted_docker}" run --name "${candidate_container}" --network none'
+        )
         self.assertLess(linux_guard, protected_build)
         self.assertLess(protected_build, protected_preflight)
         self.assertLess(protected_preflight, candidate_boundary)
@@ -2034,29 +2167,58 @@ class WorkflowStructureTests(unittest.TestCase):
         self.assertIn(
             'trusted_python="$(realpath "${trusted_python_command}")"', shell
         )
+        self.assertIn("trusted_toolchain='1.98.0'", shell)
+        self.assertIn("cargo_audit_version='0.22.2'", shell)
+        self.assertIn(
+            'cargo-audit --version "${cargo_audit_version}"',
+            shell,
+        )
+        self.assertIn('YAML_SIGIL_CARGO_AUDIT=/trusted-tools/bin/cargo-audit', shell)
+        self.assertIn('rustc --version)', shell)
+        self.assertIn('cargo --version)', shell)
+        self.assertIn('--manifest-path /candidate/Cargo.toml', shell)
+        self.assertIn('--manifest-path /candidate/xtask/Cargo.toml', shell)
+        self.assertNotIn('/candidate/conformance/rebuild-rs/Cargo.toml', shell)
+        advisory_fetch = shell.index('https://github.com/RustSec/advisory-db.git')
+        self.assertLess(advisory_fetch, candidate_boundary)
+        self.assertIn('/cargo-seed/advisory-db', shell)
+        self.assertNotIn("toolchain install stable", shell)
+        self.assertNotIn("cargo +stable", shell)
+        self.assertIn('f"+{TRUSTED_TOOLCHAIN}"', driver)
 
     def test_terminal_caches_are_candidate_owned(self) -> None:
         shell = TERMINAL_SHELL_PATH.read_text(encoding="utf-8")
-        self.assertIn('candidate_cache="${candidate_home}/.cache"', shell)
-        self.assertIn('XDG_CACHE_HOME="${candidate_cache}"', shell)
-        self.assertIn('BUF_CACHE_DIR="${candidate_buf_cache}"', shell)
+        self.assertIn('candidate_cache="${candidate_state}/cache"', shell)
+        self.assertIn("XDG_CACHE_HOME=/state/cache", shell)
+        self.assertIn("BUF_CACHE_DIR=/state/buf-cache", shell)
 
-    @mock.patch.object(terminal_candidate, "resolved_executable")
+    def test_terminal_container_excludes_runner_control_plane(self) -> None:
+        shell = TERMINAL_SHELL_PATH.read_text(encoding="utf-8")
+        self.assertIn("Runner control-plane probe", shell)
+        self.assertIn("candidate-readable=", shell)
+        self.assertIn("--network none", shell)
+        self.assertIn("--read-only", shell)
+        self.assertIn("--cap-drop ALL", shell)
+        self.assertIn("no-new-privileges=true", shell)
+        self.assertIn("--host-control-path /home/runner", shell)
+        self.assertIn("--host-control-path /var/run/docker.sock", shell)
+        self.assertNotIn("--privileged", shell)
+        self.assertNotIn("dst=/home/runner", shell)
+        self.assertNotIn("dst=/var/run/docker.sock", shell)
+        self.assertNotIn('cat "${runner_state_path}"', shell)
+
+    @mock.patch.object(terminal_candidate, "run_candidate_xtask")
     @mock.patch.object(terminal_candidate, "run_process")
     def test_candidate_ci_separates_xtask_and_root_lockfiles(
         self,
         run_process: mock.Mock,
-        resolved_executable: mock.Mock,
+        run_candidate_xtask: mock.Mock,
     ) -> None:
-        target = pathlib.Path("/candidate-target")
         external_lock = "/candidate-home/Cargo.lock"
-        candidate_xtask = target / "debug" / "xtask"
-        resolved_executable.return_value = candidate_xtask
 
         with mock.patch.dict(
             os.environ,
             {
-                "CARGO_TARGET_DIR": os.fspath(target),
                 terminal_candidate.CARGO_LOCKFILE_PATH_ENV: external_lock,
             },
             clear=True,
@@ -2071,18 +2233,64 @@ class WorkflowStructureTests(unittest.TestCase):
                 pathlib.Path("/trusted/validator"),
             )
 
-        self.assertEqual(run_process.call_count, 3)
+        self.assertEqual(run_process.call_count, 1)
         archive_environment = run_process.call_args_list[0].kwargs["environment"]
-        build_environment = run_process.call_args_list[1].kwargs["environment"]
         self.assertNotIn(terminal_candidate.CARGO_LOCKFILE_PATH_ENV, archive_environment)
-        self.assertNotIn(terminal_candidate.CARGO_LOCKFILE_PATH_ENV, build_environment)
         self.assertIn("+1.95.0", run_process.call_args_list[0].args[0])
-        self.assertIn("build", run_process.call_args_list[1].args[0])
+        run_candidate_xtask.assert_called_once_with(
+            pathlib.Path("/trusted/cargo"),
+            pathlib.Path("/candidate/xtask/Cargo.toml"),
+            pathlib.Path("/candidate"),
+        )
+
+    @mock.patch.object(terminal_candidate, "remove_phase_state")
+    @mock.patch.object(terminal_candidate, "resolved_executable")
+    @mock.patch.object(terminal_candidate, "run_prepared_process")
+    @mock.patch.object(terminal_candidate, "fresh_process_environment")
+    def test_candidate_xtask_target_never_becomes_a_protected_output(
+        self,
+        fresh_process_environment: mock.Mock,
+        run_prepared_process: mock.Mock,
+        resolved_executable: mock.Mock,
+        remove_phase_state: mock.Mock,
+    ) -> None:
+        target = pathlib.Path("/state/phase/target")
+        phase = pathlib.Path("/state/phase")
+        candidate_xtask = target / "debug" / "xtask"
+        captured: dict[str, str] = {}
+
+        def fresh(environment: dict[str, str]) -> tuple[dict[str, str], pathlib.Path]:
+            captured.update(environment)
+            isolated = dict(environment)
+            isolated["CARGO_TARGET_DIR"] = os.fspath(target)
+            return isolated, phase
+
+        fresh_process_environment.side_effect = fresh
+        resolved_executable.return_value = candidate_xtask
+        with mock.patch.dict(
+            os.environ,
+            {terminal_candidate.CARGO_LOCKFILE_PATH_ENV: "/locks/root.lock"},
+            clear=True,
+        ):
+            terminal_candidate.run_candidate_xtask(
+                pathlib.Path("/trusted/cargo"),
+                pathlib.Path("/candidate/xtask/Cargo.toml"),
+                pathlib.Path("/candidate"),
+            )
+
+        self.assertNotIn(terminal_candidate.CARGO_LOCKFILE_PATH_ENV, captured)
+        self.assertIn("build", run_prepared_process.call_args_list[0].args[0])
         self.assertEqual(
-            run_process.call_args_list[2].args[0],
+            run_prepared_process.call_args_list[1].args[0],
             [os.fspath(candidate_xtask), "ci"],
         )
-        self.assertNotIn("environment", run_process.call_args_list[2].kwargs)
+        self.assertEqual(
+            run_prepared_process.call_args_list[1].kwargs["environment"][
+                terminal_candidate.CARGO_LOCKFILE_PATH_ENV
+            ],
+            "/locks/root.lock",
+        )
+        remove_phase_state.assert_called_once_with(phase)
 
     def test_terminal_driver_rejects_runner_and_preload_environment(self) -> None:
         with mock.patch.dict(
@@ -2100,6 +2308,69 @@ class WorkflowStructureTests(unittest.TestCase):
                 with self.assertRaises(terminal_candidate.IsolationError):
                     terminal_candidate.require_minimal_environment()
 
+    def test_terminal_driver_requires_host_control_paths_to_be_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            existing = pathlib.Path(directory)
+            with self.assertRaises(terminal_candidate.IsolationError):
+                terminal_candidate.require_host_paths_absent([existing])
+            terminal_candidate.require_host_paths_absent([existing / "absent"])
+
+    def test_terminal_driver_discards_candidate_cargo_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            seed = root / "seed"
+            state = root / "state"
+            seed.mkdir()
+            state.mkdir()
+            for name in ("registry", "git", "advisory-db"):
+                (seed / name).mkdir()
+            environment = {
+                terminal_candidate.CARGO_SEED_ENV: os.fspath(seed),
+                terminal_candidate.CARGO_STATE_ROOT_ENV: os.fspath(state),
+                "CARGO_ALIAS_AUDIT": "version",
+                "CARGO_TARGET_FAKE_RUNNER": "/candidate/runner",
+                "RUSTC_WRAPPER": "/candidate/wrapper",
+            }
+            first, first_phase = terminal_candidate.fresh_process_environment(environment)
+            assert first is not None and first_phase is not None
+            self.assertNotIn("CARGO_ALIAS_AUDIT", first)
+            self.assertNotIn("CARGO_TARGET_FAKE_RUNNER", first)
+            self.assertNotIn("RUSTC_WRAPPER", first)
+            pathlib.Path(first["CARGO_HOME"]).joinpath("config.toml").write_text(
+                "[alias]\naudit='version'\n", encoding="utf-8"
+            )
+            pathlib.Path(first["CARGO_TARGET_DIR"]).joinpath("forged").write_bytes(b"x")
+            terminal_candidate.remove_phase_state(first_phase)
+
+            second, second_phase = terminal_candidate.fresh_process_environment(environment)
+            assert second is not None and second_phase is not None
+            self.assertNotEqual(first["CARGO_HOME"], second["CARGO_HOME"])
+            self.assertFalse(pathlib.Path(second["CARGO_HOME"]).joinpath("config.toml").exists())
+            self.assertFalse(pathlib.Path(second["CARGO_TARGET_DIR"]).joinpath("forged").exists())
+            terminal_candidate.remove_phase_state(second_phase)
+
+    def test_terminal_driver_requires_adopted_cargo_configuration(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            policy = root / "policy"
+            candidate = root / "candidate"
+            for checkout in (policy, candidate):
+                (checkout / ".cargo").mkdir(parents=True)
+                (checkout / ".cargo" / "config.toml").write_text(
+                    "[alias]\nxtask='run --locked'\n", encoding="utf-8"
+                )
+            terminal_candidate.require_cargo_configuration_adopted(
+                policy, candidate, "traits"
+            )
+            (candidate / ".cargo" / "config.toml").write_text(
+                "[build]\nrustc-wrapper='/candidate/wrapper'\n", encoding="utf-8"
+            )
+            with self.assertRaises(terminal_candidate.IsolationError):
+                terminal_candidate.require_cargo_configuration_adopted(
+                    policy, candidate, "traits"
+                )
+
+
     def test_detached_helper_publishes_complete_pid_atomically(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
@@ -2108,6 +2379,34 @@ class WorkflowStructureTests(unittest.TestCase):
                 self.assertEqual(terminal_candidate.detached_helper(marker), 0)
             self.assertEqual(marker.read_text(encoding="ascii"), str(os.getpid()))
             self.assertEqual(list(root.glob(".*.tmp")), [])
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux subreaper regression")
+    def test_terminal_step_reaps_a_silent_session_escapee(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            marker = root / "escapee.pid"
+            launcher = root / "launcher.py"
+            launcher.write_text(
+                "import pathlib,subprocess,sys,time\n"
+                "driver=pathlib.Path(sys.argv[1])\n"
+                "marker=pathlib.Path(sys.argv[2])\n"
+                "subprocess.Popen([sys.executable,str(driver),'detached-helper',str(marker)],"
+                "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,"
+                "start_new_session=True,close_fds=True)\n"
+                "deadline=time.monotonic()+5\n"
+                "while not marker.exists():\n"
+                "    assert time.monotonic()<deadline\n"
+                "    time.sleep(0.01)\n",
+                encoding="utf-8",
+            )
+            terminal_candidate.enable_child_subreaper()
+            terminal_candidate.run_process(
+                [sys.executable, os.fspath(launcher), os.fspath(TERMINAL_DRIVER_PATH), os.fspath(marker)],
+                root,
+            )
+            process_id = int(marker.read_text(encoding="ascii"))
+            with self.assertRaises(ProcessLookupError):
+                os.kill(process_id, 0)
 
     def test_terminal_driver_rejects_reachable_command_files(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2905,7 +3204,7 @@ class CheckRunTests(unittest.TestCase):
 
         self.assertEqual(app_api.patches[-1][1]["conclusion"], "failure")
 
-    def test_success_is_overwritten_if_main_advances_during_reconciliation(self) -> None:
+    def test_success_is_not_published_if_main_advances_before_finalization(self) -> None:
         binding = external()
         app_api = FakeCheckApi([pending_check(1, binding)])
         auth_api = FakeAuthorizationApi()
@@ -2918,6 +3217,34 @@ class CheckRunTests(unittest.TestCase):
             MAIN_SHA,
             OLD_SHA,
         ]
+
+        with self.assertRaisesRegex(
+            controller.PolicyError, "workflow policy commit is no longer current main"
+        ):
+            controller.finish_check(
+                app_api,
+                auth_api,
+                policy(),
+                event(),
+                environment(),
+                binding,
+                COMMENT_ID,
+                1,
+                job_results(),
+                APP_SLUG,
+            )
+
+        self.assertEqual(
+            [payload["conclusion"] for _path, payload in app_api.patches],
+            ["failure"],
+        )
+        self.assertEqual(app_api.checks[0]["conclusion"], "failure")
+
+    def test_success_is_overwritten_if_main_advances_during_reconciliation(self) -> None:
+        binding = external()
+        app_api = FakeCheckApi([pending_check(1, binding)])
+        auth_api = FakeAuthorizationApi()
+        auth_api.main_sha_sequence = [MAIN_SHA] * 15 + [OLD_SHA]
 
         with self.assertRaisesRegex(
             controller.PolicyError, "main changed during final check reconciliation"
@@ -2946,7 +3273,7 @@ class CheckRunTests(unittest.TestCase):
         binding = external()
         app_api = FakeCheckApi([pending_check(1, binding)])
         auth_api = FakeAuthorizationApi()
-        auth_api.main_error_on_read = 7
+        auth_api.main_error_on_read = 16
 
         with self.assertRaisesRegex(controller.PolicyError, "main ref reread failed"):
             controller.finish_check(
@@ -2968,6 +3295,45 @@ class CheckRunTests(unittest.TestCase):
         )
         self.assertEqual(app_api.patches[0][0], app_api.patches[1][0])
         self.assertEqual(app_api.checks[0]["conclusion"], "failure")
+
+    def test_final_authorization_failures_never_publish_success(self) -> None:
+        current = authorize_fixture(FakeAuthorizationApi())
+        failures = (
+            "authorization comment changed",
+            "authorization comment was deleted",
+            "commenter no longer has write permission",
+            "pull request head changed",
+            "pull request base changed",
+            "pull request is no longer open",
+        )
+        for message in failures:
+            with self.subTest(message=message):
+                binding = external()
+                app_api = FakeCheckApi([pending_check(1, binding)])
+                with (
+                    mock.patch.object(
+                        controller,
+                        "authorize_call",
+                        side_effect=[current, controller.PolicyError(message)],
+                    ),
+                    self.assertRaisesRegex(controller.PolicyError, message),
+                ):
+                    controller.finish_check(
+                        app_api,
+                        FakeAuthorizationApi(),
+                        policy(),
+                        event(),
+                        environment(),
+                        binding,
+                        COMMENT_ID,
+                        1,
+                        job_results(),
+                        APP_SLUG,
+                    )
+                self.assertEqual(
+                    [payload["conclusion"] for _path, payload in app_api.patches],
+                    ["failure"],
+                )
 
     def test_reconciliation_validates_failure_patch_response_binding(self) -> None:
         binding = external()

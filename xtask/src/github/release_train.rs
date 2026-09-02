@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::Command;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -28,9 +28,11 @@ use crate::github::{
 use crate::release_policy::detect;
 const PLAN_SCHEMA: u64 = 2;
 const INTENT_SCHEMA: u64 = 1;
-const NOTIFICATION_SCHEMA: u64 = 1;
+const SETTINGS_AUTHORIZATION_SCHEMA: u64 = 1;
+const NOTIFICATION_SCHEMA: u64 = 2;
 const MAX_PLAN_BYTES: usize = 48 * 1024;
 const MAX_INTENT_BYTES: usize = 64 * 1024;
+const MAX_SETTINGS_AUTHORIZATION_BYTES: usize = 96 * 1024;
 const MAX_NOTIFICATION_BYTES: usize = 8 * 1024;
 const MAX_EVENT_BYTES: usize = 128 * 1024;
 const MAX_POLICY_FILE_BYTES: usize = 256 * 1024;
@@ -39,8 +41,10 @@ const MAX_RELEASE_BODY_BYTES: usize = 16 * 1024;
 const MAX_LEGACY_RELEASES: usize = 64;
 const REGISTRY_POLL_COUNT: usize = 60;
 const REGISTRY_POLL_SECONDS: u64 = 20;
+const SETTINGS_AUTHORIZATION_WINDOW: Duration = Duration::from_secs(45 * 60);
 pub(super) const APP_PUBLIC_ID: u64 = 4_653_064;
 pub(super) const INTENT_NAME: &str = "Release finalization intent";
+pub(super) const SETTINGS_AUTHORIZATION_NAME: &str = "Release settings authorization";
 const RELEASE_PLZ_VERSION: &str = "0.3.160";
 const GITHUB_API_VERSION: &str = "2026-03-10";
 const LEGACY_AUTHOR_ID: u64 = 41_898_282;
@@ -58,7 +62,55 @@ pub(super) struct PrepareIntentInput<'a> {
     pub(super) plan_digest: &'a str,
     pub(super) origin_run_id: &'a str,
     pub(super) origin_run_attempt: &'a str,
-    pub(super) ruleset_evidence_sha256: &'a str,
+    pub(super) settings_evidence: &'a str,
+    pub(super) settings_review_id: &'a str,
+    pub(super) settings_reviewer_id: &'a str,
+    pub(super) settings_reviewer_login: &'a str,
+}
+
+pub(super) struct PrepareSettingsAuthorizationInput<'a> {
+    pub(super) repository: &'a str,
+    pub(super) plan: &'a str,
+    pub(super) plan_digest: &'a str,
+    pub(super) policy_commit: &'a str,
+    pub(super) run_id: &'a str,
+    pub(super) run_attempt: &'a str,
+    pub(super) settings_evidence: &'a str,
+    pub(super) settings_review_id: &'a str,
+    pub(super) settings_reviewer_id: &'a str,
+    pub(super) settings_reviewer_login: &'a str,
+}
+
+pub(super) struct CreateSettingsAuthorizationInput<'a> {
+    pub(super) repository: &'a str,
+    pub(super) plan: &'a str,
+    pub(super) plan_digest: &'a str,
+    pub(super) policy_commit: &'a str,
+    pub(super) run_id: &'a str,
+    pub(super) run_attempt: &'a str,
+    pub(super) authorization: &'a str,
+    pub(super) expected_app_slug: &'a str,
+    pub(super) expected_installation_id: &'a str,
+}
+
+pub(super) struct VerifySettingsAuthorizationInput<'a> {
+    pub(super) repository: &'a str,
+    pub(super) plan: &'a str,
+    pub(super) plan_digest: &'a str,
+    pub(super) policy_commit: &'a str,
+    pub(super) run_id: &'a str,
+    pub(super) run_attempt: &'a str,
+    pub(super) authorization: &'a str,
+    pub(super) check_id: &'a str,
+}
+
+pub(super) struct AwaitReleaseAuthorityInput<'a> {
+    pub(super) repository: &'a str,
+    pub(super) plan: &'a str,
+    pub(super) plan_digest: &'a str,
+    pub(super) policy_commit: &'a str,
+    pub(super) run_id: &'a str,
+    pub(super) run_attempt: &'a str,
 }
 
 pub(super) struct CaptureInput<'a> {
@@ -83,8 +135,13 @@ pub(super) struct FinalizeInput<'a> {
     pub(super) repository: &'a str,
     pub(super) plan: &'a str,
     pub(super) plan_digest: &'a str,
+    pub(super) policy_commit: &'a str,
+    pub(super) run_id: &'a str,
+    pub(super) run_attempt: &'a str,
     pub(super) intent: &'a str,
     pub(super) intent_check_id: &'a str,
+    pub(super) settings_authorization: &'a str,
+    pub(super) settings_authorization_check_id: &'a str,
     pub(super) expected_app_slug: &'a str,
     pub(super) expected_installation_id: &'a str,
 }
@@ -93,8 +150,13 @@ pub(super) struct NotifyInput<'a> {
     pub(super) repository: &'a str,
     pub(super) plan: &'a str,
     pub(super) plan_digest: &'a str,
+    pub(super) policy_commit: &'a str,
+    pub(super) run_id: &'a str,
+    pub(super) run_attempt: &'a str,
     pub(super) intent: &'a str,
     pub(super) intent_check_id: &'a str,
+    pub(super) settings_authorization: &'a str,
+    pub(super) settings_authorization_check_id: &'a str,
     pub(super) finalized_entries: &'a str,
     pub(super) expected_app_slug: &'a str,
     pub(super) expected_installation_id: &'a str,
@@ -112,6 +174,7 @@ struct ReceiveResult {
     captured_release_sha: String,
     release_plan_digest: String,
     intent_check_id: u64,
+    settings_authorization_check_id: u64,
     policy_sha: String,
 }
 
@@ -336,9 +399,33 @@ pub(super) struct IntentRecord {
     external_id: String,
     origin_run_id: u64,
     origin_run_attempt: u64,
-    ruleset_evidence_sha256: String,
+    settings_evidence: String,
+    settings_evidence_sha256: String,
+    settings_review_id: u64,
+    settings_reviewer_id: u64,
+    settings_reviewer_login: String,
     plan: ReleasePlan,
     tags: Vec<TagIntent>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SettingsAuthorizationRecord {
+    schema_version: u64,
+    repository: String,
+    release_sha: String,
+    policy_commit: String,
+    plan_digest: String,
+    run_id: u64,
+    run_attempt: u64,
+    settings_evidence: String,
+    settings_evidence_sha256: String,
+    settings_review_id: u64,
+    settings_reviewer_id: u64,
+    settings_reviewer_login: String,
+    attested_at: u64,
+    expires_at: u64,
+    external_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -378,6 +465,7 @@ pub(super) fn capture_command(
     if !is_sha(commit) {
         return Err("release plan commit must be one lowercase full SHA".to_string());
     }
+    require_current_policy_reference(repository, policy_commit, github)?;
     let recovered = recover_existing_intent(github, repository, commit)?;
     let current_policy = load_policy_snapshot(
         root,
@@ -412,7 +500,38 @@ pub(super) fn capture_command(
         github,
         &mut registry,
     )?;
+    if let Some((_, _, record)) = &recovered {
+        let mut current_registry = CratesIo::new();
+        let current_observed = capture_plan(
+            PlanCaptureInput {
+                root,
+                repository,
+                commit,
+                policy: &current_policy,
+                baseline_version,
+                baseline_commit,
+            },
+            github,
+            &mut current_registry,
+        )?;
+        require_recovery_policy_compatible(&record.plan, &current_observed)?;
+    }
     if recovered.is_none() {
+        if observed
+            .packages
+            .iter()
+            .any(|package| package.registry.state == RegistryState::Present)
+            && !observed.packages.iter().all(|package| {
+                matches!(
+                    package.release_objects,
+                    ReleaseObjectBaseline::Legacy { .. }
+                )
+            })
+        {
+            return Err(
+                "registry-first recovery requires a pre-publication App intent".to_string(),
+            );
+        }
         require_initial_release_objects(github, repository, &observed)?;
     }
     let plan = if let Some((_, _, record)) = &recovered {
@@ -444,7 +563,7 @@ pub(super) fn capture_command(
         .unwrap_or(("", String::new(), String::new()));
     append_outputs(&[
         ("captured_release_sha", &plan.release_sha),
-        ("policy_commit", &plan.policy_commit),
+        ("policy_commit", &current_policy.commit),
         ("plan", &body),
         ("plan_digest", &digest),
         ("registry_state", registry_state),
@@ -594,23 +713,6 @@ pub(super) fn wait_command(
     append_outputs(&[("complete", "true")])
 }
 
-pub(super) fn settings_evidence_command(
-    root: &Path,
-    repository: &str,
-    release_sha: &str,
-    run_id: &str,
-    run_attempt: &str,
-) -> Result<(), String> {
-    repository_policy_for_root(root, repository)?;
-    let digest = settings_evidence_sha256(
-        repository,
-        release_sha,
-        positive(run_id, "workflow run ID")?,
-        positive(run_attempt, "workflow run attempt")?,
-    )?;
-    append_outputs(&[("ruleset_evidence_sha256", &digest)])
-}
-
 pub(super) fn verify_legacy_command(
     root: &Path,
     repository: &str,
@@ -638,6 +740,17 @@ fn require_current_policy_source(
     repository_policy_for_root(root, repository)?;
     if !is_sha(policy_commit) || git_line(root, &["rev-parse", "HEAD"])? != policy_commit {
         return Err("protected release policy is not the exact checked-out commit".to_string());
+    }
+    require_current_policy_reference(repository, policy_commit, github)
+}
+
+fn require_current_policy_reference(
+    repository: &str,
+    policy_commit: &str,
+    github: &mut impl Transport,
+) -> Result<(), String> {
+    if !is_sha(policy_commit) {
+        return Err("protected release policy commit is invalid".to_string());
     }
     let reference: crate::github::models::GitRef =
         github.get(&format!("repos/{repository}/git/ref/heads/main"))?;
@@ -786,10 +899,15 @@ struct DispatchRepository {
 struct ReleaseNotification {
     schema_version: u64,
     repository: String,
+    policy_commit: String,
     captured_sha: String,
     release_plan_digest: String,
     intent_check_id: u64,
     intent_external_id: String,
+    settings_authorization_check_id: u64,
+    settings_authorization_external_id: String,
+    settings_authorization_run_id: u64,
+    settings_authorization_run_attempt: u64,
     releases: Vec<FinalizedEntry>,
 }
 
@@ -821,11 +939,17 @@ struct DispatchRepositoryName {
 struct ReplayDocument<'a> {
     schema_version: u64,
     repository: &'a str,
+    policy_commit: &'a str,
     release_ids: Vec<u64>,
     tags: Vec<&'a str>,
     captured_sha: &'a str,
     release_plan_digest: &'a str,
     intent_check_id: u64,
+    intent_external_id: &'a str,
+    settings_authorization_check_id: u64,
+    settings_authorization_external_id: &'a str,
+    settings_authorization_run_id: u64,
+    settings_authorization_run_attempt: u64,
 }
 
 pub(super) fn receive_command(
@@ -836,6 +960,7 @@ pub(super) fn receive_command(
     let mut registry = CratesIo::new();
     let result = receive_with_registry(root, input, github, &mut registry)?;
     let intent_check_id = result.intent_check_id.to_string();
+    let settings_authorization_check_id = result.settings_authorization_check_id.to_string();
     append_outputs(&[
         ("authorized", "true"),
         ("replay_key", &result.replay_key),
@@ -843,6 +968,10 @@ pub(super) fn receive_command(
         ("captured_release_sha", &result.captured_release_sha),
         ("release_plan_digest", &result.release_plan_digest),
         ("intent_check_id", &intent_check_id),
+        (
+            "settings_authorization_check_id",
+            &settings_authorization_check_id,
+        ),
         ("policy_sha", &result.policy_sha),
     ])
 }
@@ -885,6 +1014,32 @@ fn receive_with_registry(
     }
     validate_intent_check(&check, &intent, &intent_body)?;
     validate_notification_bindings(input.repository, input.policy_commit, &payload, &intent)?;
+    let settings_check: CheckRun = github.get(&format!(
+        "repos/{}/check-runs/{}",
+        input.repository, payload.settings_authorization_check_id
+    ))?;
+    let settings_body = settings_check
+        .output
+        .summary
+        .clone()
+        .ok_or_else(|| "settings authorization Check summary is absent".to_string())?;
+    let settings = decode_settings_authorization(
+        &settings_body,
+        &plan,
+        &plan_digest,
+        &payload.policy_commit,
+        payload.settings_authorization_run_id,
+        payload.settings_authorization_run_attempt,
+        now_epoch()?,
+        false,
+    )?;
+    if settings_check.id != payload.settings_authorization_check_id
+        || settings_check.external_id != payload.settings_authorization_external_id
+        || settings.external_id != payload.settings_authorization_external_id
+    {
+        return Err("release notification settings authorization identity is wrong".to_string());
+    }
+    validate_settings_authorization_check(&settings_check, &settings, &settings_body)?;
     validate_origin_run(input.repository, &intent, github)?;
 
     let policy = release_policy_for_repository(input.repository)?;
@@ -895,8 +1050,9 @@ fn receive_with_registry(
     validate_notification_releases(input.repository, &payload, &intent, github)?;
 
     let replay = ReplayDocument {
-        schema_version: 1,
+        schema_version: NOTIFICATION_SCHEMA,
         repository: input.repository,
+        policy_commit: &payload.policy_commit,
         release_ids: payload
             .releases
             .iter()
@@ -910,6 +1066,11 @@ fn receive_with_registry(
         captured_sha: &payload.captured_sha,
         release_plan_digest: &payload.release_plan_digest,
         intent_check_id: payload.intent_check_id,
+        intent_external_id: &payload.intent_external_id,
+        settings_authorization_check_id: payload.settings_authorization_check_id,
+        settings_authorization_external_id: &payload.settings_authorization_external_id,
+        settings_authorization_run_id: payload.settings_authorization_run_id,
+        settings_authorization_run_attempt: payload.settings_authorization_run_attempt,
     };
     let replay_body = serde_json::to_vec(&replay)
         .map_err(|error| format!("encode release replay document: {error}"))?;
@@ -925,6 +1086,7 @@ fn receive_with_registry(
         captured_release_sha: payload.captured_sha,
         release_plan_digest: payload.release_plan_digest,
         intent_check_id: payload.intent_check_id,
+        settings_authorization_check_id: payload.settings_authorization_check_id,
         policy_sha: input.policy_commit.to_string(),
     })
 }
@@ -1012,11 +1174,17 @@ fn validate_notification_shape(
     let policy = release_policy_for_repository(repository)?;
     if payload.schema_version != NOTIFICATION_SCHEMA
         || payload.repository != repository
+        || !is_sha(&payload.policy_commit)
         || !is_sha(&payload.captured_sha)
         || !is_digest(&payload.release_plan_digest)
         || payload.intent_check_id == 0
         || payload.intent_check_id > i64::MAX as u64
         || !is_digest(&payload.intent_external_id)
+        || payload.settings_authorization_check_id == 0
+        || payload.settings_authorization_check_id > i64::MAX as u64
+        || !is_digest(&payload.settings_authorization_external_id)
+        || payload.settings_authorization_run_id == 0
+        || payload.settings_authorization_run_attempt == 0
         || payload.releases.len() != policy.packages.len()
     {
         return Err("release notification binding is invalid".to_string());
@@ -1049,8 +1217,8 @@ fn validate_notification_bindings(
     let plan = &intent.plan;
     let policy = release_policy_for_repository(repository)?;
     if plan.repository != repository
+        || payload.policy_commit != policy_commit
         || plan.release_sha != payload.captured_sha
-        || plan.policy_commit != policy_commit
         || plan.packages.len() != policy.packages.len()
         || intent.tags.len() != policy.packages.len()
         || payload.releases.len() != policy.packages.len()
@@ -1103,7 +1271,7 @@ fn validate_origin_run(
     ))?;
     if run.id != intent.origin_run_id
         || run.run_attempt != intent.origin_run_attempt
-        || run.head_sha != intent.release_sha
+        || run.head_sha != intent.plan.policy_commit
         || run.head_branch != "main"
         || run.event != "workflow_dispatch"
         || run.path != ".github/workflows/publish.yml"
@@ -1121,15 +1289,15 @@ fn validate_origin_run(
             "originating workflow identity, source, attempt, or state is wrong".to_string(),
         );
     }
-    let expected = settings_evidence_sha256(
+    crate::github::release_settings::validate_evidence(
+        &intent.settings_evidence,
         repository,
-        &intent.release_sha,
+        &intent.plan.policy_commit,
         intent.origin_run_id,
         intent.origin_run_attempt,
+        0,
+        false,
     )?;
-    if intent.ruleset_evidence_sha256 != expected {
-        return Err("ruleset evidence does not bind the originating workflow".to_string());
-    }
     Ok(())
 }
 
@@ -1836,6 +2004,18 @@ fn require_static_plan_match(expected: &ReleasePlan, actual: &ReleasePlan) -> Re
     Ok(())
 }
 
+fn require_recovery_policy_compatible(
+    original: &ReleasePlan,
+    current: &ReleasePlan,
+) -> Result<(), String> {
+    let mut normalized = current.clone();
+    normalized.policy_commit = original.policy_commit.clone();
+    normalized.release_config_sha256 = original.release_config_sha256.clone();
+    normalized.legacy_inventory_sha256 = original.legacy_inventory_sha256.clone();
+    require_static_plan_match(original, &normalized)?;
+    require_registry_transition(original, current)
+}
+
 fn require_registry_transition(expected: &ReleasePlan, actual: &ReleasePlan) -> Result<(), String> {
     for (old, new) in expected.packages.iter().zip(&actual.packages) {
         match (old.registry.state, new.registry.state) {
@@ -1849,6 +2029,476 @@ fn require_registry_transition(expected: &ReleasePlan, actual: &ReleasePlan) -> 
     require_registry_prefix(&actual.packages)
 }
 
+pub(super) fn prepare_settings_authorization_command(
+    input: PrepareSettingsAuthorizationInput<'_>,
+) -> Result<(), String> {
+    let plan = decode_plan(input.plan, input.plan_digest)?;
+    if plan.repository != input.repository {
+        return Err("settings authorization repository differs from the release plan".to_string());
+    }
+    let record = build_settings_authorization(
+        &plan,
+        input.plan_digest,
+        input.policy_commit,
+        positive(input.run_id, "settings authorization run ID")?,
+        positive(input.run_attempt, "settings authorization run attempt")?,
+        input.settings_evidence,
+        positive(input.settings_review_id, "settings review ID")?,
+        positive(input.settings_reviewer_id, "settings reviewer ID")?,
+        input.settings_reviewer_login,
+        now_epoch()?,
+    )?;
+    let body = canonical_settings_authorization(&record)?;
+    let digest = sha256(body.as_bytes());
+    append_outputs(&[
+        ("settings_authorization", &body),
+        ("settings_authorization_digest", &digest),
+        ("settings_authorization_external_id", &record.external_id),
+    ])
+}
+
+// The authorization binds each reviewed identity fact independently; keeping
+// them explicit here makes omissions at the mutation boundary reviewable.
+#[allow(clippy::too_many_arguments)]
+fn build_settings_authorization(
+    plan: &ReleasePlan,
+    plan_digest: &str,
+    policy_commit: &str,
+    run_id: u64,
+    run_attempt: u64,
+    settings_evidence: &str,
+    settings_review_id: u64,
+    settings_reviewer_id: u64,
+    settings_reviewer_login: &str,
+    now: u64,
+) -> Result<SettingsAuthorizationRecord, String> {
+    if !is_sha(policy_commit) {
+        return Err("settings authorization policy commit is invalid".to_string());
+    }
+    let evidence = crate::github::release_settings::validate_evidence(
+        settings_evidence,
+        &plan.repository,
+        policy_commit,
+        run_id,
+        run_attempt,
+        now,
+        true,
+    )?;
+    let (observed_at, approve_before) = crate::github::release_settings::evidence_window(&evidence);
+    if settings_review_id == 0
+        || settings_reviewer_id == 0
+        || settings_reviewer_login.is_empty()
+        || settings_reviewer_login.len() > 256
+        || settings_reviewer_login.contains(['\0', '\r', '\n'])
+        || now < observed_at
+        || now > approve_before
+    {
+        return Err("settings authorization review identity or timing is invalid".to_string());
+    }
+    let expires_at = now
+        .checked_add(SETTINGS_AUTHORIZATION_WINDOW.as_secs())
+        .ok_or_else(|| "settings authorization expiry overflowed".to_string())?;
+    let settings_evidence_sha256 =
+        crate::github::release_settings::evidence_sha256(settings_evidence);
+    let external_id = sha256(
+        format!(
+            "release-settings-authorization-v{SETTINGS_AUTHORIZATION_SCHEMA}\0{}\0{}\0{}\0{plan_digest}\0{run_id}\0{run_attempt}\0{settings_review_id}\0{settings_reviewer_id}\0{settings_evidence_sha256}",
+            plan.repository, plan.release_sha, policy_commit,
+        )
+        .as_bytes(),
+    );
+    Ok(SettingsAuthorizationRecord {
+        schema_version: SETTINGS_AUTHORIZATION_SCHEMA,
+        repository: plan.repository.clone(),
+        release_sha: plan.release_sha.clone(),
+        policy_commit: policy_commit.to_string(),
+        plan_digest: plan_digest.to_string(),
+        run_id,
+        run_attempt,
+        settings_evidence: settings_evidence.to_string(),
+        settings_evidence_sha256,
+        settings_review_id,
+        settings_reviewer_id,
+        settings_reviewer_login: settings_reviewer_login.to_string(),
+        attested_at: now,
+        expires_at,
+        external_id,
+    })
+}
+
+fn canonical_settings_authorization(
+    record: &SettingsAuthorizationRecord,
+) -> Result<String, String> {
+    let body = serde_json::to_string(record)
+        .map_err(|error| format!("encode settings authorization: {error}"))?;
+    if body.is_empty() || body.len() > MAX_SETTINGS_AUTHORIZATION_BYTES {
+        return Err("settings authorization is empty or oversized".to_string());
+    }
+    Ok(body)
+}
+
+// Decoding deliberately rebinds every authorization dimension rather than
+// accepting an opaque context assembled elsewhere.
+#[allow(clippy::too_many_arguments)]
+fn decode_settings_authorization(
+    body: &str,
+    plan: &ReleasePlan,
+    plan_digest: &str,
+    policy_commit: &str,
+    run_id: u64,
+    run_attempt: u64,
+    now: u64,
+    require_fresh: bool,
+) -> Result<SettingsAuthorizationRecord, String> {
+    if body.is_empty() || body.len() > MAX_SETTINGS_AUTHORIZATION_BYTES {
+        return Err("settings authorization is empty or oversized".to_string());
+    }
+    let record: SettingsAuthorizationRecord = serde_json::from_str(body)
+        .map_err(|error| format!("settings authorization schema is invalid: {error}"))?;
+    let evidence = crate::github::release_settings::validate_evidence(
+        &record.settings_evidence,
+        &record.repository,
+        &record.policy_commit,
+        record.run_id,
+        record.run_attempt,
+        0,
+        false,
+    )?;
+    let (observed_at, approve_before) = crate::github::release_settings::evidence_window(&evidence);
+    let expected_expiry = record
+        .attested_at
+        .checked_add(SETTINGS_AUTHORIZATION_WINDOW.as_secs())
+        .ok_or_else(|| "settings authorization expiry overflowed".to_string())?;
+    let evidence_digest =
+        crate::github::release_settings::evidence_sha256(&record.settings_evidence);
+    let expected_external_id = sha256(
+        format!(
+            "release-settings-authorization-v{SETTINGS_AUTHORIZATION_SCHEMA}\0{}\0{}\0{}\0{plan_digest}\0{}\0{}\0{}\0{}\0{evidence_digest}",
+            record.repository,
+            record.release_sha,
+            record.policy_commit,
+            record.run_id,
+            record.run_attempt,
+            record.settings_review_id,
+            record.settings_reviewer_id,
+        )
+        .as_bytes(),
+    );
+    if canonical_settings_authorization(&record)? != body
+        || record.schema_version != SETTINGS_AUTHORIZATION_SCHEMA
+        || record.repository != plan.repository
+        || record.release_sha != plan.release_sha
+        || record.policy_commit != policy_commit
+        || record.plan_digest != plan_digest
+        || record.run_id != run_id
+        || record.run_attempt != run_attempt
+        || record.run_id == 0
+        || record.run_attempt == 0
+        || record.settings_evidence_sha256 != evidence_digest
+        || record.settings_review_id == 0
+        || record.settings_reviewer_id == 0
+        || record.settings_reviewer_login.is_empty()
+        || record.settings_reviewer_login.len() > 256
+        || record.settings_reviewer_login.contains(['\0', '\r', '\n'])
+        || record.attested_at < observed_at
+        || record.attested_at > approve_before
+        || record.expires_at != expected_expiry
+        || record.external_id != expected_external_id
+        || record.attested_at > now
+        || (require_fresh && now > record.expires_at)
+    {
+        return Err("settings authorization binding or freshness is invalid".to_string());
+    }
+    Ok(record)
+}
+
+pub(super) fn create_settings_authorization_command(
+    input: CreateSettingsAuthorizationInput<'_>,
+    github: &mut impl Transport,
+) -> Result<(), String> {
+    let plan = decode_plan(input.plan, input.plan_digest)?;
+    if plan.repository != input.repository {
+        return Err("settings authorization repository differs from the release plan".to_string());
+    }
+    let record = decode_settings_authorization(
+        input.authorization,
+        &plan,
+        input.plan_digest,
+        input.policy_commit,
+        positive(input.run_id, "settings authorization run ID")?,
+        positive(input.run_attempt, "settings authorization run attempt")?,
+        now_epoch()?,
+        true,
+    )?;
+    validate_app_token(
+        github,
+        input.repository,
+        input.expected_app_slug,
+        input.expected_installation_id,
+    )?;
+    let check = create_or_require_settings_authorization(
+        github,
+        input.repository,
+        &record,
+        input.authorization,
+    )?;
+    let check_id = check.id.to_string();
+    let digest = sha256(input.authorization.as_bytes());
+    append_outputs(&[
+        ("settings_authorization", input.authorization),
+        ("settings_authorization_digest", &digest),
+        ("settings_authorization_check_id", &check_id),
+        ("settings_authorization_external_id", &record.external_id),
+    ])
+}
+
+fn settings_authorization_checks(
+    github: &mut impl Transport,
+    repository: &str,
+    policy_commit: &str,
+) -> Result<CheckRuns, String> {
+    let path = format!(
+        "repos/{repository}/commits/{policy_commit}/check-runs?check_name={}&filter=all&per_page=100",
+        percent_encode(SETTINGS_AUTHORIZATION_NAME)
+    );
+    let checks: CheckRuns = github.get(&path)?;
+    if checks.total_count != checks.check_runs.len() as u64 || checks.total_count > 100 {
+        return Err(
+            "settings authorization Check inventory is incomplete or oversized".to_string(),
+        );
+    }
+    Ok(checks)
+}
+
+fn create_or_require_settings_authorization(
+    github: &mut impl Transport,
+    repository: &str,
+    record: &SettingsAuthorizationRecord,
+    body: &str,
+) -> Result<CheckRun, String> {
+    let checks = settings_authorization_checks(github, repository, &record.policy_commit)?;
+    let mut matching = Vec::new();
+    for check in checks.check_runs {
+        if check.name != SETTINGS_AUTHORIZATION_NAME
+            || check.app.id != APP_PUBLIC_ID
+            || check.app.slug != APP_SLUG
+        {
+            continue;
+        }
+        let prior_body = check.output.summary.as_deref().ok_or_else(|| {
+            "App-owned settings authorization Check lacks its summary".to_string()
+        })?;
+        let prior: SettingsAuthorizationRecord = serde_json::from_str(prior_body)
+            .map_err(|error| format!("existing settings authorization is invalid: {error}"))?;
+        if canonical_settings_authorization(&prior)? != prior_body
+            || prior.repository != repository
+            || prior.policy_commit != record.policy_commit
+        {
+            return Err("existing settings authorization is noncanonical or misbound".to_string());
+        }
+        if prior.run_id == record.run_id && prior.run_attempt == record.run_attempt {
+            if check.external_id != record.external_id || prior != *record {
+                return Err(
+                    "conflicting App-owned settings authorization exists for this run".to_string(),
+                );
+            }
+            matching.push(check);
+        }
+    }
+    if matching.len() > 1 {
+        return Err("duplicate settings authorization Checks claim one run".to_string());
+    }
+    if let Some(check) = matching.pop() {
+        validate_settings_authorization_check(&check, record, body)?;
+        return Ok(check);
+    }
+    let check: CheckRun = github.mutate(
+        "POST",
+        &format!("repos/{repository}/check-runs"),
+        &json!({
+            "name": SETTINGS_AUTHORIZATION_NAME,
+            "head_sha": record.policy_commit,
+            "status": "completed",
+            "conclusion": "success",
+            "external_id": record.external_id,
+            "output": {
+                "title": "Attested fresh release settings",
+                "summary": body,
+            },
+        }),
+    )?;
+    validate_settings_authorization_check(&check, record, body)?;
+    Ok(check)
+}
+
+fn validate_settings_authorization_check(
+    check: &CheckRun,
+    record: &SettingsAuthorizationRecord,
+    body: &str,
+) -> Result<(), String> {
+    if check.id == 0
+        || check.name != SETTINGS_AUTHORIZATION_NAME
+        || check.head_sha != record.policy_commit
+        || check.external_id != record.external_id
+        || check.status != "completed"
+        || check.conclusion.as_deref() != Some("success")
+        || check.app.id != APP_PUBLIC_ID
+        || check.app.slug != APP_SLUG
+        || check.output.title.as_deref() != Some("Attested fresh release settings")
+        || check.output.summary.as_deref() != Some(body)
+    {
+        return Err(
+            "settings authorization Check does not match the exact App attestation".to_string(),
+        );
+    }
+    Ok(())
+}
+
+pub(super) fn verify_settings_authorization_command(
+    input: VerifySettingsAuthorizationInput<'_>,
+    github: &mut impl Transport,
+) -> Result<(), String> {
+    let plan = decode_plan(input.plan, input.plan_digest)?;
+    if plan.repository != input.repository {
+        return Err("settings authorization repository differs from the release plan".to_string());
+    }
+    let record = decode_settings_authorization(
+        input.authorization,
+        &plan,
+        input.plan_digest,
+        input.policy_commit,
+        positive(input.run_id, "settings authorization run ID")?,
+        positive(input.run_attempt, "settings authorization run attempt")?,
+        now_epoch()?,
+        true,
+    )?;
+    require_current_policy_reference(input.repository, input.policy_commit, github)?;
+    let check_id = positive(input.check_id, "settings authorization Check ID")?;
+    let check: CheckRun =
+        github.get(&format!("repos/{}/check-runs/{check_id}", input.repository))?;
+    validate_settings_authorization_check(&check, &record, input.authorization)?;
+    let check_id = check_id.to_string();
+    let digest = sha256(input.authorization.as_bytes());
+    append_outputs(&[
+        ("settings_authorization", input.authorization),
+        ("settings_authorization_digest", &digest),
+        ("settings_authorization_check_id", &check_id),
+    ])
+}
+
+// Each query is bound to the exact plan, policy, run, and observation time.
+#[allow(clippy::too_many_arguments)]
+fn current_settings_authorization(
+    github: &mut impl Transport,
+    repository: &str,
+    plan: &ReleasePlan,
+    plan_digest: &str,
+    policy_commit: &str,
+    run_id: u64,
+    run_attempt: u64,
+    now: u64,
+) -> Result<Option<(CheckRun, String, SettingsAuthorizationRecord)>, String> {
+    let checks = settings_authorization_checks(github, repository, policy_commit)?;
+    let mut matching = Vec::new();
+    for listed in checks.check_runs {
+        if listed.name != SETTINGS_AUTHORIZATION_NAME
+            || listed.app.id != APP_PUBLIC_ID
+            || listed.app.slug != APP_SLUG
+        {
+            continue;
+        }
+        let body = listed.output.summary.as_deref().ok_or_else(|| {
+            "App-owned settings authorization Check lacks its summary".to_string()
+        })?;
+        let preliminary: SettingsAuthorizationRecord = serde_json::from_str(body)
+            .map_err(|error| format!("existing settings authorization is invalid: {error}"))?;
+        if preliminary.run_id != run_id || preliminary.run_attempt != run_attempt {
+            continue;
+        }
+        let record = decode_settings_authorization(
+            body,
+            plan,
+            plan_digest,
+            policy_commit,
+            run_id,
+            run_attempt,
+            now,
+            true,
+        )?;
+        validate_settings_authorization_check(&listed, &record, body)?;
+        let check: CheckRun =
+            github.get(&format!("repos/{repository}/check-runs/{}", listed.id))?;
+        if check.id != listed.id {
+            return Err("settings authorization Check ID changed during re-read".to_string());
+        }
+        validate_settings_authorization_check(&check, &record, body)?;
+        matching.push((check, body.to_string(), record));
+    }
+    if matching.len() > 1 {
+        return Err("multiple App-owned settings authorizations claim this run".to_string());
+    }
+    Ok(matching.pop())
+}
+
+pub(super) fn await_release_authority_command(
+    root: &Path,
+    input: AwaitReleaseAuthorityInput<'_>,
+    github: &mut impl Transport,
+) -> Result<(), String> {
+    repository_policy_for_root(root, input.repository)?;
+    let plan = decode_plan(input.plan, input.plan_digest)?;
+    if plan.repository != input.repository {
+        return Err("release authority repository differs from the release plan".to_string());
+    }
+    if !is_sha(input.policy_commit) {
+        return Err("release authority policy commit is invalid".to_string());
+    }
+    require_current_policy_reference(input.repository, input.policy_commit, github)?;
+    let run_id = positive(input.run_id, "release authority run ID")?;
+    let run_attempt = positive(input.run_attempt, "release authority run attempt")?;
+    for poll in 0..120 {
+        let intent = recover_existing_intent(github, input.repository, &plan.release_sha)?;
+        let settings = current_settings_authorization(
+            github,
+            input.repository,
+            &plan,
+            input.plan_digest,
+            input.policy_commit,
+            run_id,
+            run_attempt,
+            now_epoch()?,
+        )?;
+        if let (
+            Some((intent_check, intent_body, intent_record)),
+            Some((settings_check, settings_body, _)),
+        ) = (intent, settings)
+        {
+            if intent_record.plan != plan || intent_record.plan_digest != input.plan_digest {
+                return Err(
+                    "durable release intent differs from the current release plan".to_string(),
+                );
+            }
+            require_current_policy_reference(input.repository, input.policy_commit, github)?;
+            let intent_check_id = intent_check.id.to_string();
+            let settings_check_id = settings_check.id.to_string();
+            let intent_digest = sha256(intent_body.as_bytes());
+            let settings_digest = sha256(settings_body.as_bytes());
+            return append_outputs(&[
+                ("intent", &intent_body),
+                ("intent_digest", &intent_digest),
+                ("intent_check_id", &intent_check_id),
+                ("settings_authorization", &settings_body),
+                ("settings_authorization_digest", &settings_digest),
+                ("settings_authorization_check_id", &settings_check_id),
+            ]);
+        }
+        if poll + 1 < 120 {
+            thread::sleep(Duration::from_secs(10));
+        }
+    }
+    Err("timed out waiting for exact App-owned release authority".to_string())
+}
+
 pub(super) fn prepare_intent_command(
     root: &Path,
     input: PrepareIntentInput<'_>,
@@ -1860,7 +2510,11 @@ pub(super) fn prepare_intent_command(
         input.plan_digest,
         positive(input.origin_run_id, "origin run ID")?,
         positive(input.origin_run_attempt, "origin run attempt")?,
-        input.ruleset_evidence_sha256,
+        input.settings_evidence,
+        positive(input.settings_review_id, "settings review ID")?,
+        positive(input.settings_reviewer_id, "settings reviewer ID")?,
+        input.settings_reviewer_login,
+        now_epoch()?,
     )?;
     let record_body = canonical_intent(&record)?;
     let record_digest = sha256(record_body.as_bytes());
@@ -1898,26 +2552,40 @@ pub(super) fn create_intent_command(
     ])
 }
 
+// The durable intent keeps source, policy, run, and reviewer identities as
+// separately visible inputs.
+#[allow(clippy::too_many_arguments)]
 fn build_intent(
     root: &Path,
     plan: &ReleasePlan,
     plan_digest: &str,
     origin_run_id: u64,
     origin_run_attempt: u64,
-    ruleset_evidence_sha256: &str,
+    settings_evidence: &str,
+    settings_review_id: u64,
+    settings_reviewer_id: u64,
+    settings_reviewer_login: &str,
+    now: u64,
 ) -> Result<IntentRecord, String> {
-    if !is_digest(ruleset_evidence_sha256) {
-        return Err("ruleset evidence must be one SHA-256 digest".to_string());
-    }
-    let expected_ruleset_evidence = settings_evidence_sha256(
+    crate::github::release_settings::validate_evidence(
+        settings_evidence,
         &plan.repository,
-        &plan.release_sha,
+        &plan.policy_commit,
         origin_run_id,
         origin_run_attempt,
+        now,
+        true,
     )?;
-    if ruleset_evidence_sha256 != expected_ruleset_evidence {
-        return Err("ruleset evidence does not match canonical release settings".to_string());
+    if settings_review_id == 0
+        || settings_reviewer_id == 0
+        || settings_reviewer_login.is_empty()
+        || settings_reviewer_login.len() > 256
+        || settings_reviewer_login.contains(['\0', '\r', '\n'])
+    {
+        return Err("settings review identity is invalid".to_string());
     }
+    let settings_evidence_sha256 =
+        crate::github::release_settings::evidence_sha256(settings_evidence);
     let external_id = sha256(
         format!(
             "release-intent-v{INTENT_SCHEMA}\0{}\0{}\0{plan_digest}",
@@ -1957,7 +2625,11 @@ fn build_intent(
         external_id,
         origin_run_id,
         origin_run_attempt,
-        ruleset_evidence_sha256: ruleset_evidence_sha256.to_string(),
+        settings_evidence: settings_evidence.to_string(),
+        settings_evidence_sha256,
+        settings_review_id,
+        settings_reviewer_id,
+        settings_reviewer_login: settings_reviewer_login.to_string(),
         plan: plan.clone(),
         tags,
     })
@@ -2151,23 +2823,33 @@ fn decode_intent(
         || record.release_sha != plan.release_sha
         || record.plan_digest != plan_digest
         || !is_digest(&record.external_id)
-        || !is_digest(&record.ruleset_evidence_sha256)
+        || !is_digest(&record.settings_evidence_sha256)
         || record.origin_run_id == 0
         || record.origin_run_attempt == 0
+        || record.settings_review_id == 0
+        || record.settings_reviewer_id == 0
+        || record.settings_reviewer_login.is_empty()
+        || record.settings_reviewer_login.len() > 256
+        || record.settings_reviewer_login.contains(['\0', '\r', '\n'])
         || record.plan != *plan
         || record.tags.len() != plan.packages.len()
     {
         return Err("release intent binding is invalid".to_string());
     }
-    let expected_ruleset_evidence = settings_evidence_sha256(
+    crate::github::release_settings::validate_evidence(
+        &record.settings_evidence,
         &record.repository,
-        &record.release_sha,
+        &record.plan.policy_commit,
         record.origin_run_id,
         record.origin_run_attempt,
+        0,
+        false,
     )?;
-    if record.ruleset_evidence_sha256 != expected_ruleset_evidence {
+    if record.settings_evidence_sha256
+        != crate::github::release_settings::evidence_sha256(&record.settings_evidence)
+    {
         return Err(
-            "release intent ruleset evidence does not match canonical release settings".to_string(),
+            "release intent settings evidence does not match its canonical readback".to_string(),
         );
     }
     for ((tag, package), index) in record.tags.iter().zip(&plan.packages).zip(0..) {
@@ -2197,6 +2879,20 @@ pub(super) fn finalize_command(
     let plan = decode_plan(input.plan, input.plan_digest)?;
     let intent = decode_intent(input.intent, &plan, input.plan_digest)?;
     let intent_check_id = positive(input.intent_check_id, "intent Check ID")?;
+    let settings = decode_settings_authorization(
+        input.settings_authorization,
+        &plan,
+        input.plan_digest,
+        input.policy_commit,
+        positive(input.run_id, "finalizer run ID")?,
+        positive(input.run_attempt, "finalizer run attempt")?,
+        now_epoch()?,
+        true,
+    )?;
+    let settings_check_id = positive(
+        input.settings_authorization_check_id,
+        "settings authorization Check ID",
+    )?;
     if plan.repository != input.repository {
         return Err("finalizer repository differs from the release plan".to_string());
     }
@@ -2206,6 +2902,7 @@ pub(super) fn finalize_command(
         input.expected_app_slug,
         input.expected_installation_id,
     )?;
+    require_current_policy_reference(input.repository, input.policy_commit, github)?;
     require_captured_ancestry(github, input.repository, &plan.release_sha)?;
     let policy = release_policy_for_repository(input.repository)?;
     if policy.packages.len() != plan.packages.len() {
@@ -2257,17 +2954,27 @@ pub(super) fn finalize_command(
             return Err("registry packages do not form the planned dependency prefix".to_string());
         }
     }
-    require_finalizer_intent(
+    require_finalizer_authority(
         github,
         input.repository,
         intent_check_id,
         &intent,
         input.intent,
+        settings_check_id,
+        &settings,
+        input.settings_authorization,
+        &plan,
+        input.plan_digest,
     )?;
-    let finalizer_intent = FinalizerIntent {
-        check_id: intent_check_id,
-        record: &intent,
-        body: input.intent,
+    let finalizer_authority = FinalizerAuthority {
+        intent_check_id,
+        intent: &intent,
+        intent_body: input.intent,
+        settings_check_id,
+        settings: &settings,
+        settings_body: input.settings_authorization,
+        plan: &plan,
+        plan_digest: input.plan_digest,
     };
     let mut entries = Vec::with_capacity(present);
     for (package, tag_intent) in plan.packages.iter().zip(&intent.tags).take(present) {
@@ -2279,7 +2986,7 @@ pub(super) fn finalize_command(
                     &plan,
                     package,
                     tag_intent,
-                    &finalizer_intent,
+                    &finalizer_authority,
                 )?;
                 let release = reconcile_release(
                     github,
@@ -2287,7 +2994,7 @@ pub(super) fn finalize_command(
                     &plan,
                     package,
                     tag_intent,
-                    &finalizer_intent,
+                    &finalizer_authority,
                 )?;
                 (tag_object_id, release)
             }
@@ -2358,6 +3065,38 @@ fn require_finalizer_intent(
         return Err("finalizer intent Check ID changed during re-read".to_string());
     }
     validate_intent_check(&check, intent, intent_body)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn require_finalizer_authority(
+    github: &mut impl Transport,
+    repository: &str,
+    intent_check_id: u64,
+    intent: &IntentRecord,
+    intent_body: &str,
+    settings_check_id: u64,
+    settings: &SettingsAuthorizationRecord,
+    settings_body: &str,
+    plan: &ReleasePlan,
+    plan_digest: &str,
+) -> Result<(), String> {
+    require_current_policy_reference(repository, &settings.policy_commit, github)?;
+    require_finalizer_intent(github, repository, intent_check_id, intent, intent_body)?;
+    let current = current_settings_authorization(
+        github,
+        repository,
+        plan,
+        plan_digest,
+        &settings.policy_commit,
+        settings.run_id,
+        settings.run_attempt,
+        now_epoch()?,
+    )?
+    .ok_or_else(|| "finalizer settings authorization Check is missing".to_string())?;
+    if current.0.id != settings_check_id || current.1 != settings_body || current.2 != *settings {
+        return Err("finalizer settings authorization Check is duplicated or changed".to_string());
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2523,10 +3262,32 @@ struct TagTarget {
     sha: String,
 }
 
-struct FinalizerIntent<'a> {
-    check_id: u64,
-    record: &'a IntentRecord,
-    body: &'a str,
+struct FinalizerAuthority<'a> {
+    intent_check_id: u64,
+    intent: &'a IntentRecord,
+    intent_body: &'a str,
+    settings_check_id: u64,
+    settings: &'a SettingsAuthorizationRecord,
+    settings_body: &'a str,
+    plan: &'a ReleasePlan,
+    plan_digest: &'a str,
+}
+
+impl FinalizerAuthority<'_> {
+    fn revalidate(&self, github: &mut impl Transport, repository: &str) -> Result<(), String> {
+        require_finalizer_authority(
+            github,
+            repository,
+            self.intent_check_id,
+            self.intent,
+            self.intent_body,
+            self.settings_check_id,
+            self.settings,
+            self.settings_body,
+            self.plan,
+            self.plan_digest,
+        )
+    }
 }
 
 fn require_legacy_release_objects(
@@ -2593,7 +3354,7 @@ fn reconcile_tag(
     plan: &ReleasePlan,
     package: &PlanPackage,
     intent: &TagIntent,
-    finalizer: &FinalizerIntent<'_>,
+    finalizer: &FinalizerAuthority<'_>,
 ) -> Result<String, String> {
     let object_path = format!("repos/{repository}/git/tags/{}", intent.tag_object_id);
     let object = github.get_optional::<AnnotatedTag>(&object_path)?;
@@ -2616,13 +3377,7 @@ fn reconcile_tag(
         return Ok(intent.tag_object_id.clone());
     }
     if object.is_none() {
-        require_finalizer_intent(
-            github,
-            repository,
-            finalizer.check_id,
-            finalizer.record,
-            finalizer.body,
-        )?;
+        finalizer.revalidate(github, repository)?;
         let created: AnnotatedTag = github.mutate(
             "POST",
             &format!("repos/{repository}/git/tags"),
@@ -2640,13 +3395,7 @@ fn reconcile_tag(
         )?;
         validate_tag_object(&created, plan, package, intent)?;
     }
-    require_finalizer_intent(
-        github,
-        repository,
-        finalizer.check_id,
-        finalizer.record,
-        finalizer.body,
-    )?;
+    finalizer.revalidate(github, repository)?;
     let created: crate::github::models::GitRef = github.mutate(
         "POST",
         &format!("repos/{repository}/git/refs"),
@@ -2726,7 +3475,7 @@ fn reconcile_release(
     plan: &ReleasePlan,
     package: &PlanPackage,
     tag_intent: &TagIntent,
-    finalizer: &FinalizerIntent<'_>,
+    finalizer: &FinalizerAuthority<'_>,
 ) -> Result<Release, String> {
     let path = format!(
         "repos/{repository}/releases/tags/{}",
@@ -2737,13 +3486,7 @@ fn reconcile_release(
         require_attested_tag(github, repository, plan, package, tag_intent)?;
         return Ok(release);
     }
-    require_finalizer_intent(
-        github,
-        repository,
-        finalizer.check_id,
-        finalizer.record,
-        finalizer.body,
-    )?;
+    finalizer.revalidate(github, repository)?;
     let release: Release = github.mutate(
         "POST",
         &format!("repos/{repository}/releases"),
@@ -2822,12 +3565,30 @@ pub(super) fn notify_command(
     let plan = decode_plan(input.plan, input.plan_digest)?;
     let intent = decode_intent(input.intent, &plan, input.plan_digest)?;
     let check_id = positive(input.intent_check_id, "intent Check ID")?;
+    let settings = decode_settings_authorization(
+        input.settings_authorization,
+        &plan,
+        input.plan_digest,
+        input.policy_commit,
+        positive(input.run_id, "notification run ID")?,
+        positive(input.run_attempt, "notification run attempt")?,
+        now_epoch()?,
+        true,
+    )?;
+    let settings_check_id = positive(
+        input.settings_authorization_check_id,
+        "settings authorization Check ID",
+    )?;
+    if plan.repository != input.repository {
+        return Err("notification repository differs from the release plan".to_string());
+    }
     validate_app_token(
         github,
         input.repository,
         input.expected_app_slug,
         input.expected_installation_id,
     )?;
+    require_current_policy_reference(input.repository, input.policy_commit, github)?;
     let entries: Vec<FinalizedEntry> = serde_json::from_str(input.finalized_entries)
         .map_err(|error| format!("finalized entry schema is invalid: {error}"))?;
     if serde_json::to_string(&entries).ok().as_deref() != Some(input.finalized_entries)
@@ -2849,10 +3610,15 @@ pub(super) fn notify_command(
     let notification = ReleaseNotification {
         schema_version: NOTIFICATION_SCHEMA,
         repository: input.repository.to_string(),
-        captured_sha: plan.release_sha,
+        policy_commit: input.policy_commit.to_string(),
+        captured_sha: plan.release_sha.clone(),
         release_plan_digest: input.plan_digest.to_string(),
         intent_check_id: check_id,
-        intent_external_id: intent.external_id,
+        intent_external_id: intent.external_id.clone(),
+        settings_authorization_check_id: settings_check_id,
+        settings_authorization_external_id: settings.external_id.clone(),
+        settings_authorization_run_id: settings.run_id,
+        settings_authorization_run_attempt: settings.run_attempt,
         releases: entries,
     };
     require_notification_size(&notification)?;
@@ -2861,6 +3627,18 @@ pub(super) fn notify_command(
         event_type: "official-release-published",
         client_payload: &notification,
     };
+    require_finalizer_authority(
+        github,
+        input.repository,
+        check_id,
+        &intent,
+        input.intent,
+        settings_check_id,
+        &settings,
+        input.settings_authorization,
+        &plan,
+        input.plan_digest,
+    )?;
     github.mutate_empty(
         "POST",
         &format!("repos/{}/dispatches", input.repository),
@@ -2959,6 +3737,13 @@ fn positive(value: &str, label: &str) -> Result<u64, String> {
         .map_err(|_| format!("{label} exceeds its bound"))
 }
 
+fn now_epoch() -> Result<u64, String> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "system clock predates the Unix epoch".to_string())
+        .map(|duration| duration.as_secs())
+}
+
 fn is_digest(value: &str) -> bool {
     value.len() == 64
         && value
@@ -2974,55 +3759,6 @@ pub(super) fn settings_evidence_tag_patterns(
         "NVIDIA/yaml-sigil-rs" => Ok(RS_TAG_PATTERNS),
         _ => Err("repository is outside the settings-evidence policy".to_string()),
     }
-}
-
-fn update_settings_evidence_digest(digest: &mut Sha256, value: &str) {
-    digest.update(value.as_bytes());
-    digest.update(b"\0");
-}
-
-pub(super) fn settings_evidence_sha256(
-    repository: &str,
-    release_sha: &str,
-    run_id: u64,
-    run_attempt: u64,
-) -> Result<String, String> {
-    let tag_patterns = settings_evidence_tag_patterns(repository)?;
-    if !is_sha(release_sha) {
-        return Err("release SHA is invalid".to_string());
-    }
-    if run_id == 0 {
-        return Err("workflow run ID is invalid".to_string());
-    }
-    if run_attempt == 0 {
-        return Err("workflow run attempt is invalid".to_string());
-    }
-
-    let mut digest = Sha256::new();
-    for value in [
-        "yaml-sigil-release-setting-evidence-v1",
-        repository,
-        &run_id.to_string(),
-        &run_attempt.to_string(),
-        release_sha,
-        "immutable-releases=true",
-    ] {
-        update_settings_evidence_digest(&mut digest, value);
-    }
-    for pattern in tag_patterns {
-        update_settings_evidence_digest(
-            &mut digest,
-            &format!("creation={pattern}:Integration:{APP_PUBLIC_ID}:always"),
-        );
-    }
-    for pattern in tag_patterns {
-        update_settings_evidence_digest(&mut digest, &format!("update-delete={pattern}:no-bypass"));
-    }
-    update_settings_evidence_digest(
-        &mut digest,
-        &format!("forbidden-required-check={INTENT_NAME}"),
-    );
-    Ok(format!("{:x}", digest.finalize()))
 }
 
 fn sha256(bytes: &[u8]) -> String {
@@ -3118,6 +3854,23 @@ mod tests {
                 release_objects: ReleaseObjectBaseline::Absent,
             }],
         }
+    }
+
+    const TEST_OBSERVED_AT: u64 = 1_787_940_000;
+
+    fn settings_evidence(
+        plan: &ReleasePlan,
+        policy_commit: &str,
+        run_id: u64,
+        run_attempt: u64,
+    ) -> String {
+        crate::github::release_settings::tests::evidence(
+            &plan.repository,
+            policy_commit,
+            run_id,
+            run_attempt,
+            TEST_OBSERVED_AT,
+        )
     }
 
     fn run_git(root: &Path, args: &[&str]) -> String {
@@ -3291,9 +4044,21 @@ mod tests {
         assert_eq!(release.id, 42);
         github.finish();
 
-        let digest = settings_evidence_sha256(&plan.repository, &plan.release_sha, 100, 1).unwrap();
+        let evidence = settings_evidence(&plan, &plan.policy_commit, 100, 1);
         let (_, plan_digest) = encode_plan(&plan).unwrap();
-        let intent = build_intent(Path::new("."), &plan, &plan_digest, 100, 1, &digest).unwrap();
+        let intent = build_intent(
+            Path::new("."),
+            &plan,
+            &plan_digest,
+            100,
+            1,
+            &evidence,
+            700,
+            800,
+            "release-admin",
+            TEST_OBSERVED_AT + 1,
+        )
+        .unwrap();
         assert_eq!(intent.tags[0].tag_object_id, "8".repeat(40));
         assert!(intent.tags[0].tag_message.is_empty());
 
@@ -3374,8 +4139,9 @@ mod tests {
     fn intent_fixture() -> (ReleasePlan, IntentRecord, String) {
         let plan = plan();
         let (_, plan_digest) = encode_plan(&plan).unwrap();
-        let ruleset_evidence_sha256 =
-            settings_evidence_sha256(&plan.repository, &plan.release_sha, 100, 1).unwrap();
+        let settings_evidence = settings_evidence(&plan, &plan.policy_commit, 100, 1);
+        let settings_evidence_sha256 =
+            crate::github::release_settings::evidence_sha256(&settings_evidence);
         let intent = IntentRecord {
             schema_version: INTENT_SCHEMA,
             repository: plan.repository.clone(),
@@ -3384,7 +4150,11 @@ mod tests {
             external_id: "6".repeat(64),
             origin_run_id: 100,
             origin_run_attempt: 1,
-            ruleset_evidence_sha256,
+            settings_evidence,
+            settings_evidence_sha256,
+            settings_review_id: 700,
+            settings_reviewer_id: 800,
+            settings_reviewer_login: "release-admin".to_string(),
             plan: plan.clone(),
             tags: vec![TagIntent {
                 package: plan.packages[0].package.clone(),
@@ -3414,16 +4184,41 @@ mod tests {
         })
     }
 
+    fn settings_authorization_check(
+        record: &SettingsAuthorizationRecord,
+        body: &str,
+        id: u64,
+    ) -> Value {
+        json!({
+            "id": id,
+            "name": SETTINGS_AUTHORIZATION_NAME,
+            "head_sha": record.policy_commit,
+            "external_id": record.external_id,
+            "status": "completed",
+            "conclusion": "success",
+            "app": {"id": APP_PUBLIC_ID, "slug": APP_SLUG},
+            "output": {
+                "title": "Attested fresh release settings",
+                "summary": body,
+            },
+        })
+    }
+
     fn notification_fixture() -> ReleaseNotification {
         let (plan, intent, _) = intent_fixture();
         let package = &plan.packages[0];
         ReleaseNotification {
             schema_version: NOTIFICATION_SCHEMA,
             repository: plan.repository.clone(),
+            policy_commit: plan.policy_commit.clone(),
             captured_sha: plan.release_sha.clone(),
             release_plan_digest: intent.plan_digest,
             intent_check_id: 900,
             intent_external_id: intent.external_id,
+            settings_authorization_check_id: 901,
+            settings_authorization_external_id: "d".repeat(64),
+            settings_authorization_run_id: 101,
+            settings_authorization_run_attempt: 2,
             releases: vec![FinalizedEntry {
                 package: package.package.clone(),
                 version: package.version.clone(),
@@ -3451,14 +4246,129 @@ mod tests {
     }
 
     #[test]
-    fn settings_evidence_encoding_matches_cross_language_vectors() {
-        assert_eq!(
-            settings_evidence_sha256("NVIDIA/yaml-sigil-traits", &"a".repeat(40), 100, 1).unwrap(),
-            "a622fec239319172aefb628be3f81fccbc93d61803c5214c0729e054a2da6c09",
+    fn settings_evidence_is_canonical_and_bound_to_policy_not_source() {
+        let plan = plan();
+        let body = settings_evidence(&plan, &plan.policy_commit, 100, 1);
+        assert!(
+            crate::github::release_settings::validate_evidence(
+                &body,
+                &plan.repository,
+                &plan.policy_commit,
+                100,
+                1,
+                TEST_OBSERVED_AT + 1,
+                true,
+            )
+            .is_ok()
         );
-        assert_eq!(
-            settings_evidence_sha256("NVIDIA/yaml-sigil-rs", &"a".repeat(40), 100, 1).unwrap(),
-            "917d89e6ef528f6db27ef6a93717c7d4907420e11e040ed8adec07508e339568",
+        assert_ne!(plan.policy_commit, plan.release_sha);
+        assert!(
+            crate::github::release_settings::validate_evidence(
+                &body,
+                &plan.repository,
+                &plan.release_sha,
+                100,
+                1,
+                TEST_OBSERVED_AT + 1,
+                true,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn recovery_preserves_original_policy_and_source_under_current_policy() {
+        let (original, intent, intent_body) = intent_fixture();
+        let original_policy = original.policy_commit.clone();
+        let release_source = original.release_sha.clone();
+        let current_policy = "8".repeat(40);
+        assert_ne!(original_policy, release_source);
+        assert_ne!(original_policy, current_policy);
+        assert_ne!(release_source, current_policy);
+
+        let (plan_body, plan_digest) = encode_plan(&original).unwrap();
+        let decoded_plan = decode_plan(&plan_body, &plan_digest).unwrap();
+        let decoded_intent = decode_intent(&intent_body, &decoded_plan, &plan_digest).unwrap();
+        assert_eq!(decoded_intent.plan.policy_commit, original_policy);
+        assert_eq!(decoded_intent.release_sha, release_source);
+
+        let evidence = settings_evidence(&original, &current_policy, 101, 2);
+        let authorization = build_settings_authorization(
+            &original,
+            &plan_digest,
+            &current_policy,
+            101,
+            2,
+            &evidence,
+            701,
+            801,
+            "recovery-admin",
+            TEST_OBSERVED_AT + 1,
+        )
+        .unwrap();
+        let authorization_body = canonical_settings_authorization(&authorization).unwrap();
+        let decoded_authorization = decode_settings_authorization(
+            &authorization_body,
+            &decoded_plan,
+            &plan_digest,
+            &current_policy,
+            101,
+            2,
+            TEST_OBSERVED_AT + 2,
+            true,
+        )
+        .unwrap();
+        assert_eq!(decoded_authorization.policy_commit, current_policy);
+        assert_eq!(decoded_authorization.release_sha, release_source);
+        assert_eq!(decoded_authorization.plan_digest, plan_digest);
+        assert_eq!(intent.plan_digest, plan_digest);
+        assert!(
+            decode_settings_authorization(
+                &authorization_body,
+                &decoded_plan,
+                &plan_digest,
+                &current_policy,
+                102,
+                2,
+                TEST_OBSERVED_AT + 2,
+                true,
+            )
+            .is_err()
+        );
+        assert!(
+            decode_settings_authorization(
+                &authorization_body,
+                &decoded_plan,
+                &plan_digest,
+                &current_policy,
+                101,
+                3,
+                TEST_OBSERVED_AT + 2,
+                true,
+            )
+            .is_err()
+        );
+
+        let mut current_observation = original.clone();
+        current_observation.policy_commit = current_policy;
+        current_observation.release_config_sha256 = "3".repeat(64);
+        current_observation.legacy_inventory_sha256 = "4".repeat(64);
+        require_recovery_policy_compatible(&original, &current_observation).unwrap();
+
+        current_observation.release_sha = "7".repeat(40);
+        assert!(require_recovery_policy_compatible(&original, &current_observation).is_err());
+        assert!(
+            decode_settings_authorization(
+                &authorization_body,
+                &decoded_plan,
+                &"6".repeat(64),
+                &"8".repeat(40),
+                101,
+                2,
+                TEST_OBSERVED_AT + 2,
+                true,
+            )
+            .is_err()
         );
     }
 
@@ -3466,10 +4376,10 @@ mod tests {
     fn release_intent_rejects_a_mismatched_canonical_settings_digest() {
         let (plan, mut intent, _) = intent_fixture();
         let plan_digest = intent.plan_digest.clone();
-        intent.ruleset_evidence_sha256 = "0".repeat(64);
+        intent.settings_evidence_sha256 = "0".repeat(64);
         let body = canonical_intent(&intent).unwrap();
         let error = decode_intent(&body, &plan, &plan_digest).unwrap_err();
-        assert!(error.contains("does not match canonical release settings"));
+        assert!(error.contains("does not match its canonical readback"));
     }
 
     #[test]
@@ -3665,10 +4575,31 @@ mod tests {
                 json!({"total_count": 1, "check_runs": [failed]}),
             ),
         ]);
-        let finalizer = FinalizerIntent {
-            check_id: 900,
-            record: &intent,
-            body: &body,
+        let settings_evidence = settings_evidence(&plan, &plan.policy_commit, 100, 1);
+        let (_, plan_digest) = encode_plan(&plan).unwrap();
+        let settings = build_settings_authorization(
+            &plan,
+            &plan_digest,
+            &plan.policy_commit,
+            100,
+            1,
+            &settings_evidence,
+            700,
+            800,
+            "release-admin",
+            TEST_OBSERVED_AT + 1,
+        )
+        .unwrap();
+        let settings_body = canonical_settings_authorization(&settings).unwrap();
+        let finalizer = FinalizerAuthority {
+            intent_check_id: 900,
+            intent: &intent,
+            intent_body: &body,
+            settings_check_id: 901,
+            settings: &settings,
+            settings_body: &settings_body,
+            plan: &plan,
+            plan_digest: &plan_digest,
         };
         assert!(
             reconcile_tag(
@@ -3681,6 +4612,70 @@ mod tests {
             )
             .is_err()
         );
+        github.finish();
+    }
+
+    #[test]
+    fn current_policy_drift_blocks_tag_mutation_after_read_only_reconciliation() {
+        let (plan, intent, body) = intent_fixture();
+        let package = &plan.packages[0];
+        let tag = &intent.tags[0];
+        let object_path = format!("repos/{}/git/tags/{}", plan.repository, tag.tag_object_id);
+        let ref_path = format!(
+            "repos/{}/git/ref/tags/{}",
+            plan.repository,
+            percent_encode(&package.tag)
+        );
+        let main_path = format!("repos/{}/git/ref/heads/main", plan.repository);
+        let mut github = FakeTransport::new([
+            Expected::missing(&object_path),
+            Expected::missing(&ref_path),
+            Expected::json(
+                "GET",
+                &main_path,
+                json!({
+                    "ref": "refs/heads/main",
+                    "object": {"type": "commit", "sha": "7".repeat(40)},
+                }),
+            ),
+        ]);
+        let settings_evidence = settings_evidence(&plan, &plan.policy_commit, 100, 1);
+        let (_, plan_digest) = encode_plan(&plan).unwrap();
+        let settings = build_settings_authorization(
+            &plan,
+            &plan_digest,
+            &plan.policy_commit,
+            100,
+            1,
+            &settings_evidence,
+            700,
+            800,
+            "release-admin",
+            TEST_OBSERVED_AT + 1,
+        )
+        .unwrap();
+        let settings_body = canonical_settings_authorization(&settings).unwrap();
+        let finalizer = FinalizerAuthority {
+            intent_check_id: 900,
+            intent: &intent,
+            intent_body: &body,
+            settings_check_id: 901,
+            settings: &settings,
+            settings_body: &settings_body,
+            plan: &plan,
+            plan_digest: &plan_digest,
+        };
+
+        let error = reconcile_tag(
+            &mut github,
+            &plan.repository,
+            &plan,
+            package,
+            tag,
+            &finalizer,
+        )
+        .unwrap_err();
+        assert!(error.contains("exact current main"), "{error}");
         github.finish();
     }
 
@@ -3723,11 +4718,8 @@ mod tests {
         assert!(serde_json::from_value::<ReleaseNotification>(unknown).is_err());
 
         let canonical = serde_json::to_string(&notification).unwrap();
-        let duplicate = canonical.replacen(
-            "\"schema_version\":1",
-            "\"schema_version\":1,\"schema_version\":1",
-            1,
-        );
+        let schema = format!("\"schema_version\":{NOTIFICATION_SCHEMA}");
+        let duplicate = canonical.replacen(&schema, &format!("{schema},{schema}"), 1);
         assert!(serde_json::from_str::<ReleaseNotification>(&duplicate).is_err());
     }
 
@@ -3785,7 +4777,8 @@ mod tests {
         let (temporary, policy_commit) = protected_traits_root();
         let root = temporary.path();
         let mut plan = plan();
-        plan.policy_commit = policy_commit.clone();
+        let original_policy_commit = "9".repeat(40);
+        plan.policy_commit = original_policy_commit.clone();
 
         let archive = fixture_archive(&plan.release_sha);
         let package_policy = &crate::release_policy::TRAITS_POLICY.packages[0];
@@ -3801,17 +4794,48 @@ mod tests {
         plan.packages[0].package_inventory_sha256 = archive_inventory_sha256(&archive_entries);
 
         let (plan_body, plan_digest) = encode_plan(&plan).unwrap();
-        let ruleset_evidence =
-            settings_evidence_sha256(&plan.repository, &plan.release_sha, 100, 1).unwrap();
-        let intent = build_intent(root, &plan, &plan_digest, 100, 1, &ruleset_evidence).unwrap();
+        let original_settings_evidence = settings_evidence(&plan, &plan.policy_commit, 100, 1);
+        let intent = build_intent(
+            root,
+            &plan,
+            &plan_digest,
+            100,
+            1,
+            &original_settings_evidence,
+            700,
+            800,
+            "release-admin",
+            TEST_OBSERVED_AT + 1,
+        )
+        .unwrap();
         let intent_body = canonical_intent(&intent).unwrap();
+        let current_settings_evidence = settings_evidence(&plan, &policy_commit, 101, 2);
+        let settings = build_settings_authorization(
+            &plan,
+            &plan_digest,
+            &policy_commit,
+            101,
+            2,
+            &current_settings_evidence,
+            701,
+            801,
+            "recovery-admin",
+            TEST_OBSERVED_AT + 1,
+        )
+        .unwrap();
+        let settings_body = canonical_settings_authorization(&settings).unwrap();
         let notification = ReleaseNotification {
             schema_version: NOTIFICATION_SCHEMA,
             repository: plan.repository.clone(),
+            policy_commit: policy_commit.clone(),
             captured_sha: plan.release_sha.clone(),
             release_plan_digest: plan_digest.clone(),
             intent_check_id: 900,
             intent_external_id: intent.external_id.clone(),
+            settings_authorization_check_id: 901,
+            settings_authorization_external_id: settings.external_id.clone(),
+            settings_authorization_run_id: settings.run_id,
+            settings_authorization_run_attempt: settings.run_attempt,
             releases: vec![FinalizedEntry {
                 package: plan.packages[0].package.clone(),
                 version: plan.packages[0].version.clone(),
@@ -3907,11 +4931,16 @@ mod tests {
             ),
             Expected::json(
                 "GET",
+                &format!("repos/{repository}/check-runs/901"),
+                settings_authorization_check(&settings, &settings_body, 901),
+            ),
+            Expected::json(
+                "GET",
                 &format!("repos/{repository}/actions/runs/100"),
                 json!({
                     "id": 100,
                     "run_attempt": 1,
-                    "head_sha": plan.release_sha,
+                    "head_sha": original_policy_commit,
                     "head_branch": "main",
                     "event": "workflow_dispatch",
                     "path": ".github/workflows/publish.yml",
@@ -3978,6 +5007,7 @@ mod tests {
         assert_eq!(result.captured_release_sha, plan.release_sha);
         assert_eq!(result.release_plan_digest, plan_digest);
         assert_eq!(result.intent_check_id, 900);
+        assert_eq!(result.settings_authorization_check_id, 901);
         assert_eq!(result.policy_sha, policy_commit);
         assert!(is_digest(&result.replay_key));
         assert_eq!(registry.downloads, 1);
@@ -3990,10 +5020,15 @@ mod tests {
         let mut notification = ReleaseNotification {
             schema_version: NOTIFICATION_SCHEMA,
             repository: "NVIDIA/yaml-sigil-rs".to_string(),
+            policy_commit: "9".repeat(40),
             captured_sha: "a".repeat(40),
             release_plan_digest: "b".repeat(64),
             intent_check_id: 900,
             intent_external_id: "c".repeat(64),
+            settings_authorization_check_id: 901,
+            settings_authorization_external_id: "d".repeat(64),
+            settings_authorization_run_id: 101,
+            settings_authorization_run_attempt: 2,
             releases: crate::release_policy::RUST_POLICY
                 .packages
                 .iter()

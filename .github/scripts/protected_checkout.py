@@ -6,9 +6,9 @@
 """Verify a candidate checkout against immutable protected-main policy.
 
 The caller stages this file and ``protected_pr_ci.py`` from the exact policy
-commit before checking out candidate content. This verifier then compares all
-sensitive working-tree files with their exact Git blobs before any later step
-reads or executes a candidate path.
+commit before checking out candidate content. This verifier then compares the
+complete working tree, including portable internal links, with its exact Git
+entries before any later step reads or executes a candidate path.
 """
 
 from __future__ import annotations
@@ -29,6 +29,8 @@ import protected_pr_ci as policy
 
 MAX_SECONDS = 30.0
 MAX_POLICY_FILE_BYTES = 4 * 1024 * 1024
+MAX_LINK_BYTES = 4096
+MAX_LINK_HOPS = 40
 
 
 def metadata_identity(path: str) -> str:
@@ -210,6 +212,164 @@ def trusted_git(
     )
 
 
+def working_tree_blob_id(path: pathlib.Path, metadata: os.stat_result, label: str) -> str:
+    """Hash one no-follow working-tree file using Git's object framing."""
+
+    algorithm = "sha1"
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+        with os.fdopen(descriptor, "rb") as handle:
+            opened = os.fstat(handle.fileno())
+            stable_identity = opened.st_size == metadata.st_size
+            if os.name == "nt":
+                # Windows path and handle stat calls do not provide a stable
+                # st_dev/st_ino pair. Preserve the no-reparse checks around
+                # this open and bind the complete raw file bytes below.
+                stable_identity = (
+                    stable_identity and opened.st_mtime_ns == metadata.st_mtime_ns
+                )
+            else:
+                stable_identity = (
+                    stable_identity
+                    and opened.st_dev == metadata.st_dev
+                    and opened.st_ino == metadata.st_ino
+                )
+            policy.require(
+                stat.S_ISREG(opened.st_mode) and stable_identity,
+                f"{label} changed while it was authenticated",
+            )
+            digest = hashlib.new(algorithm)
+            digest.update(f"blob {opened.st_size}\0".encode("ascii"))
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+    except OSError as error:
+        raise policy.PolicyError(f"cannot authenticate {label}: {error}") from error
+    return digest.hexdigest()
+
+
+def authorized_link_target(
+    git: str,
+    root: pathlib.Path,
+    path: str,
+    blob: str,
+) -> str:
+    """Read and validate one symlink target from its authenticated Git blob."""
+
+    size = trusted_git(git, root, ["cat-file", "-s", blob])
+    policy.require(size.returncode == 0, f"trusted Git could not size link {path}")
+    try:
+        link_size = int(size.stdout.strip())
+    except ValueError as error:
+        raise policy.PolicyError(f"trusted Git returned an invalid size for link {path}") from error
+    policy.require(
+        0 < link_size <= MAX_LINK_BYTES,
+        f"link {path} has an empty or oversized target",
+    )
+    result = trusted_git(git, root, ["cat-file", "blob", blob], text=False)
+    policy.require(result.returncode == 0, f"trusted Git could not read link {path}")
+    policy.require(len(result.stdout) == link_size, f"trusted Git returned a truncated link {path}")
+    try:
+        target = result.stdout.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise policy.PolicyError(f"link {path} target is not UTF-8") from error
+    policy.require(
+        not target.startswith("/")
+        and "\\" not in target
+        and "\0" not in target,
+        f"link {path} target is not one portable relative path",
+    )
+    return target
+
+
+def normalized_link_destination(path: str, target: str) -> str:
+    """Resolve a relative target without permitting checkout-root escape."""
+
+    components = path.split("/")[:-1]
+    target_components = target.split("/")
+    policy.require(
+        all(component not in {"", "."} for component in target_components),
+        f"link {path} target is not normalized",
+    )
+    for component in target_components:
+        if component == "..":
+            policy.require(components, f"link {path} escapes the candidate root")
+            components.pop()
+        else:
+            components.append(component)
+    policy.require(components, f"link {path} resolves to the candidate root")
+    return policy.validate_path("/".join(components), f"link {path} destination")
+
+
+def verify_link_chain(
+    root: pathlib.Path,
+    git: str,
+    path: str,
+    leaves: dict[str, tuple[str, str, str]],
+    observed: dict[str, os.stat_result],
+) -> None:
+    """Bind one materialized link chain to authenticated in-tree file entries."""
+
+    visited: set[str] = set()
+    current = path
+    for _ in range(MAX_LINK_HOPS):
+        policy.require(current not in visited, f"link {path} contains a cycle")
+        visited.add(current)
+        entry = leaves.get(current)
+        policy.require(entry is not None, f"link {path} has a broken target")
+        entry_type, mode, blob = entry
+        policy.require(
+            entry_type == "blob" and mode == "120000",
+            f"link {path} chain contains an unsupported Git entry",
+        )
+        target = authorized_link_target(git, root, current, blob)
+        destination_path = normalized_link_destination(current, target)
+        destination = leaves.get(destination_path)
+        policy.require(
+            destination is not None,
+            f"link {path} has a broken or directory target",
+        )
+        materialized = root / current
+        metadata = observed.get(current)
+        policy.require(metadata is not None, f"link {current} is absent from the checkout")
+        if stat.S_ISLNK(metadata.st_mode):
+            try:
+                actual_target = os.readlink(materialized)
+            except OSError as error:
+                raise policy.PolicyError(f"cannot read materialized link {current}: {error}") from error
+            policy.require(
+                actual_target == target,
+                f"link {current} differs from its authorized Git blob",
+            )
+        else:
+            policy.require(
+                stat.S_ISREG(metadata.st_mode) and not has_reparse_point(metadata),
+                f"link {current} is an unsupported reparse point or filesystem entry",
+            )
+            policy.require(
+                working_tree_blob_id(materialized, metadata, f"materialized link {current}") == blob,
+                f"materialized link {current} differs from its authorized Git blob",
+            )
+
+        current = destination_path
+        if destination[:2] == ("blob", "120000"):
+            continue
+        policy.require(
+            destination[0] == "blob" and destination[1] in {"100644", "100755"},
+            f"link {path} has a directory or unsupported target",
+        )
+        target_metadata = observed.get(current)
+        policy.require(
+            target_metadata is not None
+            and stat.S_ISREG(target_metadata.st_mode)
+            and not stat.S_ISLNK(target_metadata.st_mode)
+            and not has_reparse_point(target_metadata),
+            f"link {path} target is not one authenticated regular file",
+        )
+        return
+    raise policy.PolicyError(f"link {path} exceeds {MAX_LINK_HOPS} hops")
+
+
 def verify(
     root: pathlib.Path,
     git: str,
@@ -236,15 +396,10 @@ def verify(
     resolved_root = root.resolve(strict=True)
     policy.require(resolved_root.is_dir(), "candidate root is not a directory")
     observed = enumerate_checkout(resolved_root)
-    kind = policy.require_string(config.get("repository_kind"), "repository_kind")
-    expected = {
-        path: leaf
-        for path, leaf in head.leaves.items()
-        if policy.is_sensitive_path(path, kind)
-    }
+    expected = dict(head.leaves)
     policy.require(
-        len(expected) <= policy.MAX_SENSITIVE_FILES,
-        f"candidate tree exceeds {policy.MAX_SENSITIVE_FILES} sensitive files",
+        len(expected) <= policy.MAX_TREE_ENTRIES,
+        f"candidate tree exceeds {policy.MAX_TREE_ENTRIES} files",
     )
 
     expected_files = {
@@ -252,26 +407,36 @@ def verify(
         for path, (entry_type, mode, _) in expected.items()
         if entry_type == "blob" and mode in {"100644", "100755"}
     }
+    expected_links = {
+        path
+        for path, (entry_type, mode, _) in expected.items()
+        if entry_type == "blob" and mode == "120000"
+    }
     expected_gitlinks = {
         path: leaf
         for path, leaf in expected.items()
         if leaf[:2] == ("commit", "160000")
     }
     policy.require(
-        len(expected_files) + len(expected_gitlinks) == len(expected),
-        "sensitive tree contains an unsupported Git entry",
+        len(expected_files) + len(expected_links) + len(expected_gitlinks) == len(expected),
+        "candidate tree contains an unsupported Git entry",
     )
 
-    actual_sensitive = {
+    actual_files = {
         path
         for path, metadata in observed.items()
-        if policy.is_sensitive_path(path, kind)
-        and (not stat.S_ISDIR(metadata.st_mode) or has_reparse_point(metadata))
+        if not stat.S_ISDIR(metadata.st_mode) or has_reparse_point(metadata)
     }
     policy.require(
-        actual_sensitive == expected_files,
-        "candidate checkout has missing or untracked sensitive paths",
+        actual_files == expected_files | expected_links,
+        "candidate checkout has missing or untracked paths or unsupported working-tree entries",
     )
+    for path, metadata in observed.items():
+        if stat.S_ISDIR(metadata.st_mode) and not has_reparse_point(metadata):
+            policy.require(
+                path in head.paths,
+                "candidate checkout has an untracked directory path",
+            )
 
     head_result = trusted_git(git, resolved_root, ["rev-parse", "--verify", "HEAD^{commit}"])
     policy.require(head_result.returncode == 0, "trusted Git could not resolve candidate HEAD")
@@ -317,16 +482,13 @@ def verify(
             and not has_reparse_point(metadata),
             f"sensitive path {path} is a link, reparse point, or non-regular file",
         )
-        result = trusted_git(
-            git,
-            resolved_root,
-            ["hash-object", "--no-filters", "--", path],
-        )
-        policy.require(result.returncode == 0, f"trusted Git could not hash sensitive path {path}")
         policy.require(
-            result.stdout.strip() == blob,
-            f"sensitive path {path} differs from its authorized Git blob",
+            working_tree_blob_id(resolved_root / path, metadata, f"candidate path {path}") == blob,
+            f"candidate path {path} differs from its authorized Git blob",
         )
+
+    for path in sorted(expected_links):
+        verify_link_chain(resolved_root, git, path, expected, observed)
 
 
 def build_parser() -> argparse.ArgumentParser:

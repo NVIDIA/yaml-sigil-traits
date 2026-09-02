@@ -15,9 +15,28 @@ use crate::safe_file;
 
 use super::{consts, git_line, output_detail, repository_policy_for_root};
 
-const MANIFEST_SCHEMA: u64 = 1;
+const MANIFEST_SCHEMA: u64 = 2;
 const MANIFEST_LIMIT: usize = 64 * 1024;
 const MAX_VALIDATOR_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_RELEASE_PLZ_BYTES: usize = 128 * 1024 * 1024;
+
+const RELEASE_TOOL_ENVIRONMENT: &[&str] = &[
+    "CARGO_HOME",
+    "HOME",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "NO_PROXY",
+    "PATH",
+    "RUSTUP_HOME",
+    "SSL_CERT_DIR",
+    "SSL_CERT_FILE",
+    "SYSTEMROOT",
+    "SystemRoot",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "USERPROFILE",
+];
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -26,15 +45,28 @@ struct Manifest {
     repository: String,
     current_sha: String,
     historical_sha: String,
-    release_plz: PathBuf,
 }
 
-pub(super) fn run(root: &Path, manifest_path: &Path) -> Result<(), String> {
+struct AuthenticatedReleasePlz {
+    _staging: tempfile::TempDir,
+    path: PathBuf,
+    digest: String,
+}
+
+pub(super) fn run(
+    root: &Path,
+    manifest_path: &Path,
+    release_plz: &Path,
+    expected_release_plz_sha256: &str,
+) -> Result<(), String> {
+    // Authenticate and stage caller-owned tool bytes before parsing any
+    // repository-controlled manifest data or reading a credential.
+    let release_plz = stage_release_plz(release_plz, expected_release_plz_sha256)?;
     let manifest = read_manifest(root, manifest_path)?;
     let provider = repository_policy_for_root(root, &manifest.repository)?;
     require_closed_manifest(&manifest, provider.full_name)?;
     require_exact_source(root, &manifest)?;
-    require_release_plz(&manifest.release_plz, provider.release_family)?;
+    require_release_plz(&release_plz.path, provider.release_family)?;
     let forge_token = release_plz_forge_token()?;
 
     let current_executable = std::env::current_exe()
@@ -58,6 +90,7 @@ pub(super) fn run(root: &Path, manifest_path: &Path) -> Result<(), String> {
         &staged_validator,
         provider.release_family,
         &forge_token,
+        &release_plz,
     )?;
     validate_source(
         root,
@@ -67,11 +100,15 @@ pub(super) fn run(root: &Path, manifest_path: &Path) -> Result<(), String> {
         &staged_validator,
         provider.release_family,
         &forge_token,
+        &release_plz,
     )?;
     if digest_file(&staged_validator)? != validator_digest {
         return Err("staged release validator changed during validation".to_string());
     }
-    println!("local_release_validation=valid\nvalidator_sha256={validator_digest}");
+    println!(
+        "local_release_validation=valid\nvalidator_sha256={validator_digest}\nrelease_plz_sha256={}",
+        release_plz.digest
+    );
     Ok(())
 }
 
@@ -148,14 +185,64 @@ fn require_release_plz(
         .ok_or_else(|| "release family has no GitHub repository policy".to_string())?;
     let release = release_policy(policy.release_family);
     let expected = release.toolchain.release_plz_version;
-    let output = checked_output(
-        Path::new("."),
-        release_plz
-            .to_str()
-            .ok_or_else(|| "release-plz path is not UTF-8".to_string())?,
-        &["--version"],
-    )?;
+    let mut command = Command::new(release_plz);
+    command.arg("--version");
+    apply_release_tool_environment(&mut command, None);
+    let output = bounded_process::output(&mut command, VALIDATION_OUTPUT_LIMITS)
+        .map_err(|error| format!("run authenticated release-plz --version: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "authenticated release-plz --version failed: {}",
+            output_detail(&output)
+        ));
+    }
     require_release_plz_version(&output.stdout, expected)
+}
+
+fn stage_release_plz(
+    source: &Path,
+    expected_sha256: &str,
+) -> Result<AuthenticatedReleasePlz, String> {
+    if !source.is_absolute() || !is_digest(expected_sha256) {
+        return Err("release-plz path or SHA-256 is outside caller policy".to_string());
+    }
+    let parent = source
+        .parent()
+        .ok_or_else(|| "release-plz path has no parent".to_string())?;
+    let name = source
+        .file_name()
+        .ok_or_else(|| "release-plz path has no file name".to_string())?;
+    let bytes = safe_file::TrustedRoot::open(parent)
+        .and_then(|trusted| trusted.read_bytes(Path::new(name), MAX_RELEASE_PLZ_BYTES))
+        .map_err(|error| format!("read caller-owned release-plz: {error}"))?;
+    if bytes.is_empty() {
+        return Err("caller-owned release-plz is empty".to_string());
+    }
+    let digest = format!("{:x}", Sha256::digest(&bytes));
+    if digest != expected_sha256 {
+        return Err("caller-owned release-plz SHA-256 differs from reviewed bytes".to_string());
+    }
+
+    let staging = tempfile::tempdir()
+        .map_err(|error| format!("create release-plz staging directory: {error}"))?;
+    let path = staging.path().join("release-plz");
+    fs::write(&path, bytes).map_err(|error| format!("stage release-plz: {error}"))?;
+    set_executable(&path)?;
+    if digest_file(&path)? != digest {
+        return Err("staged release-plz bytes changed".to_string());
+    }
+    Ok(AuthenticatedReleasePlz {
+        _staging: staging,
+        path,
+        digest,
+    })
+}
+
+fn is_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 fn require_release_plz_version(output: &[u8], expected: &str) -> Result<(), String> {
@@ -166,6 +253,9 @@ fn require_release_plz_version(output: &[u8], expected: &str) -> Result<(), Stri
     Ok(())
 }
 
+// Keeping these independently authenticated inputs explicit makes accidental
+// current-versus-historical source substitution visible at every call site.
+#[allow(clippy::too_many_arguments)]
 fn validate_source(
     source: &Path,
     manifest: &Manifest,
@@ -174,6 +264,7 @@ fn validate_source(
     validator: &Path,
     family: crate::release_policy::ReleaseFamily,
     forge_token: &str,
+    release_plz: &AuthenticatedReleasePlz,
 ) -> Result<(), String> {
     let temporary = tempfile::tempdir()
         .map_err(|error| format!("create {label} validation directory: {error}"))?;
@@ -257,7 +348,7 @@ fn validate_source(
             config.display().to_string(),
         ],
     )?;
-    run_release_plz(&checkout, manifest, &config, forge_token)?;
+    run_release_plz(&checkout, manifest, &config, forge_token, release_plz)?;
     require_clean(&checkout, label)?;
     let after_refs = checked_output(
         &checkout,
@@ -311,8 +402,12 @@ fn run_release_plz(
     manifest: &Manifest,
     config: &Path,
     forge_token: &str,
+    release_plz: &AuthenticatedReleasePlz,
 ) -> Result<(), String> {
-    let mut command = release_plz_command(root, manifest, config, forge_token);
+    if digest_file(&release_plz.path)? != release_plz.digest {
+        return Err("authenticated release-plz changed before credential use".to_string());
+    }
+    let mut command = release_plz_command(root, manifest, config, forge_token, &release_plz.path);
     let output = bounded_process::output(&mut command, VALIDATION_OUTPUT_LIMITS)
         .map_err(|error| format!("run pinned release-plz dry run: {error}"))?;
     if output.status.success() {
@@ -330,8 +425,10 @@ fn release_plz_command(
     manifest: &Manifest,
     config: &Path,
     forge_token: &str,
+    release_plz: &Path,
 ) -> Command {
-    let mut command = Command::new(&manifest.release_plz);
+    let mut command = Command::new(release_plz);
+    apply_release_tool_environment(&mut command, Some(forge_token));
     command
         .current_dir(root)
         .args([
@@ -352,14 +449,24 @@ fn release_plz_command(
             "GIT_CONFIG_VALUE_0",
             "disabled://yaml-sigil-local-validation",
         )
-        .env_remove("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
-        .env_remove("ACTIONS_ID_TOKEN_REQUEST_URL")
-        .env_remove("GH_TOKEN")
-        .env_remove("GITHUB_TOKEN")
-        .env("GIT_TOKEN", forge_token)
-        .env_remove("CARGO_REGISTRY_TOKEN")
-        .env_remove("CARGO_REGISTRIES_CRATES_IO_TOKEN");
+        .env("GIT_TOKEN", forge_token);
     command
+}
+
+fn apply_release_tool_environment(command: &mut Command, forge_token: Option<&str>) {
+    command.env_clear();
+    for name in RELEASE_TOOL_ENVIRONMENT {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    command.env("GIT_CONFIG_NOSYSTEM", "1").env(
+        "GIT_CONFIG_GLOBAL",
+        if cfg!(windows) { "NUL" } else { "/dev/null" },
+    );
+    if let Some(token) = forge_token {
+        command.env("GIT_TOKEN", token);
+    }
 }
 
 fn release_plz_forge_token() -> Result<String, String> {
@@ -455,11 +562,6 @@ mod tests {
             repository: "NVIDIA/yaml-sigil-traits".to_string(),
             current_sha: "a".repeat(40),
             historical_sha: "b".repeat(40),
-            release_plz: if cfg!(windows) {
-                PathBuf::from(r"C:\release-plz.exe")
-            } else {
-                PathBuf::from("/release-plz")
-            },
         }
     }
 
@@ -468,7 +570,14 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         fs::write(
             temporary.path().join("manifest.json"),
-            r#"{"schema_version":1,"repository":"NVIDIA/yaml-sigil-traits","current_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","historical_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","release_plz":"/bin/false","extra":true}"#,
+            r#"{"schema_version":2,"repository":"NVIDIA/yaml-sigil-traits","current_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","historical_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","release_plz":"/bin/false","extra":true}"#,
+        )
+        .unwrap();
+        assert!(read_manifest(temporary.path(), Path::new("manifest.json")).is_err());
+
+        fs::write(
+            temporary.path().join("manifest.json"),
+            r#"{"schema_version":2,"repository":"NVIDIA/yaml-sigil-traits","current_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","historical_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","release_plz":"/bin/false"}"#,
         )
         .unwrap();
         assert!(read_manifest(temporary.path(), Path::new("manifest.json")).is_err());
@@ -528,7 +637,14 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let value = manifest();
         let config = temporary.path().join("publication.toml");
-        let command = release_plz_command(temporary.path(), &value, &config, "test-forge-token");
+        let executable = temporary.path().join("release-plz");
+        let command = release_plz_command(
+            temporary.path(),
+            &value,
+            &config,
+            "test-forge-token",
+            &executable,
+        );
         let args = command
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
@@ -570,7 +686,7 @@ mod tests {
             environment["GIT_TOKEN"].as_deref(),
             Some("test-forge-token")
         );
-        for removed in [
+        for absent in [
             "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
             "ACTIONS_ID_TOKEN_REQUEST_URL",
             "GH_TOKEN",
@@ -578,7 +694,45 @@ mod tests {
             "CARGO_REGISTRY_TOKEN",
             "CARGO_REGISTRIES_CRATES_IO_TOKEN",
         ] {
-            assert_eq!(environment.get(removed), Some(&None));
+            assert!(!environment.contains_key(absent));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tool_bytes_are_authenticated_before_execution_or_token_use() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let executable = temporary.path().join("candidate-release-plz");
+        let marker = temporary.path().join("token-seen");
+        let body = format!(
+            "#!/bin/sh\nif test -n \"${{GIT_TOKEN-}}\"; then printf leaked > '{}'; fi\nprintf 'release-plz 0.3.160\\n'\n",
+            marker.display()
+        );
+        fs::write(&executable, &body).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(stage_release_plz(&executable, &"0".repeat(64)).is_err());
+        assert!(!marker.exists(), "unauthenticated executable was run");
+
+        let digest = format!("{:x}", Sha256::digest(body.as_bytes()));
+        let staged = stage_release_plz(&executable, &digest).unwrap();
+        let mut identity = Command::new(&staged.path);
+        identity
+            .arg("--version")
+            .env("GIT_TOKEN", "must-not-reach-version-check");
+        apply_release_tool_environment(&mut identity, None);
+        assert!(
+            bounded_process::output(&mut identity, VALIDATION_OUTPUT_LIMITS)
+                .unwrap()
+                .status
+                .success()
+        );
+        assert!(
+            !marker.exists(),
+            "version identity check received GIT_TOKEN"
+        );
+        require_release_plz(&staged.path, crate::release_policy::ReleaseFamily::Traits).unwrap();
     }
 }

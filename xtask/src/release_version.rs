@@ -6,6 +6,7 @@
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -271,14 +272,19 @@ impl CargoRunner for SystemCargoRunner {
         program: &OsStr,
         args: &[OsString],
     ) -> Result<CargoStatus, String> {
-        let status = Command::new(program)
-            .current_dir(root)
-            .args(args)
-            .status()
+        let mut command = Command::new(program);
+        command.current_dir(root).args(args);
+        let output = bounded_process::output(&mut command, VALIDATION_OUTPUT_LIMITS)
             .map_err(|error| format!("run {}: {error}", program.to_string_lossy()))?;
+        io::stdout()
+            .write_all(&output.stdout)
+            .map_err(|error| format!("write {} stdout: {error}", program.to_string_lossy()))?;
+        io::stderr()
+            .write_all(&output.stderr)
+            .map_err(|error| format!("write {} stderr: {error}", program.to_string_lossy()))?;
         Ok(CargoStatus {
-            success: status.success(),
-            code: status.code(),
+            success: output.status.success(),
+            code: output.status.code(),
         })
     }
 }
@@ -742,7 +748,8 @@ fn ensure_candidate_changelog(
     date: &str,
 ) -> Result<(), String> {
     let path = root.join(CHANGELOG);
-    let body = fs::read_to_string(&path).map_err(|error| format!("read {CHANGELOG}: {error}"))?;
+    let body = safe_file::read_manifest(root, Path::new(CHANGELOG))
+        .map_err(|error| format!("read {CHANGELOG}: {error}"))?;
     let generated_prefix = format!("## [{generated}](");
     let target_prefix = format!("## [{target}](");
     let mut changed = false;
@@ -780,7 +787,8 @@ fn promote_changelog(
     date: &str,
 ) -> Result<(), String> {
     let path = root.join(CHANGELOG);
-    let body = fs::read_to_string(&path).map_err(|error| format!("read {CHANGELOG}: {error}"))?;
+    let body = safe_file::read_manifest(root, Path::new(CHANGELOG))
+        .map_err(|error| format!("read {CHANGELOG}: {error}"))?;
     let section = changelog_section(&body, rc)?;
     let release_url = release_tag_url(root, stable)?;
     let promoted = format!("## [{stable}]({release_url}) - {date}\n{section}");
@@ -1446,6 +1454,31 @@ mod tests {
             insert_after_unreleased(body, section).unwrap(),
             "# Changelog\n\n## [Unreleased]\n\n## [0.2.0](new) - 2026-08-19\n\n- New.\n\n## [0.1.0](old) - 2026-01-01\n\n- Old.\n"
         );
+    }
+
+    #[test]
+    fn candidate_and_promotion_reject_oversized_changelogs_before_allocation() {
+        let temporary = TestDirectory::new("oversized-changelog");
+        fs::write(
+            temporary.0.join(CHANGELOG),
+            vec![b'x'; safe_file::MANIFEST_LIMIT + 1],
+        )
+        .unwrap();
+        let rc = Version::parse("1.2.3-rc.1").unwrap();
+        let stable = Version::parse("1.2.3").unwrap();
+
+        for error in [
+            ensure_candidate_changelog(&temporary.0, &rc, &rc, "2026-09-02").unwrap_err(),
+            promote_changelog(&temporary.0, &rc, &stable, "2026-09-02").unwrap_err(),
+        ] {
+            assert!(
+                error.contains(&format!(
+                    "{CHANGELOG} exceeds its {}-byte limit",
+                    safe_file::MANIFEST_LIMIT
+                )),
+                "unexpected bounded changelog error: {error}"
+            );
+        }
     }
 
     #[test]
