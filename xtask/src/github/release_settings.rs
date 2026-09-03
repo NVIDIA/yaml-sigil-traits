@@ -38,6 +38,11 @@ struct Repository {
 }
 
 #[derive(Debug, Deserialize)]
+struct WorkflowRunRepository {
+    full_name: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct GitRef {
     #[serde(rename = "ref")]
     name: String,
@@ -61,7 +66,7 @@ struct WorkflowRun {
     path: String,
     status: String,
     conclusion: Option<String>,
-    repository: Repository,
+    repository: WorkflowRunRepository,
     #[serde(default)]
     check_suite_node_id: Option<String>,
 }
@@ -1044,7 +1049,7 @@ pub(super) mod tests {
                 json!({
                     "id":123456,"run_attempt":2,"head_sha":sha,"head_branch":"main",
                     "event":"workflow_dispatch","path":WORKFLOW_PATH,"status":"waiting",
-                    "conclusion":null,"repository":{"full_name":repository,"default_branch":"main"},
+                    "conclusion":null,"repository":{"full_name":repository},
                 }),
             ),
             Expected::json(
