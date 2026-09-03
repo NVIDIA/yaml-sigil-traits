@@ -193,6 +193,12 @@ cargo xtask ci --candidate-root PATH
 The command still builds and runs the xtask from the current checkout; only
 the repository content being validated comes from `PATH`.
 
+Alternate candidate-root validation is supported only where the process
+boundary owns descendants that leave their original process group. Linux uses
+the subreaper boundary and Windows uses Job Objects. On macOS and other
+non-Linux Unix hosts, `--candidate-root` fails before candidate execution;
+ordinary `cargo xtask ci` for the trusted current checkout remains supported.
+
 After a release-path change is committed, exercise the maintained current and
 historical source harness from the exact clean checkout:
 
@@ -287,6 +293,12 @@ The surviving provider helpers have deliberately narrow roles:
 - `protected_pr_ci.py` and `test_protected_pr_ci.py` keep protected-main
   authorization checkout-free and test that immutable policy without compiling
   candidate Rust.
+- `cargo_egress_proxy.py` restricts protected Cargo prefetch transport to the
+  crates.io TLS endpoints; Cargo still authenticates TLS and Cargo Deny
+  independently validates resolved sources.
+- `test-cargo-egress-topology.sh` is a Linux-only, test-only Docker check of
+  that topology and its exact cleanup. It must not execute candidate or release
+  code.
 - `check-pull-request-commits.sh` enforces the shared exact-range, linear
   history, and DCO policy across all three YamlSigil repositories.
 - `resolve-source-spec-gitlink.sh` reads one candidate gitlink without loading
