@@ -717,6 +717,8 @@ def is_sensitive_path(path: str, repository_kind: str) -> bool:
         ".clippy.toml",
         "deny.toml",
         ".deny.toml",
+        "deny.exceptions.toml",
+        ".deny.exceptions.toml",
         "cargo-deny.toml",
         ".cargo-deny.toml",
         "cargo-machete.toml",

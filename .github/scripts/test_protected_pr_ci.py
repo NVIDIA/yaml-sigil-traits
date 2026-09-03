@@ -551,6 +551,27 @@ class AuthorizationTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertTrue(controller.is_sensitive_path(path, kind))
 
+    def test_cargo_deny_exception_basenames_are_sensitive(self) -> None:
+        cases = (
+            ("deny.exceptions.toml", True),
+            (".deny.exceptions.toml", True),
+            ("nested/deny.exceptions.toml", True),
+            ("nested/.deny.exceptions.toml", True),
+            (".cargo/deny.exceptions.toml", True),
+            (".cargo/.deny.exceptions.toml", True),
+            ("DeNy.ExCePtIoNs.ToMl", True),
+            ("ＮＥＳＴＥＤ/ＤＥＮＹ．ＥＸＣＥＰＴＩＯＮＳ．ＴＯＭＬ", True),
+            ("deny.exception.toml", False),
+            ("deny-exceptions.toml", False),
+            ("deny.exceptions.toml.example", False),
+            ("nested/cargo-deny.exceptions.toml", False),
+        )
+        for path, expected in cases:
+            with self.subTest(path=path):
+                self.assertEqual(
+                    controller.is_sensitive_path(path, "traits"), expected
+                )
+
     def test_spec_and_rs_classifier_extensions_are_explicit(self) -> None:
         for path in (
             "proto/buf.yaml",
@@ -1350,6 +1371,20 @@ class AuthorizationTests(unittest.TestCase):
         api.set_change("Cargo.toml")
         with self.assertRaisesRegex(controller.PolicyError, "test-and-adopt"):
             controller.authorize(event(), policy(), api, environment())
+
+    def test_cargo_deny_exception_change_requires_adoption(self) -> None:
+        for path in ("deny.exceptions.toml", ".deny.exceptions.toml"):
+            with self.subTest(path=path, command="test"):
+                api = FakeAuthorizationApi()
+                api.set_change(path)
+                with self.assertRaisesRegex(controller.PolicyError, "test-and-adopt"):
+                    controller.authorize(event(), policy(), api, environment())
+
+            with self.subTest(path=path, command="test-and-adopt"):
+                api = FakeAuthorizationApi()
+                api.set_change(path)
+                result = authorize_fixture(api, adoption_event())
+                self.assertTrue(result.candidate_ci_required)
 
     def test_sensitive_fork_requires_maintainer_edits(self) -> None:
         api = FakeAuthorizationApi()
