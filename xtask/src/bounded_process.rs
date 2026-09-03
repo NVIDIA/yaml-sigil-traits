@@ -306,6 +306,8 @@ mod platform {
 
     use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
     #[cfg(target_os = "linux")]
+    use rustix::io::Errno;
+    #[cfg(target_os = "linux")]
     use rustix::process::getpgid;
     #[cfg(not(target_os = "linux"))]
     use rustix::process::test_kill_process_group;
@@ -397,12 +399,22 @@ mod platform {
     }
 
     #[cfg(target_os = "linux")]
+    fn process_entry_disappeared(error: &io::Error) -> bool {
+        error.kind() == io::ErrorKind::NotFound
+            || error.raw_os_error() == Some(Errno::SRCH.raw_os_error())
+    }
+
+    #[cfg(target_os = "linux")]
     fn direct_children() -> io::Result<BTreeSet<i32>> {
         let own_pid = i32::try_from(std::process::id())
             .map_err(|_| io::Error::other("current process ID is out of range"))?;
         let mut children = BTreeSet::new();
         for entry in std::fs::read_dir("/proc")? {
-            let entry = entry?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) if process_entry_disappeared(&error) => continue,
+                Err(error) => return Err(error),
+            };
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
             };
@@ -411,7 +423,7 @@ mod platform {
             };
             let stat = match std::fs::read_to_string(entry.path().join("stat")) {
                 Ok(value) => value,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) if process_entry_disappeared(&error) => continue,
                 Err(error) => return Err(error),
             };
             let (_, fields) = stat.rsplit_once(") ").ok_or_else(|| {
@@ -435,6 +447,26 @@ mod platform {
             }
         }
         Ok(children)
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn proc_scan_ignores_only_disappeared_process_errors() {
+            assert!(process_entry_disappeared(&io::Error::new(
+                io::ErrorKind::NotFound,
+                "process disappeared",
+            )));
+            assert!(process_entry_disappeared(&io::Error::from_raw_os_error(
+                Errno::SRCH.raw_os_error(),
+            )));
+            assert!(!process_entry_disappeared(&io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "permission denied",
+            )));
+        }
     }
 
     struct Capture<R> {

@@ -1150,6 +1150,7 @@ mod tests {
 
     #[test]
     fn settings_request_does_not_require_github_credentials() {
+        let root = test_root();
         let output = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--ignored",
@@ -1160,6 +1161,14 @@ mod tests {
             ])
             .env_remove("GH_TOKEN")
             .env_remove("GITHUB_TOKEN")
+            // Protected CI presents the verified candidate checkout read-only
+            // under another owner. Trust only that exact test root for this
+            // child invocation; the setting is not inherited from candidate
+            // repository configuration.
+            .env("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "safe.directory")
+            .env("GIT_CONFIG_VALUE_0", root)
             .output()
             .unwrap();
         assert!(
