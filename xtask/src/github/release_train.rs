@@ -1881,6 +1881,7 @@ fn decode_plan(body: &str, digest: &str) -> Result<ReleasePlan, String> {
 }
 
 fn validate_plan(plan: &ReleasePlan) -> Result<(), String> {
+    let policy = release_policy_for_repository(&plan.repository)?;
     if plan.schema_version != PLAN_SCHEMA
         || !is_sha(&plan.release_sha)
         || !is_sha(&plan.policy_commit)
@@ -1897,12 +1898,21 @@ fn validate_plan(plan: &ReleasePlan) -> Result<(), String> {
     {
         return Err("release plan binding is invalid".to_string());
     }
+    if plan.packages.len() != policy.packages.len() {
+        return Err("release plan package family differs from compiled policy".to_string());
+    }
     let mut names = BTreeSet::new();
     let mut tags = BTreeSet::new();
-    for package in &plan.packages {
+    for (package, package_policy) in plan.packages.iter().zip(policy.packages) {
+        let version = semver::Version::parse(&package.version)
+            .map_err(|_| "release plan package version is invalid".to_string())?;
         if package.package.is_empty()
             || package.version.is_empty()
             || package.tag.is_empty()
+            || package.package != package_policy.package
+            || !canonical_release_version(&package.version)
+            || package.tag != package_policy.tag(&package.version)
+            || package.prerelease != !version.pre.is_empty()
             || !is_digest(&package.source_archive_sha256)
             || !is_digest(&package.package_inventory_sha256)
             || !is_digest(&package.release_body_sha256)
@@ -3080,6 +3090,35 @@ fn require_finalizer_authority(
     plan: &ReleasePlan,
     plan_digest: &str,
 ) -> Result<(), String> {
+    require_finalizer_authority_at(
+        github,
+        repository,
+        intent_check_id,
+        intent,
+        intent_body,
+        settings_check_id,
+        settings,
+        settings_body,
+        plan,
+        plan_digest,
+        now_epoch()?,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn require_finalizer_authority_at(
+    github: &mut impl Transport,
+    repository: &str,
+    intent_check_id: u64,
+    intent: &IntentRecord,
+    intent_body: &str,
+    settings_check_id: u64,
+    settings: &SettingsAuthorizationRecord,
+    settings_body: &str,
+    plan: &ReleasePlan,
+    plan_digest: &str,
+    now: u64,
+) -> Result<(), String> {
     require_current_policy_reference(repository, &settings.policy_commit, github)?;
     require_finalizer_intent(github, repository, intent_check_id, intent, intent_body)?;
     let current = current_settings_authorization(
@@ -3090,12 +3129,27 @@ fn require_finalizer_authority(
         &settings.policy_commit,
         settings.run_id,
         settings.run_attempt,
-        now_epoch()?,
+        now,
     )?
     .ok_or_else(|| "finalizer settings authorization Check is missing".to_string())?;
     if current.0.id != settings_check_id || current.1 != settings_body || current.2 != *settings {
         return Err("finalizer settings authorization Check is duplicated or changed".to_string());
     }
+    crate::github::release_settings::validate_evidence(
+        &settings.settings_evidence,
+        repository,
+        &settings.policy_commit,
+        settings.run_id,
+        settings.run_attempt,
+        now,
+        true,
+    )?;
+    crate::github::release_settings::require_current_reviewer_admin(
+        github,
+        repository,
+        &settings.settings_reviewer_login,
+        settings.settings_reviewer_id,
+    )?;
     Ok(())
 }
 
@@ -4246,6 +4300,53 @@ mod tests {
     }
 
     #[test]
+    fn release_plan_rejects_canonical_policy_divergence_before_use() {
+        let reject = |forged: ReleasePlan| {
+            let (body, digest) = encode_plan(&forged).unwrap();
+            assert_eq!(sha256(body.as_bytes()), digest);
+            assert!(decode_plan(&body, &digest).is_err());
+        };
+
+        let mut forged = plan();
+        forged.packages[0].package = "yaml-sigil-forged".to_string();
+        reject(forged);
+
+        let mut forged = plan();
+        forged.packages.push(forged.packages[0].clone());
+        reject(forged);
+
+        let mut forged = plan();
+        forged.packages[0].tag = "forged-v0.4.0".to_string();
+        reject(forged);
+
+        let mut forged = plan();
+        forged.packages[0].prerelease = true;
+        reject(forged);
+
+        let mut forged = plan();
+        forged.packages[0].version = "0.4.0+forged".to_string();
+        forged.packages[0].tag = "v0.4.0+forged".to_string();
+        reject(forged);
+
+        let mut rust_plan = plan();
+        rust_plan.repository = "NVIDIA/yaml-sigil-rs".to_string();
+        let package = rust_plan.packages[0].clone();
+        rust_plan.packages = crate::release_policy::RUST_POLICY
+            .packages
+            .iter()
+            .map(|policy| PlanPackage {
+                package: policy.package.to_string(),
+                tag: policy.tag(&package.version),
+                ..package.clone()
+            })
+            .collect();
+        let (body, digest) = encode_plan(&rust_plan).unwrap();
+        assert_eq!(decode_plan(&body, &digest).unwrap(), rust_plan);
+        rust_plan.packages.swap(0, 1);
+        reject(rust_plan);
+    }
+
+    #[test]
     fn settings_evidence_is_canonical_and_bound_to_policy_not_source() {
         let plan = plan();
         let body = settings_evidence(&plan, &plan.policy_commit, 100, 1);
@@ -4502,6 +4603,142 @@ mod tests {
             require_finalizer_intent(&mut github, &intent.repository, 900, &intent, &body)
                 .unwrap_err()
                 .contains("duplicated")
+        );
+        github.finish();
+    }
+
+    #[test]
+    fn finalizer_requires_fresh_settings_and_current_reviewer_admin() {
+        let (plan, intent, intent_body) = intent_fixture();
+        let (_, plan_digest) = encode_plan(&plan).unwrap();
+        let evidence = settings_evidence(&plan, &plan.policy_commit, 100, 1);
+        let settings = build_settings_authorization(
+            &plan,
+            &plan_digest,
+            &plan.policy_commit,
+            100,
+            1,
+            &evidence,
+            700,
+            800,
+            "release-admin",
+            TEST_OBSERVED_AT + 1,
+        )
+        .unwrap();
+        let settings_body = canonical_settings_authorization(&settings).unwrap();
+        let intent_check = intent_check(&intent, &intent_body, 900, "success");
+        let settings_check = settings_authorization_check(&settings, &settings_body, 901);
+        let main_path = format!("repos/{}/git/ref/heads/main", plan.repository);
+        let intent_inventory = format!(
+            "repos/{}/commits/{}/check-runs?check_name={}&filter=all&per_page=100",
+            plan.repository,
+            plan.release_sha,
+            percent_encode(INTENT_NAME)
+        );
+        let settings_inventory = format!(
+            "repos/{}/commits/{}/check-runs?check_name={}&filter=all&per_page=100",
+            plan.repository,
+            plan.policy_commit,
+            percent_encode(SETTINGS_AUTHORIZATION_NAME)
+        );
+        let expectations = |permission: &str, include_permission: bool| {
+            let mut expected = vec![
+                Expected::json(
+                    "GET",
+                    &main_path,
+                    json!({
+                        "ref": "refs/heads/main",
+                        "object": {"type": "commit", "sha": plan.policy_commit},
+                    }),
+                ),
+                Expected::json(
+                    "GET",
+                    &intent_inventory,
+                    json!({"total_count": 1, "check_runs": [intent_check.clone()]}),
+                ),
+                Expected::json(
+                    "GET",
+                    "repos/NVIDIA/yaml-sigil-traits/check-runs/900",
+                    intent_check.clone(),
+                ),
+                Expected::json(
+                    "GET",
+                    &settings_inventory,
+                    json!({"total_count": 1, "check_runs": [settings_check.clone()]}),
+                ),
+                Expected::json(
+                    "GET",
+                    "repos/NVIDIA/yaml-sigil-traits/check-runs/901",
+                    settings_check.clone(),
+                ),
+            ];
+            if include_permission {
+                expected.push(Expected::json(
+                    "GET",
+                    "repos/NVIDIA/yaml-sigil-traits/collaborators/release-admin/permission",
+                    json!({
+                        "permission": permission,
+                        "user": {"login": "release-admin", "id": 800},
+                    }),
+                ));
+            }
+            expected
+        };
+
+        let mut github = FakeTransport::new(expectations("admin", true));
+        require_finalizer_authority_at(
+            &mut github,
+            &plan.repository,
+            900,
+            &intent,
+            &intent_body,
+            901,
+            &settings,
+            &settings_body,
+            &plan,
+            &plan_digest,
+            TEST_OBSERVED_AT + 2,
+        )
+        .unwrap();
+        github.finish();
+
+        let mut github = FakeTransport::new(expectations("write", true));
+        assert!(
+            require_finalizer_authority_at(
+                &mut github,
+                &plan.repository,
+                900,
+                &intent,
+                &intent_body,
+                901,
+                &settings,
+                &settings_body,
+                &plan,
+                &plan_digest,
+                TEST_OBSERVED_AT + 2,
+            )
+            .unwrap_err()
+            .contains("current repository-admin")
+        );
+        github.finish();
+
+        let mut github = FakeTransport::new(expectations("admin", false));
+        assert!(
+            require_finalizer_authority_at(
+                &mut github,
+                &plan.repository,
+                900,
+                &intent,
+                &intent_body,
+                901,
+                &settings,
+                &settings_body,
+                &plan,
+                &plan_digest,
+                TEST_OBSERVED_AT + 301,
+            )
+            .unwrap_err()
+            .contains("approval window")
         );
         github.finish();
     }

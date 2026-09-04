@@ -36,6 +36,12 @@ pub enum Outcome {
 
 #[derive(Args)]
 pub struct ReleaseArgs {
+    /// Validate an exact alternate source checkout.
+    #[arg(long, requires = "validation_head")]
+    validation_root: Option<PathBuf>,
+    /// Exact commit required at the alternate validation root.
+    #[arg(long, requires = "validation_root")]
+    validation_head: Option<String>,
     #[command(subcommand)]
     command: ReleaseCommand,
 }
@@ -78,14 +84,31 @@ enum ReleaseCommand {
 }
 
 pub fn run(root: &Path, args: ReleaseArgs) -> Result<Outcome, String> {
-    match args.command {
+    let ReleaseArgs {
+        validation_root,
+        validation_head,
+        command,
+    } = args;
+    if validation_root.is_some()
+        && !matches!(
+            &command,
+            ReleaseCommand::CheckPackages { .. } | ReleaseCommand::PreparePublicationConfig { .. }
+        )
+    {
+        return Err(
+            "alternate release validation supports only check-packages and prepare-publication-config"
+                .to_string(),
+        );
+    }
+    let root = crate::resolve_validation_root(root, validation_root, validation_head)?;
+    match command {
         ReleaseCommand::InstallTools => {
-            install_tools(root)?;
+            install_tools(&root)?;
             Ok(Outcome::Success)
         }
         ReleaseCommand::CheckPackages { packages } => {
             validate_package_arguments(&packages)?;
-            check_packages(root, &packages)?;
+            check_packages(&root, &packages)?;
             Ok(Outcome::Success)
         }
         ReleaseCommand::VerifyRegistry {
@@ -93,22 +116,22 @@ pub fn run(root: &Path, args: ReleaseArgs) -> Result<Outcome, String> {
             packages,
         } => {
             validate_package_arguments(&packages)?;
-            verify_registry(root, check_version.as_ref(), &packages)
+            verify_registry(&root, check_version.as_ref(), &packages)
         }
         ReleaseCommand::RequireCurrentMain { head, fetch_url } => {
-            require_current_main(root, &head, &fetch_url)?;
+            require_current_main(&root, &head, &fetch_url)?;
             Ok(Outcome::Success)
         }
         ReleaseCommand::PreparePublicationConfig { source, output } => {
-            prepare_publication_config(root, source.as_deref(), &output)?;
+            prepare_publication_config(&root, source.as_deref(), &output)?;
             Ok(Outcome::Success)
         }
         ReleaseCommand::Baseline(args) => {
-            crate::release_baseline::run(root, args)?;
+            crate::release_baseline::run(&root, args)?;
             Ok(Outcome::Success)
         }
         ReleaseCommand::Proposal(args) => {
-            crate::release_proposal::run(root, args)?;
+            crate::release_proposal::run(&root, args)?;
             Ok(Outcome::Success)
         }
     }

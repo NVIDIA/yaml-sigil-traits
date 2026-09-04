@@ -23,6 +23,12 @@ const CHANGELOG: &str = "CHANGELOG.md";
 
 #[derive(Args)]
 pub struct ReleaseVersionArgs {
+    /// Validate an exact alternate source checkout.
+    #[arg(long, requires = "validation_head")]
+    validation_root: Option<PathBuf>,
+    /// Exact commit required at the alternate validation root.
+    #[arg(long, requires = "validation_root")]
+    validation_head: Option<String>,
     #[command(subcommand)]
     command: ReleaseVersionCommand,
 }
@@ -89,13 +95,29 @@ impl ReleaseBump {
 }
 
 pub fn run(root: &Path, args: ReleaseVersionArgs) -> Result<(), String> {
-    match args.command {
+    let ReleaseVersionArgs {
+        validation_root,
+        validation_head,
+        command,
+    } = args;
+    if validation_root.is_some()
+        && !matches!(
+            &command,
+            ReleaseVersionCommand::Show | ReleaseVersionCommand::Check
+        )
+    {
+        return Err(
+            "alternate release-version validation supports only show and check".to_string(),
+        );
+    }
+    let root = crate::resolve_validation_root(root, validation_root, validation_head)?;
+    match command {
         ReleaseVersionCommand::Show => {
-            println!("{}", read_version(root)?);
+            println!("{}", read_version(&root)?);
             Ok(())
         }
         ReleaseVersionCommand::Check => {
-            let version = read_version(root)?;
+            let version = read_version(&root)?;
             eprintln!("release-version: manifest version is {version}");
             Ok(())
         }
@@ -107,7 +129,7 @@ pub fn run(root: &Path, args: ReleaseVersionArgs) -> Result<(), String> {
             expected_current_version,
             intent,
         } => check_api_compatibility(
-            root,
+            &root,
             &baseline_manifest,
             &current_manifest,
             &package,
@@ -116,7 +138,7 @@ pub fn run(root: &Path, args: ReleaseVersionArgs) -> Result<(), String> {
             intent.as_str(),
         ),
         ReleaseVersionCommand::Intent { published } => {
-            println!("{}", release_intent(&published, &read_version(root)?)?);
+            println!("{}", release_intent(&published, &read_version(&root)?)?);
             Ok(())
         }
         ReleaseVersionCommand::Candidate {
@@ -126,21 +148,21 @@ pub fn run(root: &Path, args: ReleaseVersionArgs) -> Result<(), String> {
             release_notes,
         } => {
             validate_date(&date)?;
-            let current = read_version(root)?;
+            let current = read_version(&root)?;
             let target = candidate_version(&published, &current, bump.as_str())?;
-            write_version(root, &target)?;
+            write_version(&root, &target)?;
             if release_notes {
-                ensure_candidate_changelog(root, &current, &target, &date)?;
+                ensure_candidate_changelog(&root, &current, &target, &date)?;
             }
             println!("{target}");
             Ok(())
         }
         ReleaseVersionCommand::PromoteStable { date } => {
             validate_date(&date)?;
-            let current = read_version(root)?;
+            let current = read_version(&root)?;
             let stable = stable_version(&current)?;
-            promote_changelog(root, &current, &stable, &date)?;
-            write_version(root, &stable)?;
+            promote_changelog(&root, &current, &stable, &date)?;
+            write_version(&root, &stable)?;
             println!("{stable}");
             Ok(())
         }

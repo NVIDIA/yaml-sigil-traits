@@ -325,8 +325,20 @@ fn validate_source(
     )?
     .stdout;
     require_clean(&checkout, label)?;
-    run_validator(&checkout, validator, &["release-version", "check"])?;
-    run_validator(&checkout, validator, &["release-version", "show"])?;
+    run_validator(
+        &checkout,
+        validator,
+        sha,
+        label,
+        &["release-version", "check"],
+    )?;
+    run_validator(
+        &checkout,
+        validator,
+        sha,
+        label,
+        &["release-version", "show"],
+    )?;
     let release = release_policy(family);
     let mut package_args = vec!["release".to_string(), "check-packages".to_string()];
     package_args.extend(
@@ -335,12 +347,14 @@ fn validate_source(
             .iter()
             .map(|package| package.package.to_string()),
     );
-    run_validator_owned(&checkout, validator, &package_args)?;
+    run_validator_owned(&checkout, validator, sha, label, &package_args)?;
 
     let config = temporary.path().join(format!("{label}-publication.toml"));
     run_validator_owned(
         &checkout,
         validator,
+        sha,
+        label,
         &[
             "release".to_string(),
             "prepare-publication-config".to_string(),
@@ -348,7 +362,15 @@ fn validate_source(
             config.display().to_string(),
         ],
     )?;
-    run_release_plz(&checkout, manifest, &config, forge_token, release_plz)?;
+    run_release_plz(
+        &checkout,
+        manifest,
+        sha,
+        label,
+        &config,
+        forge_token,
+        release_plz,
+    )?;
     require_clean(&checkout, label)?;
     let after_refs = checked_output(
         &checkout,
@@ -374,17 +396,29 @@ fn require_unchanged_source_state(
     Ok(())
 }
 
-fn run_validator(root: &Path, validator: &Path, args: &[&str]) -> Result<(), String> {
+fn run_validator(
+    root: &Path,
+    validator: &Path,
+    expected_head: &str,
+    label: &str,
+    args: &[&str],
+) -> Result<(), String> {
     let owned = args
         .iter()
         .map(|value| (*value).to_string())
         .collect::<Vec<_>>();
-    run_validator_owned(root, validator, &owned)
+    run_validator_owned(root, validator, expected_head, label, &owned)
 }
 
-fn run_validator_owned(root: &Path, validator: &Path, args: &[String]) -> Result<(), String> {
-    let mut command = Command::new(validator);
-    command.current_dir(root).args(args);
+fn run_validator_owned(
+    root: &Path,
+    validator: &Path,
+    expected_head: &str,
+    label: &str,
+    args: &[String],
+) -> Result<(), String> {
+    require_bound_checkout(root, expected_head, label)?;
+    let mut command = bound_validator_command(root, validator, expected_head, args)?;
     let output = bounded_process::output(&mut command, VALIDATION_OUTPUT_LIMITS)
         .map_err(|error| format!("run staged release validator: {error}"))?;
     if output.status.success() {
@@ -397,13 +431,42 @@ fn run_validator_owned(root: &Path, validator: &Path, args: &[String]) -> Result
     }
 }
 
+fn bound_validator_command(
+    root: &Path,
+    validator: &Path,
+    expected_head: &str,
+    args: &[String],
+) -> Result<Command, String> {
+    let (command_name, command_args) = args
+        .split_first()
+        .ok_or_else(|| "staged release validator command is empty".to_string())?;
+    if !matches!(command_name.as_str(), "release" | "release-version")
+        || !super::is_sha(expected_head)
+    {
+        return Err("staged release validator binding is invalid".to_string());
+    }
+    let mut command = Command::new(validator);
+    command
+        .current_dir(root)
+        .arg(command_name)
+        .arg("--validation-root")
+        .arg(root)
+        .arg("--validation-head")
+        .arg(expected_head)
+        .args(command_args);
+    Ok(command)
+}
+
 fn run_release_plz(
     root: &Path,
     manifest: &Manifest,
+    expected_head: &str,
+    label: &str,
     config: &Path,
     forge_token: &str,
     release_plz: &AuthenticatedReleasePlz,
 ) -> Result<(), String> {
+    require_bound_checkout(root, expected_head, label)?;
     if digest_file(&release_plz.path)? != release_plz.digest {
         return Err("authenticated release-plz changed before credential use".to_string());
     }
@@ -418,6 +481,16 @@ fn run_release_plz(
             output_detail(&output)
         ))
     }
+}
+
+fn require_bound_checkout(root: &Path, expected_head: &str, label: &str) -> Result<(), String> {
+    require_clean(root, label)?;
+    if !super::is_sha(expected_head) || git_line(root, &["rev-parse", "HEAD"])? != expected_head {
+        return Err(format!(
+            "{label} validation fixture is not the exact selected commit"
+        ));
+    }
+    Ok(())
 }
 
 fn release_plz_command(
@@ -629,6 +702,44 @@ mod tests {
         assert!(
             require_unchanged_source_state("current", b"refs", b"refs", &head, &"b".repeat(40))
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn staged_validator_commands_bind_the_selected_checkout_and_head() {
+        let temporary = tempfile::tempdir().unwrap();
+        let validator = temporary.path().join("validator");
+        let head = "a".repeat(40);
+        let command = bound_validator_command(
+            temporary.path(),
+            &validator,
+            &head,
+            &["release-version".to_string(), "check".to_string()],
+        )
+        .unwrap();
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            [
+                "release-version",
+                "--validation-root",
+                &temporary.path().display().to_string(),
+                "--validation-head",
+                &head,
+                "check",
+            ]
+        );
+        assert!(
+            bound_validator_command(
+                temporary.path(),
+                &validator,
+                &head,
+                &["github".to_string(), "finalize".to_string()],
+            )
+            .is_err()
         );
     }
 

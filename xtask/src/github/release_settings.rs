@@ -486,17 +486,39 @@ fn review_once(
     let Some(review) = approved.pop() else {
         return Ok(None);
     };
+    require_current_reviewer_admin(
+        github,
+        repository,
+        &review.reviewer_login,
+        review.reviewer_id,
+    )?;
+    Ok(Some(review))
+}
+
+pub(super) fn require_current_reviewer_admin(
+    github: &mut impl Transport,
+    repository: &str,
+    reviewer_login: &str,
+    reviewer_id: u64,
+) -> Result<(), String> {
+    if reviewer_id == 0
+        || reviewer_login.is_empty()
+        || reviewer_login.len() > 256
+        || reviewer_login.contains(['\0', '\r', '\n'])
+    {
+        return Err("settings reviewer identity is invalid".to_string());
+    }
     let permission: CollaboratorPermission = github.get(&format!(
         "repos/{repository}/collaborators/{}/permission",
-        percent_encode(&review.reviewer_login)
+        percent_encode(reviewer_login)
     ))?;
     if permission.permission != "admin"
-        || permission.user.login != review.reviewer_login
-        || permission.user.id != review.reviewer_id
+        || permission.user.login != reviewer_login
+        || permission.user.id != reviewer_id
     {
         return Err("settings reviewer lacks current repository-admin authority".to_string());
     }
-    Ok(Some(review))
+    Ok(())
 }
 
 fn now_epoch() -> Result<u64, String> {
