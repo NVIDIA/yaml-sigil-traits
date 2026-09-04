@@ -27,6 +27,7 @@ head_sha="$8"
 command_file="$9"
 trusted_toolchain='1.98.0'
 cargo_audit_version='0.22.2'
+cargo_deny_version='0.20.2'
 buf_version='1.72.0'
 
 # GitHub-hosted Ubuntu images install the native system toolchain as UID 0.
@@ -245,6 +246,7 @@ link_probe_cargo_home="${link_probe_state}/cargo-home"
 link_probe_target="${link_probe_state}/target"
 link_probe_root="${sandbox}/link-probe"
 protected_cargo_config="${sandbox}/protected-cargo-config.toml"
+prefetch_cargo_config="${sandbox}/prefetch-cargo-config.toml"
 prefetch_root_lockfile="${candidate_home}/Cargo.lock"
 candidate_root_lockfile="${sandbox}/candidate-root.Cargo.lock"
 trusted_tools="${sandbox}/trusted-tools"
@@ -276,6 +278,12 @@ printf '%s\n' \
   'version = "0.0.0"' \
   >"${link_probe_root}/Cargo.lock"
 printf '%s\n' '[net]' 'offline = true' >"${protected_cargo_config}"
+{
+  if [[ "${repository_kind}" == 'rs' ]]; then
+    printf '%s\n\n' 'paths = ["/policy/.github/trusted-cargo/buf-tools"]'
+  fi
+  printf '%s\n' '[net]' 'git-fetch-with-cli = false'
+} >"${prefetch_cargo_config}"
 ln -s /cargo-seed/config.toml "${link_probe_cargo_home}/config.toml"
 
 # Preserve the Rustup multicall name after resolving the original executable.
@@ -346,8 +354,12 @@ if [[ "${profile}" != 'controller' ]]; then
     exit 1
   fi
 
-  if [[ "${repository_kind}" != 'spec' ]]; then
-    cargo +"${trusted_toolchain}" install --locked --root "${trusted_tools}" cargo-deny --version 0.20.2
+  cargo +"${trusted_toolchain}" install --locked --root "${trusted_tools}" \
+    cargo-deny --version "${cargo_deny_version}"
+  if [[ "$("${trusted_tools}/bin/cargo-deny" --version)" != \
+    "cargo-deny ${cargo_deny_version}" ]]; then
+    echo 'installed cargo-deny version differs from protected policy' >&2
+    exit 1
   fi
 
   if [[ "${repository_kind}" == 'spec' || "${repository_kind}" == 'rs' ]]; then
@@ -489,8 +501,11 @@ candidate_user_created='false'
 candidate_container="yaml-sigil-candidate-${head_sha}-$$"
 fetch_container="${candidate_container}-fetch"
 link_probe_container="${candidate_container}-link-probe"
+proxy_container="${candidate_container}-cargo-proxy"
+prefetch_network="${candidate_container}-prefetch"
 candidate_image="yaml-sigil-candidate:${head_sha}-${profile}-$$"
 candidate_image_created='false'
+prefetch_network_created='false'
 trusted_docker=''
 
 cleanup_candidate_user() {
@@ -507,6 +522,28 @@ cleanup_candidate_user() {
   candidate_user_created='false'
 }
 
+cleanup_prefetch_egress() {
+  local failed='false'
+  if [[ -z "${trusted_docker}" ]]; then
+    return
+  fi
+  if "${trusted_docker}" container inspect "${proxy_container}" >/dev/null 2>&1; then
+    "${trusted_docker}" container rm --force "${proxy_container}" >/dev/null 2>&1 || failed='true'
+  fi
+  if "${trusted_docker}" container inspect "${proxy_container}" >/dev/null 2>&1; then
+    failed='true'
+  fi
+  if [[ "${prefetch_network_created}" == 'true' ]]; then
+    "${trusted_docker}" network rm "${prefetch_network}" >/dev/null 2>&1 || failed='true'
+    if "${trusted_docker}" network inspect "${prefetch_network}" >/dev/null 2>&1; then
+      failed='true'
+    else
+      prefetch_network_created='false'
+    fi
+  fi
+  [[ "${failed}" == 'false' ]]
+}
+
 cleanup_candidate_container() {
   local failed='false'
   if [[ -z "${trusted_docker}" ]]; then
@@ -518,6 +555,7 @@ cleanup_candidate_container() {
       "${trusted_docker}" container rm --force "${container}" >/dev/null 2>&1 || failed='true'
     fi
   done
+  cleanup_prefetch_egress || failed='true'
   if [[ "${candidate_image_created}" == 'true' ]]; then
     "${trusted_docker}" image rm --force "${candidate_image}" >/dev/null 2>&1 || failed='true'
     if "${trusted_docker}" image inspect "${candidate_image}" >/dev/null 2>&1; then
@@ -535,7 +573,18 @@ cleanup_all() {
   cleanup_candidate_user || failed='true'
   [[ "${failed}" == 'false' ]]
 }
-trap 'cleanup_all || true' EXIT
+# This handler is reached through the EXIT trap registered below.
+# shellcheck disable=SC2317,SC2329
+cleanup_on_exit() {
+  local status="$?"
+  trap - EXIT
+  if ! cleanup_all; then
+    echo 'terminal candidate cleanup could not be verified' >&2
+    status='1'
+  fi
+  exit "${status}"
+}
+trap cleanup_on_exit EXIT
 
 if id "${candidate_user}" >/dev/null 2>&1; then
   echo 'disposable candidate user already exists' >&2
@@ -556,6 +605,13 @@ chmod 0700 "${command_directory}"
 # Only elevated setup may transfer writable roots to the disposable identity.
 sudo -n chown -R "${candidate_uid}" \
   "${candidate_state}" "${candidate_cargo_seed}"
+sudo -n chown 0:0 "${prefetch_cargo_config}"
+sudo -n chmod 0444 "${prefetch_cargo_config}"
+if [[ ! -f "${prefetch_cargo_config}" || -L "${prefetch_cargo_config}" || \
+  "$(stat -c '%u:%a' -- "${prefetch_cargo_config}")" != '0:444' ]]; then
+  echo 'prefetch Cargo configuration is not a root-owned read-only regular file' >&2
+  exit 1
+fi
 
 # Resolve the running agent from its executable rather than assuming a hosted
 # image directory. This probe prints metadata and accessibility only; it never
@@ -651,30 +707,210 @@ if [[ "${repository_kind}" == 'rs' ]]; then
   )
 fi
 
-# Dependency acquisition runs without credentials inside the same filesystem
-# and PID boundary later used for validation. No candidate program is built or
-# executed, and the resulting source cache becomes read-only before use.
+# Candidate-controlled Cargo acquisition has no direct route. Cargo Deny 0.20.2
+# invokes Cargo fetch before it evaluates source policy, so it runs only inside
+# this already-closed network; its locked policy then classifies the resolved
+# sources. An internal IPvlan network with a dummy parent can reach only a
+# policy-owned CONNECT proxy that permits the crates.io index and crate CDN.
+# No candidate program is built or executed, and the acquired cache becomes
+# read-only before use. The fixed RustSec clone is a separate policy-selected
+# command and cannot be redirected by candidate Cargo metadata.
 if [[ "${profile}" != 'controller' ]]; then
-  "${trusted_docker}" run --name "${fetch_container}" --rm --network bridge \
-    "${container_security[@]}" "${container_system_mounts[@]}" \
-    "${container_inputs[@]}" \
-    --mount "type=bind,src=${candidate_cargo_seed},dst=/cargo-seed" \
-    "${container_environment[@]}" \
-    --env 'CARGO_HOME=/cargo-seed' \
-    --env 'CARGO_TARGET_DIR=/state/prefetch-target' \
+  if "${trusted_docker}" network inspect "${prefetch_network}" >/dev/null 2>&1; then
+    echo 'candidate prefetch network unexpectedly exists' >&2
+    exit 1
+  fi
+  prefetch_network_created='true'
+  prefetch_network_id="$(
+    "${trusted_docker}" network create --driver ipvlan --internal \
+      "${prefetch_network}"
+  )"
+  if [[ ! "${prefetch_network_id}" =~ ^[0-9a-f]{64}$ ]]; then
+    echo 'candidate prefetch network identity is invalid' >&2
+    exit 1
+  fi
+  prefetch_network_properties="$(
+    "${trusted_docker}" network inspect --format \
+      '{{.Driver}}|{{.Internal}}|{{index .Options "parent"}}|{{.EnableIPv6}}' \
+      "${prefetch_network}"
+  )"
+  if [[ "${prefetch_network_properties}" != 'ipvlan|true||false' ]]; then
+    echo 'candidate prefetch network is not an isolated IPvlan network' >&2
+    exit 1
+  fi
+  bridge_network_id="$(
+    "${trusted_docker}" network inspect --format '{{.Id}}' bridge
+  )"
+  if [[ ! "${bridge_network_id}" =~ ^[0-9a-f]{64}$ ]]; then
+    echo 'external proxy network identity is invalid' >&2
+    exit 1
+  fi
+
+  proxy_id="$(
+    "${trusted_docker}" run --name "${proxy_container}" --detach \
+      --network bridge --read-only --cap-drop ALL \
+      --security-opt no-new-privileges=true --pids-limit 64 \
+      --user "${candidate_uid}:${candidate_gid}" \
+      --tmpfs '/tmp:rw,nosuid,nodev,noexec,size=16777216' \
+      "${container_system_mounts[@]}" \
+      --mount "type=bind,src=${policy_root},dst=/policy,readonly" \
+      --env 'PYTHONDONTWRITEBYTECODE=1' \
+      "${candidate_image}" /usr/bin/python3 -B \
+      /policy/.github/scripts/cargo_egress_proxy.py serve --port 18080
+  )"
+  if [[ ! "${proxy_id}" =~ ^[0-9a-f]{64}$ ]]; then
+    echo 'candidate prefetch proxy identity is invalid' >&2
+    exit 1
+  fi
+  "${trusted_docker}" network connect "${prefetch_network}" "${proxy_container}"
+  proxy_network_count="$(
+    "${trusted_docker}" container inspect --format \
+      '{{len .NetworkSettings.Networks}}' "${proxy_container}"
+  )"
+  proxy_bridge_id="$(
+    "${trusted_docker}" container inspect --format \
+      '{{with index .NetworkSettings.Networks "bridge"}}{{.NetworkID}}{{end}}' \
+      "${proxy_container}"
+  )"
+  proxy_prefetch_id="$(
+    "${trusted_docker}" container inspect --format \
+      "{{with index .NetworkSettings.Networks \"${prefetch_network}\"}}{{.NetworkID}}{{end}}" \
+      "${proxy_container}"
+  )"
+  if [[ "${proxy_network_count}" != '2' || \
+    "${proxy_bridge_id}" != "${bridge_network_id}" || \
+    "${proxy_prefetch_id}" != "${prefetch_network_id}" ]]; then
+    echo 'candidate prefetch proxy does not have exactly the intended interfaces' >&2
+    exit 1
+  fi
+  proxy_port_bindings="$(
+    "${trusted_docker}" container inspect --format \
+      '{{json .HostConfig.PortBindings}}' "${proxy_container}"
+  )"
+  if [[ "${proxy_port_bindings}" != '{}' ]]; then
+    echo 'candidate prefetch proxy unexpectedly publishes a host port' >&2
+    exit 1
+  fi
+  proxy_ip="$(
+    "${trusted_docker}" container inspect --format \
+      "{{with index .NetworkSettings.Networks \"${prefetch_network}\"}}{{.IPAddress}}{{end}}" \
+      "${proxy_container}"
+  )"
+  if ! "${trusted_python}" -c \
+    'import ipaddress,sys; value=ipaddress.ip_address(sys.argv[1]); raise SystemExit(0 if value.version == 4 and value.is_private and not value.is_loopback and not value.is_link_local else 1)' \
+    "${proxy_ip}"; then
+    echo 'candidate prefetch proxy address is invalid' >&2
+    exit 1
+  fi
+  proxy_ready='false'
+  for _ in {1..100}; do
+    proxy_logs="$("${trusted_docker}" logs "${proxy_container}" 2>&1 || true)"
+    if [[ "${proxy_logs}" == *'READY 0.0.0.0:18080'* ]]; then
+      proxy_ready='true'
+      break
+    fi
+    if [[ "$("${trusted_docker}" inspect --format '{{.State.Running}}' "${proxy_container}")" != 'true' ]]; then
+      break
+    fi
+    sleep 0.1
+  done
+  if [[ "${proxy_ready}" != 'true' ]]; then
+    echo 'candidate prefetch proxy did not become ready' >&2
+    exit 1
+  fi
+
+  prefetch_proxy='http://cargo-egress:18080'
+  prefetch_container=(
+    "${trusted_docker}" create --name "${fetch_container}"
+    --network "${prefetch_network}"
+    --dns 127.0.0.1
+    --add-host "cargo-egress:${proxy_ip}"
+    "${container_security[@]}"
+    "${container_system_mounts[@]}"
+    "${container_inputs[@]}"
+    --mount "type=bind,src=${candidate_cargo_seed},dst=/cargo-seed"
+    --mount "type=bind,src=${prefetch_cargo_config},dst=/cargo-seed/config.toml,readonly"
+    "${container_environment[@]}"
+    --env 'CARGO_HOME=/cargo-seed'
+    --env 'CARGO_TARGET_DIR=/state/prefetch-target'
+    --env "CARGO_HTTP_PROXY=${prefetch_proxy}"
+    --env "HTTPS_PROXY=${prefetch_proxy}"
+    --env "HTTP_PROXY=${prefetch_proxy}"
+    --env "https_proxy=${prefetch_proxy}"
+    --env "http_proxy=${prefetch_proxy}"
+    --env 'ALL_PROXY='
+    --env 'NO_PROXY='
+    --env 'no_proxy='
+    --env 'GIT_CONFIG_NOSYSTEM=1'
+    --env 'GIT_CONFIG_GLOBAL=/dev/null'
+    --env 'SSH_AUTH_SOCK='
+  )
+  run_prefetch_container() {
+    local attached_count
+    local attached_network_id
+    local command_status='0'
+    local created_id
+    local requested_network
+
+    if "${trusted_docker}" container inspect "${fetch_container}" >/dev/null 2>&1; then
+      echo 'candidate prefetch container unexpectedly exists' >&2
+      return 1
+    fi
+    if ! created_id="$("${prefetch_container[@]}" "$@")"; then
+      return 1
+    fi
+    if [[ ! "${created_id}" =~ ^[0-9a-f]{64}$ ]]; then
+      echo 'candidate prefetch container identity is invalid' >&2
+      return 1
+    fi
+    requested_network="$(
+      "${trusted_docker}" container inspect --format \
+        '{{.HostConfig.NetworkMode}}' "${fetch_container}"
+    )"
+    if [[ "${requested_network}" != "${prefetch_network}" ]]; then
+      echo 'candidate prefetch container requested an unexpected network' >&2
+      return 1
+    fi
+    "${trusted_docker}" start --attach "${fetch_container}" || command_status="$?"
+    attached_count="$(
+      "${trusted_docker}" container inspect --format \
+        '{{len .NetworkSettings.Networks}}' "${fetch_container}"
+    )"
+    attached_network_id="$(
+      "${trusted_docker}" container inspect --format \
+        "{{with index .NetworkSettings.Networks \"${prefetch_network}\"}}{{.NetworkID}}{{end}}" \
+        "${fetch_container}"
+    )"
+    if [[ "${attached_count}" != '1' || \
+      "${attached_network_id}" != "${prefetch_network_id}" ]]; then
+      echo 'candidate prefetch container has an unexpected network interface' >&2
+      command_status='1'
+    fi
+    if ! "${trusted_docker}" container rm "${fetch_container}" >/dev/null; then
+      echo 'candidate prefetch container could not be removed' >&2
+      return 1
+    fi
+    if "${trusted_docker}" container inspect "${fetch_container}" >/dev/null 2>&1; then
+      echo 'candidate prefetch container remains after cleanup' >&2
+      return 1
+    fi
+    return "${command_status}"
+  }
+
+  run_prefetch_container \
     --env 'CARGO_RESOLVER_LOCKFILE_PATH=/state/home/Cargo.lock' \
-    "${candidate_image}" \
-    /trusted-tools/bin/cargo "+${trusted_toolchain}" \
-    "${container_cargo_options[@]}" fetch \
-    --manifest-path /candidate/Cargo.toml
-  "${trusted_docker}" run --name "${fetch_container}" --rm --network bridge \
-    "${container_security[@]}" "${container_system_mounts[@]}" \
-    "${container_inputs[@]}" \
-    --mount "type=bind,src=${candidate_cargo_seed},dst=/cargo-seed" \
-    "${container_environment[@]}" \
-    --env 'CARGO_HOME=/cargo-seed' \
-    --env 'CARGO_TARGET_DIR=/state/prefetch-target' \
-    "${candidate_image}" \
+    "${candidate_image}" /trusted-tools/bin/cargo-deny \
+    --config /policy/.github/cargo-source-policy.toml \
+    --manifest-path /candidate/Cargo.toml check sources
+  run_prefetch_container \
+    --env 'CARGO_RESOLVER_LOCKFILE_PATH=/state/home/Cargo.lock' \
+    "${candidate_image}" /trusted-tools/bin/cargo "+${trusted_toolchain}" \
+    "${container_cargo_options[@]}" fetch --manifest-path /candidate/Cargo.toml
+  run_prefetch_container "${candidate_image}" \
+    /trusted-tools/bin/cargo-deny \
+    --config /policy/.github/cargo-source-policy.toml \
+    --manifest-path /candidate/xtask/Cargo.toml --locked check sources
+  run_prefetch_container "${candidate_image}" \
     /trusted-tools/bin/cargo "+${trusted_toolchain}" \
     "${container_cargo_options[@]}" fetch --locked \
     --manifest-path /candidate/xtask/Cargo.toml
@@ -684,10 +920,18 @@ if [[ "${profile}" != 'controller' ]]; then
     --mount "type=bind,src=${candidate_cargo_seed},dst=/cargo-seed" \
     "${container_environment[@]}" \
     --env 'CARGO_HOME=/cargo-seed' \
+    --env 'GIT_CONFIG_NOSYSTEM=1' \
+    --env 'GIT_CONFIG_GLOBAL=/dev/null' \
+    --env 'SSH_AUTH_SOCK=' \
     "${candidate_image}" \
-    /usr/bin/git -c core.hooksPath=/dev/null -c credential.helper= clone \
+    /usr/bin/git -c core.hooksPath=/dev/null -c credential.helper= \
+    -c core.sshCommand=false clone \
     --depth=1 --no-tags https://github.com/RustSec/advisory-db.git \
     /cargo-seed/advisory-db
+  if ! cleanup_prefetch_egress; then
+    echo 'candidate prefetch egress boundary could not be removed' >&2
+    exit 1
+  fi
   if [[ ! -f "${prefetch_root_lockfile}" ]]; then
     echo 'Cargo prefetch did not produce the external root lockfile' >&2
     exit 1

@@ -13,10 +13,12 @@ import json
 import os
 import pathlib
 import shutil
+import socket
 import stat
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from unittest import mock
 
@@ -25,10 +27,13 @@ MODULE_PATH = pathlib.Path(__file__).with_name("protected_pr_ci.py")
 VERIFIER_PATH = MODULE_PATH.with_name("protected_checkout.py")
 TERMINAL_DRIVER_PATH = MODULE_PATH.with_name("terminal_candidate.py")
 TERMINAL_SHELL_PATH = MODULE_PATH.with_name("run-terminal-candidate.sh")
+CARGO_PROXY_PATH = MODULE_PATH.with_name("cargo_egress_proxy.py")
+CARGO_SOURCE_POLICY_PATH = MODULE_PATH.parent.parent / "cargo-source-policy.toml"
 COMMIT_POLICY_PATH = MODULE_PATH.with_name("check-pull-request-commits.sh")
 POLICY_PATH = MODULE_PATH.parent.parent / "protected-pr-ci.json"
 COMMAND_WORKFLOW_PATH = MODULE_PATH.parent.parent / "workflows" / "pr-ci-command.yml"
 REUSABLE_WORKFLOW_PATH = MODULE_PATH.parent.parent / "workflows" / "pr-ci.yml"
+CI_WORKFLOW_PATH = MODULE_PATH.parent.parent / "workflows" / "ci.yml"
 RECONCILE_WORKFLOW_PATH = (
     MODULE_PATH.parent.parent / "workflows" / "pr-ci-reconcile.yml"
 )
@@ -55,6 +60,13 @@ assert TERMINAL_SPEC is not None and TERMINAL_SPEC.loader is not None
 terminal_candidate = importlib.util.module_from_spec(TERMINAL_SPEC)
 sys.modules[TERMINAL_SPEC.name] = terminal_candidate
 TERMINAL_SPEC.loader.exec_module(terminal_candidate)
+CARGO_PROXY_SPEC = importlib.util.spec_from_file_location(
+    "cargo_egress_proxy", CARGO_PROXY_PATH
+)
+assert CARGO_PROXY_SPEC is not None and CARGO_PROXY_SPEC.loader is not None
+cargo_egress_proxy = importlib.util.module_from_spec(CARGO_PROXY_SPEC)
+sys.modules[CARGO_PROXY_SPEC.name] = cargo_egress_proxy
+CARGO_PROXY_SPEC.loader.exec_module(cargo_egress_proxy)
 
 
 REPOSITORY = "NVIDIA/yaml-sigil-example"
@@ -2048,6 +2060,81 @@ class ProtectedCheckoutTests(unittest.TestCase):
         self.assertEqual(run.call_args.args[0][0], self.git)
 
 
+class CargoEgressPolicyTests(unittest.TestCase):
+    def test_only_canonical_crates_io_tls_targets_are_accepted(self) -> None:
+        for host in ("index.crates.io", "static.crates.io"):
+            with self.subTest(host=host):
+                request = (
+                    f"CONNECT {host}:443 HTTP/1.1\r\n"
+                    f"Host: {host}:443\r\n"
+                    "Proxy-Connection: Keep-Alive\r\n\r\n"
+                ).encode("ascii")
+                self.assertEqual(
+                    cargo_egress_proxy.parse_connect_request(request),
+                    (host, 443),
+                )
+
+    def test_arbitrary_and_internal_destinations_fail_closed(self) -> None:
+        requests = (
+            b"GET https://index.crates.io/ HTTP/1.1\r\n\r\n",
+            b"CONNECT github.com:443 HTTP/1.1\r\n\r\n",
+            b"CONNECT registry.example:443 HTTP/1.1\r\n\r\n",
+            b"CONNECT 127.0.0.1:443 HTTP/1.1\r\n\r\n",
+            b"CONNECT 169.254.169.254:443 HTTP/1.1\r\n\r\n",
+            b"CONNECT index.crates.io:80 HTTP/1.1\r\n\r\n",
+            b"CONNECT index.crates.io.:443 HTTP/1.1\r\n\r\n",
+            b"CONNECT INDEX.CRATES.IO:443 HTTP/1.1\r\n\r\n",
+            b"CONNECT index.crates.io:443 HTTP/1.1\r\nProxy-Authorization: x\r\n\r\n",
+            b"CONNECT index.crates.io:443 HTTP/1.1\r\n\r\nearly",
+        )
+        for request in requests:
+            with self.subTest(request=request):
+                with self.assertRaises(cargo_egress_proxy.ProxyProtocolError):
+                    cargo_egress_proxy.parse_connect_request(request)
+
+    def test_approved_dns_name_must_resolve_only_to_global_addresses(self) -> None:
+        public = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("1.1.1.1", 443))]
+        with mock.patch.object(
+            cargo_egress_proxy.socket, "getaddrinfo", return_value=public
+        ):
+            resolved = cargo_egress_proxy.resolve_global_addresses(
+                "index.crates.io", 443
+            )
+        self.assertEqual(resolved[0][3], ("1.1.1.1", 443))
+
+        for address in ("127.0.0.1", "10.0.0.1", "169.254.169.254"):
+            with (
+                self.subTest(address=address),
+                mock.patch.object(
+                    cargo_egress_proxy.socket,
+                    "getaddrinfo",
+                    return_value=[
+                        (socket.AF_INET, socket.SOCK_STREAM, 6, "", (address, 443))
+                    ],
+                ),
+                self.assertRaises(cargo_egress_proxy.ProxyProtocolError),
+            ):
+                cargo_egress_proxy.resolve_global_addresses(
+                    "index.crates.io", 443
+                )
+
+    def test_cargo_native_source_policy_is_closed(self) -> None:
+        policy = tomllib.loads(CARGO_SOURCE_POLICY_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(
+            policy,
+            {
+                "sources": {
+                    "unknown-registry": "deny",
+                    "unknown-git": "deny",
+                    "allow-registry": [
+                        "https://github.com/rust-lang/crates.io-index"
+                    ],
+                    "allow-git": [],
+                }
+            },
+        )
+
+
 class WorkflowStructureTests(unittest.TestCase):
     @staticmethod
     def job_block(workflow: str, name: str) -> str:
@@ -2186,7 +2273,15 @@ class WorkflowStructureTests(unittest.TestCase):
         self.assertIn('install -m 0555 "${trusted_cargo}"', shell)
         self.assertIn('protected_validator="${trusted_cargo}"', shell)
         self.assertIn("CARGO_RESOLVER_LOCKFILE_PATH", shell)
-        self.assertIn('if [[ "${repository_kind}" != \'spec\'', shell)
+        self.assertIn("cargo_deny_version='0.20.2'", shell)
+        self.assertIn(
+            'cargo-deny --version "${cargo_deny_version}"',
+            shell,
+        )
+        self.assertIn(
+            '"${trusted_tools}/bin/cargo-deny" --version',
+            shell,
+        )
         self.assertNotIn("trusted_bash=", shell)
         self.assertNotIn("check-acvp-corpus.sh", shell)
         linux_guard = shell.index("terminal candidate execution requires Linux")
@@ -2256,6 +2351,114 @@ class WorkflowStructureTests(unittest.TestCase):
         )
         self.assertLess(link_probe, linked_binary)
         self.assertLess(linked_binary, candidate_boundary)
+
+    def test_candidate_cargo_prefetch_has_closed_source_and_egress_policy(
+        self,
+    ) -> None:
+        shell = TERMINAL_SHELL_PATH.read_text(encoding="utf-8")
+        config = json.loads(POLICY_PATH.read_text(encoding="utf-8"))
+        prefetch = shell[
+            shell.index("# Candidate-controlled Cargo acquisition") : shell.index(
+                "# Prefetch runs as the disposable candidate identity"
+            )
+        ]
+
+        self.assertIn(
+            'network create --driver ipvlan --internal',
+            prefetch,
+        )
+        self.assertIn(
+            '{{.Driver}}|{{.Internal}}|{{index .Options "parent"}}|{{.EnableIPv6}}',
+            prefetch,
+        )
+        self.assertIn("'ipvlan|true||false'", prefetch)
+        self.assertNotIn('network create --driver bridge --internal', prefetch)
+        self.assertIn(
+            '/policy/.github/scripts/cargo_egress_proxy.py serve --port 18080',
+            prefetch,
+        )
+        self.assertIn('--network "${prefetch_network}"', prefetch)
+        self.assertIn('--dns 127.0.0.1', prefetch)
+        self.assertIn('--add-host "cargo-egress:${proxy_ip}"', prefetch)
+        self.assertIn(
+            '--mount "type=bind,src=${prefetch_cargo_config},dst=/cargo-seed/config.toml,readonly"',
+            prefetch,
+        )
+        self.assertIn('CARGO_HTTP_PROXY=${prefetch_proxy}', prefetch)
+        self.assertIn("--env 'ALL_PROXY='", prefetch)
+        self.assertIn("--env 'NO_PROXY='", prefetch)
+        self.assertIn("--env 'GIT_CONFIG_NOSYSTEM=1'", prefetch)
+        self.assertIn("--env 'GIT_CONFIG_GLOBAL=/dev/null'", prefetch)
+        self.assertIn("--env 'SSH_AUTH_SOCK='", prefetch)
+        self.assertNotIn("GITHUB_TOKEN", prefetch)
+        self.assertNotIn("--network host", shell)
+        self.assertNotIn("--publish", prefetch)
+        self.assertNotIn("host_probe_", prefetch)
+        self.assertEqual(prefetch.count("--network bridge"), 2)
+        self.assertIn("{{json .HostConfig.PortBindings}}", prefetch)
+        self.assertIn("proxy_port_bindings", prefetch)
+        self.assertIn("cleanup_prefetch_egress", prefetch)
+        self.assertIn("https://github.com/RustSec/advisory-db.git", prefetch)
+        self.assertIn("-c core.sshCommand=false clone", prefetch)
+
+        cleanup = shell[
+            shell.index("cleanup_candidate_container()") : shell.index(
+                "cleanup_all()"
+            )
+        ]
+        self.assertLess(
+            cleanup.index('for container in "${candidate_container}"'),
+            cleanup.index("cleanup_prefetch_egress"),
+        )
+
+        requested_network = prefetch.index("{{.HostConfig.NetworkMode}}")
+        start = prefetch.index(
+            '"${trusted_docker}" start --attach "${fetch_container}"',
+            requested_network,
+        )
+        realized_network = prefetch.index(
+            "{{len .NetworkSettings.Networks}}", start
+        )
+        remove = prefetch.index(
+            'container rm "${fetch_container}"', realized_network
+        )
+        self.assertLess(requested_network, start)
+        self.assertLess(start, realized_network)
+        self.assertLess(realized_network, remove)
+
+        ordinary_ci = CI_WORKFLOW_PATH.read_text(encoding="utf-8")
+        self.assertIn(
+            "run: .github/scripts/test-cargo-egress-topology.sh", ordinary_ci
+        )
+
+        manifests = (
+            ["/candidate/conformance/rebuild-rs/Cargo.toml"]
+            if config["repository_kind"] == "spec"
+            else ["/candidate/Cargo.toml", "/candidate/xtask/Cargo.toml"]
+        )
+        cursor = 0
+        for manifest in manifests:
+            deny = prefetch.index("/trusted-tools/bin/cargo-deny", cursor)
+            manifest_index = prefetch.index(
+                f"--manifest-path {manifest}", deny
+            )
+            source_check = prefetch.index("check sources", manifest_index)
+            fetch = prefetch.index("/trusted-tools/bin/cargo ", source_check)
+            fetch_manifest = prefetch.index(
+                f"--manifest-path {manifest}", fetch
+            )
+            self.assertLess(deny, source_check)
+            self.assertLess(source_check, fetch)
+            self.assertLess(fetch, fetch_manifest)
+            cursor = fetch_manifest + len(manifest)
+
+        config_install = shell.index('sudo -n chown 0:0 "${prefetch_cargo_config}"')
+        config_check = shell.index(
+            "prefetch Cargo configuration is not a root-owned read-only regular file"
+        )
+        prefetch_start = shell.index("# Candidate-controlled Cargo acquisition")
+        self.assertLess(config_install, config_check)
+        self.assertLess(config_check, prefetch_start)
 
     def test_terminal_native_tools_are_immutable_and_boundary_bound(
         self,
@@ -2554,6 +2757,15 @@ class WorkflowStructureTests(unittest.TestCase):
                     policy, candidate, "traits"
                 )
 
+            (candidate / ".cargo" / "config.toml").write_text(
+                "[source.crates-io]\nreplace-with='internal'\n"
+                "[source.internal]\nregistry='http://169.254.169.254/index'\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(terminal_candidate.IsolationError):
+                terminal_candidate.require_cargo_configuration_adopted(
+                    policy, candidate, "traits"
+                )
 
     def test_detached_helper_publishes_complete_pid_atomically(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

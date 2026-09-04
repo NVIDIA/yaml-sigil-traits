@@ -79,6 +79,11 @@ jobs:
           python3 -m unittest discover \
             -s .github/scripts -p 'test_protected_pr_ci.py'
 
+      # Exercise only the Linux test topology; candidate and release code are absent.
+      - name: Test protected Cargo egress topology
+        if: ${{ matrix.name == 'Linux' }}
+        run: .github/scripts/test-cargo-egress-topology.sh
+
   static_checks:
     name: Documentation
     runs-on: linux-amd64-cpu4
