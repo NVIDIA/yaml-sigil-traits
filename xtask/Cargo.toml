@@ -3,6 +3,8 @@
 
 [workspace]
 
+# Canary-only comment: select the protected candidate-xtask path.
+
 [package]
 name = "xtask"
 version = "0.0.0"
