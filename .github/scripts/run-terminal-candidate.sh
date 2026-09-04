@@ -217,7 +217,7 @@ original_path="${PATH}"
 # the read-only token in its own environment later.
 while IFS='=' read -r name _; do
   case "${name}" in
-    ACTIONS_* | GITHUB_* | GH_* | RUNNER_* | CI | LD_* | DYLD_* | PYTHONPATH | RUSTC_WRAPPER | RUSTDOCFLAGS)
+    ACTIONS_* | GITHUB_* | GH_* | GIT_* | RUNNER_* | CI | LD_* | DYLD_* | PYTHONPATH | RUSTC_WRAPPER | RUSTDOCFLAGS)
       unset "${name}"
       ;;
   esac
@@ -403,18 +403,32 @@ git_command=(
   "${trusted_git}"
   -c advice.detachedHead=false
   -c core.autocrlf=false
+  -c core.attributesFile=/dev/null
   -c core.fsmonitor=false
   -c core.hooksPath=/dev/null
   -c credential.helper=
+  -c filter.lfs.clean=
+  -c filter.lfs.process=
+  -c filter.lfs.required=false
+  -c filter.lfs.smudge=
 )
 
+export GIT_ATTR_NOSYSTEM=1
+export GIT_CONFIG_GLOBAL=/dev/null
+export GIT_CONFIG_NOSYSTEM=1
+export GIT_LFS_SKIP_SMUDGE=1
 export GIT_TERMINAL_PROMPT=0
 "${git_command[@]}" init --quiet --initial-branch=main "${candidate_root}"
 "${git_command[@]}" -C "${candidate_root}" remote add origin \
   "https://github.com/${head_repository}.git"
 "${git_command[@]}" -C "${candidate_root}" fetch --no-tags \
   --no-recurse-submodules --depth=1 origin "${head_sha}"
-"${git_command[@]}" -C "${candidate_root}" checkout --quiet --detach FETCH_HEAD
+"${trusted_python}" "${policy_root}/.github/scripts/protected_checkout.py" \
+  checkout-preflight \
+  --candidate-root "${candidate_root}" \
+  --git "${trusted_git}" \
+  --head-sha "${head_sha}"
+"${git_command[@]}" -C "${candidate_root}" reset --quiet --hard FETCH_HEAD
 if [[ "$("${git_command[@]}" -C "${candidate_root}" rev-parse --verify 'HEAD^{commit}')" != "${head_sha}" ]]; then
   echo 'candidate checkout did not resolve to the authorized head' >&2
   exit 1
@@ -453,7 +467,12 @@ if [[ "${repository_kind}" == 'traits' && "${profile}" != 'controller' ]]; then
     'https://github.com/NVIDIA/yaml-sigil-spec.git'
   "${git_command[@]}" -C "${candidate_root}/source-spec" fetch --no-tags \
     --no-recurse-submodules --depth=1 origin "${source_spec_sha}"
-  "${git_command[@]}" -C "${candidate_root}/source-spec" checkout --quiet --detach FETCH_HEAD
+  "${trusted_python}" "${policy_root}/.github/scripts/protected_checkout.py" \
+    checkout-preflight \
+    --candidate-root "${candidate_root}/source-spec" \
+    --git "${trusted_git}" \
+    --head-sha "${source_spec_sha}"
+  "${git_command[@]}" -C "${candidate_root}/source-spec" reset --quiet --hard FETCH_HEAD
   if [[ "$("${git_command[@]}" -C "${candidate_root}/source-spec" rev-parse --verify 'HEAD^{commit}')" != "${source_spec_sha}" ]]; then
     echo 'specification checkout did not resolve to the authorized gitlink' >&2
     exit 1

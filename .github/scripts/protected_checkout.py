@@ -188,14 +188,23 @@ def enumerate_checkout(root: pathlib.Path) -> dict[str, os.stat_result]:
 
 
 def trusted_git(
-    git: str, root: pathlib.Path, arguments: Iterable[str], *, text: bool = True
+    git: str,
+    root: pathlib.Path,
+    arguments: Iterable[str],
+    *,
+    input_data: bytes | None = None,
+    text: bool = True,
 ) -> subprocess.CompletedProcess[str] | subprocess.CompletedProcess[bytes]:
     environment = {
-        "GIT_CONFIG_COUNT": "2",
+        "GIT_ATTR_NOSYSTEM": "1",
+        "GIT_CONFIG_COUNT": "3",
         "GIT_CONFIG_KEY_0": "core.hooksPath",
         "GIT_CONFIG_VALUE_0": os.devnull,
         "GIT_CONFIG_KEY_1": "core.fsmonitor",
         "GIT_CONFIG_VALUE_1": "false",
+        "GIT_CONFIG_KEY_2": "core.attributesFile",
+        "GIT_CONFIG_VALUE_2": os.devnull,
+        "GIT_CONFIG_GLOBAL": os.devnull,
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_OPTIONAL_LOCKS": "0",
         "PATH": os.path.dirname(git),
@@ -207,9 +216,84 @@ def trusted_git(
         check=False,
         capture_output=True,
         env=environment,
+        input=input_data,
         text=text,
         timeout=10,
     )
+
+
+def require_checkout_filters_inert(
+    root: pathlib.Path, git: str, head_sha: str
+) -> None:
+    """Populate the candidate index and reject every effective Git filter.
+
+    This runs before the working tree exists. Git therefore evaluates the
+    candidate's committed attributes without giving a clean, smudge, process,
+    or LFS helper an opportunity to execute on the protected host.
+    """
+
+    resolved_root = root.resolve(strict=True)
+    policy.require(
+        (resolved_root / ".git").is_dir(),
+        "candidate Git metadata is not an ordinary directory",
+    )
+    read_tree = trusted_git(git, resolved_root, ["read-tree", head_sha])
+    policy.require(
+        read_tree.returncode == 0,
+        "trusted Git could not populate the candidate index",
+    )
+
+    listed = trusted_git(git, resolved_root, ["ls-files", "-z"], text=False)
+    policy.require(
+        listed.returncode == 0,
+        "trusted Git could not enumerate the candidate index",
+    )
+    assert isinstance(listed.stdout, bytes)
+    policy.require(
+        len(listed.stdout) <= policy.MAX_PATH_METADATA_BYTES,
+        "candidate index path metadata exceeds the 4 MiB limit",
+    )
+    paths = [value for value in listed.stdout.split(b"\0") if value]
+    policy.require(
+        len(paths) <= policy.MAX_TREE_ENTRIES,
+        f"candidate index exceeds {policy.MAX_TREE_ENTRIES} entries",
+    )
+    for encoded_path in paths:
+        try:
+            path = encoded_path.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise policy.PolicyError("candidate index path is not UTF-8") from error
+        policy.validate_path(path, "candidate index path")
+
+    attributes = trusted_git(
+        git,
+        resolved_root,
+        ["check-attr", "--cached", "-z", "--stdin", "filter"],
+        input_data=listed.stdout,
+        text=False,
+    )
+    policy.require(
+        attributes.returncode == 0,
+        "trusted Git could not inspect candidate checkout filters",
+    )
+    assert isinstance(attributes.stdout, bytes)
+    records = attributes.stdout.split(b"\0")
+    if records and not records[-1]:
+        records.pop()
+    policy.require(
+        len(records) == len(paths) * 3,
+        "trusted Git returned a malformed checkout-filter inventory",
+    )
+    for index in range(0, len(records), 3):
+        path, attribute, value = records[index : index + 3]
+        policy.require(
+            path == paths[index // 3] and attribute == b"filter",
+            "trusted Git returned a mismatched checkout-filter inventory",
+        )
+        policy.require(
+            value in {b"unspecified", b"unset"},
+            f"candidate path {path.decode('utf-8')} requires a checkout filter",
+        )
 
 
 def working_tree_blob_id(path: pathlib.Path, metadata: os.stat_result, label: str) -> str:
@@ -500,6 +584,11 @@ def build_parser() -> argparse.ArgumentParser:
     stage.add_argument("--destination", required=True)
     stage.add_argument("--github-output", required=True)
 
+    checkout_preflight = subparsers.add_parser("checkout-preflight")
+    checkout_preflight.add_argument("--candidate-root", required=True)
+    checkout_preflight.add_argument("--git", required=True)
+    checkout_preflight.add_argument("--head-sha", required=True)
+
     verify_parser = subparsers.add_parser("verify")
     verify_parser.add_argument("--candidate-root", required=True)
     verify_parser.add_argument("--git", required=True)
@@ -524,6 +613,17 @@ def main(argv: list[str] | None = None) -> int:
         print("Staged protected checkout policy and trusted tools.")
         return 0
 
+    git = os.path.realpath(args.git)
+    policy.require(os.path.isabs(git) and os.path.isfile(git), "trusted Git path is invalid")
+    if args.command == "checkout-preflight":
+        require_checkout_filters_inert(
+            pathlib.Path(args.candidate_root),
+            git,
+            policy.validate_sha(args.head_sha, "head SHA"),
+        )
+        print("Candidate checkout filter preflight succeeded.")
+        return 0
+
     staged = {
         "verifier": pathlib.Path(__file__),
         "controller": pathlib.Path(policy.__file__),
@@ -546,8 +646,6 @@ def main(argv: list[str] | None = None) -> int:
             observed == expected[label],
             f"staged {label} digest changed after candidate checkout",
         )
-    git = os.path.realpath(args.git)
-    policy.require(os.path.isabs(git) and os.path.isfile(git), "trusted Git path is invalid")
     verify(
         pathlib.Path(args.candidate_root),
         git,

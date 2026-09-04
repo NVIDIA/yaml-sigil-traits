@@ -1814,6 +1814,71 @@ class ProtectedCheckoutTests(unittest.TestCase):
     def test_exact_sensitive_blob_and_head_are_accepted(self) -> None:
         self.verify()
 
+    def test_checkout_filter_preflight_accepts_only_inert_attributes(self) -> None:
+        self.commit_entries(
+            files={
+                ".gitattributes": "*.yml -filter\n*.txt text eol=lf\n",
+                ".lfsconfig": "[lfs]\nurl = https://example.invalid/lfs\n",
+                "ordinary.txt": "ordinary\n",
+            }
+        )
+        verifier.require_checkout_filters_inert(
+            self.repository, self.git, self.head_sha
+        )
+
+    def test_checkout_filter_preflight_rejects_lfs_and_required_filters(
+        self,
+    ) -> None:
+        self.commit_entries(
+            files={
+                "fixture.bin": (
+                    "version https://git-lfs.github.com/spec/v1\n"
+                    "oid sha256:"
+                    f"{'0' * 64}\n"
+                    "size 1\n"
+                )
+            }
+        )
+        for attributes in ("*.bin filter=lfs\n", "*.yml filter=missing\n"):
+            with self.subTest(attributes=attributes):
+                self.commit_entries(
+                    files={
+                        ".gitattributes": attributes,
+                        ".lfsconfig": "[lfs]\nurl = https://example.invalid/lfs\n",
+                    }
+                )
+                if "missing" in attributes:
+                    self.run_git("config", "filter.missing.required", "true")
+                with self.assertRaisesRegex(
+                    controller.PolicyError, "requires a checkout filter"
+                ):
+                    verifier.require_checkout_filters_inert(
+                        self.repository, self.git, self.head_sha
+                    )
+
+    def test_checkout_filter_preflight_never_invokes_configured_process(
+        self,
+    ) -> None:
+        marker = self.temporary_directory / "filter-invoked"
+        process = self.temporary_directory / "filter-process.py"
+        process.write_text(
+            "import pathlib,sys\npathlib.Path(sys.argv[1]).write_text('invoked')\n",
+            encoding="utf-8",
+        )
+        self.commit_entries(files={".gitattributes": "*.yml filter=probe\n"})
+        self.run_git(
+            "config",
+            "filter.probe.process",
+            f"{sys.executable} {process} {marker}",
+        )
+        with self.assertRaisesRegex(
+            controller.PolicyError, "requires a checkout filter"
+        ):
+            verifier.require_checkout_filters_inert(
+                self.repository, self.git, self.head_sha
+            )
+        self.assertFalse(marker.exists())
+
     def test_authenticated_internal_links_are_accepted(self) -> None:
         self.commit_entries(
             files={
@@ -2057,6 +2122,9 @@ class ProtectedCheckoutTests(unittest.TestCase):
         environment = run.call_args.kwargs["env"]
         self.assertEqual(environment["PATH"], os.path.dirname(self.git))
         self.assertNotIn("HOME", environment)
+        self.assertEqual(environment["GIT_ATTR_NOSYSTEM"], "1")
+        self.assertEqual(environment["GIT_CONFIG_GLOBAL"], os.devnull)
+        self.assertEqual(environment["GIT_CONFIG_NOSYSTEM"], "1")
         self.assertEqual(run.call_args.args[0][0], self.git)
 
 
@@ -2258,6 +2326,22 @@ class WorkflowStructureTests(unittest.TestCase):
         self.assertIn("require_tree_read_only", driver)
         self.assertIn("require_tree_readable", driver)
         self.assertIn("spawn_detached_canary", driver)
+        self.assertIn("GIT_*", shell)
+        self.assertIn("export GIT_ATTR_NOSYSTEM=1", shell)
+        self.assertIn("export GIT_CONFIG_GLOBAL=/dev/null", shell)
+        self.assertIn("export GIT_CONFIG_NOSYSTEM=1", shell)
+        self.assertIn("export GIT_LFS_SKIP_SMUDGE=1", shell)
+        self.assertIn("-c core.attributesFile=/dev/null", shell)
+        self.assertIn("-c filter.lfs.clean=", shell)
+        self.assertIn("-c filter.lfs.process=", shell)
+        self.assertIn("-c filter.lfs.required=false", shell)
+        self.assertIn("-c filter.lfs.smudge=", shell)
+        checkout_preflight = shell.index("checkout-preflight")
+        materialization = shell.index("reset --quiet --hard FETCH_HEAD")
+        authenticated_checkout = shell.index("protected_checkout.py\" verify")
+        self.assertLess(checkout_preflight, materialization)
+        self.assertLess(materialization, authenticated_checkout)
+        self.assertNotIn("checkout --quiet --detach FETCH_HEAD", shell)
 
     def test_terminal_setup_uses_elevated_and_native_paths(self) -> None:
         shell = TERMINAL_SHELL_PATH.read_text(encoding="utf-8")
