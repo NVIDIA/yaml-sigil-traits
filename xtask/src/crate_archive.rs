@@ -283,6 +283,7 @@ struct ArchiveMetadata {
     device_minor: Vec<u8>,
 }
 
+#[cfg(test)]
 pub(crate) fn inspect_archive(
     archive: &[u8],
     policy: &PackagePolicy,
@@ -313,6 +314,7 @@ pub(crate) fn inspect_archive_entries(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn archive_inventory_sha256(files: &BTreeMap<String, ArchiveFile>) -> String {
     let mut digest = Sha256::new();
     inventory_value(&mut digest, b"yaml-sigil-crate-inventory-v1");
@@ -367,11 +369,13 @@ pub(crate) fn archive_inventory_sha256(files: &BTreeMap<String, ArchiveFile>) ->
     format!("{:x}", digest.finalize())
 }
 
+#[cfg(test)]
 fn inventory_value(digest: &mut Sha256, value: &[u8]) {
     digest.update(value);
     digest.update([0]);
 }
 
+#[cfg(test)]
 fn hex(value: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut encoded = String::with_capacity(value.len() * 2);
@@ -397,6 +401,7 @@ pub(crate) fn archive_vcs_commit(
     Ok(parse_vcs_info(&files, policy)?.git.sha1)
 }
 
+#[cfg(test)]
 fn inspect_archive_with_limit(
     archive: &[u8],
     policy: &PackagePolicy,

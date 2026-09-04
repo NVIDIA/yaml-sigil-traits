@@ -1,23 +1,26 @@
 name: CI
 
 on:
-  workflow_dispatch:
   push:
     branches:
       - main
+      - ci-testing/*
+      - pull-request/[0-9]+
 
-permissions:
-  contents: read
+permissions: {}
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.repository }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  workflow_lint:
-    name: GitHub Actions
+  trusted_policy:
+    name: Policy and documentation
+    if: >-
+      ${{ github.ref == 'refs/heads/main' ||
+          startsWith(github.ref, 'refs/heads/ci-testing/') }}
     runs-on: linux-amd64-cpu4
-    timeout-minutes: 10
+    timeout-minutes: 20
     permissions:
       contents: read
     steps:
@@ -25,6 +28,26 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      # Resolve the recorded gitlink without consulting submodule configuration,
+      # then fetch it only from the canonical public specification repository.
+      - name: Resolve exact specification checkout
+        id: source_spec
+        run: .github/scripts/resolve-source-spec-gitlink.sh . "${GITHUB_OUTPUT}"
+
+      - name: Check out exact specification
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          path: source-spec
+          persist-credentials: false
+          ref: ${{ steps.source_spec.outputs.sha }}
+          repository: NVIDIA/yaml-sigil-spec
+
+      - name: Lint Markdown
+        uses: rvben/rumdl@95a982d941d00cf41a0dcef4d0788bd15a29be1b # v0.2.54
+        with:
+          version: "0.2.54"
 
       - name: Lint GitHub Actions workflows
         uses: devops-actions/actionlint@9fb9c192862f19e684586ca84b500461bcd8a541 # v0.1.12 (actionlint v1.7.12)
@@ -37,85 +60,164 @@ jobs:
           scandir: .github/scripts
           version: v0.11.0
 
-      - name: Compile and test automation controllers
+      - name: Test protected reporter and candidate materialization
         run: |
           python3 -m py_compile \
-            .github/scripts/protected_pr_ci.py \
-            .github/scripts/test_protected_pr_ci.py
+            .github/scripts/bind-candidate-pr.py \
+            .github/scripts/report_required_ci.py \
+            .github/scripts/test_bind_candidate_pr.py \
+            .github/scripts/test_report_required_ci.py
           python3 -m unittest discover \
             -s .github/scripts -p 'test_*.py'
+          .github/scripts/test-materialize-candidate.sh
+          .github/scripts/test-check-release-pr.sh
+          .github/scripts/check-trusted-tool-pins.sh
+          .github/scripts/test-trusted-tool-pins.sh
 
-  platform_verifier:
-    name: Protected policy verifier tests (${{ matrix.name }})
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 15
-    permissions:
-      contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Linux
-            runner: ubuntu-latest
-          - name: macOS
-            runner: macos-latest
-          - name: Windows
-            runner: windows-latest
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      # Exercise the protected policy verifier on each supported host, including a
-      # real Windows directory junction rather than a mocked reparse point.
-      - name: Compile and run protected policy verifier tests
-        shell: bash
-        run: |
-          python3 -m py_compile \
-            .github/scripts/protected_checkout.py \
-            .github/scripts/protected_pr_ci.py \
-            .github/scripts/test_protected_pr_ci.py
-          python3 -m unittest discover \
-            -s .github/scripts -p 'test_protected_pr_ci.py'
-
-      # Exercise only the Linux test topology; candidate and release code are absent.
-      - name: Test protected Cargo egress topology
-        if: ${{ matrix.name == 'Linux' }}
-        run: .github/scripts/test-cargo-egress-topology.sh
-
-  static_checks:
-    name: Documentation
-    runs-on: linux-amd64-cpu4
-    timeout-minutes: 15
-    permissions:
-      contents: read
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Check out pinned specification
-        env:
-          GIT_ASKPASS: /bin/false
-          GIT_CONFIG_GLOBAL: /dev/null
-          GIT_CONFIG_NOSYSTEM: "1"
-          GIT_TERMINAL_PROMPT: "0"
-        run: >-
-          git -c credential.helper= submodule update --init --depth 1
-          --checkout -- source-spec
-
-      - name: Lint Markdown
-        # Refresh this immutable pin frequently to keep pace with rumdl releases.
-        uses: rvben/rumdl@95a982d941d00cf41a0dcef4d0788bd15a29be1b # v0.2.54
-        with:
-          version: "0.2.54"
-
-  rust:
-    name: Rust (${{ matrix.name }})
-    runs-on: ${{ matrix.runner }}
+  trusted_stable:
+    name: Rust 1.98.0 (Linux)
+    if: >-
+      ${{ github.ref == 'refs/heads/main' ||
+          startsWith(github.ref, 'refs/heads/ci-testing/') }}
+    runs-on: linux-amd64-cpu8
     timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      RUSTFLAGS: -D warnings
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust 1.98.0
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache: false
+          components: clippy, rustfmt
+          toolchain: 1.98.0
+
+      # This section would benefit by a change to the action allowlist
+      - name: Install Rust validation tools
+        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2.83.2
+        with:
+          checksum: true
+          fallback: none
+          tool: cargo-audit@0.22.2,cargo-deny@0.20.2,cargo-machete@0.9.2
+
+      - name: Verify exact cargo-audit
+        run: test "$(cargo-audit --version)" = "cargo-audit 0.22.2"
+
+      - name: Restore trusted Rust build cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-bin: false
+          cache-targets: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Check xtask formatting
+        run: cargo fmt --manifest-path xtask/Cargo.toml --all --check
+
+      # Compare Cargo's source list with the committed source-package inventory.
+      - name: Check package contents
+        run: cargo xtask package-content
+
+      - name: Lint crate
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Lint xtask
+        run: >-
+          cargo clippy --locked --manifest-path xtask/Cargo.toml
+          --all-targets --all-features -- -D warnings
+
+      - name: Test crate
+        run: cargo test --all-features
+
+      - name: Test xtask
+        run: cargo test --locked --manifest-path xtask/Cargo.toml
+
+      - name: Check unused dependencies
+        run: cargo-machete --with-metadata
+
+      - name: Check crate dependency policy
+        run: cargo deny check bans licenses sources -D warnings
+
+      - name: Check xtask dependency policy
+        run: >-
+          cargo deny --manifest-path xtask/Cargo.toml --locked
+          check bans licenses sources -D warnings
+
+      - name: Audit crate dependencies
+        run: cargo audit
+
+      - name: Audit xtask dependencies
+        run: cargo audit --file xtask/Cargo.lock
+
+  trusted_msrv:
+    name: Rust 1.95.0 (Linux)
+    if: >-
+      ${{ github.ref == 'refs/heads/main' ||
+          startsWith(github.ref, 'refs/heads/ci-testing/') }}
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    env:
+      RUSTFLAGS: -D warnings
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust 1.95.0
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache: false
+          toolchain: 1.95.0
+
+      - name: Test crate at the declared Rust version
+        run: cargo +1.95.0 test --all-features
+
+      - name: Test xtask at the declared Rust version
+        run: cargo +1.95.0 test --locked --manifest-path xtask/Cargo.toml
+
+  trusted_linux:
+    name: Trusted CI (Linux)
+    if: >-
+      ${{ always() &&
+          (github.ref == 'refs/heads/main' ||
+           startsWith(github.ref, 'refs/heads/ci-testing/')) }}
+    needs:
+      - trusted_policy
+      - trusted_stable
+      - trusted_msrv
+    runs-on: linux-amd64-cpu4
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Require every authoritative Linux lane
+        env:
+          MSRV_RESULT: ${{ needs.trusted_msrv.result }}
+          POLICY_RESULT: ${{ needs.trusted_policy.result }}
+          STABLE_RESULT: ${{ needs.trusted_stable.result }}
+        run: |
+          test "${POLICY_RESULT}" = success
+          test "${STABLE_RESULT}" = success
+          test "${MSRV_RESULT}" = success
+
+  trusted_portability:
+    name: Portability (${{ matrix.name }})
+    if: >-
+      ${{ github.ref == 'refs/heads/main' ||
+          startsWith(github.ref, 'refs/heads/ci-testing/') }}
+    runs-on: ${{ matrix.runner }}
+    continue-on-error: true
+    timeout-minutes: 45
     permissions:
       contents: read
     env:
@@ -124,8 +226,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: Linux
-            runner: linux-amd64-cpu8
           - name: macOS
             runner: macos-latest
           - name: Windows
@@ -140,28 +240,12 @@ jobs:
         if: ${{ runner.os == 'macOS' }}
         run: .github/scripts/remove-preinstalled-aws-tap.sh
 
-      - name: Set up Rust
+      - name: Set up Rust 1.98.0
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           cache: false
           components: clippy, rustfmt
-
-      # This section would benefit by a change to the action allowlist
-      - name: Install Rust validation tools
-        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2.83.2
-        with:
-          checksum: true
-          fallback: none
-          tool: cargo-audit,cargo-deny@0.20.2,cargo-machete@0.9.2
-
-      - name: Cache Rust build inputs
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          cache-bin: false
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-          workspaces: |
-            . -> target
-            xtask -> target
+          toolchain: 1.98.0
 
       - name: Check formatting
         run: cargo fmt --all --check
@@ -169,77 +253,529 @@ jobs:
       - name: Check xtask formatting
         run: cargo fmt --manifest-path xtask/Cargo.toml --all --check
 
-      - name: Check release version
-        run: cargo xtask release-version check
-
-      # Compares yaml-sigil-traits' Cargo source list with its committed
-      # inventory. This does not assemble or publish a crate archive.
       - name: Check package contents
         run: cargo xtask package-content
 
-      - name: Lint
+      - name: Lint crate
         run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Lint xtask
-        run: cargo clippy --locked --manifest-path xtask/Cargo.toml --all-targets --all-features -- -D warnings
+        run: >-
+          cargo clippy --locked --manifest-path xtask/Cargo.toml
+          --all-targets --all-features -- -D warnings
 
-      - name: Test
+      - name: Test crate
         run: cargo test --all-features
 
       - name: Test xtask
         run: cargo test --locked --manifest-path xtask/Cargo.toml
 
-      - name: Check unused Rust dependencies
-        run: cargo-machete --with-metadata
+  candidate_linux_lanes:
+    name: Candidate ${{ matrix.name }} (Linux)
+    if: ${{ startsWith(github.ref, 'refs/heads/pull-request/') }}
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 75
+    permissions: {}
+    env:
+      ACTIONS_CACHE_URL: ""
+      ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+      ACTIONS_ID_TOKEN_REQUEST_URL: ""
+      ACTIONS_RESULTS_URL: ""
+      ACTIONS_RUNTIME_TOKEN: ""
+      CARGO_REGISTRY_TOKEN: ""
+      CARGO_REGISTRIES_CRATES_IO_TOKEN: ""
+      GH_TOKEN: ""
+      GIT_ASKPASS: /bin/false
+      GIT_CONFIG_GLOBAL: /dev/null
+      GIT_CONFIG_NOSYSTEM: "1"
+      GIT_CONFIG_SYSTEM: /dev/null
+      GIT_LFS_SKIP_SMUDGE: "1"
+      GIT_TERMINAL_PROMPT: "0"
+      GIT_TOKEN: ""
+      GITHUB_TOKEN: ""
+      PYTHONNOUSERSITE: "1"
+      PYTHONSAFEPATH: "1"
+      RUSTFLAGS: -D warnings
+      RUSTC_WORKSPACE_WRAPPER: ""
+      RUSTC_WRAPPER: ""
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Rust 1.98.0
+            toolchain: 1.98.0
+            full: true
+          - name: Rust 1.95.0
+            toolchain: 1.95.0
+            full: false
+    steps:
+      - name: Create fresh candidate state
+        shell: bash
+        run: |
+          set -euo pipefail
+          state="${RUNNER_TEMP}/yaml-sigil-candidate-state"
+          test ! -e "${state}"
+          install -d -m 0700 \
+            "${state}" \
+            "${state}/cargo-home" \
+            "${state}/policy-bin" \
+            "${state}/target"
+          printf '%s\n' \
+            "CANDIDATE_STATE=${state}" \
+            "CARGO_HOME=${state}/cargo-home" \
+            "CARGO_TARGET_DIR=${state}/target" \
+            "POLICY_BIN=${state}/policy-bin" >> "${GITHUB_ENV}"
 
-      - name: Check Rust dependency policy
-        run: cargo deny check bans licenses sources -D warnings
+      # Complete trusted host setup before any candidate-controlled path exists.
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache: false
+          components: clippy, rustfmt
+          toolchain: ${{ matrix.toolchain }}
+
+      # This section would benefit by a change to the action allowlist
+      - name: Install Rust validation tools
+        if: ${{ matrix.full }}
+        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2.83.2
+        with:
+          checksum: true
+          fallback: none
+          tool: cargo-audit@0.22.2,cargo-deny@0.20.2,cargo-machete@0.9.2,shellcheck@0.11.0
+
+      - name: Install Markdown linter
+        if: ${{ matrix.full }}
+        uses: rvben/rumdl@95a982d941d00cf41a0dcef4d0788bd15a29be1b # v0.2.54
+        with:
+          install-only: true
+          version: "0.2.54"
+
+      # Fetch protected main before candidate source exists and stage every
+      # policy executable that must survive materialization.
+      - name: Stage protected candidate policy
+        id: protected_policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -c core.autocrlf=false init --quiet --initial-branch=main .
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git -c credential.helper= fetch --no-tags --no-recurse-submodules \
+            --depth=1 origin \
+            "+refs/heads/main:refs/remotes/origin/main"
+          git show \
+            refs/remotes/origin/main:.github/scripts/materialize-candidate.sh \
+            > "${POLICY_BIN}/materialize-candidate.sh"
+          git show \
+            refs/remotes/origin/main:.github/scripts/bind-candidate-pr.py \
+            > "${POLICY_BIN}/bind-candidate-pr.py"
+          git show \
+            refs/remotes/origin/main:.github/scripts/check-pull-request-commits.sh \
+            > "${POLICY_BIN}/check-pull-request-commits.sh"
+          git show \
+            refs/remotes/origin/main:.github/scripts/check-release-pr.sh \
+            > "${POLICY_BIN}/check-release-pr.sh"
+          chmod 0500 \
+            "${POLICY_BIN}/bind-candidate-pr.py" \
+            "${POLICY_BIN}/check-release-pr.sh" \
+            "${POLICY_BIN}/materialize-candidate.sh" \
+            "${POLICY_BIN}/check-pull-request-commits.sh"
+          printf 'base_sha=%s\n' \
+            "$(git rev-parse refs/remotes/origin/main)" >> "${GITHUB_OUTPUT}"
+
+      # Anonymous protected-main policy identifies a canonical repository-owned
+      # release branch; ordinary contributor branches produce an empty value.
+      - name: Bind current pull request metadata
+        id: candidate_pr
+        if: ${{ matrix.full }}
+        env:
+          BASE_SHA: ${{ steps.protected_policy.outputs.base_sha }}
+          CANDIDATE_REF: ${{ github.ref_name }}
+          CANDIDATE_SHA: ${{ github.sha }}
+        shell: bash
+        run: >-
+          python3 "${POLICY_BIN}/bind-candidate-pr.py"
+          --repository "${GITHUB_REPOSITORY}"
+          --copied-ref "${CANDIDATE_REF}"
+          --head-sha "${CANDIDATE_SHA}"
+          --base-sha "${BASE_SHA}"
+          --output "${GITHUB_OUTPUT}"
+
+      - name: Install fixed actionlint
+        if: ${{ matrix.full }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git show \
+            refs/remotes/origin/main:.github/scripts/install-actionlint.sh \
+            > "${POLICY_BIN}/install-actionlint.sh"
+          chmod 0500 "${POLICY_BIN}/install-actionlint.sh"
+          "${POLICY_BIN}/install-actionlint.sh" \
+            "${CANDIDATE_STATE}/actionlint"
+
+      # Resolve every command while the workspace still contains protected
+      # policy only. Candidate Cargo aliases and PATH entries cannot select
+      # these absolute executables after materialization.
+      - name: Pin fixed validation commands
+        id: fixed_tools
+        env:
+          FULL: ${{ matrix.full }}
+          TOOLCHAIN: ${{ matrix.toolchain }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_path="$(rustup which --toolchain "${TOOLCHAIN}" cargo)"
+          rustc_path="$(rustup which --toolchain "${TOOLCHAIN}" rustc)"
+          rustdoc_path="$(rustup which --toolchain "${TOOLCHAIN}" rustdoc)"
+          for path in "${cargo_path}" "${rustc_path}" "${rustdoc_path}"; do
+            [[ "${path}" == /* && "${path}" != *$'\n'* && "${path}" != *$'\r'* ]]
+            test -x "${path}"
+          done
+          printf '%s\n' \
+            "cargo=${cargo_path}" \
+            "rustc=${rustc_path}" \
+            "rustdoc=${rustdoc_path}" >> "${GITHUB_OUTPUT}"
+          # Only the full Rust 1.98.0 lane needs formatting, linting, and policy tools.
+          if [[ "${FULL}" == "true" ]]; then
+            cargo_fmt_path="$(rustup which --toolchain "${TOOLCHAIN}" cargo-fmt)"
+            cargo_clippy_path="$(rustup which --toolchain "${TOOLCHAIN}" cargo-clippy)"
+            rustfmt_path="$(rustup which --toolchain "${TOOLCHAIN}" rustfmt)"
+            python_path="$(command -v python3)"
+            for path in \
+              "${cargo_fmt_path}" \
+              "${cargo_clippy_path}" \
+              "${rustfmt_path}" \
+              "${python_path}"; do
+              [[ "${path}" == /* && "${path}" != *$'\n'* && "${path}" != *$'\r'* ]]
+              test -x "${path}"
+            done
+            for tool in cargo-audit cargo-deny cargo-machete rumdl shellcheck; do
+              source_path="$(command -v "${tool}")"
+              [[ "${source_path}" == /* \
+                && "${source_path}" != *$'\n'* \
+                && "${source_path}" != *$'\r'* ]]
+              test -x "${source_path}"
+              install -m 0500 "${source_path}" "${POLICY_BIN}/${tool}"
+            done
+            test "$("${POLICY_BIN}/cargo-audit" --version)" = \
+              "cargo-audit 0.22.2"
+            install -m 0500 \
+              "${CANDIDATE_STATE}/actionlint/actionlint" \
+              "${POLICY_BIN}/actionlint"
+            printf '%s\n' \
+              "cargo_clippy=${cargo_clippy_path}" \
+              "cargo_fmt=${cargo_fmt_path}" \
+              "python=${python_path}" \
+              "rustfmt=${rustfmt_path}" >> "${GITHUB_OUTPUT}"
+          fi
+
+      # The protected materializer now binds and checks out the exact anonymous
+      # copied ref. No Action step follows this point in the candidate job.
+      - name: Materialize exact candidate without credentials
+        env:
+          CANDIDATE_REF: ${{ github.ref_name }}
+          CANDIDATE_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          "${POLICY_BIN}/materialize-candidate.sh" \
+            "${GITHUB_REPOSITORY}" "${CANDIDATE_SHA}" "${CANDIDATE_REF}" \
+            source-spec https://github.com/NVIDIA/yaml-sigil-spec.git
+
+      - name: Check pull request commit policy
+        if: ${{ matrix.full }}
+        env:
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          BASE_SHA="$(git rev-parse refs/remotes/origin/main)"
+          export BASE_SHA
+          "${POLICY_BIN}/check-pull-request-commits.sh"
+
+      - name: Validate canonical release transaction
+        if: ${{ steps.candidate_pr.outputs.release_branch != '' }}
+        env:
+          BASE_SHA: ${{ steps.protected_policy.outputs.base_sha }}
+          HEAD_SHA: ${{ github.sha }}
+          YAML_SIGIL_RELEASE_PR_BRANCH: >-
+            ${{ steps.candidate_pr.outputs.release_branch }}
+        run: |
+          release_version="${YAML_SIGIL_RELEASE_PR_BRANCH#release-plz-manual-}"
+          "${POLICY_BIN}/check-release-pr.sh" \
+            "${BASE_SHA}" "${HEAD_SHA}" \
+            "${YAML_SIGIL_RELEASE_PR_BRANCH}" "${release_version}"
+
+      - name: Lint Markdown
+        if: ${{ matrix.full }}
+        run: >-
+          "${POLICY_BIN}/rumdl" check .
+
+      - name: Lint GitHub Actions workflows
+        if: ${{ matrix.full }}
+        run: >-
+          "${POLICY_BIN}/actionlint"
+          -shellcheck "${POLICY_BIN}/shellcheck" -pyflakes ""
+
+      - name: Lint shell scripts
+        if: ${{ matrix.full }}
+        run: >-
+          find .github/scripts -type f -name '*.sh' -print0 |
+          xargs -0 --no-run-if-empty "${POLICY_BIN}/shellcheck" --
+
+      - name: Check unused dependencies
+        if: ${{ matrix.full }}
+        env:
+          CARGO: ${{ steps.fixed_tools.outputs.cargo }}
+          RUSTC: ${{ steps.fixed_tools.outputs.rustc }}
+          RUSTDOC: ${{ steps.fixed_tools.outputs.rustdoc }}
+        run: >-
+          "${POLICY_BIN}/cargo-machete" --with-metadata
+
+      - name: Check crate dependency policy
+        if: ${{ matrix.full }}
+        env:
+          CARGO: ${{ steps.fixed_tools.outputs.cargo }}
+          RUSTC: ${{ steps.fixed_tools.outputs.rustc }}
+          RUSTDOC: ${{ steps.fixed_tools.outputs.rustdoc }}
+        run: >-
+          "${POLICY_BIN}/cargo-deny" check bans licenses sources -D warnings
 
       - name: Check xtask dependency policy
+        if: ${{ matrix.full }}
+        env:
+          CARGO: ${{ steps.fixed_tools.outputs.cargo }}
+          RUSTC: ${{ steps.fixed_tools.outputs.rustc }}
+          RUSTDOC: ${{ steps.fixed_tools.outputs.rustdoc }}
         run: >-
-          cargo deny --manifest-path xtask/Cargo.toml --locked
+          "${POLICY_BIN}/cargo-deny" --manifest-path xtask/Cargo.toml --locked
           check bans licenses sources -D warnings
 
-      # Audit after the Cargo checks have resolved this platform's dependency
-      # graph and generated the intentionally untracked root Cargo.lock.
-      - name: Audit Rust dependencies
-        run: cargo audit
+      - name: Audit crate dependencies
+        if: ${{ matrix.full }}
+        env:
+          FIXED_CARGO: ${{ steps.fixed_tools.outputs.cargo }}
+          RUSTC: ${{ steps.fixed_tools.outputs.rustc }}
+          RUSTDOC: ${{ steps.fixed_tools.outputs.rustdoc }}
+        run: |
+          "${FIXED_CARGO}" generate-lockfile --manifest-path Cargo.toml
+          "${POLICY_BIN}/cargo-audit" audit --file Cargo.lock
+          "${POLICY_BIN}/cargo-audit" audit --file xtask/Cargo.lock
 
-      # The developer-only xtask has its own committed dependency lockfile.
-      - name: Audit xtask dependencies
-        run: cargo audit --file xtask/Cargo.lock
+      # This is the only candidate-executable phase. It uses paths selected
+      # before materialization, bypasses Cargo aliases and wrappers, and is the
+      # final step so GITHUB_ENV/GITHUB_PATH writes have no later consumer.
+      - name: Execute candidate validation (terminal)
+        env:
+          FIXED_CARGO: ${{ steps.fixed_tools.outputs.cargo }}
+          FIXED_CARGO_CLIPPY: ${{ steps.fixed_tools.outputs.cargo_clippy }}
+          FIXED_CARGO_FMT: ${{ steps.fixed_tools.outputs.cargo_fmt }}
+          FIXED_PYTHON: ${{ steps.fixed_tools.outputs.python }}
+          FIXED_RUSTC: ${{ steps.fixed_tools.outputs.rustc }}
+          FIXED_RUSTDOC: ${{ steps.fixed_tools.outputs.rustdoc }}
+          FIXED_RUSTFMT: ${{ steps.fixed_tools.outputs.rustfmt }}
+          FULL: ${{ matrix.full }}
+          YAML_SIGIL_RELEASE_PR_BRANCH: >-
+            ${{ steps.candidate_pr.outputs.release_branch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_config=(
+            --config "build.rustc=\"${FIXED_RUSTC}\""
+            --config 'build.rustc-wrapper=""'
+            --config 'build.rustc-workspace-wrapper=""'
+            --config "build.target-dir=\"${CARGO_TARGET_DIR}\""
+          )
+          export RUSTC="${FIXED_RUSTC}"
+          export RUSTDOC="${FIXED_RUSTDOC}"
+          # The full Rust 1.98.0 lane executes the complete candidate-owned suite;
+          # the separate Rust 1.95.0 lane executes only its compatibility tests.
+          if [[ "${FULL}" == "true" ]]; then
+            export CARGO="${FIXED_CARGO}"
+            export RUSTFMT="${FIXED_RUSTFMT}"
+            "${FIXED_CARGO_FMT}" fmt --all --check
+            "${FIXED_CARGO_FMT}" fmt \
+              --manifest-path xtask/Cargo.toml --all --check
+            # A protected helper has already admitted this exact release diff;
+            # the credential-free xtask now validates its candidate content.
+            if [[ -n "${YAML_SIGIL_RELEASE_PR_BRANCH}" ]]; then
+              release_version="${YAML_SIGIL_RELEASE_PR_BRANCH#release-plz-manual-}"
+              "${FIXED_CARGO}" "${cargo_config[@]}" run --locked \
+                --manifest-path xtask/Cargo.toml -- \
+                release check --version "${release_version}"
+            fi
+            "${FIXED_CARGO}" "${cargo_config[@]}" run --locked \
+              --manifest-path xtask/Cargo.toml -- package-content
+            "${FIXED_CARGO_CLIPPY}" clippy "${cargo_config[@]}" \
+              --all-targets --all-features -- -D warnings
+            "${FIXED_CARGO_CLIPPY}" clippy "${cargo_config[@]}" --locked \
+              --manifest-path xtask/Cargo.toml \
+              --all-targets --all-features -- -D warnings
+            "${FIXED_CARGO}" "${cargo_config[@]}" test --all-features
+            "${FIXED_CARGO}" "${cargo_config[@]}" test --locked \
+              --manifest-path xtask/Cargo.toml
+            "${FIXED_PYTHON}" -m py_compile \
+              .github/scripts/bind-candidate-pr.py \
+              .github/scripts/report_required_ci.py \
+              .github/scripts/test_bind_candidate_pr.py \
+              .github/scripts/test_report_required_ci.py
+            "${FIXED_PYTHON}" -m unittest discover \
+              -s .github/scripts -p 'test_*.py'
+            .github/scripts/test-materialize-candidate.sh
+            .github/scripts/test-check-release-pr.sh
+          else
+            "${FIXED_CARGO}" "${cargo_config[@]}" test --all-features
+            "${FIXED_CARGO}" "${cargo_config[@]}" test --locked \
+              --manifest-path xtask/Cargo.toml
+          fi
 
-  required_ci:
-    name: Required CI
-    if: ${{ always() }}
+  candidate_linux:
+    name: Candidate CI (Linux)
+    if: ${{ always() && startsWith(github.ref, 'refs/heads/pull-request/') }}
     needs:
-      - workflow_lint
-      - platform_verifier
-      - static_checks
-      - rust
+      - candidate_linux_lanes
     runs-on: linux-amd64-cpu4
     timeout-minutes: 5
     permissions: {}
     steps:
-      - name: Require successful CI jobs
+      - name: Require Rust 1.98.0 and 1.95.0 candidate lanes
         env:
-          GITHUB_ACTIONS_RESULT: ${{ needs.workflow_lint.result }}
-          DOCUMENTATION_RESULT: ${{ needs.static_checks.result }}
-          PLATFORM_VERIFIER_RESULT: ${{ needs.platform_verifier.result }}
-          RUST_RESULT: ${{ needs.rust.result }}
-        run: |
-          require_success() {
-            local job="$1"
-            local result="$2"
-            # Aggregate every required job, including the whole OS matrix.
-            if [[ "${result}" != "success" ]]; then
-              printf '%s finished with result %s; success is required.\n' \
-                "${job}" "${result}"
-              exit 1
-            fi
-          }
+          CANDIDATE_LANES_RESULT: ${{ needs.candidate_linux_lanes.result }}
+        run: test "${CANDIDATE_LANES_RESULT}" = success
 
-          require_success "GitHub Actions" "${GITHUB_ACTIONS_RESULT}"
-          require_success "Protected policy verifier matrix" "${PLATFORM_VERIFIER_RESULT}"
-          require_success "Documentation" "${DOCUMENTATION_RESULT}"
-          require_success "Rust matrix" "${RUST_RESULT}"
+  candidate_portability:
+    name: Candidate portability (${{ matrix.name }})
+    if: ${{ startsWith(github.ref, 'refs/heads/pull-request/') }}
+    runs-on: ${{ matrix.runner }}
+    continue-on-error: true
+    timeout-minutes: 45
+    permissions: {}
+    env:
+      ACTIONS_CACHE_URL: ""
+      ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+      ACTIONS_ID_TOKEN_REQUEST_URL: ""
+      ACTIONS_RESULTS_URL: ""
+      ACTIONS_RUNTIME_TOKEN: ""
+      CARGO_REGISTRY_TOKEN: ""
+      CARGO_REGISTRIES_CRATES_IO_TOKEN: ""
+      GH_TOKEN: ""
+      GIT_ASKPASS: /bin/false
+      GIT_CONFIG_GLOBAL: /dev/null
+      GIT_CONFIG_NOSYSTEM: "1"
+      GIT_CONFIG_SYSTEM: /dev/null
+      GIT_LFS_SKIP_SMUDGE: "1"
+      GIT_TERMINAL_PROMPT: "0"
+      GIT_TOKEN: ""
+      GITHUB_TOKEN: ""
+      RUSTFLAGS: -D warnings
+      RUSTC_WORKSPACE_WRAPPER: ""
+      RUSTC_WRAPPER: ""
+      RUSTUP_TOOLCHAIN: 1.98.0
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS
+            runner: macos-latest
+          - name: Windows
+            runner: windows-latest
+    steps:
+      - name: Create fresh candidate state
+        shell: bash
+        run: |
+          set -euo pipefail
+          state="${RUNNER_TEMP}/yaml-sigil-candidate-state"
+          test ! -e "${state}"
+          install -d -m 0700 \
+            "${state}" \
+            "${state}/cargo-home" \
+            "${state}/policy-bin" \
+            "${state}/target"
+          printf '%s\n' \
+            "CANDIDATE_STATE=${state}" \
+            "CARGO_HOME=${state}/cargo-home" \
+            "CARGO_TARGET_DIR=${state}/target" \
+            "POLICY_BIN=${state}/policy-bin" >> "${GITHUB_ENV}"
+
+      # Set up the advisory host before any candidate-controlled path exists.
+      - name: Set up Rust 1.98.0
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache: false
+          components: clippy, rustfmt
+          toolchain: 1.98.0
+
+      # Stage fixed protected helpers before candidate-controlled source exists.
+      - name: Stage protected candidate policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -c core.autocrlf=false init --quiet --initial-branch=main .
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git -c credential.helper= fetch --no-tags --no-recurse-submodules \
+            --depth=1 origin \
+            "+refs/heads/main:refs/remotes/origin/main"
+          git show \
+            refs/remotes/origin/main:.github/scripts/materialize-candidate.sh \
+            > "${POLICY_BIN}/materialize-candidate.sh"
+          git show \
+            refs/remotes/origin/main:.github/scripts/remove-preinstalled-aws-tap.sh \
+            > "${POLICY_BIN}/remove-preinstalled-aws-tap.sh"
+          chmod 0500 \
+            "${POLICY_BIN}/materialize-candidate.sh" \
+            "${POLICY_BIN}/remove-preinstalled-aws-tap.sh"
+
+      - name: Remove unused preinstalled Homebrew source
+        if: ${{ runner.os == 'macOS' }}
+        shell: bash
+        run: |
+          "${POLICY_BIN}/remove-preinstalled-aws-tap.sh"
+
+      # Resolve the fixed rustup launcher before candidate files exist. `run`
+      # then selects Rust 1.98.0 tools directly without a candidate Cargo alias.
+      - name: Pin fixed Rust launcher
+        id: fixed_tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup_path="$(command -v rustup)"
+          [[ "${rustup_path}" == /* \
+            && "${rustup_path}" != *$'\n'* \
+            && "${rustup_path}" != *$'\r'* ]]
+          test -x "${rustup_path}"
+          "${rustup_path}" run 1.98.0 cargo --version
+          "${rustup_path}" run 1.98.0 cargo-fmt fmt --version
+          "${rustup_path}" run 1.98.0 cargo-clippy clippy --version
+          printf 'rustup=%s\n' "${rustup_path}" >> "${GITHUB_OUTPUT}"
+
+      # No Action or privileged host-setup step follows candidate materialization.
+      - name: Materialize exact candidate without credentials
+        env:
+          CANDIDATE_REF: ${{ github.ref_name }}
+          CANDIDATE_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          "${POLICY_BIN}/materialize-candidate.sh" \
+            "${GITHUB_REPOSITORY}" "${CANDIDATE_SHA}" "${CANDIDATE_REF}" \
+            source-spec https://github.com/NVIDIA/yaml-sigil-spec.git
+
+      # Advisory candidate execution is terminal: no policy, credential,
+      # artifact, cache-save, or host-setup consumer follows this step.
+      - name: Execute advisory candidate validation (terminal)
+        env:
+          FIXED_RUSTUP: ${{ steps.fixed_tools.outputs.rustup }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_config=(
+            --config 'build.rustc="rustc"'
+            --config 'build.rustc-wrapper=""'
+            --config 'build.rustc-workspace-wrapper=""'
+          )
+          "${FIXED_RUSTUP}" run 1.98.0 cargo-fmt fmt --all --check
+          "${FIXED_RUSTUP}" run 1.98.0 cargo "${cargo_config[@]}" run --locked \
+            --manifest-path xtask/Cargo.toml -- package-content
+          "${FIXED_RUSTUP}" run 1.98.0 cargo-clippy clippy \
+            "${cargo_config[@]}" --all-targets --all-features -- -D warnings
+          "${FIXED_RUSTUP}" run 1.98.0 cargo "${cargo_config[@]}" \
+            test --all-features
+          "${FIXED_RUSTUP}" run 1.98.0 cargo "${cargo_config[@]}" test --locked \
+            --manifest-path xtask/Cargo.toml

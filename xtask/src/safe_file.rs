@@ -86,12 +86,6 @@ impl TrustedRoot {
         read_utf8_bounded(file, limit, path)
     }
 
-    pub(crate) fn read_bytes(&self, path: &Path, limit: usize) -> io::Result<Vec<u8>> {
-        let components = relative_components(path)?;
-        let file = self.platform.open_file(&components)?;
-        read_bounded(file, limit, path)
-    }
-
     pub(crate) fn read_manifest(&self, path: &Path) -> io::Result<String> {
         self.read_utf8(path, MANIFEST_LIMIT)
     }

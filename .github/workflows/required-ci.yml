@@ -1,0 +1,87 @@
+name: Required CI reporter
+
+on:
+  workflow_run:
+    workflows:
+      - CI
+    types:
+      - completed
+
+permissions: {}
+
+concurrency:
+  group: required-ci-${{ github.repository }}-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+
+jobs:
+  report:
+    name: Report authorized candidate result
+    if: >-
+      ${{ github.event.workflow_run.event == 'push' &&
+          startsWith(github.event.workflow_run.head_branch, 'pull-request/') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # The shared App-key environment deliberately adds a second exact-run
+    # human gate after copied-head authorization and candidate execution.
+    environment: protected-automation
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+    steps:
+      # Load reporter policy only from the protected default-branch commit that
+      # GitHub selected for this workflow_run delivery.
+      - name: Load protected reporter
+        env:
+          GH_TOKEN: ${{ github.token }}
+          POLICY_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          install -d "${RUNNER_TEMP}/required-ci"
+          gh api \
+            "repos/${GITHUB_REPOSITORY}/contents/.github/scripts/report_required_ci.py?ref=${POLICY_SHA}" \
+            --jq .content | base64 --decode \
+            > "${RUNNER_TEMP}/required-ci/reporter.py"
+          test -s "${RUNNER_TEMP}/required-ci/reporter.py"
+          python3 -m py_compile "${RUNNER_TEMP}/required-ci/reporter.py"
+
+      - name: Bind exact candidate run without App authority
+        id: inspect
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python3 "${RUNNER_TEMP}/required-ci/reporter.py" inspect
+          --event "${GITHUB_EVENT_PATH}"
+          --repository "NVIDIA/yaml-sigil-traits"
+          --workflow-id "333755870"
+          --workflow-path ".github/workflows/ci.yml"
+          --job-name "Candidate CI (Linux)"
+          --check-name "Required CI"
+          --app-slug "nvidia-yamlsigil-release-pr"
+
+      - name: Create checks-only repository token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.YAML_SIGIL_RELEASE_PR_APP_CLIENT_ID }}
+          private-key: ${{ secrets.YAML_SIGIL_RELEASE_PR_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-checks: write
+
+      # Rebind every mutable field after token creation and immediately before
+      # the sole App-authorized mutation.
+      - name: Create exact App-owned verdict
+        env:
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python3 "${RUNNER_TEMP}/required-ci/reporter.py" report
+          --event "${GITHUB_EVENT_PATH}"
+          --repository "NVIDIA/yaml-sigil-traits"
+          --workflow-id "333755870"
+          --workflow-path ".github/workflows/ci.yml"
+          --job-name "Candidate CI (Linux)"
+          --check-name "Required CI"
+          --app-slug "nvidia-yamlsigil-release-pr"
