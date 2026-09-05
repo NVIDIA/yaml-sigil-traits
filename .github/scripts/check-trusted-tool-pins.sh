@@ -1,19 +1,28 @@
 #!/usr/bin/env bash
 
-# Enforce only the reviewed trusted Rust and cargo-audit source pins. This is a
-# narrow supply-chain lint, not a workflow graph or permissions parser.
+# Enforce the reviewed Rust, cargo-audit, and release registry source pins.
+# This is a narrow supply-chain lint, not a workflow graph or permissions parser.
 set -euo pipefail
 
 workflow="${1:-.github/workflows/ci.yml}"
+release_workflow="${2:-.github/workflows/publish.yml}"
 expected_audit="cargo-audit@0.22.2"
 expected_toolchain="1.98.0"
 compatibility_toolchain="1.95.0"
+expected_registry_index="sparse+https://index.crates.io/"
+expected_registry_protocol="sparse"
 # This is a literal GitHub expression admitted by the source check, not shell.
 # shellcheck disable=SC2016
 matrix_toolchain='${{ matrix.toolchain }}'
 
 if [[ ! -f "${workflow}" || -L "${workflow}" ]]; then
   echo "trusted-tool workflow is missing or not a regular file" >&2
+  exit 1
+fi
+
+# Registry policy must come from a regular protected workflow source.
+if [[ ! -f "${release_workflow}" || -L "${release_workflow}" ]]; then
+  echo "release workflow is missing or not a regular file" >&2
   exit 1
 fi
 
@@ -78,5 +87,28 @@ while IFS= read -r line; do
 done < "${workflow}"
 if ((exact_toolchains == 0)); then
   echo "trusted Rust ${expected_toolchain} setup is missing" >&2
+  exit 1
+fi
+
+index_key_count="$(grep -Ec \
+  '^[[:space:]]*CARGO_REGISTRIES_CRATES_IO_INDEX:' "${release_workflow}" || :)"
+index_value_count="$(grep -Fxc \
+  "          CARGO_REGISTRIES_CRATES_IO_INDEX: ${expected_registry_index}" \
+  "${release_workflow}" || :)"
+protocol_key_count="$(grep -Ec \
+  '^[[:space:]]*CARGO_REGISTRIES_CRATES_IO_PROTOCOL:' "${release_workflow}" || :)"
+protocol_value_count="$(grep -Fxc \
+  "          CARGO_REGISTRIES_CRATES_IO_PROTOCOL: ${expected_registry_protocol}" \
+  "${release_workflow}" || :)"
+
+# Exactly one canonical sparse index prevents implicit or alternate resolution.
+if ((index_key_count != 1 || index_value_count != 1)); then
+  echo "release registry index is missing, duplicated, or not canonical" >&2
+  exit 1
+fi
+
+# Keep Cargo's protocol aligned with the canonical sparse index scheme.
+if ((protocol_key_count != 1 || protocol_value_count != 1)); then
+  echo "release registry protocol is missing, duplicated, or not sparse" >&2
   exit 1
 fi
