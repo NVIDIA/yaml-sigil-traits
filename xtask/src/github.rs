@@ -43,6 +43,7 @@ const RELEASE_SIGNATURE_QUERY: &str = r#"
 query($owner:String!,$name:String!,$number:Int!){
   repository(owner:$owner,name:$name){
     pullRequest(number:$number){
+      mergeCommit{oid}
       commits(first:2){
         totalCount
         nodes{
@@ -327,7 +328,7 @@ fn qualify(
         "repos/{REPOSITORY}/commits/{}/pulls?per_page=100&page=1",
         context.source
     ))?;
-    let Some(release_pr) = select_merged_pull_request(&pulls, &context.source)? else {
+    let Some(release_pr) = select_merged_pull_request(&pulls)? else {
         if mode == QualificationMode::Push {
             return Ok(Qualification::ordinary(&context.source));
         }
@@ -359,8 +360,12 @@ fn qualify(
         release_pr.head.sha
     ))?;
     validate_release_head(&source_commit, &head_commit, release_pr)?;
-    let head_signature =
-        read_release_head_signature(github, release_pr.number, &release_pr.head.sha)?;
+    let head_signature = read_release_head_signature(
+        github,
+        release_pr.number,
+        &release_pr.head.sha,
+        &context.source,
+    )?;
     validate_release_head_signature(&head_commit, &head_signature)?;
 
     let registry_state = match registry
@@ -472,20 +477,18 @@ fn original_run_matches(
         && run.repository.full_name == REPOSITORY
 }
 
-fn select_merged_pull_request<'a>(
-    pulls: &'a [PullRequest],
-    source: &str,
-) -> Result<Option<&'a PullRequest>, String> {
+fn select_merged_pull_request(pulls: &[PullRequest]) -> Result<Option<&PullRequest>, String> {
     if pulls.len() >= 100 {
         return Err("commit association inventory is incomplete or oversized".to_string());
     }
+    // The commit-scoped endpoint binds this response to the requested source;
+    // current REST responses no longer carry a duplicate merge SHA field.
     let matches: Vec<_> = pulls
         .iter()
         .filter(|pull| {
             pull.number > 0
                 && pull.state == "closed"
                 && pull.merged_at.is_some()
-                && pull.merge_commit_sha.as_deref() == Some(source)
                 && pull.base.reference == "main"
                 && pull.base.repository().full_name == REPOSITORY
         })
@@ -514,11 +517,13 @@ fn read_release_head_signature(
     github: &mut impl Transport,
     pull_number: u64,
     expected_oid: &str,
+    expected_merge_oid: &str,
 ) -> Result<VerifiedSignature, String> {
     if pull_number == 0 {
         return Err("release pull request number is invalid".to_string());
     }
     require_sha(expected_oid, "release pull request head")?;
+    require_sha(expected_merge_oid, "release merge commit")?;
     let payload = json!({
         "query": RELEASE_SIGNATURE_QUERY,
         "variables": {
@@ -538,6 +543,9 @@ fn read_release_head_signature(
     let pull = repository
         .pull_request
         .ok_or_else(|| "release signature pull request is missing".to_string())?;
+    if pull.merge_commit.as_ref().map(|commit| commit.oid.as_str()) != Some(expected_merge_oid) {
+        return Err("release pull request merge commit differs".to_string());
+    }
     let commits = pull.commits;
     if commits.total_count != 1
         || commits.nodes.len() != 1
@@ -1065,7 +1073,6 @@ struct PullRequest {
     number: u64,
     state: String,
     merged_at: Option<String>,
-    merge_commit_sha: Option<String>,
     base: PullSide,
     head: PullSide,
 }
@@ -1115,7 +1122,14 @@ struct SignatureRepository {
 
 #[derive(Clone, Debug, Deserialize)]
 struct SignaturePullRequest {
+    #[serde(rename = "mergeCommit")]
+    merge_commit: Option<SignatureMergeCommit>,
     commits: SignatureCommitConnection,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct SignatureMergeCommit {
+    oid: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1650,12 +1664,11 @@ mod tests {
         }
     }
 
-    fn pull(source: &str) -> PullRequest {
+    fn pull() -> PullRequest {
         PullRequest {
             number: 7,
             state: "closed".to_string(),
             merged_at: Some("2026-09-04T00:00:00Z".to_string()),
-            merge_commit_sha: Some(source.to_string()),
             base: side("main", &"b".repeat(40)),
             head: side("release-plz-manual-0.4.0-rc.3", &"c".repeat(40)),
         }
@@ -1725,11 +1738,12 @@ mod tests {
         }
     }
 
-    fn release_signature_response(head: &str) -> Value {
+    fn release_signature_response(head: &str, merge_commit: &str) -> Value {
         json!({
             "data": {
                 "repository": {
                     "pullRequest": {
+                        "mergeCommit": {"oid": merge_commit},
                         "commits": {
                             "totalCount": 1,
                             "nodes": [{
@@ -1858,28 +1872,49 @@ mod tests {
 
     #[test]
     fn pull_association_is_exact_and_unambiguous() {
-        let source = "a".repeat(40);
-        let valid = pull(&source);
+        let valid = pull();
         assert_eq!(
-            select_merged_pull_request(std::slice::from_ref(&valid), &source)
+            select_merged_pull_request(std::slice::from_ref(&valid))
                 .unwrap()
                 .map(|pull| pull.number),
             Some(7)
         );
-        assert!(select_merged_pull_request(&[valid.clone(), valid], &source).is_err());
-        assert!(select_merged_pull_request(&vec![pull(&source); 100], &source).is_err());
-        assert!(
-            select_merged_pull_request(&[pull(&"d".repeat(40))], &source)
-                .unwrap()
-                .is_none()
-        );
+        assert!(select_merged_pull_request(&[valid.clone(), valid]).is_err());
+        assert!(select_merged_pull_request(&vec![pull(); 100]).is_err());
 
-        let mut wrong_base = pull(&source);
+        let mut unmerged = pull();
+        unmerged.state = "open".to_string();
+        unmerged.merged_at = None;
+        assert!(select_merged_pull_request(&[unmerged]).unwrap().is_none());
+
+        let mut wrong_base = pull();
         wrong_base.base.reference = "develop".to_string();
-        assert!(
-            select_merged_pull_request(&[wrong_base], &source)
+        assert!(select_merged_pull_request(&[wrong_base]).unwrap().is_none());
+    }
+
+    #[test]
+    fn pull_association_decodes_without_removed_merge_sha_field() {
+        let payload = json!({
+            "number": 7,
+            "state": "closed",
+            "merged_at": "2026-09-04T00:00:00Z",
+            "base": {
+                "ref": "main",
+                "sha": "b".repeat(40),
+                "repo": {"full_name": REPOSITORY},
+            },
+            "head": {
+                "ref": "release-plz-manual-0.4.0-rc.3",
+                "sha": "c".repeat(40),
+                "repo": {"full_name": REPOSITORY},
+            },
+        });
+        let observed: PullRequest = serde_json::from_value(payload).unwrap();
+        assert_eq!(
+            select_merged_pull_request(&[observed])
                 .unwrap()
-                .is_none()
+                .map(|pull| pull.number),
+            Some(7)
         );
     }
 
@@ -2068,26 +2103,35 @@ mod tests {
     #[test]
     fn release_signature_query_is_exact_and_complete() {
         let head = "c".repeat(40);
+        let merge_commit = "a".repeat(40);
         let mut github = FakeGithub {
             responses: BTreeMap::from([(
                 "graphql:release-signature".to_string(),
-                release_signature_response(&head),
+                release_signature_response(&head, &merge_commit),
             )]),
         };
-        let signature = read_release_head_signature(&mut github, 7, &head).unwrap();
+        let signature = read_release_head_signature(&mut github, 7, &head, &merge_commit).unwrap();
         assert_eq!(
             signature.signer.unwrap().database_id,
             Some(RELEASE_SIGNER_ID)
         );
 
-        let mut incomplete = release_signature_response(&head);
+        let mut incomplete = release_signature_response(&head, &merge_commit);
         incomplete["data"]["repository"]["pullRequest"]["commits"]["totalCount"] = json!(2);
         let mut github = FakeGithub {
             responses: BTreeMap::from([("graphql:release-signature".to_string(), incomplete)]),
         };
-        assert!(read_release_head_signature(&mut github, 7, &head).is_err());
+        assert!(read_release_head_signature(&mut github, 7, &head, &merge_commit).is_err());
 
-        let mut null = release_signature_response(&head);
+        let mut wrong_merge = release_signature_response(&head, &merge_commit);
+        wrong_merge["data"]["repository"]["pullRequest"]["mergeCommit"]["oid"] =
+            json!("d".repeat(40));
+        let mut github = FakeGithub {
+            responses: BTreeMap::from([("graphql:release-signature".to_string(), wrong_merge)]),
+        };
+        assert!(read_release_head_signature(&mut github, 7, &head, &merge_commit).is_err());
+
+        let mut null = release_signature_response(&head, &merge_commit);
         null["data"]["repository"]["pullRequest"]["commits"]["nodes"][0]["commit"]["signature"]["signer"] =
             Value::Null;
         let response: SignatureEnvelope = serde_json::from_value(null).unwrap();
@@ -2111,7 +2155,7 @@ mod tests {
     #[test]
     fn release_head_must_be_one_commit_current_with_base() {
         let source = "a".repeat(40);
-        let pull = pull(&source);
+        let pull = pull();
         let merged = commit(&source, &pull.base.sha, RELEASE_PATHS);
         let mut head = commit(&pull.head.sha, &pull.base.sha, RELEASE_PATHS);
         validate_release_head(&merged, &head, &pull).unwrap();
