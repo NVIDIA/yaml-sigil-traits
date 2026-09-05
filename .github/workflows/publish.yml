@@ -261,6 +261,9 @@ jobs:
       - name: Publish exact source with Trusted Publishing
         if: ${{ steps.requalify.outputs.registry_state == 'absent' }}
         env:
+          # release-plz resolves the explicit Cargo publish registry by name.
+          CARGO_REGISTRIES_CRATES_IO_INDEX: sparse+https://index.crates.io/
+          CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
           MODE: ${{ needs.qualify.outputs.mode }}
           POLICY_SHA: ${{ github.sha }}
           SOURCE_SHA: ${{ needs.qualify.outputs.source }}
