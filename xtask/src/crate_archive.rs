@@ -35,7 +35,9 @@ const GNU_GID_RANGE: std::ops::Range<usize> = 116..124;
 const GNU_TYPEFLAG_OFFSET: usize = 156;
 const GNU_DEVICE_MAJOR_RANGE: std::ops::Range<usize> = 329..337;
 const GNU_DEVICE_MINOR_RANGE: std::ops::Range<usize> = 337..345;
-const USER_AGENT: &str = "yaml-sigil-release-workflow/1.0";
+const CRATES_IO_USER_AGENT: &str =
+    "yaml-sigil-release-verifier/1.0 (https://github.com/NVIDIA/yaml-sigil-traits)";
+const CRATES_IO_REQUEST_DELAY: Duration = Duration::from_secs(1);
 type RequiredArchive = (String, Vec<u8>, BTreeMap<String, ArchiveFile>);
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -52,6 +54,14 @@ pub(crate) trait Registry {
         version: &str,
     ) -> Result<Option<RegistryVersion>, String>;
     fn download(&mut self, package: &str, version: &str) -> Result<Vec<u8>, String>;
+}
+
+fn crates_io_request_command(request_args: &[&str], sleep: impl FnOnce(Duration)) -> Command {
+    let mut command = Command::new("curl");
+    command.args(["--disable", "--user-agent", CRATES_IO_USER_AGENT]);
+    command.args(request_args);
+    sleep(CRATES_IO_REQUEST_DELAY);
+    command
 }
 
 pub(crate) struct CratesIo {
@@ -80,23 +90,22 @@ impl CratesIo {
         let url = format!("https://crates.io/api/v1{path}");
         let mut last = None;
         for attempt in 1..=READ_ATTEMPTS {
-            let mut command = Command::new("curl");
-            command.args([
-                "--disable",
-                "--silent",
-                "--show-error",
-                "--proto",
-                "=https",
-                "--proto-redir",
-                "=https",
-                "--max-time",
-                "30",
-                "--write-out",
-                "\n%{http_code}",
-                "--user-agent",
-                USER_AGENT,
-                &url,
-            ]);
+            let mut command = crates_io_request_command(
+                &[
+                    "--silent",
+                    "--show-error",
+                    "--proto",
+                    "=https",
+                    "--proto-redir",
+                    "=https",
+                    "--max-time",
+                    "30",
+                    "--write-out",
+                    "\n%{http_code}",
+                    &url,
+                ],
+                thread::sleep,
+            );
             let output = bounded_process::output(
                 &mut command,
                 OutputLimits {
@@ -157,27 +166,27 @@ impl Registry for CratesIo {
         validate_component(package, "crate name")?;
         validate_component(version, "crate version")?;
         let url = format!("https://crates.io/api/v1/crates/{package}/{version}/download");
+        let max_crate_bytes = MAX_CRATE_BYTES.to_string();
         let mut last = None;
         for attempt in 1..=READ_ATTEMPTS {
-            let mut command = Command::new("curl");
-            command.args([
-                "--disable",
-                "--silent",
-                "--show-error",
-                "--fail",
-                "--location",
-                "--proto",
-                "=https",
-                "--proto-redir",
-                "=https",
-                "--max-time",
-                "60",
-                "--max-filesize",
-                &MAX_CRATE_BYTES.to_string(),
-                "--user-agent",
-                USER_AGENT,
-                &url,
-            ]);
+            let mut command = crates_io_request_command(
+                &[
+                    "--silent",
+                    "--show-error",
+                    "--fail",
+                    "--location",
+                    "--proto",
+                    "=https",
+                    "--proto-redir",
+                    "=https",
+                    "--max-time",
+                    "60",
+                    "--max-filesize",
+                    &max_crate_bytes,
+                    &url,
+                ],
+                thread::sleep,
+            );
             let output = bounded_process::output(
                 &mut command,
                 OutputLimits {
@@ -799,6 +808,7 @@ mod tests {
     use super::*;
     use flate2::Compression;
     use flate2::write::GzEncoder;
+    use std::cell::Cell;
     use std::io::Write as _;
 
     #[derive(Clone, Copy)]
@@ -901,6 +911,32 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         output.stdout
+    }
+
+    #[test]
+    fn crates_io_request_uses_exact_identity_and_pacing() {
+        const URL: &str = "https://crates.io/api/v1/crates/yaml-sigil-traits/0.4.0";
+        let observed_delay = Cell::new(None);
+        let command = crates_io_request_command(&["--silent", URL], |delay| {
+            observed_delay.set(Some(delay));
+        });
+        let args = command
+            .get_args()
+            .map(|argument| argument.to_str().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(observed_delay.get(), Some(Duration::from_secs(1)));
+        assert_eq!(
+            args,
+            [
+                "--disable",
+                "--user-agent",
+                CRATES_IO_USER_AGENT,
+                "--silent",
+                URL,
+            ]
+        );
+        assert!(!CRATES_IO_USER_AGENT.to_ascii_lowercase().contains("curl"));
     }
 
     #[test]
