@@ -17,8 +17,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use toml_edit::DocumentMut;
 
+use crate::bounded_process::{self, VALIDATION_OUTPUT_LIMITS};
 use crate::crate_archive::{CratesIo, Registry, RegistryVersion, inspect_archive, is_checksum};
 use crate::release_policy::{ReleaseFamily, ReleasePolicy, detect};
+use crate::safe_file;
 
 const INVENTORY_SCHEMA: u64 = 3;
 const READ_ONLY_PUSH_URL: &str = "disabled://yaml-sigil-release-proposal";
@@ -41,7 +43,7 @@ enum BaselineCommand {
 
 #[derive(Args)]
 struct BaselinePrepareArgs {
-    /// Exact protected-main commit being analyzed.
+    /// Exact captured release commit being analyzed.
     #[arg(long, value_name = "SHA")]
     head: String,
     /// New detached baseline directory.
@@ -65,11 +67,14 @@ struct BaselinePrepareArgs {
     /// Exact non-mutating push URL configured for baseline preparation.
     #[arg(long, default_value = READ_ONLY_PUSH_URL)]
     expected_push_url: String,
+    /// Explicit captured source checkout for a staged current validator.
+    #[arg(long)]
+    source_root: Option<PathBuf>,
 }
 
 #[derive(Args)]
 struct BaselineVerifyArgs {
-    /// Exact protected-main commit being revalidated.
+    /// Exact captured release commit being revalidated.
     #[arg(long, value_name = "SHA")]
     head: String,
     /// Persisted official-tag inventory to revalidate.
@@ -91,6 +96,7 @@ pub(crate) fn run(root: &Path, args: BaselineArgs) -> Result<(), String> {
 }
 
 fn prepare_command(root: &Path, args: BaselinePrepareArgs) -> Result<(), String> {
+    let root = resolve_source_root(root, args.source_root.as_deref())?;
     let parsed = ParsedArgs {
         head: args.head,
         expected_fetch_url: args.expected_fetch_url,
@@ -117,10 +123,10 @@ fn prepare_command(root: &Path, args: BaselinePrepareArgs) -> Result<(), String>
                     .unwrap_or("baseline")
             ))
     });
-    let policy = detect(root)?;
+    let policy = detect(&root)?;
     let mut registry = CratesIo::new();
     let result = prepare(
-        root,
+        &root,
         policy,
         &parsed,
         output,
@@ -133,6 +139,21 @@ fn prepare_command(root: &Path, args: BaselinePrepareArgs) -> Result<(), String>
         result.commit, result.manifest
     );
     Ok(())
+}
+
+fn resolve_source_root(
+    compiled_root: &Path,
+    source_root: Option<&Path>,
+) -> Result<PathBuf, String> {
+    let Some(root) = source_root else {
+        return Ok(compiled_root.to_path_buf());
+    };
+    if !root.is_absolute() {
+        return Err("--source-root must be an absolute path".to_string());
+    }
+    safe_file::TrustedRoot::open(root)
+        .map_err(|error| format!("open captured source root {}: {error}", root.display()))?;
+    Ok(root.to_path_buf())
 }
 
 fn verify_command(root: &Path, args: BaselineVerifyArgs) -> Result<(), String> {
@@ -155,7 +176,7 @@ fn verify_command(root: &Path, args: BaselineVerifyArgs) -> Result<(), String> {
     let policy = detect(root)?;
     let mut registry = CratesIo::new();
     verify_snapshot(root, policy, &parsed, inventory, &mut registry)?;
-    eprintln!("release: verified unchanged official tags, archives, and current main");
+    eprintln!("release: verified unchanged official tags, archives, and captured source");
     Ok(())
 }
 
@@ -292,7 +313,7 @@ fn prepare(
         return Err("detached baseline checkout is not exact and clean".to_string());
     }
     let manifest = output.join("Cargo.toml");
-    if manifest_version(&manifest, policy.family)? != version {
+    if manifest_version(output, policy.family)? != version {
         return Err("detached baseline manifest does not match its official tag".to_string());
     }
 
@@ -545,7 +566,7 @@ fn require_excluded_current_version(
     head: &str,
     tags: &BTreeMap<String, TagRecord>,
 ) -> Result<(), String> {
-    if manifest_version(&root.join("Cargo.toml"), policy.family)? != version {
+    if manifest_version(root, policy.family)? != version {
         return Err("excluded retry version does not match current source".to_string());
     }
     for package in policy.packages {
@@ -691,22 +712,12 @@ fn require_repository_state(root: &Path, args: &ParsedArgs) -> Result<(), String
     if push_urls != [args.expected_push_url.as_str()] {
         return Err("origin does not have the exact disabled push URL".to_string());
     }
-    let main = remote_git_output(
-        root,
-        &["ls-remote", "--exit-code", "origin", "refs/heads/main"],
-    )?;
-    let (sha, reference) = main
-        .trim_end()
-        .split_once('\t')
-        .ok_or_else(|| "origin returned invalid main state".to_string())?;
-    if sha != args.head || reference != "refs/heads/main" {
-        return Err("origin/main advanced beyond the checked-out commit".to_string());
-    }
     Ok(())
 }
 
-fn manifest_version(path: &Path, family: ReleaseFamily) -> Result<String, String> {
-    let body = fs::read_to_string(path)
+fn manifest_version(root: &Path, family: ReleaseFamily) -> Result<String, String> {
+    let path = Path::new("Cargo.toml");
+    let body = safe_file::read_manifest(root, path)
         .map_err(|error| format!("read baseline manifest {}: {error}", path.display()))?;
     let document = body
         .parse::<DocumentMut>()
@@ -822,15 +833,10 @@ fn git_status(root: &Path, args: &[&str]) -> Result<(), String> {
 }
 
 fn git_process(root: &Path, args: &[&str]) -> Result<Output, String> {
-    let output = Command::new("git")
-        .current_dir(root)
-        .args(args)
-        .output()
-        .map_err(|error| format!("run git {}: {error}", args.join(" ")))?;
-    if output.stdout.len() > MAX_GIT_OUTPUT || output.stderr.len() > MAX_GIT_OUTPUT {
-        return Err("Git output exceeded its bound".to_string());
-    }
-    Ok(output)
+    let mut command = Command::new("git");
+    command.current_dir(root).args(args);
+    bounded_process::output(&mut command, VALIDATION_OUTPUT_LIMITS)
+        .map_err(|error| format!("run git {}: {error}", args.join(" ")))
 }
 
 fn detail(output: &Output) -> String {
@@ -956,6 +962,28 @@ mod tests {
     }
 
     #[test]
+    fn staged_source_root_is_absolute_and_no_follow() {
+        let compiled = tempfile::tempdir().unwrap();
+        assert_eq!(
+            resolve_source_root(compiled.path(), None).unwrap(),
+            compiled.path()
+        );
+        assert!(resolve_source_root(compiled.path(), Some(Path::new("relative"))).is_err());
+
+        let source = tempfile::tempdir().unwrap();
+        assert_eq!(
+            resolve_source_root(compiled.path(), Some(source.path())).unwrap(),
+            source.path()
+        );
+        #[cfg(unix)]
+        {
+            let link = compiled.path().join("source-link");
+            std::os::unix::fs::symlink(source.path(), &link).unwrap();
+            assert!(resolve_source_root(compiled.path(), Some(&link)).is_err());
+        }
+    }
+
+    #[test]
     fn snapshot_representation_is_canonical() {
         let snapshot = InventorySnapshot {
             schema: INVENTORY_SCHEMA,
@@ -1012,7 +1040,9 @@ mod tests {
         let encoder = GzEncoder::new(Vec::new(), Compression::default());
         let mut builder = tar::Builder::new(encoder);
         let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::file());
         header.set_mode(0o644);
+        header.set_mtime(crate::crate_archive::CARGO_ARCHIVE_MTIME);
         header.set_size(vcs.len() as u64);
         header.set_cksum();
         builder
@@ -1080,6 +1110,57 @@ mod tests {
         );
         let new = git(root.path(), &["rev-parse", "HEAD"]);
         (root, old, new)
+    }
+
+    #[test]
+    fn repository_state_allows_recovery_after_main_advances() {
+        let parent = tempfile::tempdir().unwrap();
+        let remote = parent.path().join("remote.git");
+        let checkout = parent.path().join("checkout");
+        let remote_arg = remote.to_str().unwrap();
+        let checkout_arg = checkout.to_str().unwrap();
+        git(parent.path(), &["init", "--quiet", "--bare", remote_arg]);
+        git(
+            parent.path(),
+            &["clone", "--quiet", remote_arg, checkout_arg],
+        );
+        git(&checkout, &["config", "user.name", "Test"]);
+        git(&checkout, &["config", "user.email", "test@example.invalid"]);
+        git(
+            &checkout,
+            &["commit", "--quiet", "--allow-empty", "-m", "captured"],
+        );
+        git(&checkout, &["branch", "-M", "main"]);
+        git(
+            &checkout,
+            &["push", "--quiet", "--set-upstream", "origin", "main"],
+        );
+        let captured = git(&checkout, &["rev-parse", "HEAD"]);
+        git(
+            &checkout,
+            &["commit", "--quiet", "--allow-empty", "-m", "advanced"],
+        );
+        let advanced = git(&checkout, &["rev-parse", "HEAD"]);
+        assert_ne!(captured, advanced);
+        git(&checkout, &["push", "--quiet", "origin", "main"]);
+        git(&checkout, &["reset", "--quiet", "--hard", &captured]);
+        git(
+            &checkout,
+            &["config", "remote.origin.pushurl", READ_ONLY_PUSH_URL],
+        );
+
+        let args = ParsedArgs {
+            head: captured,
+            expected_fetch_url: remote_arg.to_string(),
+            expected_push_url: READ_ONLY_PUSH_URL.to_string(),
+            version: None,
+            exclude_version: None,
+            output: None,
+            result: None,
+            inventory_output: None,
+            inventory: None,
+        };
+        require_repository_state(&checkout, &args).unwrap();
     }
 
     fn tag(name: String, object: char, commit: &str) -> TagRecord {

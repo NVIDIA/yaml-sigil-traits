@@ -2,10 +2,12 @@
 
 This repository publishes `yaml-sigil-traits` as a crates.io `.crate` source
 package. Official publications also create a version tag and a source-only
-GitHub Release from the reviewed changelog. Neither release-plz nor any other
-release step builds or attaches binary assets. The workflow retains no build
-artifacts or separately generated archives. GitHub's automatic source archives
-are expected.
+GitHub Release from the reviewed changelog. Release-plz has source-crate
+publication authority only. After exact registry confirmation, a protected
+GitHub App finalizer creates the annotated tag and immutable, zero-asset
+Release. No release step builds or attaches binary assets. The workflow retains
+no build artifacts or separately generated archives. GitHub's automatic source
+archives are expected.
 
 Cargo disables implicit binary targets, and release validation rejects an
 explicit binary target. Do not distribute compiled executables from this
@@ -69,21 +71,70 @@ before the push. A concurrent `main` update makes the normal push fail closed;
 rebase and re-sign the human-owned branch, or refresh the App-owned proposal,
 then rerun exact-head CI. Never force-push `main`.
 
-The workflow remains a successful no-op while the GitHub App configuration is
-absent. It also waits without advancing the train until the version on `main`
-is available and non-yanked on crates.io.
+When enabled, the workflow remains a successful no-op while the GitHub App
+configuration is absent. It also waits without advancing the train until the
+version on `main` is available and non-yanked on crates.io.
 
-A push or `repository_dispatch` event may create one default `patch` proposal
-when no exact App-owned proposal exists. Once that proposal exists, background
+The manually bounded `release-pr.yml` entrypoint accepts pushes to `main` and
+writer dispatches. It calls `release-proposal.yml`, which is call-only and has
+no public event entrypoint. After a complete official publication, the enabled
+`publish.yml` receiver authenticates the closed, versioned
+`official-release-published` payload before calling that same reusable
+workflow. The dispatch name is unchanged; its payload is an internal
+sender/receiver contract, not a public external trigger contract.
+
+A trusted background entrypoint may create one default `patch` proposal when
+no exact App-owned proposal exists. Once that proposal exists, background
 events leave it untouched. A repository writer must dispatch `Release
 proposal` with an explicit `patch`, `minor`, or `major` selection to revise the
 proposal. The workflow uses that dispatch input directly and does not store
 release intent in pull-request text.
 
-Release proposals enter `protected-automation`, which is restricted to exact
-`main` and supplies only the App credential. Official publication enters
-`crates-io`, whose configured approval gates the OIDC-enabled publication job.
-Validation enters neither environment and receives no OIDC permission.
+Proposal mutation, release intent, finalization, and notification enter
+`protected-automation` only when they need the narrowly scoped App credential.
+Official source-crate publication enters `crates-io`, whose configured approval
+gates the OIDC-enabled publication job. Readiness receives no OIDC permission
+and enters neither environment. Validation may require the repository-admin
+evidence command plus a non-publishing `crates-io` approval solely to test the
+authority chain; its authority job has no OIDC, registry, tag, or Release
+mutation capability.
+
+### Bound workflow activation
+
+Keep the event entrypoints `release-pr.yml` and `publish.yml` manually disabled
+between bounded release operations. The reusable `release-proposal.yml` remains
+enabled but is call-only. Check all three actual GitHub states, including
+disabled workflows, with:
+
+```shell
+gh workflow list --repo NVIDIA/yaml-sigil-traits --all
+```
+
+Enable only the workflow needed for the current operation. To create or revise
+the next RC proposal from exact current `main`, keep `publish.yml` disabled and
+run:
+
+```shell
+gh workflow enable release-pr.yml --repo NVIDIA/yaml-sigil-traits
+gh workflow run release-pr.yml --repo NVIDIA/yaml-sigil-traits \
+  --ref main -f mode=next-candidate -f bump=patch
+```
+
+Replace `patch` only with the reviewed `minor` or `major` intent. Stable
+promotion uses `mode=promote-stable` and `bump=patch`. Wait for the selected
+run to close, then disable the proposal workflow immediately:
+
+```shell
+gh workflow disable release-pr.yml --repo NVIDIA/yaml-sigil-traits
+```
+
+Do not rely on a push that occurred while `release-pr.yml` was disabled; use a
+fresh explicit dispatch after enabling it. Do not enable proposal and
+publication entrypoints at the same time. The later validation and publication
+procedures enable only `publish.yml`. A successful publication keeps
+`publish.yml` enabled until its authenticated receiver run completes; that
+receiver may call the reusable proposal workflow while `release-pr.yml` remains
+disabled.
 
 Every proposal resolves its comparison baseline from the last official
 annotated `v<version>` tag. The workflow confirms that the tag matches origin,
@@ -101,7 +152,7 @@ become release-analysis baselines.
 
 Use this procedure when the App is unavailable or cannot safely update its
 owned proposal. A repository writer may prepare the same release transaction
-on a human-authored branch. Use Rust `1.95.0`, cargo-binstall `1.20.1`,
+on a human-authored branch. Use current stable Rust, cargo-binstall `1.20.1`,
 release-plz `0.3.160`, and cargo-semver-checks `0.49.0`. Create a
 same-repository branch named
 `release-plz-manual-<target>` from exact current `main`; do not reuse the
@@ -117,13 +168,14 @@ Before either proposal mode, fetch current main and tags, verify the analyzer
 versions, and prepare the detached official baseline:
 
 ```shell
-export RUSTUP_TOOLCHAIN=1.95.0
+rustup toolchain install stable --profile minimal \
+  --component clippy --component rustfmt --no-self-update
+export RUSTUP_TOOLCHAIN=stable
 fetch_url="https://github.com/NVIDIA/yaml-sigil-traits"
 test "$(git remote get-url origin)" = "${fetch_url}"
 git fetch origin main --tags
 test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"
-rustc_version="$(rustc --version)"
-test "${rustc_version%% (*}" = "rustc 1.95.0"
+test "$(rustc --version)" = "$(rustup run stable rustc --version)"
 test "$(cargo-binstall -V)" = "1.20.1"
 cargo xtask release install-tools
 published_version="$(cargo xtask release-version show)"
@@ -215,6 +267,9 @@ GIT_CONFIG_VALUE_0=disabled://yaml-sigil-release-proposal \
     --head "$(git rev-parse HEAD)" \
     --inventory "${inventory_path}" \
     --expected-fetch-url "${fetch_url}"
+cargo xtask release require-current-main \
+  --head "$(git rev-parse HEAD)" \
+  --fetch-url "${fetch_url}"
 ```
 
 The direct compatibility check converts the selected bump into Cargo's
@@ -279,8 +334,9 @@ The default release progression is:
   `MAJOR.MINOR.(PATCH+1)-rc.1`;
 - a published `MAJOR.MINOR.PATCH-rc.N` advances to
   `MAJOR.MINOR.PATCH-rc.(N+1)`; and
-- a background event creates a default patch proposal only when the App-owned
-  proposal does not already exist.
+- a trusted push or authenticated post-publication notification creates a
+  default patch proposal only when the App-owned proposal does not already
+  exist.
 
 An empty next-version seed remains a draft pull request. A proposal with
 release notes is marked ready for review.
@@ -320,34 +376,95 @@ Before validation or publication, confirm:
   `.github/workflows/publish.yml` and the `crates-io` environment;
 - the `crates-io` environment requires its configured approval and has no
   long-lived registry token; and
+- repository administrators have reviewed the exact proposed release-tag
+  creation and update/deletion rulesets and prospective immutable-Release
+  setting, without changing them as part of workflow validation;
+- `.github/legacy-release-inventory.json` still pins all four historical,
+  mutable, zero-asset source-only Releases; and
 - the version, tag, and GitHub Release do not already exist, except when
   deliberately recovering a partial run.
 
 Run validation from `main`:
 
 ```shell
-gh workflow run publish.yml --ref main -f operation=validate
+gh workflow enable publish.yml --repo NVIDIA/yaml-sigil-traits
+gh workflow run publish.yml --repo NVIDIA/yaml-sigil-traits \
+  --ref main -f operation=validate
 ```
 
 Validation compares the candidate with the detached last official tagged
 source using cargo-semver-checks before it runs ordinary `cargo package` and a
-release-plz dry run. It has no OIDC permission, uploads nothing, and does not
-enter the publication environment.
+release-plz dry run. The readiness job has no OIDC permission, uploads nothing,
+verifies the pinned legacy Release inventory, and captures the exact release
+source and policy plan. It neither reads administrator-only settings nor enters
+the publication environment.
+
+After readiness, the validation-only authority job and `release-intent` run
+concurrently. The authority job pauses at the existing `crates-io` environment;
+use the exact administrator command and commented approval procedure under
+"Publish an official release" below. This exercises the production settings,
+reviewer, intent, and final authority handshake, but grants no OIDC permission
+and invokes no publishing, tag, or Release command. It retains no artifact. A
+later publication is a different run and requires its own fresh per-release
+evidence and approval.
+
+If validation fails or publication will not begin immediately, disable
+`publish.yml` before investigating. When an authorized publication follows the
+successful validation immediately, leave it active only through that one
+publication run.
 
 ## Publish an official release
 
 Dispatch publication from `main`:
 
 ```shell
-gh workflow run publish.yml --ref main -f operation=publish
+gh workflow run publish.yml --repo NVIDIA/yaml-sigil-traits \
+  --ref main -f operation=publish
 ```
 
 The validation job runs first. The publication job starts only after
 validation succeeds and the `crates-io` environment is approved. Only that job
-receives `id-token: write` and `contents: write`. Release-plz exchanges the job
-identity for a short-lived crates.io credential, publishes the source package,
-and creates the configured tag and source-only GitHub Release. A prerelease
-version becomes a GitHub prerelease.
+receives `id-token: write`; it retains only the read permissions needed for
+source, pull-request, and final Check verification. Release-plz exchanges the
+job identity for a short-lived crates.io credential and publishes only the
+source package. It cannot create a tag or GitHub Release.
+
+Before approving the pending deployment, a repository administrator must run
+the exact read-only command displayed by the concurrent `release-intent` job.
+Run it from a clean checkout whose `HEAD` is the displayed policy commit. The
+command uses the administrator's existing `gh` identity; do not substitute a
+workflow token, PAT, or App credential:
+
+```shell
+GH_TOKEN="$(gh auth token --hostname github.com)" \
+cargo +stable xtask github release-train settings-preflight \
+  --repository NVIDIA/yaml-sigil-traits \
+  --policy-commit <policy-commit> \
+  --run-id <run-id> \
+  --run-attempt <run-attempt>
+```
+
+The preflight must report `repository_admin_settings=valid`. It verifies
+immutable Releases, every main-applicable control, the exact release-tag
+rulesets, the Release App bypass, and absence of a required-check name
+collision. It performs no mutation. Copy the complete value printed after
+`approval_comment=` into the pending `crates-io` deployment approval comment,
+then approve before the printed `approve_before_utc` deadline, at most five
+minutes after the readback. Do not edit, wrap, or reuse that value.
+
+Approve only the pending `crates-io` deployment on the selected exact-SHA run.
+Use `gh run view <run-id> --web` to open it, confirm the readiness job passed,
+the run still identifies current `main`, and the fresh administrator readback
+remains inside its deadline, then record the environment approval with that
+exact comment. The workflow rejects missing, stale, duplicate, malformed, or
+cross-run evidence and rechecks the reviewer's current repository-admin
+permission. An earlier authorization or another run's deployment is not a
+substitute for this per-release gate.
+
+This repository-admin readback and commented deployment approval are ordinary
+per-release operator steps. They require no source or workflow patch, new
+repository or organization setting, GitHub App permission or installation
+change, or additional credential provision.
 
 Both validation and publication independently require exact current `main` to
 be the merge result of one reviewed App proposal or the documented signed
@@ -360,20 +477,57 @@ reviewed configuration only by authorizing the already-checked checkout and
 using a Git-invalid pull-request branch prefix, so release-plz cannot select or
 check out another commit.
 
+For the manual fallback, source authorization rechecks both the merger's and
+proposal owner's current repository write permission after its final `main`
+and pull-request reread.
+
 The publication invocation deliberately omits release-plz's `--dry-run` CLI
-flag.
-After a successful publication, the workflow requests the next release
-proposal.
+flag. After exact registry confirmation, separate App-authenticated jobs attest
+the release intent, create the annotated tag and immutable zero-asset Release,
+and emit the authenticated internal notification. These jobs receive no OIDC
+credential; the finalizer's App token has repository `contents: write` and the
+notifier's separately minted token is isolated to notification.
+
+The finalizer receives the exact numeric intent Check ID. It requires exactly
+one successful same-name Check from the expected App, re-reads that Check by
+ID, and compares its repository, captured SHA, external ID, canonical body,
+and digest immediately before each tag-object, tag-ref, or Release mutation.
+The receiver separately verifies the originating workflow run and attempt,
+recomputes the canonical repository-setting evidence, and derives the complete
+physical archive inventory from the bounded downloaded crate before any
+proposal mutation.
+
+If publication succeeds, wait for the resulting authenticated receiver run to
+complete before disabling `publish.yml`. If the publication run fails before
+notification, disable it after the failure is understood. Then confirm both
+event entrypoints are disabled and the call-only reusable workflow remains
+active:
+
+```shell
+gh workflow disable publish.yml --repo NVIDIA/yaml-sigil-traits
+gh workflow list --repo NVIDIA/yaml-sigil-traits --all
+```
+
+After a successful publication, the authenticated receiver may create the next
+default proposal while `release-pr.yml` remains disabled. It never replaces an
+existing exact App-owned proposal. Use the bounded proposal procedure later for
+an explicit bump or revision; do not leave either event entrypoint enabled.
 
 ## Verify and recover
 
 The workflow waits for crates.io to expose the expected version as non-yanked
-and confirms Cargo can resolve it. It then requires `v<version>` to be an
-annotated tag whose object targets exact publication `main`. The GitHub Release
-must use that tag and name, contain the exact reviewed version section from
-`CHANGELOG.md`, have the expected prerelease state, and have no attached
-assets. Record the workflow run, package, tag, and Release in the workspace
+and confirms Cargo can resolve it. The App finalizer then requires `v<version>`
+to be an annotated tag whose object targets the captured publication commit.
+The App-authored GitHub Release must be immutable, use that tag and name,
+contain the exact reviewed version section from `CHANGELOG.md`, have the
+expected prerelease state, and have no attached assets. Record the workflow
+run, package, tag, Release, readback digest, and captured SHA in the workspace
 release records.
+
+The immutable-Release setting is prospective. The four historical releases in
+the pinned inventory remain mutable and are never rewritten; their exact tags,
+source archives, bodies, author, state, and zero-asset inventories are checked
+before every new finalization.
 
 Never blindly retry a failed publication. Inspect crates.io, the annotated tag,
 and the GitHub Release first. An existing crate version cannot be overwritten,
@@ -389,11 +543,13 @@ even if yanked. On a reviewed retry, the workflow distinguishes two states:
   checksum, downloads that exact `.crate`, rejects unsafe archive entries,
   requires clean `.cargo_vcs_info.json` provenance at publication `main`, and
   reproduces all commit-controlled source content with exact Cargo `1.95.0` in
-  an ephemeral directory. The generated root `Cargo.lock` must be valid and
-  bound to the exact package in both archives, but its dependency resolution
-  may differ because Cargo regenerates it; every other packaged file remains
-  byte-identical. The workflow rechecks the same non-yanked checksum after the
-  final forge objects are present.
+  an ephemeral directory. The Cargo-generated `Cargo.lock` remains opaque; its
+  bytes and Cargo archive metadata must match exactly, and no archive entry is
+  excluded from the published-versus-reproduced comparison. The complete
+  compressed archive bytes must also be identical. Extra gzip members,
+  trailing bytes, tar records after the terminator, pseudo-entries, and raw
+  path aliases are rejected. The workflow rechecks the same non-yanked
+  checksum after the final forge objects are present.
 
 Recovery never moves or replaces an existing ref, edits an existing Release,
 deletes an object, or uploads an asset. A lightweight or wrong-target tag, a

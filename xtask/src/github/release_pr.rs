@@ -4,6 +4,7 @@
 //! Create and finalize exact GitHub-signed release proposal commits.
 
 use std::env;
+#[cfg(test)]
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -13,6 +14,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use toml_edit::DocumentMut;
 
+use crate::bounded_process::{self, OutputLimits};
 use crate::github::consts::{
     RELEASE_AUTHORIZATION_SENTENCE, RELEASE_TITLE_PREFIX, RepositoryKind, RepositoryPolicy,
     repository_policy,
@@ -25,9 +27,12 @@ use crate::github::{
     env_bool, env_required, git_line, git_output, is_positive_integer, is_sha, output_detail,
     validate_ref_component, workflow_repository,
 };
+use crate::safe_file;
 
 const MAX_CHANGED_FILES: usize = 16;
 const MAX_TOTAL_CONTENT_BYTES: usize = 4 * 1024 * 1024;
+const REPLAY_TRAILER: &str = "YamlSigil-Release-Replay: ";
+const REPLAY_COMMENT_PREFIX: &str = "<!-- yaml-sigil-release-replay-v1:";
 
 pub(super) fn apply(
     root: &Path,
@@ -38,6 +43,13 @@ pub(super) fn apply(
         return Err("GH_TOKEN must contain the GitHub App installation token".to_string());
     }
     let context = Context::from_environment(root)?;
+    let installation_id = env_required("APP_INSTALLATION_ID")?;
+    crate::github::release_train::validate_app_token(
+        github,
+        &context.repository,
+        APP_SLUG,
+        &installation_id,
+    )?;
     let bot = require_bot(github)?;
     match phase {
         ReleasePrPhase::Update => update(root, &context, &bot, github),
@@ -45,14 +57,15 @@ pub(super) fn apply(
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Context {
     repository: String,
     main: String,
     title: String,
-    body: String,
+    base_body: String,
     draft: bool,
     hold_draft: bool,
+    replay_key: Option<String>,
 }
 
 impl Context {
@@ -75,16 +88,57 @@ impl Context {
         if manifest_version(root, policy.kind)? != target {
             return Err("RELEASE_TARGET disagrees with the exact release manifest".to_string());
         }
-        let (title, body) = release_pull_text(policy, &target);
+        let (title, base_body) = release_pull_text(policy, &target);
+        let replay_key = optional_replay_key()?;
         Ok(Self {
             repository,
             main,
             title,
-            body,
+            base_body,
             draft: !substantive,
             hold_draft,
+            replay_key,
         })
     }
+
+    fn with_replay_key(&self, replay_key: Option<String>) -> Self {
+        let mut context = self.clone();
+        context.replay_key = replay_key;
+        context
+    }
+
+    fn body(&self) -> String {
+        match self.replay_key.as_deref() {
+            Some(key) => format!(
+                "{}\n{REPLAY_COMMENT_PREFIX}{key} -->\n",
+                self.base_body.trim_end()
+            ),
+            None => self.base_body.clone(),
+        }
+    }
+}
+
+fn optional_replay_key() -> Result<Option<String>, String> {
+    let Some(value) = env::var_os("RELEASE_REPLAY_KEY") else {
+        return Ok(None);
+    };
+    let value = value
+        .into_string()
+        .map_err(|_| "RELEASE_REPLAY_KEY is not valid UTF-8".to_string())?;
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if !is_digest(&value) {
+        return Err("RELEASE_REPLAY_KEY must be a lowercase SHA-256".to_string());
+    }
+    Ok(Some(value))
+}
+
+fn is_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn parse_release_target(value: &str) -> Result<Version, String> {
@@ -107,14 +161,8 @@ fn parse_release_target(value: &str) -> Result<Version, String> {
 }
 
 fn manifest_version(root: &Path, kind: RepositoryKind) -> Result<String, String> {
-    let path = root.join("Cargo.toml");
-    let metadata = fs::symlink_metadata(&path)
-        .map_err(|error| format!("read release manifest metadata: {error}"))?;
-    if !metadata.file_type().is_file() || metadata.len() > MAX_FILE_BYTES {
-        return Err("release manifest is missing, indirect, or oversized".to_string());
-    }
-    let body =
-        fs::read_to_string(&path).map_err(|error| format!("read release manifest: {error}"))?;
+    let body = safe_file::read_manifest(root, Path::new("Cargo.toml"))
+        .map_err(|error| format!("read release manifest: {error}"))?;
     let document = body
         .parse::<DocumentMut>()
         .map_err(|error| format!("parse release manifest: {error}"))?;
@@ -143,6 +191,117 @@ fn release_pull_text(policy: &RepositoryPolicy, target: &str) -> (String, String
         policy.release_subject, policy.release_object_sentence
     );
     (title, body)
+}
+
+fn commit_message(context: &Context, dco: &str) -> String {
+    let mut message = format!("{}\n\n{dco}", context.title);
+    if let Some(key) = context.replay_key.as_deref() {
+        message.push_str(&format!("\n{REPLAY_TRAILER}{key}"));
+    }
+    message
+}
+
+fn replay_trailer(message: &str) -> Result<Option<String>, String> {
+    let mut found = None;
+    for line in message.lines() {
+        if let Some(value) = line.strip_prefix(REPLAY_TRAILER) {
+            if found.is_some() || !is_digest(value) {
+                return Err("release commit has an invalid or duplicate replay trailer".to_string());
+            }
+            found = Some(value.to_string());
+        } else if line.contains("YamlSigil-Release-Replay") {
+            return Err("release commit has a malformed replay trailer".to_string());
+        }
+    }
+    Ok(found)
+}
+
+fn replay_comment(body: &str) -> Result<Option<String>, String> {
+    let mut found = None;
+    for line in body.lines() {
+        if let Some(value) = line.strip_prefix(REPLAY_COMMENT_PREFIX) {
+            let value = value
+                .strip_suffix(" -->")
+                .ok_or_else(|| "release pull request has a malformed replay comment".to_string())?;
+            if found.is_some() || !is_digest(value) {
+                return Err(
+                    "release pull request has an invalid or duplicate replay comment".to_string(),
+                );
+            }
+            found = Some(value.to_string());
+        } else if line.contains("yaml-sigil-release-replay-v1:") {
+            return Err("release pull request has a malformed replay comment".to_string());
+        }
+    }
+    Ok(found)
+}
+
+fn require_exact_replay_key(message: &str, expected: Option<&str>) -> Result<(), String> {
+    if replay_trailer(message)?.as_deref() != expected {
+        return Err("release commit replay identity is unexpected".to_string());
+    }
+    Ok(())
+}
+
+fn resolve_update_replay_key(
+    requested: Option<&str>,
+    target_exists: bool,
+    target_ahead: u64,
+    target_marker: Option<&str>,
+    pull: Option<&PullRequest>,
+) -> Result<Option<String>, String> {
+    if let Some(pull) = pull {
+        let body_marker = replay_comment(pull.body.as_deref().unwrap_or_default())?;
+        if target_ahead != 1 || body_marker.as_deref() != target_marker {
+            return Err("the active release proposal has inconsistent replay evidence".to_string());
+        }
+        if let Some(requested) = requested {
+            if target_marker == Some(requested) {
+                return Err("release notification replay is already durably consumed".to_string());
+            }
+            return Err("an active release proposal has a different replay identity".to_string());
+        }
+        return Ok(body_marker);
+    }
+
+    let Some(requested) = requested else {
+        return Ok(None);
+    };
+    if !target_exists || target_ahead == 0 {
+        return Ok(Some(requested.to_string()));
+    }
+    if target_ahead == 1 && target_marker == Some(requested) {
+        return Ok(Some(requested.to_string()));
+    }
+    Err("release proposal branch is not the exact abandoned replay".to_string())
+}
+
+pub(super) fn notification_replay_state(
+    github: &mut impl Transport,
+    repository: &str,
+    key: &str,
+) -> Result<&'static str, String> {
+    if !is_digest(key) {
+        return Err("release notification replay key is invalid".to_string());
+    }
+    let bot = require_bot(github)?;
+    let (target, ahead, marker) = inspect_target(github, repository, &bot)?;
+    let pull = inspect_open_pull(github, repository, target.as_ref(), &bot)?;
+    let resolved = resolve_update_replay_key(
+        Some(key),
+        target.is_some(),
+        ahead,
+        marker.as_deref(),
+        pull.as_ref(),
+    )?;
+    if resolved.as_deref() != Some(key) {
+        return Err("release notification replay state lost its exact key".to_string());
+    }
+    Ok(if target.is_none() || ahead == 0 {
+        "new"
+    } else {
+        "recover"
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -180,15 +339,24 @@ fn update(
     }
     require_ref(github, &context.repository, "main", &context.main)?;
     let changes = generated_changes(root, &context.repository)?;
-    let target = inspect_target(github, &context.repository, bot)?;
+    let (target, target_ahead, target_replay_key) =
+        inspect_target(github, &context.repository, bot)?;
     let mut pull = inspect_open_pull(github, &context.repository, target.as_ref(), bot)?;
+    let replay_key = resolve_update_replay_key(
+        context.replay_key.as_deref(),
+        target.is_some(),
+        target_ahead,
+        target_replay_key.as_deref(),
+        pull.as_ref(),
+    )?;
+    let context = context.with_replay_key(replay_key);
     let effective_draft = context.hold_draft || context.draft;
     if context.hold_draft && pull.as_ref().is_some_and(|value| !value.draft) {
         let number = pull.as_ref().expect("present pull").number;
         let node = pull.as_ref().expect("present pull").node_id.clone();
         transition_review_state(github, &context.repository, number, &node, true)?;
         let held = get_pull(github, &context.repository, number)?;
-        require_owned_pull(&held, context, bot, target.as_ref(), true)?;
+        require_owned_pull(&held, &context, bot, target.as_ref(), true)?;
         pull = Some(held);
     }
 
@@ -198,7 +366,7 @@ fn update(
 
     let operation = finish_update(
         root,
-        context,
+        &context,
         bot,
         github,
         &changes,
@@ -210,9 +378,11 @@ fn update(
     let cleanup = delete_ref_exact(github, &context.repository, &staging);
     match (operation, cleanup) {
         (Ok(result), Ok(())) => {
+            let replay_key = result.replay_key.as_deref().unwrap_or("");
             append_outputs(&[
                 ("commit_sha", &result.commit),
                 ("pr_number", &result.pull.to_string()),
+                ("release_replay_key", replay_key),
             ])?;
             eprintln!(
                 "github: created or updated PR #{} at Verified commit {}",
@@ -231,6 +401,7 @@ fn update(
 struct UpdateResult {
     commit: String,
     pull: u64,
+    replay_key: Option<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -270,13 +441,20 @@ fn finish_update(
     }
 
     let dco = format!("Signed-off-by: {} <{}>", bot.login, bot.email);
-    let message = format!("{}\n\n{dco}", context.title);
+    let message = commit_message(context, &dco);
     let commit: CreatedCommit = github.mutate(
         "POST",
         &format!("repos/{}/git/commits", context.repository),
         &json!({"message": message, "tree": tree.sha, "parents": [context.main]}),
     )?;
-    require_created_app_commit(&commit, bot, &context.main, &tree.sha, &dco)?;
+    require_created_app_commit(
+        &commit,
+        bot,
+        &context.main,
+        &tree.sha,
+        &dco,
+        context.replay_key.as_deref(),
+    )?;
     require_ref(github, &context.repository, "main", &context.main)?;
     update_ref_exact(github, &context.repository, staging, &commit.sha)?;
     let visible: RepositoryCommit = github.get(&format!(
@@ -284,6 +462,7 @@ fn finish_update(
         context.repository, commit.sha
     ))?;
     require_repository_app_commit(&visible, bot, Some(&context.main))?;
+    require_exact_replay_key(&visible.commit.message, context.replay_key.as_deref())?;
 
     fetch_staging(root, staging, &commit.sha)?;
     require_ref(github, &context.repository, "main", &context.main)?;
@@ -309,6 +488,7 @@ fn finish_update(
     Ok(UpdateResult {
         commit: commit.sha,
         pull: number,
+        replay_key: context.replay_key.clone(),
     })
 }
 
@@ -334,6 +514,10 @@ fn finalize(
     let release_commit: RepositoryCommit =
         github.get(&format!("repos/{}/commits/{commit}", context.repository))?;
     require_repository_app_commit(&release_commit, bot, Some(&context.main))?;
+    require_exact_replay_key(
+        &release_commit.commit.message,
+        context.replay_key.as_deref(),
+    )?;
     let held = get_pull(github, &context.repository, number)?;
     require_final_pull(&held, context, bot, &commit, true)?;
     if !context.draft {
@@ -374,6 +558,8 @@ fn generated_changes(root: &Path, repository: &str) -> Result<Vec<GeneratedChang
         return Err("release automation may not change file modes or path identity".to_string());
     }
     let inventory = git_output(root, &["diff", "--name-status", "--no-renames"])?;
+    let trusted_root = safe_file::TrustedRoot::open(root)
+        .map_err(|error| format!("open release workspace: {error}"))?;
     let mut changes = Vec::new();
     let mut total = 0usize;
     for line in inventory.lines() {
@@ -389,19 +575,15 @@ fn generated_changes(root: &Path, repository: &str) -> Result<Vec<GeneratedChang
         {
             return Err("release diff contains a duplicate path".to_string());
         }
-        let metadata = fs::metadata(root.join(path))
+        let content = trusted_root
+            .read_utf8(Path::new(path), MAX_FILE_BYTES as usize)
             .map_err(|error| format!("read generated path {path}: {error}"))?;
-        if !metadata.is_file() || metadata.len() > MAX_FILE_BYTES {
-            return Err(format!("generated path {path} is missing or oversized"));
-        }
         total = total
-            .checked_add(metadata.len() as usize)
+            .checked_add(content.len())
             .ok_or_else(|| "generated content size overflowed".to_string())?;
         if total > MAX_TOTAL_CONTENT_BYTES {
             return Err("generated release content exceeded its total bound".to_string());
         }
-        let content = fs::read_to_string(root.join(path))
-            .map_err(|error| format!("generated path {path} is not UTF-8: {error}"))?;
         if content.contains('\0') {
             return Err(format!("generated path {path} contains NUL"));
         }
@@ -441,7 +623,7 @@ fn inspect_target(
     github: &mut impl Transport,
     repository: &str,
     bot: &Bot,
-) -> Result<Option<GitRef>, String> {
+) -> Result<(Option<GitRef>, u64, Option<String>), String> {
     let refs: Vec<GitRef> = github.get(&format!(
         "repos/{repository}/git/matching-refs/heads/{}",
         percent_encode(RELEASE_BRANCH)
@@ -450,7 +632,7 @@ fn inspect_target(
         return Err("GitHub returned ambiguous release branch state".to_string());
     }
     let Some(target) = refs.into_iter().next() else {
-        return Ok(None);
+        return Ok((None, 0, None));
     };
     require_exact_ref(&target, RELEASE_BRANCH, &target.object.sha)?;
     let compare: Compare = github.get(&format!(
@@ -474,12 +656,15 @@ fn inspect_target(
             "{RELEASE_BRANCH} contains a non-App commit and will not be overwritten"
         ));
     }
-    if compare.ahead_by == 1 {
+    let replay_key = if compare.ahead_by == 1 {
         let commit: RepositoryCommit =
             github.get(&format!("repos/{repository}/commits/{}", target.object.sha))?;
         require_repository_app_commit(&commit, bot, None)?;
-    }
-    Ok(Some(target))
+        replay_trailer(&commit.commit.message)?
+    } else {
+        None
+    };
+    Ok((Some(target), compare.ahead_by, replay_key))
 }
 
 fn inspect_open_pull(
@@ -528,15 +713,16 @@ fn mutate_pull(
     commit: &str,
     draft: bool,
 ) -> Result<u64, String> {
+    let body = context.body();
     let number = if let Some(existing) = existing {
         let mutation: Result<PullRequest, String> = github.mutate(
             "PATCH",
             &format!("repos/{}/pulls/{}", context.repository, existing.number),
-            &json!({"title": context.title, "body": context.body}),
+            &json!({"title": context.title, "body": body.as_str()}),
         );
         let reread = get_pull(github, &context.repository, existing.number)?;
         if mutation.is_err()
-            && (reread.title != context.title || reread.body.as_deref() != Some(&context.body))
+            && (reread.title != context.title || reread.body.as_deref() != Some(body.as_str()))
         {
             return Err(mutation.expect_err("checked mutation error"));
         }
@@ -549,7 +735,7 @@ fn mutate_pull(
                 "title": context.title,
                 "head": RELEASE_BRANCH,
                 "base": "main",
-                "body": context.body,
+                "body": body.as_str(),
                 "draft": draft,
             }),
         );
@@ -683,9 +869,10 @@ fn require_final_pull(
     draft: bool,
 ) -> Result<(), String> {
     require_owned_pull_identity(pull, &context.repository, bot, commit)?;
+    let body = context.body();
     if pull.base.sha != context.main
         || pull.title != context.title
-        || pull.body.as_deref() != Some(&context.body)
+        || pull.body.as_deref() != Some(body.as_str())
         || pull.draft != draft
     {
         return Err("GitHub returned an unexpected release pull-request state".to_string());
@@ -822,7 +1009,8 @@ fn push_with_lease(
     let lease = format!("--force-with-lease=refs/heads/{branch}:{expected_old}");
     let url = format!("https://github.com/{repository}.git");
     let refspec = format!("{commit}:refs/heads/{branch}");
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .current_dir(root)
         .env("GIT_TERMINAL_PROMPT", "0")
         .args([
@@ -835,14 +1023,15 @@ fn push_with_lease(
             &lease,
             &url,
             &refspec,
-        ])
-        .output()
-        .map_err(|error| format!("run atomic release branch push: {error}"))?;
-    if output.stdout.len() > crate::github::transport::MAX_RESPONSE_BYTES
-        || output.stderr.len() > crate::github::transport::MAX_ERROR_BYTES
-    {
-        return Err("Git push output exceeded its bound".to_string());
-    }
+        ]);
+    let output = bounded_process::output(
+        &mut command,
+        OutputLimits {
+            stdout: crate::github::transport::MAX_RESPONSE_BYTES,
+            stderr: crate::github::transport::MAX_ERROR_BYTES,
+        },
+    )
+    .map_err(|error| format!("run atomic release branch push: {error}"))?;
     if !output.status.success() {
         return Err(format!(
             "the App-owned release branch changed before its atomic update: {}",
@@ -863,7 +1052,9 @@ fn require_created_app_commit(
     parent: &str,
     tree: &str,
     dco: &str,
+    replay_key: Option<&str>,
 ) -> Result<(), String> {
+    let observed_replay_key = replay_trailer(&commit.message)?;
     if !is_sha(&commit.sha)
         || commit.author.name != bot.login
         || commit.author.email != bot.email
@@ -872,6 +1063,7 @@ fn require_created_app_commit(
         || !commit.verification.verified
         || commit.verification.reason != "valid"
         || dco_lines(&commit.message) != [dco]
+        || observed_replay_key.as_deref() != replay_key
         || commit.tree.sha != tree
         || commit.parents.len() != 1
         || commit.parents[0].sha != parent
@@ -886,6 +1078,7 @@ pub(super) fn require_repository_app_commit(
     bot: &Bot,
     parent: Option<&str>,
 ) -> Result<(), String> {
+    replay_trailer(&commit.commit.message)?;
     let author = commit.author.as_ref();
     let committer = commit.committer.as_ref();
     let expected_dco = format!("Signed-off-by: {} <{}>", bot.login, bot.email);
@@ -1058,12 +1251,91 @@ mod tests {
         }
     }
 
+    fn replay_pull(body: &str) -> PullRequest {
+        serde_json::from_value(json!({
+            "number": 17,
+            "state": "open",
+            "user": {"login": APP_LOGIN, "id": APP_ID},
+            "head": {
+                "ref": RELEASE_BRANCH,
+                "sha": "a".repeat(40),
+                "repo": {"full_name": TRAITS_REPOSITORY}
+            },
+            "base": {
+                "ref": "main",
+                "sha": "c".repeat(40),
+                "repo": {"full_name": TRAITS_REPOSITORY}
+            },
+            "commits": 1,
+            "node_id": "PR_node",
+            "draft": true,
+            "title": "release proposal",
+            "body": body
+        }))
+        .unwrap()
+    }
+
     #[test]
     fn app_commit_requires_signature_dco_and_immutable_identities() {
         let mut commit = app_commit();
         assert!(require_repository_app_commit(&commit, &bot(), Some(&"c".repeat(40))).is_ok());
+        commit
+            .commit
+            .message
+            .push_str(&format!("\n{REPLAY_TRAILER}{}", "1".repeat(64)));
+        assert!(require_repository_app_commit(&commit, &bot(), Some(&"c".repeat(40))).is_ok());
+        commit
+            .commit
+            .message
+            .push_str("\nYamlSigil-Release-Replay: invalid");
+        assert!(require_repository_app_commit(&commit, &bot(), None).is_err());
         commit.commit.verification.verified = false;
         assert!(require_repository_app_commit(&commit, &bot(), None).is_err());
+    }
+
+    #[test]
+    fn dispatch_replay_is_new_recoverable_or_durably_consumed() {
+        let key = "1".repeat(64);
+        assert_eq!(
+            resolve_update_replay_key(Some(&key), false, 0, None, None).unwrap(),
+            Some(key.clone())
+        );
+        assert_eq!(
+            resolve_update_replay_key(Some(&key), true, 1, Some(&key), None).unwrap(),
+            Some(key.clone())
+        );
+        assert!(
+            resolve_update_replay_key(Some(&key), true, 1, Some(&"2".repeat(64)), None).is_err()
+        );
+
+        let body = format!("proposal\n\n{REPLAY_COMMENT_PREFIX}{key} -->\n");
+        let pull = replay_pull(&body);
+        assert!(
+            resolve_update_replay_key(Some(&key), true, 1, Some(&key), Some(&pull))
+                .unwrap_err()
+                .contains("durably consumed")
+        );
+        assert_eq!(
+            resolve_update_replay_key(None, true, 1, Some(&key), Some(&pull)).unwrap(),
+            Some(key)
+        );
+    }
+
+    #[test]
+    fn replay_markers_reject_noncanonical_or_duplicate_forms() {
+        let key = "1".repeat(64);
+        assert_eq!(
+            replay_trailer(&format!("proposal\n\n{REPLAY_TRAILER}{key}")).unwrap(),
+            Some(key.clone())
+        );
+        assert!(replay_trailer("proposal\nYamlSigil-Release-Replay: INVALID").is_err());
+        assert!(
+            replay_comment(&format!(
+                "{REPLAY_COMMENT_PREFIX}{key} -->\n{REPLAY_COMMENT_PREFIX}{key} -->"
+            ))
+            .is_err()
+        );
+        assert!(replay_comment("<!-- yaml-sigil-release-replay-v1:invalid -->").is_err());
     }
 
     #[test]

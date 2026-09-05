@@ -6,6 +6,7 @@
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -16,6 +17,7 @@ use toml_edit::DocumentMut;
 use crate::bounded_process::{self, VALIDATION_OUTPUT_LIMITS};
 use crate::release::exact_output_line;
 use crate::release_policy::TRAITS_TOOLCHAIN;
+use crate::safe_file;
 
 const CHANGELOG: &str = "CHANGELOG.md";
 
@@ -168,7 +170,7 @@ fn validate_date(date: &str) -> Result<(), String> {
 }
 
 fn read_version(root: &Path) -> Result<Version, String> {
-    let manifest = fs::read_to_string(root.join("Cargo.toml"))
+    let manifest = safe_file::read_manifest(root, Path::new("Cargo.toml"))
         .map_err(|error| format!("read Cargo.toml: {error}"))?;
     let value = section_version(&manifest, "[package]")?
         .ok_or_else(|| "missing [package] version in Cargo.toml".to_string())?;
@@ -270,14 +272,19 @@ impl CargoRunner for SystemCargoRunner {
         program: &OsStr,
         args: &[OsString],
     ) -> Result<CargoStatus, String> {
-        let status = Command::new(program)
-            .current_dir(root)
-            .args(args)
-            .status()
+        let mut command = Command::new(program);
+        command.current_dir(root).args(args);
+        let output = bounded_process::output(&mut command, VALIDATION_OUTPUT_LIMITS)
             .map_err(|error| format!("run {}: {error}", program.to_string_lossy()))?;
+        io::stdout()
+            .write_all(&output.stdout)
+            .map_err(|error| format!("write {} stdout: {error}", program.to_string_lossy()))?;
+        io::stderr()
+            .write_all(&output.stderr)
+            .map_err(|error| format!("write {} stderr: {error}", program.to_string_lossy()))?;
         Ok(CargoStatus {
-            success: status.success(),
-            code: status.code(),
+            success: output.status.success(),
+            code: output.status.code(),
         })
     }
 }
@@ -322,30 +329,23 @@ fn metadata_version_from_json(
     manifest: &Path,
     package: &str,
 ) -> Result<Version, String> {
-    bounded_process::require_within_limit(
-        output,
-        VALIDATION_OUTPUT_LIMITS.stdout,
-        "Cargo metadata",
-    )
-    .map_err(|error| error.to_string())?;
-    let metadata: serde_json::Value = serde_json::from_slice(output)
-        .map_err(|error| format!("Cargo returned invalid metadata: {error}"))?;
-    let packages = metadata
-        .get("packages")
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| "Cargo returned invalid package metadata".to_string())?;
+    let metadata =
+        crate::cargo_metadata_output::parse_bounded(output, "Cargo returned invalid metadata")?;
     let mut matches = Vec::new();
-    for item in packages {
-        if item.get("name").and_then(serde_json::Value::as_str) != Some(package) {
+    for item in &metadata.packages {
+        if item.name.as_ref() != package {
             continue;
         }
-        let path = item
-            .get("manifest_path")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| format!("metadata did not contain a manifest path for {package}"))?;
-        let identity = Path::new(path)
+        let identity = item
+            .manifest_path
+            .as_std_path()
             .canonicalize()
-            .map_err(|error| format!("resolve Cargo metadata manifest {path}: {error}"))?;
+            .map_err(|error| {
+                format!(
+                    "resolve Cargo metadata manifest {}: {error}",
+                    item.manifest_path
+                )
+            })?;
         if identity == manifest {
             matches.push(item);
         }
@@ -356,12 +356,7 @@ fn metadata_version_from_json(
             manifest.display()
         ));
     }
-    let value = matches[0]
-        .get("version")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| format!("metadata did not contain a version for {package}"))?;
-    let version = Version::parse(value)
-        .map_err(|error| format!("metadata returned invalid version {value}: {error}"))?;
+    let version = matches[0].version.clone();
     release_rc(&version)?;
     Ok(version)
 }
@@ -511,8 +506,8 @@ fn check_api_compatibility_with_runner(
 
 fn write_version(root: &Path, version: &Version) -> Result<(), String> {
     let path = root.join("Cargo.toml");
-    let manifest =
-        fs::read_to_string(&path).map_err(|error| format!("read Cargo.toml: {error}"))?;
+    let manifest = safe_file::read_manifest(root, Path::new("Cargo.toml"))
+        .map_err(|error| format!("read Cargo.toml: {error}"))?;
     let updated = replace_section_version(&manifest, "[package]", &version.to_string())?;
     if updated != manifest {
         fs::write(path, updated).map_err(|error| format!("write Cargo.toml: {error}"))?;
@@ -753,7 +748,8 @@ fn ensure_candidate_changelog(
     date: &str,
 ) -> Result<(), String> {
     let path = root.join(CHANGELOG);
-    let body = fs::read_to_string(&path).map_err(|error| format!("read {CHANGELOG}: {error}"))?;
+    let body = safe_file::read_manifest(root, Path::new(CHANGELOG))
+        .map_err(|error| format!("read {CHANGELOG}: {error}"))?;
     let generated_prefix = format!("## [{generated}](");
     let target_prefix = format!("## [{target}](");
     let mut changed = false;
@@ -791,7 +787,8 @@ fn promote_changelog(
     date: &str,
 ) -> Result<(), String> {
     let path = root.join(CHANGELOG);
-    let body = fs::read_to_string(&path).map_err(|error| format!("read {CHANGELOG}: {error}"))?;
+    let body = safe_file::read_manifest(root, Path::new(CHANGELOG))
+        .map_err(|error| format!("read {CHANGELOG}: {error}"))?;
     let section = changelog_section(&body, rc)?;
     let release_url = release_tag_url(root, stable)?;
     let promoted = format!("## [{stable}]({release_url}) - {date}\n{section}");
@@ -800,13 +797,8 @@ fn promote_changelog(
 }
 
 fn release_tag_url(root: &Path, version: &Version) -> Result<String, String> {
-    let path = root.join("Cargo.toml");
-    let metadata = fs::symlink_metadata(&path)
-        .map_err(|error| format!("read Cargo.toml metadata: {error}"))?;
-    if !metadata.file_type().is_file() || metadata.len() > 1024 * 1024 {
-        return Err("Cargo.toml is missing, indirect, or oversized".to_string());
-    }
-    let body = fs::read_to_string(&path).map_err(|error| format!("read Cargo.toml: {error}"))?;
+    let body = safe_file::read_manifest(root, Path::new("Cargo.toml"))
+        .map_err(|error| format!("read Cargo.toml: {error}"))?;
     let document = body
         .parse::<DocumentMut>()
         .map_err(|error| format!("parse Cargo.toml: {error}"))?;
@@ -872,6 +864,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use crate::cargo_metadata_output::test_support as metadata_fixture;
     use crate::release_policy::TRAITS_POLICY;
 
     const TRAITS_PACKAGE: &str = TRAITS_POLICY.packages[0].package;
@@ -1009,16 +1002,29 @@ mod tests {
         manifest: &Path,
         version: &str,
     ) -> Result<CargoOutput, String> {
-        cargo_output(
-            serde_json::to_vec(&serde_json::json!({
-                "packages": [{
-                    "name": package,
-                    "manifest_path": manifest,
-                    "version": version
-                }]
-            }))
-            .unwrap(),
-        )
+        cargo_output(metadata_bytes(package, manifest, version))
+    }
+
+    fn metadata_bytes(package: &str, manifest: &Path, version: &str) -> Vec<u8> {
+        let root = manifest
+            .parent()
+            .expect("fixture manifest has a parent directory");
+        metadata_fixture::encoded(&metadata_fixture::metadata(
+            root,
+            vec![metadata_fixture::package(
+                package,
+                version,
+                None,
+                manifest,
+                Some(&["crates-io"]),
+                Vec::new(),
+                vec![metadata_fixture::target(
+                    package,
+                    "lib",
+                    &root.join("src/lib.rs"),
+                )],
+            )],
+        ))
     }
 
     fn compatibility_fixture(
@@ -1198,35 +1204,16 @@ mod tests {
         fs::write(other.join("Cargo.toml"), "[package]\n").unwrap();
         let manifest = release.join("Cargo.toml").canonicalize().unwrap();
         let equivalent_spelling = release.join("..").join("release").join("Cargo.toml");
-        let exact = serde_json::json!({
-            "packages": [{
-                "name": TRAITS_PACKAGE,
-                "version": "0.4.0-rc.1",
-                "manifest_path": equivalent_spelling
-            }]
-        });
+        let exact = metadata_bytes(TRAITS_PACKAGE, &equivalent_spelling, "0.4.0-rc.1");
         assert_eq!(
-            metadata_version_from_json(
-                &serde_json::to_vec(&exact).unwrap(),
-                &manifest,
-                TRAITS_PACKAGE
-            )
-            .unwrap(),
+            metadata_version_from_json(&exact, &manifest, TRAITS_PACKAGE).unwrap(),
             Version::parse("0.4.0-rc.1").unwrap()
         );
 
         let wrong_manifest = other.join("Cargo.toml").canonicalize().unwrap();
-        assert!(
-            metadata_version_from_json(
-                &serde_json::to_vec(&exact).unwrap(),
-                &wrong_manifest,
-                TRAITS_PACKAGE
-            )
-            .is_err()
-        );
-        assert!(
-            metadata_version_from_json(br#"{"packages":[]}"#, &manifest, TRAITS_PACKAGE).is_err()
-        );
+        assert!(metadata_version_from_json(&exact, &wrong_manifest, TRAITS_PACKAGE).is_err());
+        let empty = metadata_fixture::encoded(&metadata_fixture::metadata(&release, Vec::new()));
+        assert!(metadata_version_from_json(&empty, &manifest, TRAITS_PACKAGE).is_err());
     }
 
     #[test]
@@ -1467,6 +1454,31 @@ mod tests {
             insert_after_unreleased(body, section).unwrap(),
             "# Changelog\n\n## [Unreleased]\n\n## [0.2.0](new) - 2026-08-19\n\n- New.\n\n## [0.1.0](old) - 2026-01-01\n\n- Old.\n"
         );
+    }
+
+    #[test]
+    fn candidate_and_promotion_reject_oversized_changelogs_before_allocation() {
+        let temporary = TestDirectory::new("oversized-changelog");
+        fs::write(
+            temporary.0.join(CHANGELOG),
+            vec![b'x'; safe_file::MANIFEST_LIMIT + 1],
+        )
+        .unwrap();
+        let rc = Version::parse("1.2.3-rc.1").unwrap();
+        let stable = Version::parse("1.2.3").unwrap();
+
+        for error in [
+            ensure_candidate_changelog(&temporary.0, &rc, &rc, "2026-09-02").unwrap_err(),
+            promote_changelog(&temporary.0, &rc, &stable, "2026-09-02").unwrap_err(),
+        ] {
+            assert!(
+                error.contains(&format!(
+                    "{CHANGELOG} exceeds its {}-byte limit",
+                    safe_file::MANIFEST_LIMIT
+                )),
+                "unexpected bounded changelog error: {error}"
+            );
+        }
     }
 
     #[test]

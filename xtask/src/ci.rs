@@ -3,14 +3,26 @@
 
 //! Local entry point for the repository's non-release validation sequence.
 
-use std::io;
-use std::path::Path;
+use std::ffi::OsStr;
+use std::io::{self, Write as _};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::{package_content, release_version};
+use crate::{bounded_process, package_content, release_version};
 
 const CARGO_MACHETE_INSTALL_COMMAND: &str = "cargo install --locked cargo-machete --version 0.9.2";
 const CARGO_DENY_INSTALL_COMMAND: &str = "cargo install --locked cargo-deny --version 0.20.2";
+const CARGO_LOCKFILE_PATH_ENV: &str = "CARGO_RESOLVER_LOCKFILE_PATH";
+const PROTECTED_MARKER_ENV: &str = "YAML_SIGIL_TERMINAL_CANDIDATE";
+const PROTECTED_AUDIT_ENV: &str = "YAML_SIGIL_CARGO_AUDIT";
+const PROTECTED_SEED_ENV: &str = "YAML_SIGIL_CARGO_SEED";
+const PROTECTED_STATE_ENV: &str = "YAML_SIGIL_CARGO_STATE_ROOT";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ExecutionBoundary {
+    Ordinary,
+    Protected { cargo_audit: PathBuf },
+}
 
 #[derive(Clone, Copy, Debug)]
 struct Step {
@@ -25,6 +37,54 @@ impl Step {
             .chain(self.args.iter().copied())
             .collect::<Vec<_>>()
             .join(" ")
+    }
+
+    fn command(self, root: &Path) -> io::Result<Command> {
+        let root_lockfile = std::env::var_os(CARGO_LOCKFILE_PATH_ENV);
+        Ok(self.command_with_root_lockfile(root, root_lockfile.as_deref(), &execution_boundary()?))
+    }
+
+    fn command_with_root_lockfile(
+        self,
+        root: &Path,
+        root_lockfile: Option<&OsStr>,
+        boundary: &ExecutionBoundary,
+    ) -> Command {
+        let mut command = if self.is_dependency_audit()
+            && let ExecutionBoundary::Protected { cargo_audit } = boundary
+        {
+            let mut command = Command::new(cargo_audit);
+            command.args(["audit", "--no-fetch"]);
+            command.args(&self.args[1..]);
+            command
+        } else {
+            let mut command = Command::new(self.program);
+            command.args(self.args);
+            command
+        };
+        command.current_dir(root);
+        if self.uses_xtask_workspace() {
+            command.env_remove(CARGO_LOCKFILE_PATH_ENV);
+        } else if self.is_root_dependency_audit()
+            && let Some(lockfile) = root_lockfile
+        {
+            command.args(["--file"]).arg(lockfile);
+        }
+        command
+    }
+
+    fn uses_xtask_workspace(self) -> bool {
+        self.args
+            .iter()
+            .any(|argument| matches!(*argument, "xtask/Cargo.toml" | "xtask/Cargo.lock"))
+    }
+
+    fn is_root_dependency_audit(self) -> bool {
+        self.program == "cargo" && self.args == ["audit"]
+    }
+
+    fn is_dependency_audit(self) -> bool {
+        self.program == "cargo" && self.args.first() == Some(&"audit")
     }
 }
 
@@ -100,16 +160,13 @@ const POST_PACKAGE_STEPS: &[Step] = &[
     },
     Step {
         label: "Rust dependency policy",
-        program: "cargo",
-        args: &[
-            "deny", "check", "bans", "licenses", "sources", "-D", "warnings",
-        ],
+        program: "cargo-deny",
+        args: &["check", "bans", "licenses", "sources", "-D", "warnings"],
     },
     Step {
         label: "xtask dependency policy",
-        program: "cargo",
+        program: "cargo-deny",
         args: &[
-            "deny",
             "--manifest-path",
             "xtask/Cargo.toml",
             "--locked",
@@ -149,18 +206,53 @@ pub(crate) fn run(root: &Path) -> io::Result<()> {
 
 fn run_step(root: &Path, step: Step) -> io::Result<()> {
     eprintln!("+ {} (cwd {})", step.command_line(), root.display());
-    let status = Command::new(step.program)
-        .args(step.args)
-        .current_dir(root)
-        .status()
-        .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", step.label)))?;
-    if !status.success() {
+    let mut command = step.command(root)?;
+    let output =
+        bounded_process::output(&mut command, bounded_process::VALIDATION_OUTPUT_LIMITS)
+            .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", step.label)))?;
+    io::stdout().write_all(&output.stdout)?;
+    io::stderr().write_all(&output.stderr)?;
+    if !output.status.success() {
         return Err(io::Error::other(format!(
-            "{} failed with {status}",
-            step.label
+            "{} failed with {}",
+            step.label, output.status
         )));
     }
     Ok(())
+}
+
+fn execution_boundary() -> io::Result<ExecutionBoundary> {
+    let marker = std::env::var_os(PROTECTED_MARKER_ENV);
+    let audit = std::env::var_os(PROTECTED_AUDIT_ENV);
+    let seed = std::env::var_os(PROTECTED_SEED_ENV);
+    let state = std::env::var_os(PROTECTED_STATE_ENV);
+    if marker.is_none() && audit.is_none() && seed.is_none() && state.is_none() {
+        return Ok(ExecutionBoundary::Ordinary);
+    }
+    let Some(audit) = audit.filter(|value| !value.is_empty()) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "protected dependency-audit boundary is incomplete",
+        ));
+    };
+    if marker.as_deref() != Some(OsStr::new("1"))
+        || seed.as_ref().is_none_or(|value| value.is_empty())
+        || state.as_ref().is_none_or(|value| value.is_empty())
+        || std::env::var_os("CARGO_NET_OFFLINE").as_deref() != Some(OsStr::new("true"))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "protected dependency-audit boundary is incomplete",
+        ));
+    }
+    let cargo_audit = PathBuf::from(audit);
+    if !cargo_audit.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "protected cargo-audit path is not absolute",
+        ));
+    }
+    Ok(ExecutionBoundary::Protected { cargo_audit })
 }
 
 fn require_cargo_machete() -> io::Result<()> {
@@ -201,9 +293,12 @@ fn require_cargo_tool(program: &str, install_command: &str) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CARGO_DENY_INSTALL_COMMAND, CARGO_MACHETE_INSTALL_COMMAND, POST_PACKAGE_STEPS};
     #[cfg(windows)]
-    use super::{PRE_PACKAGE_STEPS, run_step};
+    use super::run_step;
+    use super::{
+        CARGO_DENY_INSTALL_COMMAND, CARGO_LOCKFILE_PATH_ENV, CARGO_MACHETE_INSTALL_COMMAND,
+        ExecutionBoundary, POST_PACKAGE_STEPS, PRE_PACKAGE_STEPS, Path, PathBuf,
+    };
 
     const AGENT_GUIDANCE: &str = include_str!("../../AGENTS.md");
     const GITMODULES: &str = include_str!("../../.gitmodules");
@@ -258,6 +353,84 @@ mod tests {
                 .any(|command| command == "cargo audit --file xtask/Cargo.lock")
         );
         assert!(AGENT_GUIDANCE.contains("cargo audit --file xtask/Cargo.lock"));
+    }
+
+    #[test]
+    fn xtask_commands_retain_the_committed_xtask_lock() {
+        let steps = PRE_PACKAGE_STEPS.iter().chain(POST_PACKAGE_STEPS);
+        let mut xtask_steps = 0;
+
+        for step in steps {
+            let command = step.command(std::path::Path::new(".")).unwrap();
+            let removes_external_lock = command
+                .get_envs()
+                .any(|(name, value)| name == CARGO_LOCKFILE_PATH_ENV && value.is_none());
+            assert_eq!(
+                removes_external_lock,
+                step.uses_xtask_workspace(),
+                "unexpected lockfile environment for {}",
+                step.command_line()
+            );
+            xtask_steps += usize::from(step.uses_xtask_workspace());
+        }
+
+        assert!(
+            xtask_steps > 0,
+            "CI must retain explicit xtask-workspace steps"
+        );
+    }
+
+    #[test]
+    fn root_audit_reads_the_cargo_generated_external_lock() {
+        let root_audit = POST_PACKAGE_STEPS
+            .iter()
+            .copied()
+            .find(|step| step.is_root_dependency_audit())
+            .expect("CI must audit the root dependency lock");
+        let lockfile = std::path::Path::new("/candidate-home/Cargo.lock");
+        let command = root_audit.command_with_root_lockfile(
+            std::path::Path::new("."),
+            Some(lockfile.as_os_str()),
+            &ExecutionBoundary::Ordinary,
+        );
+        let arguments = command.get_args().collect::<Vec<_>>();
+
+        assert_eq!(arguments, ["audit", "--file", "/candidate-home/Cargo.lock"]);
+    }
+
+    #[test]
+    fn protected_audits_use_authenticated_binary_and_seed_only() {
+        for step in POST_PACKAGE_STEPS
+            .iter()
+            .copied()
+            .filter(|step| step.is_dependency_audit())
+        {
+            let command = step.command_with_root_lockfile(
+                Path::new("."),
+                None,
+                &ExecutionBoundary::Protected {
+                    cargo_audit: PathBuf::from("/trusted-tools/bin/cargo-audit"),
+                },
+            );
+            assert_eq!(command.get_program(), "/trusted-tools/bin/cargo-audit");
+            let arguments = command.get_args().collect::<Vec<_>>();
+            assert_eq!(&arguments[..2], ["audit", "--no-fetch"]);
+        }
+    }
+
+    #[test]
+    fn ordinary_audit_can_seed_a_clean_cargo_home() {
+        let clean = tempfile::tempdir().unwrap();
+        let audit = POST_PACKAGE_STEPS
+            .iter()
+            .copied()
+            .find(|step| step.is_root_dependency_audit())
+            .unwrap();
+        let mut command =
+            audit.command_with_root_lockfile(Path::new("."), None, &ExecutionBoundary::Ordinary);
+        command.env("CARGO_HOME", clean.path());
+        assert_eq!(command.get_program(), "cargo");
+        assert_eq!(command.get_args().collect::<Vec<_>>(), ["audit"]);
     }
 
     #[cfg(windows)]

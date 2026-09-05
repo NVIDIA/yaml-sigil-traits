@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import fnmatch
+import hashlib
 import json
 import os
 import re
@@ -34,8 +34,8 @@ from pathlib import PurePosixPath
 from typing import Any, Iterable, Mapping, Sequence
 
 
-API_VERSION = "2022-11-28"
-COMMAND_RE = re.compile(r"/ok to test ([0-9a-f]{40})")
+API_VERSION = "2026-03-10"
+COMMAND_RE = re.compile(r"/ok to (test|test-and-adopt) ([0-9a-f]{40})")
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 JOB_BINDING_MARKER = "protected-ci|"
 CALLER_JOB_NAME = "Run authorized protected CI"
@@ -53,9 +53,26 @@ MAX_API_RESPONSE_BYTES = 32 * 1024 * 1024
 MAX_API_ERROR_DETAIL_BYTES = 500
 MAX_CHANGED_PATHS = 3_000
 MAX_PULL_COMMITS = 250
-MAX_TREE_ENTRIES = 100_000
+MAX_SIGNATURE_BATCH = 50
+MAX_SIGNATURE_REQUESTS = 5
+MAX_SIGNATURE_JSON_NODES = 25_000
+MAX_SIGNATURE_CURSOR_BYTES = 1_024
+MAX_TREE_ENTRIES = 10_000
+MAX_SENSITIVE_FILES = 512
+MAX_PATH_METADATA_BYTES = 4 * 1024 * 1024
 MAX_WORKFLOW_JOBS = 1_000
 MAX_PAGES = 100
+
+POLICY_CONTROLLER = ".github/scripts/protected_pr_ci.py"
+POLICY_TESTS = ".github/scripts/test_protected_pr_ci.py"
+CHECKOUT_VERIFIER = ".github/scripts/protected_checkout.py"
+CANDIDATE_CHECKOUT_ACTION = ".github/actions/protected-candidate-checkout/action.yml"
+TERMINAL_CANDIDATE_DRIVER = ".github/scripts/terminal_candidate.py"
+TERMINAL_CANDIDATE_SHELL = ".github/scripts/run-terminal-candidate.sh"
+POLICY_CONFIG = ".github/protected-pr-ci.json"
+RECONCILE_WORKFLOW = ".github/workflows/pr-ci-reconcile.yml"
+REUSABLE_WORKFLOW = ".github/workflows/pr-ci.yml"
+COMMIT_POLICY = ".github/scripts/check-pull-request-commits.sh"
 
 
 class PolicyError(RuntimeError):
@@ -91,6 +108,15 @@ def validate_sha(value: Any, label: str) -> str:
     sha = require_string(value, label)
     require(SHA_RE.fullmatch(sha) is not None, f"{label} must be a lowercase 40-character SHA")
     return sha
+
+
+def validate_digest(value: Any, label: str) -> str:
+    digest = require_string(value, label)
+    require(
+        re.fullmatch(r"[0-9a-f]{64}", digest) is not None,
+        f"{label} must be a lowercase SHA-256 digest",
+    )
+    return digest
 
 
 def validate_login(value: Any, label: str) -> str:
@@ -137,17 +163,34 @@ def load_config(path: str) -> Mapping[str, Any]:
     config = require_mapping(load_json(path), "policy configuration")
     required = {
         "version",
+        "repository",
+        "repository_kind",
         "default_branch",
         "workflow_file",
         "required_check",
         "release_app",
         "expected_jobs",
-        "candidate_ci_paths",
+        "supplemental_candidate_ci",
+        "trusted_gitlinks",
     }
     require(set(config) == required, "policy configuration keys are incomplete or ambiguous")
-    require(config["version"] == 2, "unsupported policy configuration version")
+    require(config["version"] == 4, "unsupported policy configuration version")
+    validate_repository(config["repository"], "repository")
+    require(
+        config["repository_kind"] in {"spec", "traits", "rs"},
+        "repository_kind is unsupported",
+    )
     require(config["default_branch"] == "main", "the protected branch must be exact main")
-    validate_path(config["workflow_file"], "workflow_file")
+    workflow_file = validate_path(config["workflow_file"], "workflow_file")
+    require(
+        isinstance(config["supplemental_candidate_ci"], bool),
+        "supplemental_candidate_ci must be boolean",
+    )
+    require(
+        config["supplemental_candidate_ci"]
+        == (config["repository_kind"] != "spec"),
+        "supplemental candidate CI must be disabled only for spec",
+    )
     require(config["required_check"] == CHECK_NAME, f"required_check must be {CHECK_NAME!r}")
 
     release_app = require_mapping(config["release_app"], "release_app")
@@ -212,23 +255,68 @@ def load_config(path: str) -> Mapping[str, Any]:
             f"expected_jobs[{index}] is not a job identifier",
         )
 
-    patterns = require_sequence(config["candidate_ci_paths"], "candidate_ci_paths")
-    require(
-        patterns and len(set(patterns)) == len(patterns),
-        "candidate_ci_paths must be nonempty and unique",
-    )
-    for index, pattern in enumerate(patterns):
-        require_string(pattern, f"candidate_ci_paths[{index}]")
+    trusted_gitlinks = require_sequence(config["trusted_gitlinks"], "trusted_gitlinks")
+    parsed_gitlinks = []
+    for index, value in enumerate(trusted_gitlinks):
+        item = require_mapping(value, f"trusted_gitlinks[{index}]")
         require(
-            "\\" not in pattern and not pattern.startswith("/"),
-            f"candidate_ci_paths[{index}] is invalid",
+            set(item) == {"path", "repository", "branch"},
+            f"trusted_gitlinks[{index}] keys are incomplete or ambiguous",
         )
+        parsed_gitlinks.append(
+            {
+                "path": validate_path(item["path"], f"trusted_gitlinks[{index}].path"),
+                "repository": validate_repository(
+                    item["repository"], f"trusted_gitlinks[{index}].repository"
+                ),
+                "branch": require_string(
+                    item["branch"], f"trusted_gitlinks[{index}].branch"
+                ),
+            }
+        )
+    require(
+        len({item["path"] for item in parsed_gitlinks}) == len(parsed_gitlinks),
+        "trusted_gitlinks paths must be unique",
+    )
+    expected_gitlinks = (
+        [
+            {
+                "path": "source-spec",
+                "repository": "NVIDIA/yaml-sigil-spec",
+                "branch": "main",
+            }
+        ]
+        if config["repository_kind"] == "traits"
+        else []
+    )
+    require(
+        parsed_gitlinks == expected_gitlinks,
+        "trusted_gitlinks do not match the repository policy",
+    )
+
+    protected_paths = {
+        POLICY_CONTROLLER,
+        POLICY_TESTS,
+        CHECKOUT_VERIFIER,
+        CANDIDATE_CHECKOUT_ACTION,
+        TERMINAL_CANDIDATE_DRIVER,
+        TERMINAL_CANDIDATE_SHELL,
+        POLICY_CONFIG,
+        workflow_file,
+        RECONCILE_WORKFLOW,
+        REUSABLE_WORKFLOW,
+        COMMIT_POLICY,
+    }
+    require(
+        all(is_sensitive_path(item, config["repository_kind"]) for item in protected_paths),
+        "protected CI policy files are not all sensitive",
+    )
 
     return config
 
 
 class GitHubApi:
-    """Small fail-closed GitHub REST client."""
+    """Small fail-closed GitHub REST and GraphQL client."""
 
     def __init__(self, token: str, api_url: str = "https://api.github.com") -> None:
         require(token != "", "GitHub API token is empty")
@@ -287,6 +375,174 @@ class GitHubApi:
     def patch(self, path: str, payload: Mapping[str, Any]) -> Any:
         return self.request("PATCH", path, payload)
 
+    def commit_signatures(
+        self, repository: str, pull_number: int, oids: Sequence[str]
+    ) -> Mapping[str, Mapping[str, Any]]:
+        """Read exact PR commit-signature identities within one aggregate budget."""
+
+        require(
+            1 <= len(oids) <= MAX_PULL_COMMITS,
+            "signature inventory is outside the supported commit limit",
+        )
+        require(
+            len(set(oids)) == len(oids),
+            "signature inventory contains duplicate commit OIDs",
+        )
+        require(
+            isinstance(pull_number, int) and not isinstance(pull_number, bool)
+            and pull_number > 0,
+            "signature pull request number must be positive",
+        )
+        owner, name = validate_repository(repository).split("/", 1)
+        observed: dict[str, Mapping[str, Any]] = {}
+        aggregate_bytes = 0
+        aggregate_nodes = 0
+        request_count = 0
+        cursor: str | None = None
+
+        for offset in range(0, len(oids), MAX_SIGNATURE_BATCH):
+            batch = list(oids[offset : offset + MAX_SIGNATURE_BATCH])
+            request_count += 1
+            require(
+                request_count <= MAX_SIGNATURE_REQUESTS,
+                "commit signatures require too many GraphQL requests",
+            )
+            for index, oid in enumerate(batch):
+                validate_sha(oid, f"signature OID {offset + index}")
+            variables: dict[str, Any] = {
+                "owner": owner,
+                "name": name,
+                "number": pull_number,
+                "first": len(batch),
+                "after": cursor,
+            }
+            query = (
+                "query($owner:String!,$name:String!,$number:Int!,"
+                "$first:Int!,$after:String){repository(owner:$owner,name:$name){"
+                "pullRequest(number:$number){commits(first:$first,after:$after){"
+                "totalCount nodes{commit{oid signature{__typename email isValid "
+                "state wasSignedByGitHub signer{databaseId login __typename}}}}"
+                "pageInfo{hasNextPage endCursor}}}}}"
+            )
+            payload = json.dumps(
+                {"query": query, "variables": variables},
+                separators=(",", ":"),
+            ).encode("utf-8")
+            request = urllib.request.Request(
+                f"{self.api_url}/graphql",
+                data=payload,
+                headers={
+                    "Accept": "application/vnd.github+json",
+                    "Authorization": f"Bearer {self.token}",
+                    "Content-Type": "application/json",
+                    "User-Agent": "yaml-sigil-protected-pr-ci/2",
+                    "X-GitHub-Api-Version": API_VERSION,
+                },
+                method="POST",
+            )
+            remaining = MAX_API_RESPONSE_BYTES - aggregate_bytes
+            require(remaining >= 0, "commit signature response budget is exhausted")
+            try:
+                with urllib.request.urlopen(request, timeout=30) as response:
+                    raw = response.read(remaining + 1)
+                    require(
+                        len(raw) <= remaining,
+                        "aggregate commit signature responses exceed the 32 MiB limit",
+                    )
+                    require(
+                        200 <= response.status < 300,
+                        f"GitHub GraphQL returned HTTP {response.status}",
+                    )
+            except urllib.error.HTTPError as error:
+                raw_detail = error.read(MAX_API_ERROR_DETAIL_BYTES + 1)
+                detail = raw_detail[:MAX_API_ERROR_DETAIL_BYTES].decode("utf-8", "replace")
+                if len(raw_detail) > MAX_API_ERROR_DETAIL_BYTES:
+                    detail = f"{detail}..."
+                raise PolicyError(
+                    f"GitHub GraphQL failed with HTTP {error.code}: {detail}"
+                ) from error
+            except (urllib.error.URLError, TimeoutError, OSError) as error:
+                raise PolicyError(f"GitHub GraphQL failed: {error}") from error
+            aggregate_bytes += len(raw)
+            try:
+                value = json.loads(raw)
+            except json.JSONDecodeError as error:
+                raise PolicyError("GitHub GraphQL returned invalid JSON") from error
+            aggregate_nodes += json_node_count(value)
+            require(
+                aggregate_nodes <= MAX_SIGNATURE_JSON_NODES,
+                "commit signature responses contain too many JSON nodes",
+            )
+            envelope = require_mapping(value, "GraphQL response")
+            require("errors" not in envelope, "GraphQL signature response contains errors")
+            data = require_mapping(envelope.get("data"), "GraphQL data")
+            repo = require_mapping(data.get("repository"), "GraphQL repository")
+            pull = require_mapping(repo.get("pullRequest"), "GraphQL pull request")
+            commits = require_mapping(
+                pull.get("commits"), "GraphQL pull request commits"
+            )
+            require(
+                set(commits) == {"totalCount", "nodes", "pageInfo"},
+                "GraphQL signature response fields are incomplete or ambiguous",
+            )
+            total_count = require_integer(
+                commits.get("totalCount"), "GraphQL signature total count"
+            )
+            require(
+                total_count == len(oids),
+                "GraphQL signature total count changed",
+            )
+            nodes = require_sequence(commits.get("nodes"), "GraphQL signature results")
+            require(
+                len(nodes) == len(batch),
+                "GraphQL signature response has missing or unrequested results",
+            )
+            for index, requested_oid in enumerate(batch):
+                node = require_mapping(nodes[index], f"signature node {offset + index}")
+                require(
+                    set(node) == {"commit"},
+                    f"signature node {offset + index} fields are ambiguous",
+                )
+                commit = require_mapping(
+                    node.get("commit"), f"signature result {offset + index}"
+                )
+                oid = validate_sha(commit.get("oid"), f"signature result {index} OID")
+                require(oid == requested_oid, "GraphQL signature result OID is out of order")
+                require(oid not in observed, "GraphQL signature result is duplicated")
+                observed[oid] = commit
+
+            page_info = require_mapping(
+                commits.get("pageInfo"), "GraphQL signature page info"
+            )
+            require(
+                set(page_info) == {"hasNextPage", "endCursor"},
+                "GraphQL signature page info fields are incomplete or ambiguous",
+            )
+            has_next = page_info.get("hasNextPage")
+            require(
+                isinstance(has_next, bool),
+                "GraphQL signature pagination state is missing",
+            )
+            more_expected = offset + len(batch) < len(oids)
+            require(
+                has_next is more_expected,
+                "GraphQL signature pagination does not match the commit inventory",
+            )
+            if more_expected:
+                cursor = require_string(
+                    page_info.get("endCursor"), "GraphQL signature cursor"
+                )
+                require(
+                    len(cursor.encode("utf-8")) <= MAX_SIGNATURE_CURSOR_BYTES,
+                    "GraphQL signature cursor exceeds the supported size limit",
+                )
+
+        require(
+            list(observed) == list(oids),
+            "GraphQL signature results do not exactly match the requested OIDs",
+        )
+        return observed
+
     def paginate(self, path: str, *, max_items: int, label: str) -> list[Any]:
         items: list[Any] = []
         for page in range(1, MAX_PAGES + 1):
@@ -325,6 +581,21 @@ class GitHubApi:
         raise PolicyError(f"{label} pagination did not terminate")
 
 
+def json_node_count(value: Any) -> int:
+    """Count aggregate JSON values without recursive call-stack growth."""
+
+    count = 0
+    pending = [value]
+    while pending:
+        current = pending.pop()
+        count += 1
+        if isinstance(current, dict):
+            pending.extend(current.values())
+        elif isinstance(current, list):
+            pending.extend(current)
+    return count
+
+
 def repo_api_path(repository: str, suffix: str) -> str:
     owner, name = validate_repository(repository).split("/", 1)
     return f"/repos/{urllib.parse.quote(owner, safe='')}/{urllib.parse.quote(name, safe='')}{suffix}"
@@ -341,26 +612,69 @@ def permission_for(api: GitHubApi, repository: str, login: str) -> str:
     return permission
 
 
+def require_app_token_repository_scope(api: GitHubApi, repository: str) -> None:
+    """Require an installation token scoped to exactly one named repository."""
+
+    repositories = api.paginate_key(
+        "/installation/repositories",
+        "repositories",
+        max_items=2,
+        label="App token repository inventory",
+    )
+    require(
+        len(repositories) == 1,
+        "App token repository inventory is not exactly one repository",
+    )
+    selected = require_mapping(repositories[0], "App token repository")
+    require(
+        validate_repository(selected.get("full_name"), "App token repository name")
+        == repository,
+        "App token is scoped to an unexpected repository",
+    )
+    require(
+        require_integer(selected.get("id"), "App token repository ID") > 0,
+        "App token repository ID must be positive",
+    )
+
+
 def require_writer(api: GitHubApi, repository: str, login: str, label: str) -> None:
     permission = permission_for(api, repository, login)
     require(permission in WRITER_PERMISSIONS, f"{label} does not currently have write authority")
 
 
-def command_sha(body: Any) -> str | None:
+@dataclass(frozen=True)
+class CommandRequest:
+    mode: str
+    head_sha: str
+
+    @property
+    def adoption(self) -> bool:
+        return self.mode == "test-and-adopt"
+
+
+def command_request(body: Any) -> CommandRequest | None:
     if not isinstance(body, str):
         return None
     match = COMMAND_RE.fullmatch(body)
-    return match.group(1) if match is not None else None
+    if match is None:
+        return None
+    return CommandRequest(mode=match.group(1), head_sha=match.group(2))
 
 
-def exact_command(body: Any) -> str:
-    requested_sha = command_sha(body)
+def command_sha(body: Any) -> str | None:
+    request = command_request(body)
+    return request.head_sha if request is not None else None
+
+
+def exact_command(body: Any) -> CommandRequest:
+    requested = command_request(body)
     require(
-        requested_sha is not None,
-        "comment must be exactly /ok to test followed by a lowercase full head SHA",
+        requested is not None,
+        "comment must be exactly /ok to test or /ok to test-and-adopt "
+        "followed by a lowercase full head SHA",
     )
-    assert requested_sha is not None
-    return requested_sha
+    assert requested is not None
+    return requested
 
 
 def normalized_casefold(value: str) -> str:
@@ -370,15 +684,66 @@ def normalized_casefold(value: str) -> str:
     return unicodedata.normalize("NFKC", normalized.casefold())
 
 
-def matches_path_inventory(path: str, patterns: Sequence[str]) -> bool:
-    """Match declarations, treating a trailing ``/**`` as including its root."""
-    identity = normalized_casefold(path)
-    for pattern in patterns:
-        declaration = normalized_casefold(pattern)
-        if fnmatch.fnmatchcase(identity, declaration):
+def normalized_components(path: str) -> tuple[str, ...]:
+    return tuple(normalized_casefold(part) for part in validate_path(path, "path").split("/"))
+
+
+def is_sensitive_path(path: str, repository_kind: str) -> bool:
+    """Classify one normalized repository path under the shared policy."""
+
+    parts = normalized_components(path)
+    name = parts[-1]
+    if "~" in path or any("~" in part for part in parts):
+        return True
+    if parts[0] == ".github":
+        return True
+    if name == ".gitattributes" or parts == (".gitmodules",):
+        return True
+    if parts in {
+        ("codeowners",),
+        (".github", "codeowners"),
+        ("docs", "codeowners"),
+    }:
+        return True
+    if name in {
+        "cargo.toml",
+        "cargo.lock",
+        "build.rs",
+        "rust-toolchain",
+        "rust-toolchain.toml",
+        "rustfmt.toml",
+        ".rustfmt.toml",
+        "clippy.toml",
+        ".clippy.toml",
+        "deny.toml",
+        ".deny.toml",
+        "deny.exceptions.toml",
+        ".deny.exceptions.toml",
+        "cargo-deny.toml",
+        ".cargo-deny.toml",
+        "cargo-machete.toml",
+        ".cargo-machete.toml",
+        "audit.toml",
+        ".release-plz.toml",
+        "release-plz.toml",
+    }:
+        return True
+    if ".cargo" in parts or parts[0] == "xtask" or name == "releasing.md":
+        return True
+    if repository_kind == "traits" and parts == ("source-spec",):
+        return True
+    buf_policy_names = {"buf.yaml", "buf.lock", "buf.gen.yaml"}
+    if repository_kind == "rs" and name in buf_policy_names:
+        return True
+    if repository_kind == "spec":
+        if parts[:1] == ("proto",) and len(parts) == 2 and name in buf_policy_names:
             return True
-        if declaration.endswith("/**") and fnmatch.fnmatchcase(
-            identity, declaration[:-3]
+        acvp_root = ("conformance", "rebuild-rs")
+        if parts[: len(acvp_root)] == acvp_root and (
+            parts[:4] == (*acvp_root, "vendor", "acvp")
+            or parts[:3] == (*acvp_root, "pinned-dir")
+            or parts[:3] == (*acvp_root, "xtask")
+            or parts[:3] == (*acvp_root, "src")
         ):
             return True
     return False
@@ -400,11 +765,85 @@ def signoffs(message: Any) -> set[str]:
     return found
 
 
-def require_verified(commit: Mapping[str, Any], label: str) -> None:
-    details = require_mapping(commit.get("commit"), f"{label} details")
-    verification = require_mapping(details.get("verification"), f"{label} verification")
-    require(verification.get("verified") is True, f"{label} is not GitHub Verified")
-    require(verification.get("reason") == "valid", f"{label} verification is not valid")
+@dataclass(frozen=True)
+class SignatureIdentity:
+    oid: str
+    kind: str
+    email: str
+    signer_id: int
+    signer_login: str
+    signer_type: str
+    was_signed_by_github: bool
+
+
+def signature_identity(value: Mapping[str, Any], label: str) -> SignatureIdentity:
+    require(
+        set(value) == {"oid", "signature"},
+        f"{label} signature result fields are incomplete or ambiguous",
+    )
+    oid = validate_sha(value.get("oid"), f"{label} OID")
+    signature = require_mapping(value.get("signature"), f"{label} signature")
+    require(
+        set(signature)
+        == {
+            "__typename",
+            "email",
+            "isValid",
+            "state",
+            "wasSignedByGitHub",
+            "signer",
+        },
+        f"{label} signature fields are incomplete or ambiguous",
+    )
+    kind = require_string(signature.get("__typename"), f"{label} signature type")
+    require(
+        kind in {"GpgSignature", "SshSignature", "SmimeSignature"},
+        f"{label} signature type is unsupported",
+    )
+    require(signature.get("isValid") is True, f"{label} is not GitHub Verified")
+    require(signature.get("state") == "VALID", f"{label} signature state is not valid")
+    require(
+        isinstance(signature.get("wasSignedByGitHub"), bool),
+        f"{label} GitHub-signing state is missing",
+    )
+    signer = require_mapping(signature.get("signer"), f"{label} signer")
+    require(
+        set(signer) == {"databaseId", "login", "__typename"},
+        f"{label} signer fields are incomplete or ambiguous",
+    )
+    signer_id = require_integer(signer.get("databaseId"), f"{label} signer ID")
+    require(signer_id > 0, f"{label} signer ID must be positive")
+    signer_type = require_string(signer.get("__typename"), f"{label} signer type")
+    require(signer_type == "User", f"{label} signer is not a GitHub User")
+    return SignatureIdentity(
+        oid=oid,
+        kind=kind,
+        email=require_string(signature.get("email"), f"{label} signature email"),
+        signer_id=signer_id,
+        signer_login=validate_login(signer.get("login"), f"{label} signer login"),
+        signer_type=signer_type,
+        was_signed_by_github=signature.get("wasSignedByGitHub") is True,
+    )
+
+
+def rest_account(value: Any, label: str) -> tuple[int, str, str]:
+    account = require_mapping(value, label)
+    account_id = require_integer(account.get("id"), f"{label} ID")
+    require(account_id > 0, f"{label} ID must be positive")
+    account_type = require_string(account.get("type"), f"{label} type")
+    require(account_type in {"User", "Bot"}, f"{label} type is unsupported")
+    return account_id, validate_login(account.get("login"), f"{label} login"), account_type
+
+
+def require_rest_signature_account(
+    account: Any, signature: SignatureIdentity, label: str
+) -> tuple[int, str, str]:
+    identity = rest_account(account, label)
+    require(
+        identity == (signature.signer_id, signature.signer_login, signature.signer_type),
+        f"{label} does not match the verified signer",
+    )
+    return identity
 
 
 def require_author_dco(commit: Mapping[str, Any], *, label: str) -> None:
@@ -412,6 +851,61 @@ def require_author_dco(commit: Mapping[str, Any], *, label: str) -> None:
     found = signoffs(details.get("message"))
     author = commit_author_identity(commit)
     require(author in found, f"{label} lacks the author's DCO sign-off")
+
+
+def raw_identity(commit: Mapping[str, Any], role: str, label: str) -> tuple[str, str, str]:
+    details = require_mapping(commit.get("commit"), f"{label} details")
+    actor = require_mapping(details.get(role), f"{label} raw {role}")
+    name = require_string(actor.get("name"), f"{label} raw {role} name")
+    email = require_string(actor.get("email"), f"{label} raw {role} email")
+    return name, email, f"{name} <{email}>"
+
+
+def require_direct_contributor_commit(
+    commit: Mapping[str, Any], signature: SignatureIdentity, label: str
+) -> None:
+    require(not signature.was_signed_by_github, f"{label} uses an unsupported GitHub web-flow signature")
+    author_account = require_rest_signature_account(commit.get("author"), signature, f"{label} author")
+    committer_account = require_rest_signature_account(
+        commit.get("committer"), signature, f"{label} committer"
+    )
+    require(author_account == committer_account, f"{label} author and committer identities differ")
+    _, author_email, author_dco = raw_identity(commit, "author", label)
+    _, committer_email, _ = raw_identity(commit, "committer", label)
+    require(
+        author_email == committer_email == signature.email,
+        f"{label} signature email does not match the raw author and committer",
+    )
+    require(
+        author_dco in signoffs(require_mapping(commit.get("commit"), f"{label} details").get("message")),
+        f"{label} lacks the author's DCO sign-off",
+    )
+
+
+def require_adopted_commit(
+    api: GitHubApi,
+    repository: str,
+    commit: Mapping[str, Any],
+    signature: SignatureIdentity,
+    label: str,
+) -> None:
+    require(not signature.was_signed_by_github, f"{label} uses an unsupported GitHub web-flow signature")
+    author_account = rest_account(commit.get("author"), f"{label} author")
+    committer_account = require_rest_signature_account(
+        commit.get("committer"), signature, f"{label} committer"
+    )
+    require(author_account[2] == "User", f"{label} original author is not a GitHub User")
+    require(committer_account[2] == "User", f"{label} adopting committer is not a GitHub User")
+    require_writer(api, repository, signature.signer_login, f"{label} adopting signer")
+    _, _, author_dco = raw_identity(commit, "author", label)
+    _, committer_email, committer_dco = raw_identity(commit, "committer", label)
+    require(
+        committer_email == signature.email,
+        f"{label} signature email does not match the adopting committer",
+    )
+    found = signoffs(require_mapping(commit.get("commit"), f"{label} details").get("message"))
+    require(author_dco in found, f"{label} lacks the original author's DCO sign-off")
+    require(committer_dco in found, f"{label} lacks the adopting committer's DCO sign-off")
 
 
 def current_main(api: GitHubApi, repository: str, branch: str) -> str:
@@ -511,6 +1005,10 @@ def require_no_path_collisions(paths: Iterable[str]) -> None:
 
     identities: dict[str, str] = {}
     for path in sorted(paths):
+        require(
+            all("~" not in part for part in normalized_components(path)),
+            "candidate tree contains a Windows short-name-shaped path component",
+        )
         identity = normalized_casefold(path)
         previous = identities.setdefault(identity, path)
         require(
@@ -534,9 +1032,137 @@ def changed_tree_paths(base: GitTree, head: GitTree) -> tuple[list[str], list[st
             statuses.append("added")
         elif path not in head.leaves:
             statuses.append("removed")
+        elif base.leaves[path][:2] != head.leaves[path][:2]:
+            statuses.append("mode-or-type-changed")
         else:
             statuses.append("modified")
     return paths, statuses
+
+
+@dataclass(frozen=True)
+class SensitiveInventory:
+    entries: tuple[Mapping[str, Any], ...]
+    digest: str
+
+    @property
+    def present(self) -> bool:
+        return bool(self.entries)
+
+
+def sensitive_inventory(
+    base: GitTree,
+    head: GitTree,
+    paths: Sequence[str],
+    statuses: Sequence[str],
+    repository_kind: str,
+) -> SensitiveInventory:
+    require(len(paths) == len(statuses), "tree diff paths and statuses are misaligned")
+    entries: list[Mapping[str, Any]] = []
+    for path, status in zip(paths, statuses, strict=True):
+        base_leaf = base.leaves.get(path)
+        head_leaf = head.leaves.get(path)
+        gitlink_changed = any(
+            leaf is not None and leaf[:2] == ("commit", "160000")
+            for leaf in (base_leaf, head_leaf)
+        )
+        if not gitlink_changed and not is_sensitive_path(path, repository_kind):
+            continue
+        entries.append(
+            {
+                "path": path,
+                "status": status,
+                "base": list(base.leaves[path]) if path in base.leaves else None,
+                "head": list(head.leaves[path]) if path in head.leaves else None,
+            }
+        )
+    require(
+        len(entries) <= MAX_SENSITIVE_FILES,
+        f"sensitive diff exceeds the supported limit of {MAX_SENSITIVE_FILES} files",
+    )
+    encoded = json.dumps(entries, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    require(
+        len(encoded) <= MAX_PATH_METADATA_BYTES,
+        "sensitive diff metadata exceeds the 4 MiB limit",
+    )
+    return SensitiveInventory(
+        entries=tuple(entries),
+        digest=hashlib.sha256(encoded).hexdigest(),
+    )
+
+
+def require_ancestor(
+    api: GitHubApi,
+    repository: str,
+    ancestor: str,
+    descendant: str,
+    label: str,
+) -> None:
+    """Require one exact commit to be in the approved descendant lineage."""
+
+    validate_sha(ancestor, f"{label} ancestor")
+    validate_sha(descendant, f"{label} descendant")
+    if ancestor == descendant:
+        return
+    comparison = require_mapping(
+        api.get(repo_api_path(repository, f"/compare/{ancestor}...{descendant}")),
+        f"{label} comparison",
+    )
+    merge_base = require_mapping(comparison.get("merge_base_commit"), f"{label} merge base")
+    base_commit = require_mapping(comparison.get("base_commit"), f"{label} base commit")
+    head_commit = require_mapping(comparison.get("head_commit"), f"{label} head commit")
+    require(
+        validate_sha(merge_base.get("sha"), f"{label} merge-base SHA") == ancestor
+        and validate_sha(base_commit.get("sha"), f"{label} base SHA") == ancestor
+        and validate_sha(head_commit.get("sha"), f"{label} head SHA") == descendant
+        and comparison.get("status") == "ahead",
+        f"{label} does not prove approved forward ancestry",
+    )
+
+
+def require_trusted_gitlink_lineage(
+    api: GitHubApi,
+    config: Mapping[str, Any],
+    base: GitTree,
+    head: GitTree,
+    paths: Sequence[str],
+) -> None:
+    """Bind every changed gitlink to its configured upstream forward lineage."""
+
+    trusted = {
+        require_string(item.get("path"), "trusted gitlink path"): item
+        for item in require_sequence(config.get("trusted_gitlinks"), "trusted_gitlinks")
+        if isinstance(item, Mapping)
+    }
+    for path in paths:
+        base_leaf = base.leaves.get(path)
+        head_leaf = head.leaves.get(path)
+        if not any(
+            leaf is not None and leaf[:2] == ("commit", "160000")
+            for leaf in (base_leaf, head_leaf)
+        ):
+            continue
+        policy = require_mapping(trusted.get(path), f"trusted lineage policy for {path}")
+        require(
+            base_leaf is not None
+            and head_leaf is not None
+            and base_leaf[:2] == ("commit", "160000")
+            and head_leaf[:2] == ("commit", "160000"),
+            f"trusted gitlink {path} must remain an exact commit gitlink",
+        )
+        upstream = validate_repository(policy.get("repository"), f"{path} upstream repository")
+        branch = require_string(policy.get("branch"), f"{path} upstream branch")
+        require(branch == "main", f"{path} upstream branch must be exact main")
+        reference = require_mapping(
+            api.get(repo_api_path(upstream, f"/git/ref/heads/{branch}")),
+            f"{path} upstream branch",
+        )
+        target = require_mapping(reference.get("object"), f"{path} upstream branch object")
+        require(target.get("type") == "commit", f"{path} upstream branch is not a commit")
+        upstream_sha = validate_sha(target.get("sha"), f"{path} upstream branch SHA")
+        base_sha = validate_sha(base_leaf[2], f"{path} base gitlink SHA")
+        head_sha = validate_sha(head_leaf[2], f"{path} candidate gitlink SHA")
+        require_ancestor(api, upstream, base_sha, head_sha, f"{path} forward update")
+        require_ancestor(api, upstream, head_sha, upstream_sha, f"{path} upstream lineage")
 
 
 def pull_commits(api: GitHubApi, repository: str, number: int, expected: int) -> list[Mapping[str, Any]]:
@@ -641,12 +1267,21 @@ def require_release_app_change(
     statuses: Sequence[str],
     main_sha: str,
     release_app: Mapping[str, Any],
+    signatures: Mapping[str, Mapping[str, Any]],
 ) -> None:
     require(release_app.get("enabled") is True, "release App exception is disabled")
-    user = require_mapping(pull.get("user"), "pull request author")
-    require(user.get("login") == release_app.get("login"), "pull request is not owned by the release App")
+    user = rest_account(pull.get("user"), "pull request author")
     require(
-        user.get("id") == release_app.get("bot_user_id"),
+        user
+        == (
+            release_app.get("bot_user_id"),
+            release_app.get("login"),
+            "Bot",
+        ),
+        "pull request is not owned by the exact release App identity",
+    )
+    require(
+        user[0] == release_app.get("bot_user_id"),
         "pull request author ID does not match the release App",
     )
     head = require_mapping(pull.get("head"), "pull request head")
@@ -663,24 +1298,50 @@ def require_release_app_change(
 
     sha = validate_sha(commits[0].get("sha"), "release App commit SHA")
     commit = full_commit(api, repository, sha)
+    signature = signature_identity(
+        require_mapping(signatures.get(sha), "release App signature result"),
+        "release App commit",
+    )
+    require(signature.oid == sha, "release App signature OID is unexpected")
     parents = require_sequence(commit.get("parents"), "release App commit parents")
     require(len(parents) == 1, "release App commit must have exactly one parent")
     parent = require_mapping(parents[0], "release App commit parent")
     require(parent.get("sha") == main_sha, "release App commit parent is not current main")
-    author = require_mapping(commit.get("author"), "release App commit author")
-    require(author.get("login") == release_app.get("login"), "release App commit author is unexpected")
+    author = rest_account(commit.get("author"), "release App commit author")
     require(
-        author.get("id") == release_app.get("bot_user_id"),
+        author
+        == (
+            release_app.get("bot_user_id"),
+            release_app.get("login"),
+            "Bot",
+        ),
+        "release App commit author is unexpected",
+    )
+    require(
+        author[0] == release_app.get("bot_user_id"),
         "release App commit author ID is unexpected",
     )
-    committer = require_mapping(commit.get("committer"), "release App commit committer")
+    committer = rest_account(commit.get("committer"), "release App commit committer")
     require(
-        committer.get("login") == release_app.get("commit_committer_login"),
+        committer
+        == (
+            release_app.get("commit_committer_user_id"),
+            release_app.get("commit_committer_login"),
+            "User",
+        ),
         "release App commit committer is unexpected",
     )
     require(
-        committer.get("id") == release_app.get("commit_committer_user_id"),
+        committer[0] == release_app.get("commit_committer_user_id"),
         "release App commit committer ID is unexpected",
+    )
+    require(
+        signature.kind == "GpgSignature"
+        and signature.was_signed_by_github
+        and signature.signer_id == release_app.get("commit_committer_user_id")
+        and signature.signer_login == release_app.get("commit_committer_login")
+        and signature.email == release_app.get("commit_committer_email"),
+        "release App commit does not have the exact GitHub web-flow signature",
     )
     details = require_mapping(commit.get("commit"), "release App commit details")
     raw_author = require_mapping(details.get("author"), "release App raw commit author")
@@ -703,7 +1364,6 @@ def require_release_app_change(
         raw_committer.get("email") == release_app.get("commit_committer_email"),
         "release App raw commit committer email is unexpected",
     )
-    require_verified(commit, "release App commit")
     require_author_dco(commit, label="release App commit")
 
 
@@ -711,6 +1371,9 @@ def require_contributor_change(
     api: GitHubApi,
     repository: str,
     commits: Sequence[Mapping[str, Any]],
+    signatures: Mapping[str, Mapping[str, Any]],
+    *,
+    adopted: bool,
 ) -> None:
     for index, summary in enumerate(commits):
         sha = validate_sha(summary.get("sha"), f"contributor commit {index} SHA")
@@ -719,8 +1382,16 @@ def require_contributor_change(
             commit.get("parents"), f"contributor commit {index} parents"
         )
         require(len(parents) == 1, f"contributor commit {index} must be linear")
-        require_verified(commit, f"contributor commit {index}")
-        require_author_dco(commit, label=f"contributor commit {index}")
+        label = f"contributor commit {index}"
+        signature = signature_identity(
+            require_mapping(signatures.get(sha), f"{label} signature result"),
+            label,
+        )
+        require(signature.oid == sha, f"{label} signature OID is unexpected")
+        if adopted:
+            require_adopted_commit(api, repository, commit, signature, label)
+        else:
+            require_direct_contributor_commit(commit, signature, label)
 
 
 @dataclass(frozen=True)
@@ -728,13 +1399,53 @@ class Authorization:
     repository: str
     pull_number: int
     commenter: str
+    commenter_id: int
+    commenter_type: str
     head_sha: str
     base_sha: str
     head_repository: str
     head_ref: str
     policy_sha: str
     comment_id: int
+    comment_body: str
+    comment_created_at: str
+    comment_updated_at: str
+    command_mode: str
+    sensitive_inventory_digest: str
+    sensitive: bool
     candidate_ci_required: bool
+
+    def canonical_binding(self) -> bytes:
+        value = {
+            "version": 2,
+            "repository": self.repository,
+            "pull_number": self.pull_number,
+            "head_sha": self.head_sha,
+            "base_sha": self.base_sha,
+            "head_repository": self.head_repository,
+            "head_ref": self.head_ref,
+            "policy_sha": self.policy_sha,
+            "comment": {
+                "id": self.comment_id,
+                "body": self.comment_body,
+                "created_at": self.comment_created_at,
+                "updated_at": self.comment_updated_at,
+                "user": {
+                    "id": self.commenter_id,
+                    "login": self.commenter,
+                    "type": self.commenter_type,
+                },
+            },
+            "command_mode": self.command_mode,
+            "sensitive_inventory_digest": self.sensitive_inventory_digest,
+            "sensitive": self.sensitive,
+            "candidate_ci_required": self.candidate_ci_required,
+        }
+        return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+    @property
+    def binding_digest(self) -> str:
+        return hashlib.sha256(self.canonical_binding()).hexdigest()
 
     def github_outputs(self) -> Mapping[str, str]:
         return {
@@ -745,6 +1456,9 @@ class Authorization:
             "head_repository": self.head_repository,
             "policy_sha": self.policy_sha,
             "comment_id": str(self.comment_id),
+            "binding_digest": self.binding_digest,
+            "command_mode": self.command_mode,
+            "sensitive": str(self.sensitive).lower(),
             "candidate_ci_required": str(self.candidate_ci_required).lower(),
         }
 
@@ -783,6 +1497,69 @@ class CallBinding:
         )
 
 
+@dataclass(frozen=True)
+class CommentBinding:
+    comment_id: int
+    body: str
+    created_at: str
+    updated_at: str
+    user_id: int
+    user_login: str
+    user_type: str
+
+
+def timestamp(value: Any, label: str) -> str:
+    encoded = require_string(value, label)
+    try:
+        parsed = dt.datetime.fromisoformat(encoded.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise PolicyError(f"{label} is not an ISO-8601 timestamp") from error
+    require(parsed.tzinfo is not None, f"{label} must include a timezone")
+    return encoded
+
+
+def comment_binding(value: Mapping[str, Any], label: str) -> CommentBinding:
+    user = require_mapping(value.get("user"), f"{label} user")
+    user_id = require_integer(user.get("id"), f"{label} user ID")
+    require(user_id > 0, f"{label} user ID must be positive")
+    user_type = require_string(user.get("type"), f"{label} user type")
+    require(user_type == "User", f"{label} must be authored by a GitHub User")
+    comment_id = require_integer(value.get("id"), f"{label} ID")
+    require(comment_id > 0, f"{label} ID must be positive")
+    return CommentBinding(
+        comment_id=comment_id,
+        body=require_string(value.get("body"), f"{label} body"),
+        created_at=timestamp(value.get("created_at"), f"{label} created_at"),
+        updated_at=timestamp(value.get("updated_at"), f"{label} updated_at"),
+        user_id=user_id,
+        user_login=validate_login(user.get("login"), f"{label} user login"),
+        user_type=user_type,
+    )
+
+
+def require_comment_unchanged(
+    api: GitHubApi,
+    repository: str,
+    pull_number: int,
+    expected: CommentBinding,
+    phase: str,
+) -> None:
+    current = require_mapping(
+        api.get(repo_api_path(repository, f"/issues/comments/{expected.comment_id}")),
+        "rechecked authorization comment",
+    )
+    expected_issue_url = f"{api.api_url}{repo_api_path(repository, f'/issues/{pull_number}')}"
+    require(
+        current.get("issue_url") == expected_issue_url,
+        f"authorization comment moved during {phase}",
+    )
+    require(
+        comment_binding(current, "rechecked authorization comment") == expected,
+        f"authorization comment or identity changed during {phase}",
+    )
+    require_writer(api, repository, expected.user_login, "comment author")
+
+
 def authorize(
     event: Mapping[str, Any],
     config: Mapping[str, Any],
@@ -791,6 +1568,7 @@ def authorize(
 ) -> Authorization:
     require(event.get("action") == "created", "only newly created comments are accepted")
     repository = validate_repository(environment.get("GITHUB_REPOSITORY"), "GITHUB_REPOSITORY")
+    require(repository == config.get("repository"), "policy repository does not match the workflow repository")
     event_repo = require_mapping(event.get("repository"), "event repository")
     require(event_repo.get("full_name") == repository, "event repository does not match the workflow repository")
 
@@ -799,15 +1577,28 @@ def authorize(
     pull_number = require_integer(issue.get("number"), "pull request number")
     require(pull_number > 0, "pull request number must be positive")
     comment = require_mapping(event.get("comment"), "event comment")
-    requested_sha = exact_command(comment.get("body"))
-    comment_id = require_integer(comment.get("id"), "comment id")
-    require(comment_id > 0, "comment id must be positive")
-    commenter = validate_login(require_mapping(comment.get("user"), "comment user").get("login"), "commenter")
+    event_comment = comment_binding(comment, "event comment")
+    requested = exact_command(event_comment.body)
+    comment_id = event_comment.comment_id
+    commenter = event_comment.user_login
+    sender = require_mapping(event.get("sender"), "event sender")
+    require(
+        rest_account(sender, "event sender")
+        == (event_comment.user_id, event_comment.user_login, event_comment.user_type),
+        "event sender does not match the comment author",
+    )
     actor = validate_login(environment.get("GITHUB_ACTOR"), "GITHUB_ACTOR")
     triggering_actor = validate_login(environment.get("GITHUB_TRIGGERING_ACTOR"), "GITHUB_TRIGGERING_ACTOR")
     require(commenter == actor, "workflow actor does not match the comment author")
     require_writer(api, repository, commenter, "comment author")
     require_writer(api, repository, triggering_actor, "triggering actor")
+    require_comment_unchanged(
+        api,
+        repository,
+        pull_number,
+        event_comment,
+        "initial authorization",
+    )
 
     policy_sha = validate_sha(environment.get("POLICY_SHA"), "POLICY_SHA")
     branch = require_string(config.get("default_branch"), "default_branch")
@@ -825,7 +1616,7 @@ def authorize(
     require(base_sha == main_sha, "pull request base is not current main")
     head = require_mapping(pull.get("head"), "pull request head")
     head_sha = validate_sha(head.get("sha"), "pull request head SHA")
-    require(head_sha == requested_sha, "comment SHA is not the exact current pull request head")
+    require(head_sha == requested.head_sha, "comment SHA is not the exact current pull request head")
     head_repo = require_mapping(head.get("repo"), "pull request head repository")
     head_repository = validate_repository(head_repo.get("full_name"), "pull request head repository")
     head_ref = require_string(head.get("ref"), "pull request head ref")
@@ -840,6 +1631,15 @@ def authorize(
     commits = pull_commits(api, repository, pull_number, commit_count)
     require(validate_sha(commits[-1].get("sha"), "last pull request commit SHA") == head_sha, "commit list does not end at pull request head")
     require_commit_chain(commits, base_sha, head_sha)
+    commit_oids = [
+        validate_sha(commit.get("sha"), f"pull request commit {index} SHA")
+        for index, commit in enumerate(commits)
+    ]
+    signatures = api.commit_signatures(repository, pull_number, commit_oids)
+
+    repository_kind = require_string(config.get("repository_kind"), "repository_kind")
+    inventory = sensitive_inventory(base_tree, head_tree, paths, statuses, repository_kind)
+    require_trusted_gitlink_lineage(api, config, base_tree, head_tree, paths)
 
     release_app = require_mapping(config.get("release_app"), "release_app")
     user = require_mapping(pull.get("user"), "pull request author")
@@ -848,21 +1648,37 @@ def authorize(
         or user.get("id") == release_app.get("bot_user_id")
     )
     if is_release_app:
+        require(not requested.adoption, "release App proposals use the ordinary authorization command")
         require_release_app_change(
-            api, repository, pull, commits, paths, statuses, main_sha, release_app
+            api,
+            repository,
+            pull,
+            commits,
+            paths,
+            statuses,
+            main_sha,
+            release_app,
+            signatures,
         )
     else:
-        require_contributor_change(api, repository, commits)
-
-    patterns = [
-        require_string(value, "candidate CI path pattern")
-        for value in require_sequence(
-            config.get("candidate_ci_paths"), "candidate_ci_paths"
+        require(
+            requested.adoption == inventory.present,
+            "sensitive changes require /ok to test-and-adopt; ordinary changes require /ok to test",
         )
-    ]
-    candidate_ci_required = any(
-        matches_path_inventory(path, patterns) for path in paths
-    )
+        if inventory.present and head_repository != repository:
+            require(
+                pull.get("maintainer_can_modify") is True,
+                "sensitive fork changes require maintainer edits on the original pull request",
+            )
+        require_contributor_change(
+            api,
+            repository,
+            commits,
+            signatures,
+            adopted=inventory.present,
+        )
+
+    candidate_ci_required = bool(config.get("supplemental_candidate_ci")) and inventory.present
 
     require_live_authorization_state(
         api,
@@ -874,17 +1690,32 @@ def authorize(
         head_repository,
         head_ref,
     )
+    require_comment_unchanged(
+        api,
+        repository,
+        pull_number,
+        event_comment,
+        "final authorization",
+    )
 
     return Authorization(
         repository=repository,
         pull_number=pull_number,
         commenter=commenter,
+        commenter_id=event_comment.user_id,
+        commenter_type=event_comment.user_type,
         head_sha=head_sha,
         base_sha=base_sha,
         head_repository=head_repository,
         head_ref=head_ref,
         policy_sha=policy_sha,
         comment_id=comment_id,
+        comment_body=event_comment.body,
+        comment_created_at=event_comment.created_at,
+        comment_updated_at=event_comment.updated_at,
+        command_mode=requested.mode,
+        sensitive_inventory_digest=inventory.digest,
+        sensitive=inventory.present,
         candidate_ci_required=candidate_ci_required,
     )
 
@@ -907,6 +1738,7 @@ def original_comment_event(
         "repository": {"full_name": repository},
         "issue": {"number": pull_number, "pull_request": {}},
         "comment": comment,
+        "sender": comment.get("user"),
     }
 
 
@@ -919,6 +1751,7 @@ def require_authorization_values(
     base_sha: str,
     policy_sha: str,
     comment_id: int,
+    binding_digest: str | None = None,
 ) -> None:
     require(authorization.repository == repository, "authorized repository changed")
     require(authorization.pull_number == pull_number, "authorized pull request changed")
@@ -926,6 +1759,11 @@ def require_authorization_values(
     require(authorization.base_sha == base_sha, "authorized base SHA changed")
     require(authorization.policy_sha == policy_sha, "authorized policy SHA changed")
     require(authorization.comment_id == comment_id, "authorized comment changed")
+    if binding_digest is not None:
+        require(
+            authorization.binding_digest == binding_digest,
+            "authorization binding digest changed",
+        )
 
 
 def authorize_live_comment(
@@ -1061,6 +1899,7 @@ def authorize_call(
         base_sha=base_sha,
         policy_sha=policy_sha,
         comment_id=comment_id,
+        binding_digest=event_authorization.binding_digest,
     )
     return live_authorization
 
@@ -1083,17 +1922,16 @@ class ExternalId:
     head_sha: str
     base_sha: str
     policy_sha: str
+    binding_digest: str
     run_id: int
     run_attempt: int
 
     def encode(self) -> str:
         fields = (
-            "v1",
-            self.repository,
+            "v2",
             str(self.pull_number),
             self.head_sha,
-            self.base_sha,
-            self.policy_sha,
+            validate_digest(self.binding_digest, "authorization binding digest"),
             str(self.run_id),
             str(self.run_attempt),
         )
@@ -1103,23 +1941,30 @@ class ExternalId:
         return encoded
 
     @staticmethod
-    def decode(value: Any) -> "ExternalId":
+    def decode(
+        value: Any,
+        *,
+        repository: str = "unknown/unknown",
+        base_sha: str = "0000000000000000000000000000000000000000",
+        policy_sha: str = "0000000000000000000000000000000000000000",
+    ) -> "ExternalId":
         encoded = require_string(value, "check external ID")
         fields = encoded.split("|")
-        require(len(fields) == 8 and fields[0] == "v1", "check external ID is invalid")
+        require(len(fields) == 6 and fields[0] == "v2", "check external ID is invalid")
         try:
-            pull_number = int(fields[2])
-            run_id = int(fields[6])
-            run_attempt = int(fields[7])
+            pull_number = int(fields[1])
+            run_id = int(fields[4])
+            run_attempt = int(fields[5])
         except ValueError as error:
             raise PolicyError("check external ID contains a non-integer field") from error
         require(pull_number > 0 and run_id > 0 and run_attempt > 0, "check external ID integers must be positive")
         return ExternalId(
-            repository=validate_repository(fields[1], "external ID repository"),
+            repository=validate_repository(repository, "external ID repository context"),
             pull_number=pull_number,
-            head_sha=validate_sha(fields[3], "external ID head SHA"),
-            base_sha=validate_sha(fields[4], "external ID base SHA"),
-            policy_sha=validate_sha(fields[5], "external ID policy SHA"),
+            head_sha=validate_sha(fields[2], "external ID head SHA"),
+            base_sha=validate_sha(base_sha, "external ID base SHA context"),
+            policy_sha=validate_sha(policy_sha, "external ID policy SHA context"),
+            binding_digest=validate_digest(fields[3], "external ID binding digest"),
             run_id=run_id,
             run_attempt=run_attempt,
         )
@@ -1192,8 +2037,13 @@ def start_check(
     for check in checks:
         if not check_is_from_app(check, app_slug) or check.get("status") in TERMINAL_CHECK_STATUSES:
             continue
-        prior = ExternalId.decode(check.get("external_id"))
-        if prior.repository == external.repository and prior.pull_number == external.pull_number and prior.head_sha == external.head_sha:
+        prior = ExternalId.decode(
+            check.get("external_id"),
+            repository=external.repository,
+            base_sha=external.base_sha,
+            policy_sha=external.policy_sha,
+        )
+        if prior.pull_number == external.pull_number and prior.head_sha == external.head_sha:
             check_id = require_integer(check.get("id"), "prior check id")
             complete_check(
                 api,
@@ -1241,6 +2091,28 @@ def parse_results(values: Iterable[str], expected_jobs: Sequence[str]) -> Mappin
     return results
 
 
+def parse_results_json(value: str, expected_jobs: Sequence[str]) -> Mapping[str, str]:
+    require(len(value.encode("utf-8")) <= 16 * 1024, "job result JSON exceeds its limit")
+    try:
+        decoded = json.loads(value)
+    except json.JSONDecodeError as error:
+        raise PolicyError("job result JSON is invalid") from error
+    mapping = require_mapping(decoded, "job results")
+    require(
+        set(mapping) == set(expected_jobs),
+        "reported jobs do not exactly match the protected inventory",
+    )
+    results: dict[str, str] = {}
+    for job in expected_jobs:
+        result = require_string(mapping.get(job), f"job {job} result")
+        require(
+            result in {"success", "failure", "cancelled", "skipped"},
+            f"job {job!r} has unknown result {result!r}",
+        )
+        results[job] = result
+    return results
+
+
 def validate_check_value(
     check: Mapping[str, Any],
     config: Mapping[str, Any],
@@ -1284,7 +2156,7 @@ def finish_check(
     external: ExternalId,
     comment_id: int,
     check_id: int,
-    result_values: Iterable[str],
+    results_json: str,
     observed_app_slug: str,
 ) -> None:
     check = validate_check(app_api, config, external, check_id, observed_app_slug)
@@ -1305,8 +2177,12 @@ def finish_check(
             run_id=external.run_id,
             run_attempt=external.run_attempt,
         )
+        require(
+            current.binding_digest == external.binding_digest,
+            "authorization binding changed before finalization",
+        )
         expected = [require_string(value, "expected job") for value in require_sequence(config.get("expected_jobs"), "expected_jobs")]
-        results = parse_results(result_values, expected)
+        results = parse_results_json(results_json, expected)
         failed = [
             (job, result)
             for job, result in results.items()
@@ -1320,6 +2196,52 @@ def finish_check(
         if failed:
             details = ", ".join(f"{job}={result}" for job, result in failed)
             raise PolicyError(f"required candidate jobs did not all succeed: {details}")
+
+        current = authorize_call(
+            event,
+            config,
+            auth_api,
+            environment,
+            repository=external.repository,
+            pull_number=external.pull_number,
+            head_sha=external.head_sha,
+            base_sha=external.base_sha,
+            policy_sha=external.policy_sha,
+            comment_id=comment_id,
+            run_id=external.run_id,
+            run_attempt=external.run_attempt,
+        )
+        require(
+            current.binding_digest == external.binding_digest,
+            "authorization binding changed immediately before success",
+        )
+        branch = require_string(config.get("default_branch"), "default_branch")
+        require_live_authorization_state(
+            auth_api,
+            external.repository,
+            branch,
+            external.pull_number,
+            external.base_sha,
+            external.head_sha,
+            current.head_repository,
+            current.head_ref,
+            phase="pre-success authorization",
+        )
+        require_comment_unchanged(
+            auth_api,
+            external.repository,
+            external.pull_number,
+            CommentBinding(
+                comment_id=current.comment_id,
+                body=current.comment_body,
+                created_at=current.comment_created_at,
+                updated_at=current.comment_updated_at,
+                user_id=current.commenter_id,
+                user_login=current.commenter,
+                user_type=current.commenter_type,
+            ),
+            "pre-success authorization",
+        )
     except PolicyError as caught:
         error = caught
 
@@ -1341,7 +2263,6 @@ def finish_check(
             # branch and pull-request refs. Narrow that unavoidable window by
             # checking the exact state again after success is visible. Strict
             # up-to-date branch protection remains the merge-time backstop.
-            branch = require_string(config.get("default_branch"), "default_branch")
             require_live_authorization_state(
                 auth_api,
                 external.repository,
@@ -1352,6 +2273,21 @@ def finish_check(
                 current.head_repository,
                 current.head_ref,
                 phase="final check reconciliation",
+            )
+            require_comment_unchanged(
+                auth_api,
+                external.repository,
+                external.pull_number,
+                CommentBinding(
+                    comment_id=current.comment_id,
+                    body=current.comment_body,
+                    created_at=current.comment_created_at,
+                    updated_at=current.comment_updated_at,
+                    user_id=current.commenter_id,
+                    user_login=current.commenter,
+                    user_type=current.commenter_type,
+                ),
+                "final check reconciliation",
             )
         except PolicyError as reconciliation_error:
             failed = complete_check(
@@ -1620,14 +2556,16 @@ def pending_checks_for_run(
     for check in checks:
         if not check_is_from_app(check, app_slug) or check.get("status") in TERMINAL_CHECK_STATUSES:
             continue
-        external = ExternalId.decode(check.get("external_id"))
+        external = ExternalId.decode(
+            check.get("external_id"),
+            repository=repository,
+            policy_sha=policy_sha,
+        )
         if (
-            external.repository == repository
-            and external.pull_number == pull_number
+            external.pull_number == pull_number
             and external.head_sha == head_sha
             and external.run_id == run_id
             and external.run_attempt == run_attempt
-            and external.policy_sha == policy_sha
         ):
             matches.append((check, external))
     return matches
@@ -1676,9 +2614,10 @@ def close_pending_check_for_run(
             repository=external.repository,
             pull_number=external.pull_number,
             head_sha=external.head_sha,
-            base_sha=external.base_sha,
+            base_sha=authorization.base_sha,
             policy_sha=external.policy_sha,
             comment_id=run.binding.comment_id,
+            binding_digest=external.binding_digest,
         )
     except PolicyError as error:
         summary = f"{summary} Final state validation failed: {error}"
@@ -1821,6 +2760,7 @@ def external_from_args(args: argparse.Namespace) -> ExternalId:
         head_sha=validate_sha(args.head_sha, "head SHA"),
         base_sha=validate_sha(args.base_sha, "base SHA"),
         policy_sha=validate_sha(args.policy_sha, "policy SHA"),
+        binding_digest=validate_digest(args.binding_digest, "binding digest"),
         run_id=args.run_id,
         run_attempt=args.run_attempt,
     )
@@ -1832,6 +2772,7 @@ def add_external_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--head-sha", required=True)
     parser.add_argument("--base-sha", required=True)
     parser.add_argument("--policy-sha", required=True)
+    parser.add_argument("--binding-digest", required=True)
     parser.add_argument("--run-id", required=True, type=int)
     parser.add_argument("--run-attempt", required=True, type=int)
 
@@ -1862,7 +2803,7 @@ def build_parser() -> argparse.ArgumentParser:
     finish_parser.add_argument("--config", required=True)
     finish_parser.add_argument("--check-id", required=True, type=int)
     finish_parser.add_argument("--comment-id", required=True, type=int)
-    finish_parser.add_argument("--result", action="append", default=[])
+    finish_parser.add_argument("--results-json", required=True)
     add_external_arguments(finish_parser)
 
     inspect_parser = subparsers.add_parser("inspect-run")
@@ -1879,6 +2820,10 @@ def build_parser() -> argparse.ArgumentParser:
     sweep_parser = subparsers.add_parser("sweep")
     sweep_parser.add_argument("--config", required=True)
     sweep_parser.add_argument("--repository", required=True)
+
+    verify_token_parser = subparsers.add_parser("verify-app-token")
+    verify_token_parser.add_argument("--config", required=True)
+    verify_token_parser.add_argument("--repository", required=True)
     return parser
 
 
@@ -1948,13 +2893,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             external_from_args(args),
             args.comment_id,
             args.check_id,
-            args.result,
+            args.results_json,
             required_env("APP_SLUG"),
         )
         print(f"Finished App check {args.check_id}.")
         return 0
 
     repository = validate_repository(args.repository)
+    if args.command == "verify-app-token":
+        require_app_token_repository_scope(
+            GitHubApi(required_env("APP_TOKEN"), api_url), repository
+        )
+        print(f"Verified App token repository scope for {repository}.")
+        return 0
+
     if args.command == "inspect-run":
         protected = completed_run_from_event(
             GitHubApi(required_env("GITHUB_TOKEN"), api_url),

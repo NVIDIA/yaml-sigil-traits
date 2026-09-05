@@ -1,5 +1,7 @@
 {
-  "version": 2,
+  "version": 4,
+  "repository": "NVIDIA/yaml-sigil-traits",
+  "repository_kind": "traits",
   "default_branch": "main",
   "workflow_file": ".github/workflows/pr-ci-command.yml",
   "required_check": "Required CI",
@@ -23,31 +25,17 @@
   "expected_jobs": [
     "commit_policy",
     "workflow_lint",
+    "platform_verifier",
     "static_checks",
     "rust",
     "candidate_ci"
   ],
-  "candidate_ci_paths": [
-    ".cargo/**",
-    "**/.cargo/**",
-    ".github/workflows/ci.yml",
-    ".github/workflows/pr-ci.yml",
-    "rust-toolchain",
-    "rust-toolchain.toml",
-    "**/rust-toolchain",
-    "**/rust-toolchain.toml",
-    "rustfmt.toml",
-    ".rustfmt.toml",
-    "**/rustfmt.toml",
-    "**/.rustfmt.toml",
-    "clippy.toml",
-    ".clippy.toml",
-    "**/clippy.toml",
-    "**/.clippy.toml",
-    ".rumdl.toml",
-    "rumdl.toml",
-    "deny.toml",
-    "deny.exceptions.toml",
-    "xtask/**"
+  "supplemental_candidate_ci": true,
+  "trusted_gitlinks": [
+    {
+      "path": "source-spec",
+      "repository": "NVIDIA/yaml-sigil-spec",
+      "branch": "main"
+    }
   ]
 }

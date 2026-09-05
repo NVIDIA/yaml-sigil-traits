@@ -5,6 +5,7 @@
 //! `cargo xtask <COMMAND>`.
 
 mod bounded_process;
+mod cargo_metadata_output;
 mod ci;
 mod crate_archive;
 mod github;
@@ -15,6 +16,7 @@ mod release_baseline;
 mod release_policy;
 mod release_proposal;
 mod release_version;
+mod safe_file;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -106,6 +108,7 @@ fn workspace_root() -> PathBuf {
 }
 
 fn resolve_ci_root(candidate_root: Option<PathBuf>) -> Result<PathBuf, String> {
+    require_alternate_candidate_support(candidate_root.is_some())?;
     let candidate = candidate_root.unwrap_or_else(workspace_root);
     let candidate = candidate.canonicalize().map_err(|error| {
         format!(
@@ -122,17 +125,30 @@ fn resolve_ci_root(candidate_root: Option<PathBuf>) -> Result<PathBuf, String> {
     Ok(candidate)
 }
 
+fn require_alternate_candidate_support(explicit: bool) -> Result<(), &'static str> {
+    if explicit && cfg!(all(unix, not(target_os = "linux"))) {
+        return Err("alternate --candidate-root validation is unsupported on non-Linux Unix hosts");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn ci_candidate_root_is_repository_scoped() {
+    fn ci_candidate_root_is_repository_scoped_and_platform_bounded() {
         let root = workspace_root();
-        assert_eq!(
-            resolve_ci_root(Some(root.clone())).unwrap(),
-            root.canonicalize().unwrap()
-        );
+        assert_eq!(resolve_ci_root(None).unwrap(), root.canonicalize().unwrap());
+        let alternate = resolve_ci_root(Some(root));
+        if cfg!(all(unix, not(target_os = "linux"))) {
+            assert_eq!(
+                alternate.unwrap_err(),
+                "alternate --candidate-root validation is unsupported on non-Linux Unix hosts"
+            );
+        } else {
+            assert!(alternate.is_ok());
+        }
         assert!(Cli::try_parse_from(["xtask", "ci", "--candidate-root"]).is_err());
         assert!(Cli::try_parse_from(["xtask", "ci", "--unknown", "value"]).is_err());
     }

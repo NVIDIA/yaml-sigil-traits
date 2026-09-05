@@ -4,7 +4,6 @@
 //! Authorize publication from immutable commits and exact Git trees.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
 use std::path::Path;
 
 use semver::Version;
@@ -18,11 +17,18 @@ use crate::github::release_pr::require_repository_app_commit;
 use crate::github::transport::{Transport, percent_encode};
 use crate::github::{
     APP_EMAIL, APP_ID, APP_LOGIN, RELEASE_BRANCH, WEB_FLOW_EMAIL, WEB_FLOW_ID, WEB_FLOW_LOGIN,
-    WEB_FLOW_NAME, git_line, is_sha, repository_policy_for_root,
+    WEB_FLOW_NAME, git_line, is_sha, repository_policy_for_root, require_captured_ancestry,
 };
+use crate::safe_file;
 
 const MAX_MANUAL_COMMITS: usize = 100;
 const WRITER_PERMISSIONS: &[&str] = &["admin", "maintain", "write"];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum MainRequirement {
+    Exact,
+    Ancestry,
+}
 
 pub(super) fn authorize_command(
     root: &Path,
@@ -32,26 +38,40 @@ pub(super) fn authorize_command(
     baseline_commit: &str,
     github: &mut impl Transport,
 ) -> Result<(), String> {
-    let number = authorize_source(
+    let authorization = authorize_source(
         github,
         repository,
         commit,
         root,
         baseline_version,
         baseline_commit,
+        MainRequirement::Ancestry,
     )?;
-    eprintln!("github: authorized exact merged release proposal PR #{number}");
+    eprintln!(
+        "github: authorized exact merged release proposal PR #{}",
+        authorization.pull_request
+    );
     Ok(())
 }
 
-fn authorize_source(
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceAuthorization {
+    pub(super) pull_request: u64,
+    pub(super) proposal_commit: String,
+    pub(super) base_commit: String,
+    pub(super) owner_id: u64,
+    pub(super) merger_id: u64,
+}
+
+pub(super) fn authorize_source(
     github: &mut impl Transport,
     repository: &str,
     commit: &str,
     root: &Path,
     baseline_version: &str,
     baseline_commit: &str,
-) -> Result<u64, String> {
+    main_requirement: MainRequirement,
+) -> Result<SourceAuthorization, String> {
     if !is_sha(commit) || !is_sha(baseline_commit) {
         return Err("repository or release commit is unsupported".to_string());
     }
@@ -60,7 +80,7 @@ fn authorize_source(
     if git_line(root, &["rev-parse", "HEAD"])? != commit {
         return Err("checkout does not identify the release commit".to_string());
     }
-    require_main(github, repository, commit)?;
+    require_main_position(github, repository, commit, main_requirement)?;
     let current = manifest_release_version(root, repository)?;
     let stable_promotion = is_stable_promotion(&baseline, &current);
     let manual_branch = format!("release-plz-manual-{current}");
@@ -144,15 +164,26 @@ fn authorize_source(
     )?;
 
     // Re-read the mutable authorities immediately before granting publication.
-    require_main(github, repository, commit)?;
+    require_main_position(github, repository, commit, main_requirement)?;
     let final_pull: PullRequest = github.get(&format!("repos/{repository}/pulls/{number}"))?;
     require_unchanged_pull(&final_pull, &association, repository, commit)?;
     let final_merger = final_pull
         .merged_by
         .as_ref()
         .ok_or_else(|| "release pull request lost its merger".to_string())?;
-    require_writer(github, repository, final_merger, "release merger")?;
-    Ok(number)
+    require_current_release_writers(
+        github,
+        repository,
+        final_merger,
+        manual_proposal.then_some(&final_pull.user),
+    )?;
+    Ok(SourceAuthorization {
+        pull_request: number,
+        proposal_commit: proposal.sha.clone(),
+        base_commit: base_sha.to_string(),
+        owner_id: pull.user.id,
+        merger_id: final_merger.id,
+    })
 }
 
 fn release_version(value: &str) -> Result<Version, String> {
@@ -173,7 +204,7 @@ fn release_version(value: &str) -> Result<Version, String> {
 }
 
 fn manifest_release_version(root: &Path, repository: &str) -> Result<Version, String> {
-    let body = fs::read_to_string(root.join("Cargo.toml"))
+    let body = safe_file::read_manifest(root, Path::new("Cargo.toml"))
         .map_err(|error| format!("read release manifest: {error}"))?;
     let document = body
         .parse::<DocumentMut>()
@@ -220,11 +251,18 @@ fn exact_merged_association(
             .merged_at
             .as_ref()
             .is_some_and(|value| !value.is_empty())
-        && pull.merge_commit_sha.as_deref() == Some(commit)
+        && integrated_commit_matches(pull, commit)
         && (app || manual)
         && pull.head.repo.full_name == repository
         && pull.base.repo.full_name == repository
         && pull.base.branch == "main"
+}
+
+fn integrated_commit_matches(pull: &PullRequest, commit: &str) -> bool {
+    match pull.merge_commit_sha.as_deref() {
+        Some(merge_commit) => merge_commit == commit,
+        None => pull.head.sha == commit,
+    }
 }
 
 fn require_unchanged_pull(
@@ -236,7 +274,7 @@ fn require_unchanged_pull(
     if detailed.number != associated.number
         || detailed.state != "closed"
         || detailed.merged_at != associated.merged_at
-        || detailed.merge_commit_sha.as_deref() != Some(commit)
+        || !integrated_commit_matches(detailed, commit)
         || detailed.user != associated.user
         || detailed.head != associated.head
         || detailed.base != associated.base
@@ -269,6 +307,19 @@ fn require_writer(
         || permission.user.id != user.id
     {
         return Err(format!("{label} lacks current write authority"));
+    }
+    Ok(())
+}
+
+fn require_current_release_writers(
+    github: &mut impl Transport,
+    repository: &str,
+    merger: &User,
+    manual_owner: Option<&User>,
+) -> Result<(), String> {
+    require_writer(github, repository, merger, "release merger")?;
+    if let Some(owner) = manual_owner {
+        require_writer(github, repository, owner, "release owner")?;
     }
     Ok(())
 }
@@ -470,6 +521,18 @@ fn allowed_tree_path(repository: &str, path: &str) -> bool {
     repository_policy(repository).is_some_and(|policy| policy.generated_paths.contains(&path))
 }
 
+fn require_main_position(
+    github: &mut impl Transport,
+    repository: &str,
+    commit: &str,
+    requirement: MainRequirement,
+) -> Result<(), String> {
+    match requirement {
+        MainRequirement::Exact => require_main(github, repository, commit),
+        MainRequirement::Ancestry => require_captured_ancestry(github, repository, commit),
+    }
+}
+
 fn require_main(github: &mut impl Transport, repository: &str, commit: &str) -> Result<(), String> {
     let value: crate::github::models::GitRef =
         github.get(&format!("repos/{repository}/git/ref/heads/main"))?;
@@ -497,6 +560,21 @@ mod tests {
             kind: "blob".to_string(),
             sha: sha.to_string().repeat(40),
         }
+    }
+
+    fn user(login: &str, id: u64) -> User {
+        User {
+            login: login.to_string(),
+            id,
+            name: None,
+        }
+    }
+
+    fn permission(user: &User, value: &str) -> Value {
+        json!({
+            "permission": value,
+            "user": {"login": user.login, "id": user.id},
+        })
     }
 
     #[test]
@@ -539,6 +617,69 @@ mod tests {
             sha: "d".repeat(40),
         };
         assert!(is_sha(&identity.sha));
+    }
+
+    #[test]
+    fn merged_association_accepts_only_exact_merge_or_rebase_identity() {
+        let commit = "a".repeat(40);
+        let other = "b".repeat(40);
+        let pull = |merge_commit_sha: Option<&str>, head: &str| {
+            serde_json::from_value::<PullRequest>(json!({
+                "number": 1,
+                "state": "closed",
+                "user": {"login": "owner", "id": 1},
+                "head": {
+                    "ref": "release-plz-manual-0.4.0-rc.2",
+                    "sha": head,
+                    "repo": {"full_name": TRAITS_REPOSITORY},
+                },
+                "base": {
+                    "ref": "main",
+                    "sha": other,
+                    "repo": {"full_name": TRAITS_REPOSITORY},
+                },
+                "node_id": "PR_1",
+                "draft": false,
+                "merged_at": "2026-08-27T21:48:16Z",
+                "merge_commit_sha": merge_commit_sha,
+            }))
+            .unwrap()
+        };
+
+        assert!(integrated_commit_matches(
+            &pull(Some(&commit), &other),
+            &commit
+        ));
+        assert!(integrated_commit_matches(&pull(None, &commit), &commit));
+        assert!(!integrated_commit_matches(&pull(None, &other), &commit));
+        assert!(!integrated_commit_matches(
+            &pull(Some(&other), &commit),
+            &commit
+        ));
+    }
+
+    #[test]
+    fn exact_main_requirement_rejects_an_ancestor() {
+        let commit = "a".repeat(40);
+        let mut github = FakeTransport::new([Expected::json(
+            "GET",
+            &format!("repos/{TRAITS_REPOSITORY}/git/ref/heads/main"),
+            json!({
+                "ref": "refs/heads/main",
+                "object": {"type": "commit", "sha": "b".repeat(40)},
+            }),
+        )]);
+        assert_eq!(
+            require_main_position(
+                &mut github,
+                TRAITS_REPOSITORY,
+                &commit,
+                MainRequirement::Exact,
+            )
+            .unwrap_err(),
+            "protected main changed during source authorization"
+        );
+        github.finish();
     }
 
     fn tree_value(sha: char, entries: Vec<TreeEntry>) -> Value {
@@ -608,5 +749,48 @@ mod tests {
         ]);
         assert!(require_exact_tree_diff(&mut linked, TRAITS_REPOSITORY, &base, &proposal).is_err());
         linked.finish();
+    }
+
+    #[test]
+    fn final_manual_authorization_rechecks_merger_and_owner() {
+        let merger = user("release-merger", 41);
+        let owner = user("release-owner", 42);
+        let path = |user: &User| {
+            format!(
+                "repos/{TRAITS_REPOSITORY}/collaborators/{}/permission",
+                percent_encode(&user.login)
+            )
+        };
+        let mut github = FakeTransport::new([
+            Expected::json("GET", &path(&merger), permission(&merger, "maintain")),
+            Expected::json("GET", &path(&owner), permission(&owner, "write")),
+        ]);
+
+        require_current_release_writers(&mut github, TRAITS_REPOSITORY, &merger, Some(&owner))
+            .unwrap();
+        github.finish();
+    }
+
+    #[test]
+    fn final_manual_authorization_rejects_owner_permission_loss() {
+        let merger = user("release-merger", 41);
+        let owner = user("release-owner", 42);
+        let path = |user: &User| {
+            format!(
+                "repos/{TRAITS_REPOSITORY}/collaborators/{}/permission",
+                percent_encode(&user.login)
+            )
+        };
+        let mut github = FakeTransport::new([
+            Expected::json("GET", &path(&merger), permission(&merger, "admin")),
+            Expected::json("GET", &path(&owner), permission(&owner, "read")),
+        ]);
+
+        let error =
+            require_current_release_writers(&mut github, TRAITS_REPOSITORY, &merger, Some(&owner))
+                .unwrap_err();
+
+        assert_eq!(error, "release owner lacks current write authority");
+        github.finish();
     }
 }

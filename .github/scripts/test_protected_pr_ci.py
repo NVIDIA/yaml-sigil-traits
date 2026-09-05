@@ -9,23 +9,64 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import json
 import os
 import pathlib
+import shutil
+import socket
+import stat
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from unittest import mock
 
 
 MODULE_PATH = pathlib.Path(__file__).with_name("protected_pr_ci.py")
+VERIFIER_PATH = MODULE_PATH.with_name("protected_checkout.py")
+TERMINAL_DRIVER_PATH = MODULE_PATH.with_name("terminal_candidate.py")
+TERMINAL_SHELL_PATH = MODULE_PATH.with_name("run-terminal-candidate.sh")
+CARGO_PROXY_PATH = MODULE_PATH.with_name("cargo_egress_proxy.py")
+CARGO_SOURCE_POLICY_PATH = MODULE_PATH.parent.parent / "cargo-source-policy.toml"
 COMMIT_POLICY_PATH = MODULE_PATH.with_name("check-pull-request-commits.sh")
 POLICY_PATH = MODULE_PATH.parent.parent / "protected-pr-ci.json"
+COMMAND_WORKFLOW_PATH = MODULE_PATH.parent.parent / "workflows" / "pr-ci-command.yml"
+REUSABLE_WORKFLOW_PATH = MODULE_PATH.parent.parent / "workflows" / "pr-ci.yml"
+CI_WORKFLOW_PATH = MODULE_PATH.parent.parent / "workflows" / "ci.yml"
+RECONCILE_WORKFLOW_PATH = (
+    MODULE_PATH.parent.parent / "workflows" / "pr-ci-reconcile.yml"
+)
+CHECKOUT_ACTION_PATH = (
+    MODULE_PATH.parent.parent
+    / "actions"
+    / "protected-candidate-checkout"
+    / "action.yml"
+)
 SPEC = importlib.util.spec_from_file_location("protected_pr_ci", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None
 controller = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = controller
 SPEC.loader.exec_module(controller)
+VERIFIER_SPEC = importlib.util.spec_from_file_location("protected_checkout", VERIFIER_PATH)
+assert VERIFIER_SPEC is not None and VERIFIER_SPEC.loader is not None
+verifier = importlib.util.module_from_spec(VERIFIER_SPEC)
+sys.modules[VERIFIER_SPEC.name] = verifier
+VERIFIER_SPEC.loader.exec_module(verifier)
+TERMINAL_SPEC = importlib.util.spec_from_file_location(
+    "terminal_candidate", TERMINAL_DRIVER_PATH
+)
+assert TERMINAL_SPEC is not None and TERMINAL_SPEC.loader is not None
+terminal_candidate = importlib.util.module_from_spec(TERMINAL_SPEC)
+sys.modules[TERMINAL_SPEC.name] = terminal_candidate
+TERMINAL_SPEC.loader.exec_module(terminal_candidate)
+CARGO_PROXY_SPEC = importlib.util.spec_from_file_location(
+    "cargo_egress_proxy", CARGO_PROXY_PATH
+)
+assert CARGO_PROXY_SPEC is not None and CARGO_PROXY_SPEC.loader is not None
+cargo_egress_proxy = importlib.util.module_from_spec(CARGO_PROXY_SPEC)
+sys.modules[CARGO_PROXY_SPEC.name] = cargo_egress_proxy
+CARGO_PROXY_SPEC.loader.exec_module(cargo_egress_proxy)
 
 
 REPOSITORY = "NVIDIA/yaml-sigil-example"
@@ -37,6 +78,7 @@ HEAD_TREE_SHA = "e" * 40
 BASE_BLOB_SHA = "1" * 40
 HEAD_BLOB_SHA = "2" * 40
 DIRECTORY_TREE_SHA = "f" * 40
+SPEC_MAIN_SHA = "6" * 40
 RUN_ID = 101
 RUN_ATTEMPT = 1
 WORKFLOW_ID = 701
@@ -55,7 +97,9 @@ MAINTAINER = "maintainer"
 
 def policy() -> dict:
     return {
-        "version": 2,
+        "version": 4,
+        "repository": REPOSITORY,
+        "repository_kind": "traits",
         "default_branch": "main",
         "workflow_file": ".github/workflows/pr-ci-command.yml",
         "required_check": "Required CI",
@@ -74,16 +118,37 @@ def policy() -> dict:
             "allowed_paths": ["Cargo.toml", "CHANGELOG.md"],
         },
         "expected_jobs": ["commit_policy", "workflow_lint", "candidate_ci"],
-        "candidate_ci_paths": [
-            ".cargo/**",
-            "**/.cargo/**",
-            ".github/workflows/ci.yml",
-            ".github/workflows/pr-ci.yml",
-            "deny.toml",
-            "deny.exceptions.toml",
-            "xtask/**",
+        "supplemental_candidate_ci": True,
+        "trusted_gitlinks": [
+            {
+                "path": "source-spec",
+                "repository": "NVIDIA/yaml-sigil-spec",
+                "branch": "main",
+            }
         ],
     }
+
+
+def policy_bash() -> str:
+    """Return Git Bash on Windows instead of the WSL launcher."""
+    if os.name != "nt":
+        return "bash"
+
+    git = shutil.which("git")
+    if git is None:
+        raise RuntimeError("cannot locate Git while resolving Git Bash")
+    git_path = pathlib.Path(git)
+    candidates = (
+        git_path.parent / "bash.exe",
+        git_path.parent.parent / "bin" / "bash.exe",
+        git_path.parent.parent / "usr" / "bin" / "bash.exe",
+        git_path.parent.parent.parent / "bin" / "bash.exe",
+        git_path.parent.parent.parent / "usr" / "bin" / "bash.exe",
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return os.fspath(candidate)
+    raise RuntimeError(f"cannot locate Git Bash beside {git_path}")
 
 
 def event(body: str | None = None) -> dict:
@@ -94,9 +159,16 @@ def event(body: str | None = None) -> dict:
         "comment": {
             "id": 19,
             "body": body if body is not None else f"/ok to test {HEAD_SHA}",
-            "user": {"login": MAINTAINER},
+            "created_at": "2026-08-28T12:00:00Z",
+            "updated_at": "2026-08-28T12:00:00Z",
+            "user": {"id": 1, "login": MAINTAINER, "type": "User"},
         },
+        "sender": {"id": 1, "login": MAINTAINER, "type": "User"},
     }
+
+
+def adoption_event() -> dict:
+    return event(f"/ok to test-and-adopt {HEAD_SHA}")
 
 
 def environment() -> dict[str, str]:
@@ -188,6 +260,8 @@ def git_commit(
     committer_login: str = MAINTAINER,
     author_id: int = 1,
     committer_id: int = 1,
+    author_type: str = "User",
+    committer_type: str = "User",
     author_name: str = "Maintainer",
     author_email: str = "maintainer@example.invalid",
     committer_name: str = "Maintainer",
@@ -207,8 +281,12 @@ def git_commit(
     return {
         "sha": sha,
         "parents": [{"sha": parent}],
-        "author": {"login": author_login, "id": author_id},
-        "committer": {"login": committer_login, "id": committer_id},
+        "author": {"login": author_login, "id": author_id, "type": author_type},
+        "committer": {
+            "login": committer_login,
+            "id": committer_id,
+            "type": committer_type,
+        },
         "commit": {
             "author": {"name": author_name, "email": author_email},
             "committer": {"name": committer_name, "email": committer_email},
@@ -216,6 +294,33 @@ def git_commit(
             "verification": {
                 "verified": verified,
                 "reason": "valid" if verified else "unsigned",
+            },
+        },
+    }
+
+
+def git_signature(
+    *,
+    sha: str = HEAD_SHA,
+    signer_login: str = MAINTAINER,
+    signer_id: int = 1,
+    email: str = "maintainer@example.invalid",
+    valid: bool = True,
+    github_signed: bool = False,
+    kind: str = "GpgSignature",
+) -> dict:
+    return {
+        "oid": sha,
+        "signature": {
+            "__typename": kind,
+            "email": email,
+            "isValid": valid,
+            "state": "VALID" if valid else "INVALID",
+            "wasSignedByGitHub": github_signed,
+            "signer": {
+                "databaseId": signer_id,
+                "login": signer_login,
+                "__typename": "User",
             },
         },
     }
@@ -258,6 +363,7 @@ class FakeAuthorizationApi:
         self.permissions = {MAINTAINER: "write"}
         self.commits = [{"sha": HEAD_SHA, "parents": [{"sha": MAIN_SHA}]}]
         self.details = {HEAD_SHA: git_commit()}
+        self.signatures = {HEAD_SHA: git_signature()}
         self.git_commits = {
             MAIN_SHA: {"sha": MAIN_SHA, "tree": {"sha": BASE_TREE_SHA}},
             HEAD_SHA: {"sha": HEAD_SHA, "tree": {"sha": HEAD_TREE_SHA}},
@@ -277,10 +383,12 @@ class FakeAuthorizationApi:
         self.main_reads = 0
         self.pull_reads = 0
         self.final_pull = None
+        self.spec_main_sha = SPEC_MAIN_SHA
+        self.comparisons = {}
         self.pull = {
             "number": 7,
             "state": "open",
-            "user": {"login": "contributor", "id": 42},
+            "user": {"login": "contributor", "id": 42, "type": "User"},
             "base": {
                 "ref": "main",
                 "sha": MAIN_SHA,
@@ -293,6 +401,15 @@ class FakeAuthorizationApi:
             },
             "changed_files": 1,
             "commits": 1,
+            "maintainer_can_modify": True,
+        }
+
+    def allow_ancestry(self, ancestor: str, descendant: str) -> None:
+        self.comparisons[(ancestor, descendant)] = {
+            "status": "ahead",
+            "merge_base_commit": {"sha": ancestor},
+            "base_commit": {"sha": ancestor},
+            "head_commit": {"sha": descendant},
         }
 
     def set_tree_files(
@@ -329,6 +446,12 @@ class FakeAuthorizationApi:
         if "/collaborators/" in path and path.endswith("/permission"):
             login = path.split("/collaborators/", 1)[1].rsplit("/permission", 1)[0]
             return {"permission": self.permissions.get(login, "none")}
+        if path == "/repos/NVIDIA/yaml-sigil-spec/git/ref/heads/main":
+            return {"object": {"type": "commit", "sha": self.spec_main_sha}}
+        if path.startswith("/repos/NVIDIA/yaml-sigil-spec/compare/"):
+            pair = path.rsplit("/", 1)[1]
+            ancestor, descendant = pair.split("...", 1)
+            return copy.deepcopy(self.comparisons[(ancestor, descendant)])
         if path.endswith("/git/ref/heads/main"):
             self.main_reads += 1
             if self.main_reads == self.main_error_on_read:
@@ -392,52 +515,125 @@ class FakeAuthorizationApi:
             return copy.deepcopy(self.runs)
         raise AssertionError(f"unexpected keyed pagination label {label}")
 
+    def commit_signatures(self, repository, pull_number, oids):
+        self.signature_repository = repository
+        self.signature_pull_number = pull_number
+        return {oid: copy.deepcopy(self.signatures[oid]) for oid in oids}
+
     def post(self, path: str, payload: dict):
         self.posts.append((path, payload))
         return None
+
+
+def authorize_fixture(
+    api: FakeAuthorizationApi,
+    approval: dict | None = None,
+) -> controller.Authorization:
+    selected = approval or event()
+    api.comment = copy.deepcopy(selected["comment"])
+    return controller.authorize(selected, policy(), api, environment())
 
 
 class AuthorizationTests(unittest.TestCase):
     def test_repository_policy_configuration_is_valid(self) -> None:
         controller.load_config(str(POLICY_PATH))
 
-    def test_repository_policy_covers_candidate_validation_surfaces(self) -> None:
+    def test_shared_classifier_covers_candidate_validation_surfaces(self) -> None:
         repository_policy = controller.load_config(str(POLICY_PATH))
-        required = {
-            ".cargo/**",
-            "**/.cargo/**",
+        kind = repository_policy["repository_kind"]
+        for path in (
             ".github/workflows/ci.yml",
+            ".github/workflows/pr-ci-command.yml",
+            ".github/workflows/pr-ci-reconcile.yml",
             ".github/workflows/pr-ci.yml",
+            ".github/scripts/protected_pr_ci.py",
+            ".github/scripts/protected_checkout.py",
+            ".github/scripts/check-pull-request-commits.sh",
+            ".github/protected-pr-ci.json",
+            ".cargo/config.toml",
+            "nested/.cargo/config.toml",
+            "Cargo.toml",
+            "nested/Cargo.lock",
+            "build.rs",
             "deny.toml",
-            "deny.exceptions.toml",
-            "xtask/**",
-        }
-        self.assertLessEqual(required, set(repository_policy["candidate_ci_paths"]))
+            "xtask/src/main.rs",
+            ".release-plz.toml",
+            "RELEASING.md",
+        ):
+            with self.subTest(path=path):
+                self.assertTrue(controller.is_sensitive_path(path, kind))
 
-    def test_repository_directory_patterns_match_roots_and_descendants(self) -> None:
-        repository_policy = controller.load_config(str(POLICY_PATH))
-        declarations = [
-            pattern
-            for pattern in repository_policy["candidate_ci_paths"]
-            if pattern.endswith("/**")
-        ]
-        self.assertTrue(declarations)
-
-        for declaration in declarations:
-            root = declaration[:-3]
-            if root.startswith("**/"):
-                root = f"nested/{root[3:]}"
-            with self.subTest(declaration=declaration, root=root):
-                self.assertTrue(controller.matches_path_inventory(root, [declaration]))
-                self.assertTrue(
-                    controller.matches_path_inventory(
-                        f"{root}/representative-file", [declaration]
-                    )
+    def test_cargo_deny_exception_basenames_are_sensitive(self) -> None:
+        cases = (
+            ("deny.exceptions.toml", True),
+            (".deny.exceptions.toml", True),
+            ("nested/deny.exceptions.toml", True),
+            ("nested/.deny.exceptions.toml", True),
+            (".cargo/deny.exceptions.toml", True),
+            (".cargo/.deny.exceptions.toml", True),
+            ("DeNy.ExCePtIoNs.ToMl", True),
+            ("ＮＥＳＴＥＤ/ＤＥＮＹ．ＥＸＣＥＰＴＩＯＮＳ．ＴＯＭＬ", True),
+            ("deny.exception.toml", False),
+            ("deny-exceptions.toml", False),
+            ("deny.exceptions.toml.example", False),
+            ("nested/cargo-deny.exceptions.toml", False),
+        )
+        for path, expected in cases:
+            with self.subTest(path=path):
+                self.assertEqual(
+                    controller.is_sensitive_path(path, "traits"), expected
                 )
 
-    def test_repository_policy_has_no_path_based_adoption_rule(self) -> None:
-        repository_policy = controller.load_config(str(POLICY_PATH))
-        self.assertNotIn("sensitive_paths", repository_policy)
+    def test_spec_and_rs_classifier_extensions_are_explicit(self) -> None:
+        for path in (
+            "proto/buf.yaml",
+            "proto/buf.lock",
+            "proto/buf.gen.yaml",
+            "ＰＲＯＴＯ/ＢＵＦ.YAML",
+        ):
+            with self.subTest(spec_buf_policy=path):
+                self.assertTrue(controller.is_sensitive_path(path, "spec"))
+        for path in (
+            "buf.yaml",
+            "nested/proto/buf.yaml",
+            "proto/buf.yaml.example",
+            "proto/readme.md",
+        ):
+            with self.subTest(spec_buf_near_miss=path):
+                self.assertFalse(controller.is_sensitive_path(path, "spec"))
+        self.assertTrue(
+            controller.is_sensitive_path(
+                "conformance/rebuild-rs/vendor/acvp/vectors.json", "spec"
+            )
+        )
+        self.assertTrue(
+            controller.is_sensitive_path(
+                "conformance/rebuild-rs/pinned-dir/src/lib.rs", "spec"
+            )
+        )
+        self.assertTrue(
+            controller.is_sensitive_path(
+                "conformance/rebuild-rs/xtask/src/main.rs", "spec"
+            )
+        )
+        for path in (
+            "conformance/rebuild-rs/src/p256.rs",
+            "conformance/rebuild-rs/src/util.rs",
+            "conformance/rebuild-rs/src/wire.rs",
+            "conformance/rebuild-rs/src/main.rs",
+            "conformance/rebuild-rs/src/future/nested.rs",
+        ):
+            with self.subTest(spec_rebuilder_source=path):
+                self.assertTrue(controller.is_sensitive_path(path, "spec"))
+        self.assertFalse(
+            controller.is_sensitive_path(
+                "conformance/rebuild-rs/docs/design.md", "spec"
+            )
+        )
+        self.assertTrue(
+            controller.is_sensitive_path("crates/core/buf.yaml", "rs")
+        )
+        self.assertFalse(controller.is_sensitive_path("README.md", "traits"))
 
     def test_writer_permissions_are_accepted(self) -> None:
         for permission in ("write", "push", "maintain", "admin"):
@@ -462,18 +658,23 @@ class AuthorizationTests(unittest.TestCase):
             controller.authorize(event(), policy(), api, env)
 
     def test_command_is_exact_and_sha_bound(self) -> None:
-        api = FakeAuthorizationApi()
         for body in (
             f" /ok to test {HEAD_SHA}",
             f"/ok to test {HEAD_SHA}\n",
             f"/ok to test {HEAD_SHA.upper()}",
             "/ok to test main",
         ):
+            candidate_event = event(body)
+            api = FakeAuthorizationApi()
+            api.comment = copy.deepcopy(candidate_event["comment"])
             with self.subTest(body=body), self.assertRaises(controller.PolicyError):
-                controller.authorize(event(body), policy(), api, environment())
+                controller.authorize(candidate_event, policy(), api, environment())
 
+        candidate_event = event(f"/ok to test {OLD_SHA}")
+        api = FakeAuthorizationApi()
+        api.comment = copy.deepcopy(candidate_event["comment"])
         with self.assertRaisesRegex(controller.PolicyError, "exact current pull request head"):
-            controller.authorize(event(f"/ok to test {OLD_SHA}"), policy(), api, environment())
+            controller.authorize(candidate_event, policy(), api, environment())
 
     def test_stale_policy_and_base_are_rejected(self) -> None:
         api = FakeAuthorizationApi()
@@ -522,7 +723,9 @@ class AuthorizationTests(unittest.TestCase):
             "renamed",
             previous_filename=".github/workflows/ci.yml",
         )
-        result = controller.authorize(event(), policy(), api, environment())
+        approval = adoption_event()
+        api.comment = copy.deepcopy(approval["comment"])
+        result = controller.authorize(approval, policy(), api, environment())
         self.assertTrue(result.candidate_ci_required)
 
     def test_mutable_pull_file_view_is_never_authoritative(self) -> None:
@@ -535,7 +738,9 @@ class AuthorizationTests(unittest.TestCase):
     def test_workflow_change_from_fork_is_authorized(self) -> None:
         api = FakeAuthorizationApi()
         api.set_change(".github/workflows/ci.yml")
-        result = controller.authorize(event(), policy(), api, environment())
+        approval = adoption_event()
+        api.comment = copy.deepcopy(approval["comment"])
+        result = controller.authorize(approval, policy(), api, environment())
         self.assertEqual(
             result.head_repository, "contributor/yaml-sigil-example"
         )
@@ -549,27 +754,23 @@ class AuthorizationTests(unittest.TestCase):
             with self.subTest(path=path):
                 api = FakeAuthorizationApi()
                 api.set_change(path)
-                result = controller.authorize(event(), policy(), api, environment())
+                approval = adoption_event()
+                api.comment = copy.deepcopy(approval["comment"])
+                result = controller.authorize(
+                    approval, policy(), api, environment()
+                )
                 self.assertTrue(result.candidate_ci_required)
 
-    def test_directory_patterns_cover_roots_descendants_and_near_misses(self) -> None:
-        patterns = [
-            ".cargo/**",
-            "**/.cargo/**",
-            "source-spec/**",
-        ]
+    def test_classifier_directory_roots_descendants_and_near_misses(self) -> None:
         for path in (
             ".cargo",
             ".CARGO/config.toml",
             ".ＣＡＲＧＯ",
             "nested/.cargo",
             "nested/.ＣＡＲＧＯ/config.toml",
-            "source-spec",
-            "SOURCE-SPEC/proto/schema.proto",
-            "ＳＯＵＲＣＥ－ＳＰＥＣ/README.md",
         ):
             with self.subTest(path=path):
-                self.assertTrue(controller.matches_path_inventory(path, patterns))
+                self.assertTrue(controller.is_sensitive_path(path, "traits"))
 
         for path in (
             ".carg",
@@ -580,7 +781,7 @@ class AuthorizationTests(unittest.TestCase):
             "source-specification/README.md",
         ):
             with self.subTest(near_miss=path):
-                self.assertFalse(controller.matches_path_inventory(path, patterns))
+                self.assertFalse(controller.is_sensitive_path(path, "traits"))
 
     def test_unusual_directory_entries_use_the_same_commit_policy(self) -> None:
         for path, leaf in (
@@ -591,14 +792,97 @@ class AuthorizationTests(unittest.TestCase):
             ("nested/ＢＥＮＣＨＥＳ", ("blob", "120000", HEAD_BLOB_SHA)),
             ("examples", ("blob", "120000", HEAD_BLOB_SHA)),
             ("nested/ＥＸＡＭＰＬＥＳ", ("blob", "120000", HEAD_BLOB_SHA)),
-            ("source-spec", ("commit", "160000", HEAD_BLOB_SHA)),
             ("source-spec/README.md", ("blob", "100644", HEAD_BLOB_SHA)),
         ):
             with self.subTest(path=path, entry_type=leaf[0]):
                 api = FakeAuthorizationApi()
                 api.set_tree_files({}, {path: leaf})
-                result = controller.authorize(event(), policy(), api, environment())
+                approval = (
+                    adoption_event()
+                    if controller.is_sensitive_path(path, "traits")
+                    else event()
+                )
+                api.comment = copy.deepcopy(approval["comment"])
+                result = controller.authorize(approval, policy(), api, environment())
                 self.assertEqual(result.head_sha, HEAD_SHA)
+
+    def test_changed_gitlink_requires_adoption_and_approved_forward_lineage(self) -> None:
+        api = FakeAuthorizationApi()
+        api.set_tree_files(
+            {"source-spec": ("commit", "160000", BASE_BLOB_SHA)},
+            {"source-spec": ("commit", "160000", HEAD_BLOB_SHA)},
+        )
+        api.allow_ancestry(BASE_BLOB_SHA, HEAD_BLOB_SHA)
+        api.allow_ancestry(HEAD_BLOB_SHA, SPEC_MAIN_SHA)
+
+        with self.assertRaisesRegex(controller.PolicyError, "sensitive changes require"):
+            controller.authorize(event(), policy(), api, environment())
+
+        result = authorize_fixture(api, adoption_event())
+        self.assertTrue(result.sensitive)
+        self.assertIn(
+            "/repos/NVIDIA/yaml-sigil-spec/compare/"
+            f"{HEAD_BLOB_SHA}...{SPEC_MAIN_SHA}",
+            api.get_paths,
+        )
+
+    def test_unchanged_gitlink_uses_the_protected_base_pin(self) -> None:
+        api = FakeAuthorizationApi()
+        source_spec = ("commit", "160000", BASE_BLOB_SHA)
+        api.set_tree_files(
+            {
+                "source-spec": source_spec,
+                "README.md": ("blob", "100644", BASE_BLOB_SHA),
+            },
+            {
+                "source-spec": source_spec,
+                "README.md": ("blob", "100644", HEAD_BLOB_SHA),
+            },
+        )
+
+        result = controller.authorize(event(), policy(), api, environment())
+        self.assertFalse(result.sensitive)
+        self.assertFalse(any("/compare/" in path for path in api.get_paths))
+
+    def test_gitlink_lineage_rejects_downgrades_and_fork_only_commits(self) -> None:
+        for failure in ("downgrade", "fork-only"):
+            with self.subTest(failure=failure):
+                api = FakeAuthorizationApi()
+                api.set_tree_files(
+                    {"source-spec": ("commit", "160000", BASE_BLOB_SHA)},
+                    {"source-spec": ("commit", "160000", HEAD_BLOB_SHA)},
+                )
+                api.allow_ancestry(BASE_BLOB_SHA, HEAD_BLOB_SHA)
+                api.allow_ancestry(HEAD_BLOB_SHA, SPEC_MAIN_SHA)
+                if failure == "downgrade":
+                    api.comparisons[(BASE_BLOB_SHA, HEAD_BLOB_SHA)][
+                        "merge_base_commit"
+                    ]["sha"] = HEAD_BLOB_SHA
+                else:
+                    api.comparisons[(HEAD_BLOB_SHA, SPEC_MAIN_SHA)][
+                        "merge_base_commit"
+                    ]["sha"] = OLD_SHA
+                with self.assertRaisesRegex(
+                    controller.PolicyError, "approved forward ancestry"
+                ):
+                    authorize_fixture(api, adoption_event())
+
+    def test_gitlink_lineage_rejects_untrusted_or_malformed_entries(self) -> None:
+        api = FakeAuthorizationApi()
+        api.set_tree_files(
+            {"other-spec": ("commit", "160000", BASE_BLOB_SHA)},
+            {"other-spec": ("commit", "160000", HEAD_BLOB_SHA)},
+        )
+        with self.assertRaisesRegex(controller.PolicyError, "trusted lineage policy"):
+            authorize_fixture(api, adoption_event())
+
+        api = FakeAuthorizationApi()
+        api.set_tree_files(
+            {"source-spec": ("commit", "160000", BASE_BLOB_SHA)},
+            {"source-spec": ("blob", "100644", HEAD_BLOB_SHA)},
+        )
+        with self.assertRaisesRegex(controller.PolicyError, "exact commit gitlink"):
+            authorize_fixture(api, adoption_event())
 
     def test_candidate_ci_directory_entries_match_any_leaf_type(self) -> None:
         for path, leaf in (
@@ -610,7 +894,11 @@ class AuthorizationTests(unittest.TestCase):
             with self.subTest(path=path, entry_type=leaf[0]):
                 api = FakeAuthorizationApi()
                 api.set_tree_files({}, {path: leaf})
-                result = controller.authorize(event(), policy(), api, environment())
+                approval = adoption_event()
+                api.comment = copy.deepcopy(approval["comment"])
+                result = controller.authorize(
+                    approval, policy(), api, environment()
+                )
                 self.assertTrue(result.candidate_ci_required)
 
     def test_executable_targets_use_the_same_commit_policy(self) -> None:
@@ -632,25 +920,26 @@ class AuthorizationTests(unittest.TestCase):
             with self.subTest(path=path):
                 api = FakeAuthorizationApi()
                 api.set_change(path)
-                result = controller.authorize(event(), policy(), api, environment())
+                approval = adoption_event()
+                api.comment = copy.deepcopy(approval["comment"])
+                result = controller.authorize(approval, policy(), api, environment())
                 self.assertEqual(result.head_sha, HEAD_SHA)
-                self.assertFalse(result.candidate_ci_required)
+                self.assertTrue(result.candidate_ci_required)
 
-    def test_verified_human_commit_requires_only_exact_author_dco(self) -> None:
+    def test_sensitive_adoption_preserves_author_and_adopter_dco(self) -> None:
         api = FakeAuthorizationApi()
         api.set_change("Cargo.toml")
         api.details[HEAD_SHA] = git_commit(
             author_login="contributor",
+            author_id=42,
             author_name="Contributor",
             author_email="contributor@example.invalid",
             committer_name="Maintainer",
             committer_email="maintainer@example.invalid",
-            message=(
-                "ci: update policy\n\n"
-                "Signed-off-by: Contributor <contributor@example.invalid>\n"
-            ),
         )
-        result = controller.authorize(event(), policy(), api, environment())
+        approval = adoption_event()
+        api.comment = copy.deepcopy(approval["comment"])
+        result = controller.authorize(approval, policy(), api, environment())
         self.assertEqual(
             result.head_repository, "contributor/yaml-sigil-example"
         )
@@ -659,49 +948,40 @@ class AuthorizationTests(unittest.TestCase):
             "ci: update policy\n\n"
             "Signed-off-by: Maintainer <maintainer@example.invalid>\n"
         )
-        with self.assertRaisesRegex(controller.PolicyError, "author's DCO sign-off"):
-            controller.authorize(event(), policy(), api, environment())
+        with self.assertRaisesRegex(controller.PolicyError, "original author's DCO"):
+            controller.authorize(approval, policy(), api, environment())
+
+        api.details[HEAD_SHA]["commit"]["message"] = (
+            "ci: update policy\n\n"
+            "Signed-off-by: Contributor <contributor@example.invalid>\n"
+        )
+        with self.assertRaisesRegex(controller.PolicyError, "adopting committer's DCO"):
+            controller.authorize(approval, policy(), api, environment())
 
     def test_every_human_commit_requires_valid_github_verification(self) -> None:
         api = FakeAuthorizationApi()
         api.set_change("AGENTS.md")
-        api.details[HEAD_SHA] = git_commit(verified=False)
+        api.signatures[HEAD_SHA] = git_signature(valid=False)
         with self.assertRaisesRegex(controller.PolicyError, "not GitHub Verified"):
             controller.authorize(event(), policy(), api, environment())
 
+        api = FakeAuthorizationApi()
+        api.set_change("AGENTS.md")
         api.details[HEAD_SHA] = git_commit(committer_login="outsider")
-        api.permissions["outsider"] = "read"
-        result = controller.authorize(event(), policy(), api, environment())
-        self.assertEqual(result.head_sha, HEAD_SHA)
+        with self.assertRaisesRegex(controller.PolicyError, "verified signer"):
+            controller.authorize(event(), policy(), api, environment())
 
     def test_full_commit_response_must_match_requested_sha(self) -> None:
         api = FakeAuthorizationApi()
         api.set_change("Cargo.toml")
         api.details[HEAD_SHA]["sha"] = OLD_SHA
+        approval = adoption_event()
+        api.comment = copy.deepcopy(approval["comment"])
         with self.assertRaisesRegex(controller.PolicyError, "requested SHA"):
-            controller.authorize(event(), policy(), api, environment())
+            controller.authorize(approval, policy(), api, environment())
 
     def test_exact_release_app_author_and_committer_are_accepted(self) -> None:
-        api = FakeAuthorizationApi()
-        api.set_change("Cargo.toml")
-        api.pull["user"] = {"login": BOT, "id": BOT_ID}
-        api.pull["head"]["repo"]["full_name"] = REPOSITORY
-        api.pull["head"]["ref"] = "release-plz-next"
-        api.details[HEAD_SHA] = git_commit(
-            author_login=BOT,
-            author_id=BOT_ID,
-            committer_login=WEB_FLOW,
-            committer_id=WEB_FLOW_ID,
-            author_name=BOT,
-            author_email=BOT_EMAIL,
-            committer_name=GITHUB_COMMITTER_NAME,
-            committer_email=GITHUB_COMMITTER_EMAIL,
-            message=(
-                "chore(release): prepare candidate\n\n"
-                "Signed-off-by: nvidia-yamlsigil-release-pr[bot] "
-                f"<{BOT_EMAIL}>\n"
-            ),
-        )
+        api = self.release_app_api()
         result = controller.authorize(event(), policy(), api, environment())
         self.assertEqual(result.head_sha, HEAD_SHA)
 
@@ -712,12 +992,13 @@ class AuthorizationTests(unittest.TestCase):
     def release_app_api(self) -> FakeAuthorizationApi:
         api = FakeAuthorizationApi()
         api.set_change("Cargo.toml")
-        api.pull["user"] = {"login": BOT, "id": BOT_ID}
+        api.pull["user"] = {"login": BOT, "id": BOT_ID, "type": "Bot"}
         api.pull["head"]["repo"]["full_name"] = REPOSITORY
         api.pull["head"]["ref"] = "release-plz-next"
         api.details[HEAD_SHA] = git_commit(
             author_login=BOT,
             author_id=BOT_ID,
+            author_type="Bot",
             committer_login=WEB_FLOW,
             committer_id=WEB_FLOW_ID,
             author_name=BOT,
@@ -730,22 +1011,28 @@ class AuthorizationTests(unittest.TestCase):
                 f"<{BOT_EMAIL}>\n"
             ),
         )
+        api.signatures[HEAD_SHA] = git_signature(
+            signer_login=WEB_FLOW,
+            signer_id=WEB_FLOW_ID,
+            email=GITHUB_COMMITTER_EMAIL,
+            github_signed=True,
+        )
         return api
 
     def test_release_app_rejects_wrong_bot_id_and_raw_author(self) -> None:
         api = self.release_app_api()
         api.pull["user"]["id"] += 1
-        with self.assertRaisesRegex(controller.PolicyError, "pull request author ID"):
+        with self.assertRaisesRegex(controller.PolicyError, "exact release App identity"):
             controller.authorize(event(), policy(), api, environment())
 
         api = self.release_app_api()
         api.pull["user"]["login"] = "release-app-lookalike"
-        with self.assertRaisesRegex(controller.PolicyError, "not owned by the release App"):
+        with self.assertRaisesRegex(controller.PolicyError, "exact release App identity"):
             controller.authorize(event(), policy(), api, environment())
 
         api = self.release_app_api()
         api.details[HEAD_SHA]["author"]["id"] += 1
-        with self.assertRaisesRegex(controller.PolicyError, "author ID"):
+        with self.assertRaisesRegex(controller.PolicyError, "author is unexpected"):
             controller.authorize(event(), policy(), api, environment())
 
         for field in ("name", "email"):
@@ -781,7 +1068,7 @@ class AuthorizationTests(unittest.TestCase):
     def test_release_app_rejects_wrong_web_flow_user_id(self) -> None:
         api = self.release_app_api()
         api.details[HEAD_SHA]["committer"]["id"] += 1
-        with self.assertRaisesRegex(controller.PolicyError, "committer ID"):
+        with self.assertRaisesRegex(controller.PolicyError, "committer is unexpected"):
             controller.authorize(event(), policy(), api, environment())
 
     def test_release_app_rejects_wrong_web_flow_and_raw_github_identity(self) -> None:
@@ -799,10 +1086,13 @@ class AuthorizationTests(unittest.TestCase):
 
     def test_release_app_rejects_invalid_signature(self) -> None:
         api = self.release_app_api()
-        api.details[HEAD_SHA]["commit"]["verification"] = {
-            "verified": False,
-            "reason": "invalid",
-        }
+        api.signatures[HEAD_SHA] = git_signature(
+            signer_login=WEB_FLOW,
+            signer_id=WEB_FLOW_ID,
+            email=GITHUB_COMMITTER_EMAIL,
+            valid=False,
+            github_signed=True,
+        )
         with self.assertRaisesRegex(controller.PolicyError, "not GitHub Verified"):
             controller.authorize(event(), policy(), api, environment())
 
@@ -822,13 +1112,14 @@ class AuthorizationTests(unittest.TestCase):
     def test_release_app_identity_parent_and_allowlist_are_exact(self) -> None:
         base_api = FakeAuthorizationApi()
         base_api.set_change("Cargo.toml")
-        base_api.pull["user"] = {"login": BOT, "id": BOT_ID}
+        base_api.pull["user"] = {"login": BOT, "id": BOT_ID, "type": "Bot"}
         base_api.pull["head"]["repo"]["full_name"] = REPOSITORY
         base_api.pull["head"]["ref"] = "release-plz-next"
         base_api.details[HEAD_SHA] = git_commit(
             parent=OLD_SHA,
             author_login=BOT,
             author_id=BOT_ID,
+            author_type="Bot",
             committer_login=WEB_FLOW,
             committer_id=WEB_FLOW_ID,
             author_name=BOT,
@@ -840,6 +1131,12 @@ class AuthorizationTests(unittest.TestCase):
                 "Signed-off-by: nvidia-yamlsigil-release-pr[bot] "
                 f"<{BOT_EMAIL}>\n"
             ),
+        )
+        base_api.signatures[HEAD_SHA] = git_signature(
+            signer_login=WEB_FLOW,
+            signer_id=WEB_FLOW_ID,
+            email=GITHUB_COMMITTER_EMAIL,
+            github_signed=True,
         )
         with self.assertRaisesRegex(controller.PolicyError, "current main"):
             controller.authorize(event(), policy(), base_api, environment())
@@ -874,6 +1171,9 @@ class AuthorizationTests(unittest.TestCase):
                 "head_repository": "contributor/yaml-sigil-example",
                 "policy_sha": MAIN_SHA,
                 "comment_id": str(COMMENT_ID),
+                "binding_digest": authorization.binding_digest,
+                "command_mode": "test",
+                "sensitive": "false",
                 "candidate_ci_required": "false",
             },
         )
@@ -930,7 +1230,7 @@ class AuthorizationTests(unittest.TestCase):
     def test_reusable_call_rejects_changed_comment_issue_or_ref(self) -> None:
         api = FakeAuthorizationApi()
         api.comment["body"] = f"/ok to test {OLD_SHA}"
-        with self.assertRaisesRegex(controller.PolicyError, "exact current pull request head"):
+        with self.assertRaisesRegex(controller.PolicyError, "comment or identity changed"):
             controller.authorize_call(
                 event(),
                 policy(),
@@ -948,7 +1248,7 @@ class AuthorizationTests(unittest.TestCase):
 
         api = FakeAuthorizationApi()
         api.comment_issue_number = 8
-        with self.assertRaisesRegex(controller.PolicyError, "another issue"):
+        with self.assertRaisesRegex(controller.PolicyError, "comment moved"):
             controller.authorize_call(
                 event(),
                 policy(),
@@ -1078,6 +1378,143 @@ class AuthorizationTests(unittest.TestCase):
             )
 
 
+    def test_sensitive_change_rejects_the_ordinary_command(self) -> None:
+        api = FakeAuthorizationApi()
+        api.set_change("Cargo.toml")
+        with self.assertRaisesRegex(controller.PolicyError, "test-and-adopt"):
+            controller.authorize(event(), policy(), api, environment())
+
+    def test_cargo_deny_exception_change_requires_adoption(self) -> None:
+        for path in ("deny.exceptions.toml", ".deny.exceptions.toml"):
+            with self.subTest(path=path, command="test"):
+                api = FakeAuthorizationApi()
+                api.set_change(path)
+                with self.assertRaisesRegex(controller.PolicyError, "test-and-adopt"):
+                    controller.authorize(event(), policy(), api, environment())
+
+            with self.subTest(path=path, command="test-and-adopt"):
+                api = FakeAuthorizationApi()
+                api.set_change(path)
+                result = authorize_fixture(api, adoption_event())
+                self.assertTrue(result.candidate_ci_required)
+
+    def test_sensitive_fork_requires_maintainer_edits(self) -> None:
+        api = FakeAuthorizationApi()
+        api.set_change(".github/workflows/ci.yml")
+        api.pull["maintainer_can_modify"] = False
+        with self.assertRaisesRegex(controller.PolicyError, "maintainer edits"):
+            authorize_fixture(api, adoption_event())
+
+    def test_edit_away_and_restore_invalidates_the_comment_timestamp(self) -> None:
+        api = FakeAuthorizationApi()
+        api.comment["updated_at"] = "2026-08-28T12:00:01Z"
+        with self.assertRaisesRegex(controller.PolicyError, "comment or identity changed"):
+            controller.authorize(event(), policy(), api, environment())
+
+    def test_direct_external_contributor_identity_is_valid_without_membership(self) -> None:
+        api = FakeAuthorizationApi()
+        api.set_change("src/lib.rs")
+        api.details[HEAD_SHA] = git_commit(
+            author_login="external-contributor",
+            committer_login="external-contributor",
+            author_id=42,
+            committer_id=42,
+            author_name="External Contributor",
+            committer_name="External Contributor",
+            author_email="external@example.invalid",
+            committer_email="external@example.invalid",
+        )
+        api.signatures[HEAD_SHA] = git_signature(
+            signer_login="external-contributor",
+            signer_id=42,
+            email="external@example.invalid",
+            kind="SshSignature",
+        )
+        result = authorize_fixture(api)
+        self.assertEqual(result.head_sha, HEAD_SHA)
+        self.assertNotIn("external-contributor", api.permissions)
+
+    def test_direct_identity_id_login_and_type_disagreements_fail_closed(self) -> None:
+        mutations = (
+            ("id", 2),
+            ("login", "lookalike"),
+            ("type", "Bot"),
+        )
+        for field, value in mutations:
+            with self.subTest(field=field):
+                api = FakeAuthorizationApi()
+                api.set_change("src/lib.rs")
+                api.details[HEAD_SHA]["author"][field] = value
+                with self.assertRaisesRegex(controller.PolicyError, "verified signer"):
+                    authorize_fixture(api)
+
+    def test_null_signature_signer_and_forged_dco_fail_closed(self) -> None:
+        api = FakeAuthorizationApi()
+        api.set_change("src/lib.rs")
+        api.signatures[HEAD_SHA]["signature"]["signer"] = None
+        with self.assertRaisesRegex(controller.PolicyError, "signer must be an object"):
+            authorize_fixture(api)
+
+        api = FakeAuthorizationApi()
+        api.set_change("src/lib.rs")
+        api.details[HEAD_SHA]["commit"]["message"] = (
+            "ci: forged trailer\n\n"
+            "Signed-off-by: Lookalike <maintainer@example.invalid>\n"
+        )
+        with self.assertRaisesRegex(controller.PolicyError, "author's DCO"):
+            authorize_fixture(api)
+
+    def test_web_flow_does_not_authorize_an_arbitrary_human_commit(self) -> None:
+        api = FakeAuthorizationApi()
+        api.set_change("src/lib.rs")
+        api.details[HEAD_SHA] = git_commit(
+            author_login=WEB_FLOW,
+            committer_login=WEB_FLOW,
+            author_id=WEB_FLOW_ID,
+            committer_id=WEB_FLOW_ID,
+            author_name=GITHUB_COMMITTER_NAME,
+            committer_name=GITHUB_COMMITTER_NAME,
+            author_email=GITHUB_COMMITTER_EMAIL,
+            committer_email=GITHUB_COMMITTER_EMAIL,
+        )
+        api.signatures[HEAD_SHA] = git_signature(
+            signer_login=WEB_FLOW,
+            signer_id=WEB_FLOW_ID,
+            email=GITHUB_COMMITTER_EMAIL,
+            github_signed=True,
+        )
+        with self.assertRaisesRegex(controller.PolicyError, "unsupported GitHub web-flow"):
+            authorize_fixture(api)
+
+    def test_release_app_requires_the_exact_gpg_web_flow_shape(self) -> None:
+        api = self.release_app_api()
+        api.signatures[HEAD_SHA]["signature"]["__typename"] = "SshSignature"
+        with self.assertRaisesRegex(controller.PolicyError, "exact GitHub web-flow"):
+            controller.authorize(event(), policy(), api, environment())
+
+    def test_adopting_signer_must_remain_a_writer(self) -> None:
+        api = FakeAuthorizationApi()
+        api.set_change("Cargo.toml")
+        api.details[HEAD_SHA] = git_commit(
+            author_login="external-contributor",
+            author_id=42,
+            author_name="External Contributor",
+            author_email="external@example.invalid",
+            committer_login="adopter",
+            committer_id=2,
+            committer_name="Adopter",
+            committer_email="adopter@example.invalid",
+        )
+        api.signatures[HEAD_SHA] = git_signature(
+            signer_login="adopter",
+            signer_id=2,
+            email="adopter@example.invalid",
+        )
+        api.permissions["adopter"] = "read"
+        with self.assertRaisesRegex(controller.PolicyError, "adopting signer"):
+            authorize_fixture(api, adoption_event())
+
+
 class ImmutableTreeTests(unittest.TestCase):
     @staticmethod
     def snapshot(leaves: dict[str, tuple[str, str, str]]) -> controller.GitTree:
@@ -1109,7 +1546,7 @@ class ImmutableTreeTests(unittest.TestCase):
             list(zip(paths, statuses, strict=True)),
             [
                 ("added.txt", "added"),
-                ("modified.txt", "modified"),
+                ("modified.txt", "mode-or-type-changed"),
                 ("new-name.txt", "added"),
                 ("old-name.txt", "removed"),
                 ("removed.txt", "removed"),
@@ -1253,6 +1690,1183 @@ class ImmutableTreeTests(unittest.TestCase):
                     controller.authorize(event(), policy(), api, environment())
 
 
+class ProtectedCheckoutTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_directory.cleanup)
+        self.temporary_directory = pathlib.Path(temporary_directory.name)
+        self.repository = self.temporary_directory / "repository"
+        self.repository.mkdir()
+        discovered_git = shutil.which("git")
+        assert discovered_git is not None
+        self.git = os.path.realpath(discovered_git)
+        self.run_git("init", "--quiet", "--initial-branch=main")
+        self.run_git("config", "core.autocrlf", "false")
+        self.run_git("config", "user.name", "Verifier Test")
+        self.run_git("config", "user.email", "verifier@example.invalid")
+        workflow = self.repository / ".github" / "workflows" / "ci.yml"
+        workflow.parent.mkdir(parents=True)
+        workflow.write_text("name: candidate\n", encoding="utf-8")
+        self.run_git("add", ".github/workflows/ci.yml")
+        self.run_git("commit", "--quiet", "-m", "test: candidate")
+        self.head_sha = self.run_git("rev-parse", "HEAD").stdout.strip()
+        self.blob_sha = self.run_git(
+            "hash-object", "--no-filters", "--", ".github/workflows/ci.yml"
+        ).stdout.strip()
+        self.base_tree = controller.GitTree(paths=frozenset(), leaves={})
+        self.head_tree = controller.GitTree(
+            paths=frozenset(
+                {
+                    ".github",
+                    ".github/workflows",
+                    ".github/workflows/ci.yml",
+                }
+            ),
+            leaves={
+                ".github/workflows/ci.yml": (
+                    "blob",
+                    "100644",
+                    self.blob_sha,
+                )
+            },
+        )
+        self.config = self.temporary_directory / "protected-pr-ci.json"
+        self.config.write_text(
+            json.dumps(policy(), sort_keys=True), encoding="utf-8"
+        )
+
+    def run_git(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [self.git, *arguments],
+            cwd=self.repository,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+
+    def refresh_head_tree(self) -> None:
+        completed = subprocess.run(
+            [self.git, "ls-tree", "-rz", "--full-tree", "HEAD"],
+            cwd=self.repository,
+            capture_output=True,
+            check=True,
+        )
+        paths: set[str] = set()
+        leaves: dict[str, tuple[str, str, str]] = {}
+        for record in completed.stdout.split(b"\0"):
+            if not record:
+                continue
+            metadata, encoded_path = record.split(b"\t", 1)
+            mode, entry_type, blob = metadata.decode("ascii").split(" ")
+            path = encoded_path.decode("utf-8")
+            leaves[path] = (entry_type, mode, blob)
+            components = path.split("/")
+            for length in range(1, len(components) + 1):
+                paths.add("/".join(components[:length]))
+        self.head_sha = self.run_git("rev-parse", "HEAD").stdout.strip()
+        self.head_tree = controller.GitTree(paths=frozenset(paths), leaves=leaves)
+
+    def commit_entries(
+        self,
+        *,
+        files: dict[str, str] | None = None,
+        links: dict[str, str] | None = None,
+    ) -> None:
+        for path, value in (files or {}).items():
+            destination = self.repository / path
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(value, encoding="utf-8")
+            self.run_git("add", "--", path)
+        for path, target in (links or {}).items():
+            destination = self.repository / path
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if os.name == "nt":
+                destination.write_text(target, encoding="utf-8")
+            else:
+                destination.symlink_to(target)
+            blob = subprocess.run(
+                [self.git, "hash-object", "-w", "--stdin"],
+                cwd=self.repository,
+                input=target.encode("utf-8"),
+                capture_output=True,
+                check=True,
+            ).stdout.decode("ascii").strip()
+            self.run_git("update-index", "--add", "--cacheinfo", "120000", blob, path)
+        self.run_git("commit", "--quiet", "-m", "test: add authenticated entries")
+        self.refresh_head_tree()
+
+    def verify(self) -> None:
+        with mock.patch.object(
+            verifier.policy,
+            "git_tree_for_commit",
+            side_effect=[self.base_tree, self.head_tree],
+        ):
+            verifier.verify(
+                self.repository,
+                self.git,
+                REPOSITORY,
+                MAIN_SHA,
+                self.head_sha,
+                os.fspath(self.config),
+                mock.Mock(),
+            )
+
+    def test_exact_sensitive_blob_and_head_are_accepted(self) -> None:
+        self.verify()
+
+    def test_authenticated_internal_links_are_accepted(self) -> None:
+        self.commit_entries(
+            files={
+                "AGENTS.md": "repository guidance\n",
+                "CONTRIBUTING.md": "contributor guidance\n",
+            },
+            links={
+                "MAINTAINERS.md": "AGENTS.md",
+                "crates/example/CONTRIBUTING.md": "../../CONTRIBUTING.md",
+            },
+        )
+        self.verify()
+
+    def test_external_escaping_broken_directory_and_cyclic_links_fail_closed(self) -> None:
+        cases = (
+            ("external.md", "/dev/null", {}, "portable relative"),
+            ("escape.md", "../../outside.md", {}, "escapes the candidate root"),
+            ("broken.md", "missing.md", {}, "broken or directory target"),
+            (
+                "directory.md",
+                "docs",
+                {"docs/readme.md": "documentation\n"},
+                "broken or directory target",
+            ),
+        )
+        for link, target, files, message in cases:
+            with self.subTest(link=link):
+                temporary = tempfile.TemporaryDirectory()
+                self.addCleanup(temporary.cleanup)
+                previous_repository = self.repository
+                previous_head = self.head_sha
+                previous_tree = self.head_tree
+                try:
+                    clone = pathlib.Path(temporary.name) / "repository"
+                    subprocess.run(
+                        [
+                            self.git,
+                            "-c",
+                            "core.autocrlf=false",
+                            "clone",
+                            "--quiet",
+                            os.fspath(previous_repository),
+                            os.fspath(clone),
+                        ],
+                        check=True,
+                    )
+                    self.repository = clone
+                    self.run_git("config", "core.autocrlf", "false")
+                    self.run_git("config", "user.name", "Verifier Test")
+                    self.run_git("config", "user.email", "verifier@example.invalid")
+                    self.commit_entries(files=files, links={link: target})
+                    with self.assertRaisesRegex(controller.PolicyError, message):
+                        self.verify()
+                finally:
+                    self.repository = previous_repository
+                    self.head_sha = previous_head
+                    self.head_tree = previous_tree
+
+        self.commit_entries(links={"a.md": "b.md", "b.md": "a.md"})
+        with self.assertRaisesRegex(controller.PolicyError, "contains a cycle"):
+            self.verify()
+
+    def test_exact_sensitive_gitlink_is_verified_from_the_index(self) -> None:
+        source_sha = "6" * 40
+        self.run_git(
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            "160000",
+            source_sha,
+            "source-spec",
+        )
+        self.run_git("commit", "--quiet", "-m", "test: add exact gitlink")
+        self.head_sha = self.run_git("rev-parse", "HEAD").stdout.strip()
+        self.head_tree = controller.GitTree(
+            paths=self.head_tree.paths | {"source-spec"},
+            leaves={
+                **self.head_tree.leaves,
+                "source-spec": ("commit", "160000", source_sha),
+            },
+        )
+        self.verify()
+
+        self.head_tree = controller.GitTree(
+            paths=self.head_tree.paths,
+            leaves={
+                **self.head_tree.leaves,
+                "source-spec": ("commit", "160000", "7" * 40),
+            },
+        )
+        with self.assertRaisesRegex(
+            controller.PolicyError, "differs from its authorized Git entry"
+        ):
+            self.verify()
+
+    def test_policy_staging_records_exact_files_digests_and_tools(self) -> None:
+        destination = self.temporary_directory / "staged-policy"
+        github_output = self.temporary_directory / "github-output"
+        verifier.stage_policy(
+            MODULE_PATH.parents[2], destination, os.fspath(github_output)
+        )
+        outputs = dict(
+            line.split("=", 1)
+            for line in github_output.read_text(encoding="utf-8").splitlines()
+        )
+        self.assertEqual(
+            set(outputs),
+            {
+                "verifier",
+                "verifier_sha256",
+                "controller",
+                "controller_sha256",
+                "config",
+                "config_sha256",
+                "python",
+                "git",
+                "path",
+            },
+        )
+        for label in ("verifier", "controller", "config"):
+            value = pathlib.Path(outputs[label]).read_bytes()
+            self.assertEqual(outputs[f"{label}_sha256"], verifier.sha256_bytes(value))
+        self.assertTrue(os.path.isabs(outputs["python"]))
+        self.assertTrue(os.path.isabs(outputs["git"]))
+
+    def test_modified_or_untracked_candidate_file_fails_closed(self) -> None:
+        workflow = self.repository / ".github" / "workflows" / "ci.yml"
+        workflow.write_text("name: tampered\n", encoding="utf-8")
+        with self.assertRaisesRegex(controller.PolicyError, "authorized Git blob"):
+            self.verify()
+
+        self.run_git("checkout", "--quiet", "--", ".github/workflows/ci.yml")
+        (self.repository / "Cargo.toml").write_text("[package]\n", encoding="utf-8")
+        with self.assertRaisesRegex(controller.PolicyError, "missing or untracked paths"):
+            self.verify()
+
+    def test_sensitive_symlink_and_reparse_point_fail_closed(self) -> None:
+        workflow = self.repository / ".github" / "workflows" / "ci.yml"
+        # The helper executes only in the Linux candidate runner. Other hosts
+        # retain the structural assertions below without emulating Bash policy.
+        if os.name != "nt":
+            workflow.unlink()
+            workflow.symlink_to(self.repository / ".git" / "HEAD")
+            with self.assertRaisesRegex(
+                controller.PolicyError, "link, reparse point"
+            ):
+                self.verify()
+
+            workflow.unlink()
+            workflow.write_text("name: candidate\n", encoding="utf-8")
+        with (
+            mock.patch.object(
+                verifier,
+                "has_reparse_point",
+                side_effect=lambda metadata: stat.S_ISREG(metadata.st_mode),
+            ),
+            self.assertRaisesRegex(controller.PolicyError, "link, reparse point"),
+        ):
+            self.verify()
+
+    @unittest.skipUnless(os.name == "nt", "Windows reparse-point regression")
+    def test_windows_intermediate_junction_fails_closed(self) -> None:
+        workflows = self.repository / ".github" / "workflows"
+        target = self.repository / "workflows-target"
+        workflows.replace(target)
+        completed = subprocess.run(
+            [
+                os.environ.get("COMSPEC", "cmd.exe"),
+                "/d",
+                "/c",
+                "mklink",
+                "/J",
+                os.fspath(workflows),
+                os.fspath(target),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            f"cannot create test junction: {completed.stdout}{completed.stderr}",
+        )
+        self.addCleanup(os.rmdir, workflows)
+
+        with self.assertRaisesRegex(
+            controller.PolicyError,
+            "missing or untracked paths or unsupported working-tree entries",
+        ):
+            self.verify()
+
+    def test_aliases_and_short_name_shapes_fail_closed(self) -> None:
+        if os.name != "nt":
+            alias_root = self.repository / ".GITHUB"
+            if not alias_root.exists():
+                alias = alias_root / "workflows"
+                alias.mkdir(parents=True)
+                (alias / "extra.yml").write_text(
+                    "name: alias\n", encoding="utf-8"
+                )
+                with self.assertRaisesRegex(
+                    controller.PolicyError, "casefold aliases"
+                ):
+                    self.verify()
+
+                shutil.rmtree(alias_root)
+            else:
+                self.assertTrue(
+                    os.path.samefile(alias_root, self.repository / ".github")
+                )
+        (self.repository / "CARGO~1.TOM").write_text("alias\n", encoding="utf-8")
+        with self.assertRaisesRegex(controller.PolicyError, "short-name-shaped"):
+            self.verify()
+
+    def test_enumeration_entry_metadata_and_time_limits_fail_closed(self) -> None:
+        with (
+            mock.patch.object(controller, "MAX_TREE_ENTRIES", 0),
+            self.assertRaisesRegex(controller.PolicyError, "exceeds 0 entries"),
+        ):
+            self.verify()
+
+        with (
+            mock.patch.object(controller, "MAX_PATH_METADATA_BYTES", 1),
+            self.assertRaisesRegex(controller.PolicyError, "metadata exceeds"),
+        ):
+            self.verify()
+
+        with (
+            mock.patch.object(verifier.time, "monotonic", side_effect=[0.0, 31.0]),
+            self.assertRaisesRegex(controller.PolicyError, "exceeded 30 seconds"),
+        ):
+            self.verify()
+
+    def test_trusted_git_uses_only_the_resolved_tool_directory(self) -> None:
+        completed = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        with mock.patch.object(
+            verifier.subprocess, "run", return_value=completed
+        ) as run:
+            verifier.trusted_git(self.git, self.repository, ["status"])
+        environment = run.call_args.kwargs["env"]
+        self.assertEqual(environment["PATH"], os.path.dirname(self.git))
+        self.assertNotIn("HOME", environment)
+        self.assertEqual(run.call_args.args[0][0], self.git)
+
+
+class CargoEgressPolicyTests(unittest.TestCase):
+    def test_only_canonical_crates_io_tls_targets_are_accepted(self) -> None:
+        for host in ("index.crates.io", "static.crates.io"):
+            with self.subTest(host=host):
+                request = (
+                    f"CONNECT {host}:443 HTTP/1.1\r\n"
+                    f"Host: {host}:443\r\n"
+                    "Proxy-Connection: Keep-Alive\r\n\r\n"
+                ).encode("ascii")
+                self.assertEqual(
+                    cargo_egress_proxy.parse_connect_request(request),
+                    (host, 443),
+                )
+
+    def test_arbitrary_and_internal_destinations_fail_closed(self) -> None:
+        requests = (
+            b"GET https://index.crates.io/ HTTP/1.1\r\n\r\n",
+            b"CONNECT github.com:443 HTTP/1.1\r\n\r\n",
+            b"CONNECT registry.example:443 HTTP/1.1\r\n\r\n",
+            b"CONNECT 127.0.0.1:443 HTTP/1.1\r\n\r\n",
+            b"CONNECT 169.254.169.254:443 HTTP/1.1\r\n\r\n",
+            b"CONNECT index.crates.io:80 HTTP/1.1\r\n\r\n",
+            b"CONNECT index.crates.io.:443 HTTP/1.1\r\n\r\n",
+            b"CONNECT INDEX.CRATES.IO:443 HTTP/1.1\r\n\r\n",
+            b"CONNECT index.crates.io:443 HTTP/1.1\r\nProxy-Authorization: x\r\n\r\n",
+            b"CONNECT index.crates.io:443 HTTP/1.1\r\n\r\nearly",
+        )
+        for request in requests:
+            with self.subTest(request=request):
+                with self.assertRaises(cargo_egress_proxy.ProxyProtocolError):
+                    cargo_egress_proxy.parse_connect_request(request)
+
+    def test_approved_dns_name_must_resolve_only_to_global_addresses(self) -> None:
+        public = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("1.1.1.1", 443))]
+        with mock.patch.object(
+            cargo_egress_proxy.socket, "getaddrinfo", return_value=public
+        ):
+            resolved = cargo_egress_proxy.resolve_global_addresses(
+                "index.crates.io", 443
+            )
+        self.assertEqual(resolved[0][3], ("1.1.1.1", 443))
+
+        for address in ("127.0.0.1", "10.0.0.1", "169.254.169.254"):
+            with (
+                self.subTest(address=address),
+                mock.patch.object(
+                    cargo_egress_proxy.socket,
+                    "getaddrinfo",
+                    return_value=[
+                        (socket.AF_INET, socket.SOCK_STREAM, 6, "", (address, 443))
+                    ],
+                ),
+                self.assertRaises(cargo_egress_proxy.ProxyProtocolError),
+            ):
+                cargo_egress_proxy.resolve_global_addresses(
+                    "index.crates.io", 443
+                )
+
+    def test_cargo_native_source_policy_is_closed(self) -> None:
+        policy = tomllib.loads(CARGO_SOURCE_POLICY_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(
+            policy,
+            {
+                "sources": {
+                    "unknown-registry": "deny",
+                    "unknown-git": "deny",
+                    "allow-registry": [
+                        "https://github.com/rust-lang/crates.io-index"
+                    ],
+                    "allow-git": [],
+                }
+            },
+        )
+
+
+class WorkflowStructureTests(unittest.TestCase):
+    @staticmethod
+    def job_block(workflow: str, name: str) -> str:
+        lines = workflow.splitlines(keepends=True)
+        start = lines.index(f"  {name}:\n")
+        end = next(
+            (
+                index
+                for index in range(start + 1, len(lines))
+                if lines[index].startswith("  ")
+                and not lines[index].startswith("    ")
+                and lines[index].rstrip().endswith(":")
+            ),
+            len(lines),
+        )
+        return "".join(lines[start:end])
+
+    def test_composite_verifier_is_the_first_post_checkout_step(self) -> None:
+        action = CHECKOUT_ACTION_PATH.read_text(encoding="utf-8")
+        stage = action.index("- name: Stage protected verifier and trusted tools")
+        checkout = action.index("- name: Check out exact candidate")
+        verify_step = action.index("- name: Verify exact candidate checkout")
+        self.assertLess(stage, checkout)
+        self.assertLess(checkout, verify_step)
+        between = action[checkout:verify_step]
+        self.assertNotIn("\n    - name:", between)
+        self.assertIn("persist-credentials: false", between)
+        self.assertIn("submodules: false", between)
+        self.assertIn("--expected-verifier-sha256", action[verify_step:])
+        self.assertIn('PATH: ${{ steps.protected.outputs.path }}', action[verify_step:])
+
+    def test_every_primary_candidate_checkout_uses_the_protected_action(self) -> None:
+        workflow = REUSABLE_WORKFLOW_PATH.read_text(encoding="utf-8")
+        protected_uses = (
+            "uses: ./policy/.github/actions/protected-candidate-checkout"
+        )
+        self.assertGreaterEqual(workflow.count(protected_uses), 1)
+        self.assertNotIn("- name: Check out exact candidate\n", workflow)
+        self.assertIn("binding_digest:", workflow)
+        self.assertIn("--binding-digest", workflow)
+        self.assertIn("results_json:", workflow)
+
+    def test_protected_candidate_jobs_are_linux_terminal_and_action_free(
+        self,
+    ) -> None:
+        workflow = REUSABLE_WORKFLOW_PATH.read_text(encoding="utf-8")
+        config = json.loads(POLICY_PATH.read_text(encoding="utf-8"))
+        jobs = (
+            ["rebuild_rs"]
+            if config["repository_kind"] == "spec"
+            else ["rust", "candidate_ci"]
+        )
+        for name in jobs:
+            block = self.job_block(workflow, name)
+            self.assertIn("runs-on: ubuntu-latest", block, name)
+            self.assertNotIn("matrix:", block, name)
+            self.assertNotIn("uses:", block, name)
+            self.assertEqual(
+                sum(
+                    line.startswith("      - name:")
+                    for line in block.splitlines()
+                ),
+                1,
+                name,
+            )
+            self.assertIn("exec bash --noprofile --norc", block, name)
+            self.assertIn("run-terminal-candidate.sh", block, name)
+            self.assertIn('${GITHUB_ENV}', block, name)
+
+    def test_platform_verifier_uses_ordinary_cross_platform_jobs(self) -> None:
+        workflow = REUSABLE_WORKFLOW_PATH.read_text(encoding="utf-8")
+        block = self.job_block(workflow, "platform_verifier")
+        self.assertIn("runner: ubuntu-latest", block)
+        self.assertIn("runner: macos-latest", block)
+        self.assertIn("runner: windows-latest", block)
+        self.assertIn("uses: actions/checkout@", block)
+        self.assertIn("persist-credentials: false", block)
+        self.assertNotIn("run-terminal-candidate.sh", block)
+
+    def test_non_linux_jobs_never_execute_candidate_code(self) -> None:
+        workflow = REUSABLE_WORKFLOW_PATH.read_text(encoding="utf-8")
+        verifier = self.job_block(workflow, "platform_verifier")
+        self.assertNotIn("\n  compatibility:\n", workflow)
+        self.assertNotIn("protected-candidate-checkout", verifier)
+        self.assertNotIn("cargo ", verifier)
+        self.assertNotIn("candidate-root", verifier)
+        other_jobs = workflow.replace(verifier, "")
+        self.assertNotIn("runner: macos-latest", other_jobs)
+        self.assertNotIn("runner: windows-latest", other_jobs)
+
+    def test_terminal_boundary_scrubs_and_separates_candidate_identity(self) -> None:
+        shell = TERMINAL_SHELL_PATH.read_text(encoding="utf-8")
+        driver = TERMINAL_DRIVER_PATH.read_text(encoding="utf-8")
+        self.assertIn("terminal candidate execution requires Linux", shell)
+        self.assertIn('--user "${candidate_uid}:${candidate_gid}"', shell)
+        self.assertIn('chmod 0700 "${command_directory}"', shell)
+        self.assertIn('pkill -KILL -u "${candidate_uid}"', shell)
+        self.assertIn("for _ in {1..300}", shell)
+        cleanup_tail = shell[shell.index("candidate_status=$?") :]
+        self.assertLess(
+            cleanup_tail.index('pkill -KILL -u "${candidate_uid}"'),
+            cleanup_tail.index("for _ in {1..300}"),
+        )
+        self.assertLess(
+            cleanup_tail.index("for _ in {1..300}"),
+            cleanup_tail.index("cleanup_all"),
+        )
+        self.assertIn('ps -U "${candidate_uid}"', cleanup_tail)
+        for name in ("GITHUB_ENV", "GITHUB_PATH", "GITHUB_OUTPUT", "GITHUB_STEP_SUMMARY"):
+            self.assertIn(name, shell)
+        self.assertIn("runner command files do not share one protected directory", shell)
+        self.assertIn("candidate container or disposable identity could not be removed", shell)
+        self.assertNotIn("run-terminal-candidate-windows.ps1", shell)
+        self.assertNotIn("cygpath", shell)
+        self.assertNotIn("launchctl", shell)
+        self.assertNotIn("dscl", shell)
+        self.assertIn("terminal candidate execution requires Linux", driver)
+        self.assertIn("require_command_files_inaccessible", driver)
+        self.assertIn("require_parent_process_isolated", driver)
+        self.assertIn("require_host_paths_absent", driver)
+        self.assertIn("require_tree_read_only", driver)
+        self.assertIn("require_tree_readable", driver)
+        self.assertIn("spawn_detached_canary", driver)
+
+    def test_terminal_setup_uses_elevated_and_native_paths(self) -> None:
+        shell = TERMINAL_SHELL_PATH.read_text(encoding="utf-8")
+        driver = TERMINAL_DRIVER_PATH.read_text(encoding="utf-8")
+        self.assertIn('--git "${trusted_git}"', shell)
+        self.assertIn('sudo -n chown -R "${candidate_uid}"', shell)
+        self.assertNotIn('\nchown -R "${candidate_uid}"', shell)
+        self.assertIn('sandbox="$(mktemp -d)"', shell)
+        physical_sandbox = shell.index('cd -P -- "${sandbox}"')
+        candidate_root = shell.index('candidate_root="${sandbox}/candidate"')
+        self.assertIn("pwd -P", shell)
+        self.assertLess(physical_sandbox, candidate_root)
+        self.assertIn('install -m 0555 "${trusted_cargo}"', shell)
+        self.assertIn('protected_validator="${trusted_cargo}"', shell)
+        self.assertIn("CARGO_RESOLVER_LOCKFILE_PATH", shell)
+        self.assertIn("cargo_deny_version='0.20.2'", shell)
+        self.assertIn(
+            'cargo-deny --version "${cargo_deny_version}"',
+            shell,
+        )
+        self.assertIn(
+            '"${trusted_tools}/bin/cargo-deny" --version',
+            shell,
+        )
+        self.assertNotIn("trusted_bash=", shell)
+        self.assertNotIn("check-acvp-corpus.sh", shell)
+        linux_guard = shell.index("terminal candidate execution requires Linux")
+        protected_build = shell.index(
+            'cargo +"${trusted_toolchain}" "${policy_cargo_options[@]}" build --locked'
+        )
+        protected_preflight = shell.index(
+            '"${protected_validator}" candidate-preflight'
+        )
+        candidate_boundary = shell.index(
+            '"${trusted_docker}" run --name "${candidate_container}" --network none'
+        )
+        self.assertLess(linux_guard, protected_build)
+        self.assertLess(protected_build, protected_preflight)
+        self.assertLess(protected_preflight, candidate_boundary)
+        self.assertIn('--candidate-root "${candidate_root}"', shell)
+        self.assertIn(
+            'trusted_python="$(realpath "${trusted_python_command}")"', shell
+        )
+        self.assertIn("trusted_toolchain='1.98.0'", shell)
+        self.assertIn("cargo_audit_version='0.22.2'", shell)
+        self.assertIn('trusted_linker="$(realpath /usr/bin/cc)"', shell)
+        self.assertIn('trusted_archiver="$(realpath /usr/bin/ar)"', shell)
+        self.assertIn('trusted_ranlib="$(realpath /usr/bin/ranlib)"', shell)
+        self.assertIn("trusted native tool path is not canonical", shell)
+        self.assertIn(
+            'require_trusted_native_tool "${trusted_native_tool}"', shell
+        )
+        self.assertIn("/usr/bin/stat -c '%u:%a'", shell)
+        self.assertIn("^0:([0-7]{3,4})$", shell)
+        self.assertIn("8#${mode} & 8#022", shell)
+        self.assertIn(
+            "trusted native tool parent is not a direct directory", shell
+        )
+        self.assertIn('linker = "%s"', shell)
+        self.assertIn(
+            'sudo -n install -o 0 -g 0 -m 0444 "${protected_cargo_config}"',
+            shell,
+        )
+        self.assertIn(
+            'cargo-audit --version "${cargo_audit_version}"',
+            shell,
+        )
+        self.assertIn('YAML_SIGIL_CARGO_AUDIT=/trusted-tools/bin/cargo-audit', shell)
+        self.assertIn('rustc --version)', shell)
+        self.assertIn('cargo --version)', shell)
+        self.assertIn('--manifest-path /candidate/Cargo.toml', shell)
+        self.assertIn('--manifest-path /candidate/xtask/Cargo.toml', shell)
+        self.assertNotIn('/candidate/conformance/rebuild-rs/Cargo.toml', shell)
+        advisory_fetch = shell.index('https://github.com/RustSec/advisory-db.git')
+        self.assertLess(advisory_fetch, candidate_boundary)
+        self.assertIn('/cargo-seed/advisory-db', shell)
+        self.assertIn("buf_version='1.72.0'", shell)
+        self.assertIn('BUF=/trusted-tools/bin/buf', shell)
+        self.assertIn(
+            "trusted Buf is not a direct executable regular file", shell
+        )
+        self.assertIn(
+            "protected Cargo configuration is not a root-owned read-only regular file",
+            shell,
+        )
+        link_probe = shell.index(
+            '/trusted-tools/bin/cargo "+${trusted_toolchain}" build --locked --offline'
+        )
+        linked_binary = shell.index(
+            '/state/link-probe/target/debug/yaml-sigil-protected-link-probe'
+        )
+        self.assertLess(link_probe, linked_binary)
+        self.assertLess(linked_binary, candidate_boundary)
+
+    def test_candidate_cargo_prefetch_has_closed_source_and_egress_policy(
+        self,
+    ) -> None:
+        shell = TERMINAL_SHELL_PATH.read_text(encoding="utf-8")
+        config = json.loads(POLICY_PATH.read_text(encoding="utf-8"))
+        prefetch = shell[
+            shell.index("# Candidate-controlled Cargo acquisition") : shell.index(
+                "# Prefetch runs as the disposable candidate identity"
+            )
+        ]
+
+        self.assertIn(
+            'network create --driver ipvlan --internal',
+            prefetch,
+        )
+        self.assertIn(
+            '{{.Driver}}|{{.Internal}}|{{index .Options "parent"}}|{{.EnableIPv6}}',
+            prefetch,
+        )
+        self.assertIn("'ipvlan|true||false'", prefetch)
+        self.assertNotIn('network create --driver bridge --internal', prefetch)
+        self.assertIn(
+            '/policy/.github/scripts/cargo_egress_proxy.py serve --port 18080',
+            prefetch,
+        )
+        self.assertIn('--network "${prefetch_network}"', prefetch)
+        self.assertIn('--dns 127.0.0.1', prefetch)
+        self.assertIn('--add-host "cargo-egress:${proxy_ip}"', prefetch)
+        self.assertIn(
+            '--mount "type=bind,src=${prefetch_cargo_config},dst=/cargo-seed/config.toml,readonly"',
+            prefetch,
+        )
+        self.assertIn('CARGO_HTTP_PROXY=${prefetch_proxy}', prefetch)
+        self.assertIn("--env 'ALL_PROXY='", prefetch)
+        self.assertIn("--env 'NO_PROXY='", prefetch)
+        self.assertIn("--env 'GIT_CONFIG_NOSYSTEM=1'", prefetch)
+        self.assertIn("--env 'GIT_CONFIG_GLOBAL=/dev/null'", prefetch)
+        self.assertIn("--env 'SSH_AUTH_SOCK='", prefetch)
+        self.assertNotIn("GITHUB_TOKEN", prefetch)
+        self.assertNotIn("--network host", shell)
+        self.assertNotIn("--publish", prefetch)
+        self.assertNotIn("host_probe_", prefetch)
+        self.assertEqual(prefetch.count("--network bridge"), 2)
+        self.assertIn("{{json .HostConfig.PortBindings}}", prefetch)
+        self.assertIn("proxy_port_bindings", prefetch)
+        self.assertIn("cleanup_prefetch_egress", prefetch)
+        self.assertIn("https://github.com/RustSec/advisory-db.git", prefetch)
+        self.assertIn("-c core.sshCommand=false clone", prefetch)
+
+        cleanup = shell[
+            shell.index("cleanup_candidate_container()") : shell.index(
+                "cleanup_all()"
+            )
+        ]
+        self.assertLess(
+            cleanup.index('for container in "${candidate_container}"'),
+            cleanup.index("cleanup_prefetch_egress"),
+        )
+
+        requested_network = prefetch.index("{{.HostConfig.NetworkMode}}")
+        start = prefetch.index(
+            '"${trusted_docker}" start --attach "${fetch_container}"',
+            requested_network,
+        )
+        realized_network = prefetch.index(
+            "{{len .NetworkSettings.Networks}}", start
+        )
+        remove = prefetch.index(
+            'container rm "${fetch_container}"', realized_network
+        )
+        self.assertLess(requested_network, start)
+        self.assertLess(start, realized_network)
+        self.assertLess(realized_network, remove)
+
+        ordinary_ci = CI_WORKFLOW_PATH.read_text(encoding="utf-8")
+        self.assertIn(
+            "run: .github/scripts/test-cargo-egress-topology.sh", ordinary_ci
+        )
+
+        manifests = (
+            ["/candidate/conformance/rebuild-rs/Cargo.toml"]
+            if config["repository_kind"] == "spec"
+            else ["/candidate/Cargo.toml", "/candidate/xtask/Cargo.toml"]
+        )
+        cursor = 0
+        for manifest in manifests:
+            deny = prefetch.index("/trusted-tools/bin/cargo-deny", cursor)
+            manifest_index = prefetch.index(
+                f"--manifest-path {manifest}", deny
+            )
+            source_check = prefetch.index("check sources", manifest_index)
+            fetch = prefetch.index("/trusted-tools/bin/cargo ", source_check)
+            fetch_manifest = prefetch.index(
+                f"--manifest-path {manifest}", fetch
+            )
+            self.assertLess(deny, source_check)
+            self.assertLess(source_check, fetch)
+            self.assertLess(fetch, fetch_manifest)
+            cursor = fetch_manifest + len(manifest)
+
+        config_install = shell.index('sudo -n chown 0:0 "${prefetch_cargo_config}"')
+        config_check = shell.index(
+            "prefetch Cargo configuration is not a root-owned read-only regular file"
+        )
+        prefetch_start = shell.index("# Candidate-controlled Cargo acquisition")
+        self.assertLess(config_install, config_check)
+        self.assertLess(config_check, prefetch_start)
+
+    def test_terminal_native_tools_are_immutable_and_boundary_bound(
+        self,
+    ) -> None:
+        shell = TERMINAL_SHELL_PATH.read_text(encoding="utf-8")
+        driver = TERMINAL_DRIVER_PATH.read_text(encoding="utf-8")
+        function_name = "require_root_owned_nonwritable_metadata"
+        function_start = shell.index(f"{function_name}() {{")
+        function_end = shell.index("\n}\n", function_start) + len("\n}\n")
+        function_source = shell[function_start:function_end]
+        command = (
+            "set -euo pipefail\n"
+            f"{function_source}\n"
+            f'{function_name} "$1" "trusted fixture"'
+        )
+        if os.name != "nt":
+            for metadata, accepted in (
+                ("0:755", True),
+                ("0:555", True),
+                ("1000:755", False),
+                ("0:775", False),
+                ("0:757", False),
+                ("not-metadata", False),
+            ):
+                with self.subTest(metadata=metadata):
+                    completed = subprocess.run(
+                        ["bash", "-c", command, "native-tool-policy", metadata],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertEqual(completed.returncode == 0, accepted)
+        self.assertIn('--name "${link_probe_container}" --rm --network none', shell)
+        self.assertIn('src=/usr,dst=/usr,readonly', shell)
+        self.assertIn('dst=/trusted-tools,readonly', shell)
+        self.assertNotIn('type=bind,src=/etc,dst=/etc', shell)
+        self.assertNotIn("toolchain install stable", shell)
+        self.assertNotIn("cargo +stable", shell)
+        self.assertIn('f"+{TRUSTED_TOOLCHAIN}"', driver)
+
+    def test_terminal_caches_are_candidate_owned(self) -> None:
+        shell = TERMINAL_SHELL_PATH.read_text(encoding="utf-8")
+        self.assertIn('candidate_cache="${candidate_state}/cache"', shell)
+        self.assertIn("XDG_CACHE_HOME=/state/cache", shell)
+        self.assertIn("BUF_CACHE_DIR=/state/buf-cache", shell)
+
+    def test_prefetched_cargo_seed_is_trusted_before_validation(self) -> None:
+        shell = TERMINAL_SHELL_PATH.read_text(encoding="utf-8")
+        prefetch = shell.index('https://github.com/RustSec/advisory-db.git')
+        owner_handoff = shell.index(
+            'sudo -n chown -R --no-dereference 0:0 -- "${candidate_cargo_seed}"'
+        )
+        read_only = shell.index(
+            'sudo -n chmod -R a+rX,go-w -- "${candidate_cargo_seed}"'
+        )
+        validation_mount = shell.index(
+            '--mount "type=bind,src=${candidate_cargo_seed},dst=/cargo-seed,readonly"'
+        )
+        self.assertLess(prefetch, owner_handoff)
+        self.assertLess(owner_handoff, read_only)
+        self.assertLess(read_only, validation_mount)
+        self.assertNotIn(
+            '\nchmod -R a+rX,go-w "${candidate_cargo_seed}"', shell
+        )
+
+    def test_terminal_container_excludes_runner_control_plane(self) -> None:
+        shell = TERMINAL_SHELL_PATH.read_text(encoding="utf-8")
+        self.assertIn("Runner control-plane probe", shell)
+        self.assertIn("candidate-readable=", shell)
+        self.assertIn("--network none", shell)
+        self.assertIn("--read-only", shell)
+        self.assertIn("--cap-drop ALL", shell)
+        self.assertIn("no-new-privileges=true", shell)
+        self.assertIn("--host-control-path /home/runner", shell)
+        self.assertIn("--host-control-path /var/run/docker.sock", shell)
+        self.assertNotIn("--privileged", shell)
+        self.assertNotIn("dst=/home/runner", shell)
+        self.assertNotIn("dst=/var/run/docker.sock", shell)
+        self.assertNotIn('cat "${runner_state_path}"', shell)
+
+    @mock.patch.object(terminal_candidate, "run_candidate_xtask")
+    @mock.patch.object(terminal_candidate, "run_process")
+    def test_candidate_ci_separates_xtask_and_root_lockfiles(
+        self,
+        run_process: mock.Mock,
+        run_candidate_xtask: mock.Mock,
+    ) -> None:
+        external_lock = "/candidate-home/Cargo.lock"
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                terminal_candidate.CARGO_LOCKFILE_PATH_ENV: external_lock,
+            },
+            clear=True,
+        ):
+            terminal_candidate.run_profile(
+                "candidate-ci",
+                "traits",
+                pathlib.Path("/policy"),
+                pathlib.Path("/candidate"),
+                pathlib.Path("/trusted/cargo"),
+                pathlib.Path("/trusted/python"),
+                pathlib.Path("/trusted/validator"),
+            )
+
+        self.assertEqual(run_process.call_count, 1)
+        archive_environment = run_process.call_args_list[0].kwargs["environment"]
+        self.assertNotIn(terminal_candidate.CARGO_LOCKFILE_PATH_ENV, archive_environment)
+        self.assertIn("+1.95.0", run_process.call_args_list[0].args[0])
+        run_candidate_xtask.assert_called_once_with(
+            pathlib.Path("/trusted/cargo"),
+            pathlib.Path("/candidate/xtask/Cargo.toml"),
+            pathlib.Path("/candidate"),
+        )
+
+    @mock.patch.object(terminal_candidate, "remove_phase_state")
+    @mock.patch.object(terminal_candidate, "resolved_executable")
+    @mock.patch.object(terminal_candidate, "run_prepared_process")
+    @mock.patch.object(terminal_candidate, "fresh_process_environment")
+    def test_candidate_xtask_target_never_becomes_a_protected_output(
+        self,
+        fresh_process_environment: mock.Mock,
+        run_prepared_process: mock.Mock,
+        resolved_executable: mock.Mock,
+        remove_phase_state: mock.Mock,
+    ) -> None:
+        target = pathlib.Path("/state/phase/target")
+        phase = pathlib.Path("/state/phase")
+        candidate_xtask = target / "debug" / "xtask"
+        captured: dict[str, str] = {}
+
+        def fresh(environment: dict[str, str]) -> tuple[dict[str, str], pathlib.Path]:
+            captured.update(environment)
+            isolated = dict(environment)
+            isolated["CARGO_TARGET_DIR"] = os.fspath(target)
+            return isolated, phase
+
+        fresh_process_environment.side_effect = fresh
+        resolved_executable.return_value = candidate_xtask
+        with mock.patch.dict(
+            os.environ,
+            {terminal_candidate.CARGO_LOCKFILE_PATH_ENV: "/locks/root.lock"},
+            clear=True,
+        ):
+            terminal_candidate.run_candidate_xtask(
+                pathlib.Path("/trusted/cargo"),
+                pathlib.Path("/candidate/xtask/Cargo.toml"),
+                pathlib.Path("/candidate"),
+            )
+
+        self.assertNotIn(terminal_candidate.CARGO_LOCKFILE_PATH_ENV, captured)
+        self.assertIn("build", run_prepared_process.call_args_list[0].args[0])
+        self.assertEqual(
+            run_prepared_process.call_args_list[1].args[0],
+            [os.fspath(candidate_xtask), "ci"],
+        )
+        self.assertEqual(
+            run_prepared_process.call_args_list[1].kwargs["environment"][
+                terminal_candidate.CARGO_LOCKFILE_PATH_ENV
+            ],
+            "/locks/root.lock",
+        )
+        remove_phase_state.assert_called_once_with(phase)
+
+    def test_terminal_driver_rejects_runner_and_preload_environment(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"YAML_SIGIL_TERMINAL_CANDIDATE": "1"},
+            clear=True,
+        ):
+            terminal_candidate.require_minimal_environment()
+        for name in ("GITHUB_ENV", "ACTIONS_RUNTIME_TOKEN", "LD_PRELOAD"):
+            with self.subTest(name=name), mock.patch.dict(
+                os.environ,
+                {"YAML_SIGIL_TERMINAL_CANDIDATE": "1", name: "poison"},
+                clear=True,
+            ):
+                with self.assertRaises(terminal_candidate.IsolationError):
+                    terminal_candidate.require_minimal_environment()
+
+    def test_terminal_driver_requires_host_control_paths_to_be_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            existing = pathlib.Path(directory)
+            with self.assertRaises(terminal_candidate.IsolationError):
+                terminal_candidate.require_host_paths_absent([existing])
+            terminal_candidate.require_host_paths_absent([existing / "absent"])
+
+    def test_terminal_driver_discards_candidate_cargo_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            seed = root / "seed"
+            state = root / "state"
+            seed.mkdir()
+            state.mkdir()
+            for name in ("registry", "git", "advisory-db"):
+                (seed / name).mkdir()
+            (seed / "config.toml").write_text(
+                "[net]\noffline = true\n", encoding="utf-8"
+            )
+            (seed / "config.toml").chmod(0o444)
+            environment = {
+                terminal_candidate.CARGO_SEED_ENV: os.fspath(seed),
+                terminal_candidate.CARGO_STATE_ROOT_ENV: os.fspath(state),
+                "CARGO_ALIAS_AUDIT": "version",
+                "CARGO_TARGET_FAKE_RUNNER": "/candidate/runner",
+                "RUSTC_WRAPPER": "/candidate/wrapper",
+            }
+            first, first_phase = terminal_candidate.fresh_process_environment(environment)
+            assert first is not None and first_phase is not None
+            self.assertNotIn("CARGO_ALIAS_AUDIT", first)
+            self.assertNotIn("CARGO_TARGET_FAKE_RUNNER", first)
+            self.assertNotIn("RUSTC_WRAPPER", first)
+            first_config = pathlib.Path(first["CARGO_HOME"]).joinpath("config.toml")
+            self.assertTrue(first_config.is_symlink())
+            self.assertEqual(
+                first_config.read_text(encoding="utf-8"),
+                "[net]\noffline = true\n",
+            )
+            first_config.unlink()
+            first_config.write_text(
+                "[alias]\naudit='version'\n", encoding="utf-8"
+            )
+            pathlib.Path(first["CARGO_TARGET_DIR"]).joinpath("forged").write_bytes(b"x")
+            terminal_candidate.remove_phase_state(first_phase)
+
+            second, second_phase = terminal_candidate.fresh_process_environment(environment)
+            assert second is not None and second_phase is not None
+            self.assertNotEqual(first["CARGO_HOME"], second["CARGO_HOME"])
+            second_config = pathlib.Path(second["CARGO_HOME"]).joinpath("config.toml")
+            self.assertTrue(second_config.is_symlink())
+            self.assertEqual(
+                second_config.read_text(encoding="utf-8"),
+                "[net]\noffline = true\n",
+            )
+            self.assertFalse(pathlib.Path(second["CARGO_TARGET_DIR"]).joinpath("forged").exists())
+            terminal_candidate.remove_phase_state(second_phase)
+
+    def test_terminal_driver_rejects_linked_seed_configuration(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            seed = root / "seed"
+            state = root / "state"
+            seed.mkdir()
+            state.mkdir()
+            (root / "outside.toml").write_text(
+                "[net]\noffline = true\n", encoding="utf-8"
+            )
+            (seed / "config.toml").symlink_to(root / "outside.toml")
+            environment = {
+                terminal_candidate.CARGO_SEED_ENV: os.fspath(seed),
+                terminal_candidate.CARGO_STATE_ROOT_ENV: os.fspath(state),
+            }
+            with self.assertRaises(terminal_candidate.IsolationError):
+                terminal_candidate.fresh_process_environment(environment)
+
+    def test_terminal_driver_rejects_missing_or_mutable_seed_configuration(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            seed = root / "seed"
+            state = root / "state"
+            seed.mkdir()
+            state.mkdir()
+            environment = {
+                terminal_candidate.CARGO_SEED_ENV: os.fspath(seed),
+                terminal_candidate.CARGO_STATE_ROOT_ENV: os.fspath(state),
+            }
+            with self.assertRaises(terminal_candidate.IsolationError):
+                terminal_candidate.fresh_process_environment(environment)
+            (seed / "config.toml").write_text(
+                "[net]\noffline = true\n", encoding="utf-8"
+            )
+            with self.assertRaises(terminal_candidate.IsolationError):
+                terminal_candidate.fresh_process_environment(environment)
+
+    def test_terminal_driver_requires_adopted_cargo_configuration(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            policy = root / "policy"
+            candidate = root / "candidate"
+            for checkout in (policy, candidate):
+                (checkout / ".cargo").mkdir(parents=True)
+                (checkout / ".cargo" / "config.toml").write_text(
+                    "[alias]\nxtask='run --locked'\n", encoding="utf-8"
+                )
+            terminal_candidate.require_cargo_configuration_adopted(
+                policy, candidate, "traits"
+            )
+            (candidate / ".cargo" / "config.toml").write_text(
+                "[build]\nrustc-wrapper='/candidate/wrapper'\n", encoding="utf-8"
+            )
+            with self.assertRaises(terminal_candidate.IsolationError):
+                terminal_candidate.require_cargo_configuration_adopted(
+                    policy, candidate, "traits"
+                )
+
+            (candidate / ".cargo" / "config.toml").write_text(
+                "[source.crates-io]\nreplace-with='internal'\n"
+                "[source.internal]\nregistry='http://169.254.169.254/index'\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(terminal_candidate.IsolationError):
+                terminal_candidate.require_cargo_configuration_adopted(
+                    policy, candidate, "traits"
+                )
+
+    def test_detached_helper_publishes_complete_pid_atomically(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            marker = root / "detached.pid"
+            with mock.patch.object(terminal_candidate.time, "sleep"):
+                self.assertEqual(terminal_candidate.detached_helper(marker), 0)
+            self.assertEqual(marker.read_text(encoding="ascii"), str(os.getpid()))
+            self.assertEqual(list(root.glob(".*.tmp")), [])
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux subreaper regression")
+    def test_terminal_step_reaps_a_silent_session_escapee(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            marker = root / "escapee.pid"
+            launcher = root / "launcher.py"
+            launcher.write_text(
+                "import pathlib,subprocess,sys,time\n"
+                "driver=pathlib.Path(sys.argv[1])\n"
+                "marker=pathlib.Path(sys.argv[2])\n"
+                "subprocess.Popen([sys.executable,str(driver),'detached-helper',str(marker)],"
+                "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,"
+                "start_new_session=True,close_fds=True)\n"
+                "deadline=time.monotonic()+5\n"
+                "while not marker.exists():\n"
+                "    assert time.monotonic()<deadline\n"
+                "    time.sleep(0.01)\n",
+                encoding="utf-8",
+            )
+            terminal_candidate.enable_child_subreaper()
+            terminal_candidate.run_process(
+                [sys.executable, os.fspath(launcher), os.fspath(TERMINAL_DRIVER_PATH), os.fspath(marker)],
+                root,
+            )
+            process_id = int(marker.read_text(encoding="ascii"))
+            with self.assertRaises(ProcessLookupError):
+                os.kill(process_id, 0)
+
+    def test_terminal_driver_rejects_reachable_command_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            command_file = pathlib.Path(directory) / "github_env"
+            command_file.write_text("", encoding="utf-8")
+            with self.assertRaises(terminal_candidate.IsolationError):
+                terminal_candidate.require_command_files_inaccessible(command_file)
+
+    def test_terminal_driver_rejects_writable_trusted_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            trusted_file = root / "trusted-tool"
+            trusted_file.write_bytes(b"tool")
+            with self.assertRaises(terminal_candidate.IsolationError):
+                terminal_candidate.require_tree_read_only(root, "trusted tree")
+            with self.assertRaises(terminal_candidate.IsolationError):
+                terminal_candidate.require_file_read_only(trusted_file, "trusted tool")
+
+    def test_terminal_driver_names_an_unreadable_candidate_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            unreadable = root / "blocked.txt"
+            unreadable.write_bytes(b"blocked")
+            with mock.patch.object(
+                pathlib.Path,
+                "open",
+                side_effect=PermissionError(13, "denied"),
+            ):
+                with self.assertRaisesRegex(
+                    terminal_candidate.IsolationError,
+                    r"cannot read candidate source tree entry blocked\.txt",
+                ):
+                    terminal_candidate.require_tree_readable(
+                        root, "candidate source tree"
+                    )
+
+    def test_controller_token_jobs_compile_before_checks_only_tokens(self) -> None:
+        command = COMMAND_WORKFLOW_PATH.read_text(encoding="utf-8")
+        self.assertEqual(command.count("Create checks-only GitHub App token"), 2)
+        self.assertEqual(command.count("permission-checks: write"), 2)
+        self.assertNotIn("permission-contents:", command)
+        start = command.index("  start_check:")
+        protected = command.index("  protected_ci:")
+        finish = command.index("  finish_check:")
+        start_job = command[start:protected]
+        finish_job = command[finish:]
+        for job in (start_job, finish_job):
+            self.assertLess(
+                job.index("Load immutable check policy"),
+                job.index("Create checks-only GitHub App token"),
+            )
+            self.assertLess(
+                job.index("Verify exact App token repository scope"),
+                job.index("App-owned in-progress check")
+                if "App-owned in-progress check" in job
+                else job.index("Revalidate state and finalize App check"),
+            )
+            self.assertNotIn("actions/checkout@", job)
+
+    def test_reconciliation_token_jobs_remain_checkout_free(self) -> None:
+        workflow = RECONCILE_WORKFLOW_PATH.read_text(encoding="utf-8")
+        self.assertNotIn("actions/checkout@", workflow)
+
+
 class CommitPolicyTests(unittest.TestCase):
     def setUp(self) -> None:
         temporary_directory = tempfile.TemporaryDirectory()
@@ -1312,7 +2926,7 @@ class CommitPolicyTests(unittest.TestCase):
         process_environment = os.environ.copy()
         process_environment.update({"BASE_SHA": base_sha, "HEAD_SHA": head_sha})
         return subprocess.run(
-            ["bash", str(COMMIT_POLICY_PATH)],
+            [policy_bash(), str(COMMIT_POLICY_PATH)],
             cwd=self.repository,
             env=process_environment,
             text=True,
@@ -1466,6 +3080,300 @@ class PaginationTests(unittest.TestCase):
                 api.paginate("/items", max_items=200, label="items")
 
 
+class GraphQlResponse:
+    status = 200
+
+    def __init__(self, value: dict) -> None:
+        self.raw = json.dumps(value, separators=(",", ":")).encode("utf-8")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def read(self, limit: int) -> bytes:
+        return self.raw[:limit]
+
+
+def requested_graphql_page(request) -> tuple[int, str | None, int, str]:
+    body = json.loads(request.data)
+    variables = body["variables"]
+    return variables["first"], variables["after"], variables["number"], body["query"]
+
+
+def graphql_signature_value(
+    signatures: list[dict],
+    *,
+    total_count: int,
+    has_next: bool,
+    end_cursor: str | None,
+) -> dict:
+    return {
+        "data": {
+            "repository": {
+                "pullRequest": {
+                    "commits": {
+                        "totalCount": total_count,
+                        "nodes": [{"commit": signature} for signature in signatures],
+                        "pageInfo": {
+                            "hasNextPage": has_next,
+                            "endCursor": end_cursor,
+                        },
+                    }
+                }
+            }
+        }
+    }
+
+
+def graphql_signature_response(
+    oids: list[str],
+    *,
+    total_count: int | None = None,
+    has_next: bool = False,
+    end_cursor: str | None = None,
+) -> GraphQlResponse:
+    return GraphQlResponse(
+        graphql_signature_value(
+            [git_signature(sha=oid) for oid in oids],
+            total_count=len(oids) if total_count is None else total_count,
+            has_next=has_next,
+            end_cursor=end_cursor,
+        )
+    )
+
+
+def graphql_signature_pages(oids: list[str]):
+    offset = 0
+    expected_cursor = None
+
+    def respond(request, *_args, **_kwargs) -> GraphQlResponse:
+        nonlocal offset, expected_cursor
+        first, after, number, query = requested_graphql_page(request)
+        if number != PULL_NUMBER or after != expected_cursor:
+            raise AssertionError("unexpected pull request signature page")
+        if "pullRequest(number:$number)" not in query or "object(oid:" in query:
+            raise AssertionError("signature query escaped the pull request connection")
+        batch = oids[offset : offset + first]
+        offset += len(batch)
+        has_next = offset < len(oids)
+        end_cursor = f"cursor-{offset}"
+        expected_cursor = end_cursor if has_next else None
+        return graphql_signature_response(
+            batch,
+            total_count=len(oids),
+            has_next=has_next,
+            end_cursor=end_cursor,
+        )
+
+    return respond
+
+
+class GraphQlSignatureTests(unittest.TestCase):
+    def test_signature_query_text_matches_the_intended_selection_tree(self) -> None:
+        api = controller.GitHubApi("token", "https://example.invalid")
+        with mock.patch.object(
+            controller.urllib.request,
+            "urlopen",
+            return_value=graphql_signature_response([HEAD_SHA]),
+        ) as urlopen:
+            api.commit_signatures(REPOSITORY, PULL_NUMBER, [HEAD_SHA])
+
+        _, _, _, query = requested_graphql_page(urlopen.call_args.args[0])
+        expected = "".join(
+            """
+            query($owner:String!,$name:String!,$number:Int!,$first:Int!,$after:String){
+              repository(owner:$owner,name:$name){
+                pullRequest(number:$number){
+                  commits(first:$first,after:$after){
+                    totalCount
+                    nodes{
+                      commit{
+                        oid
+                        signature{
+                          __typename
+                          email
+                          isValid
+                          state
+                          wasSignedByGitHub
+                          signer{databaseId login __typename}
+                        }
+                      }
+                    }
+                    pageInfo{hasNextPage endCursor}
+                  }
+                }
+              }
+            }
+            """.split()
+        )
+        self.assertEqual("".join(query.split()), expected)
+
+    def test_signature_inventory_is_batched_five_by_fifty(self) -> None:
+        oids = [f"{index:040x}" for index in range(1, 251)]
+        api = controller.GitHubApi("token", "https://example.invalid")
+        with mock.patch.object(
+            controller.urllib.request,
+            "urlopen",
+            side_effect=graphql_signature_pages(oids),
+        ) as urlopen:
+            observed = api.commit_signatures(REPOSITORY, PULL_NUMBER, oids)
+        self.assertEqual(list(observed), oids)
+        self.assertEqual(urlopen.call_count, 5)
+        self.assertTrue(
+            all(
+                requested_graphql_page(call.args[0])[0] == 50
+                for call in urlopen.call_args_list
+            )
+        )
+        self.assertTrue(
+            all(
+                requested_graphql_page(call.args[0])[2] == PULL_NUMBER
+                and "pullRequest(number:$number)"
+                in requested_graphql_page(call.args[0])[3]
+                and "object(oid:" not in requested_graphql_page(call.args[0])[3]
+                for call in urlopen.call_args_list
+            )
+        )
+
+    def test_251_commits_and_excess_requests_fail_before_ambiguity(self) -> None:
+        api = controller.GitHubApi("token", "https://example.invalid")
+        oids = [f"{index:040x}" for index in range(1, 252)]
+        with self.assertRaisesRegex(controller.PolicyError, "commit limit"):
+            api.commit_signatures(REPOSITORY, PULL_NUMBER, oids)
+
+        with (
+            mock.patch.object(controller, "MAX_SIGNATURE_BATCH", 1),
+            mock.patch.object(controller, "MAX_SIGNATURE_REQUESTS", 1),
+            mock.patch.object(
+                controller.urllib.request,
+                "urlopen",
+                side_effect=graphql_signature_pages([HEAD_SHA, OLD_SHA]),
+            ) as urlopen,
+            self.assertRaisesRegex(controller.PolicyError, "too many GraphQL requests"),
+        ):
+            api.commit_signatures(REPOSITORY, PULL_NUMBER, [HEAD_SHA, OLD_SHA])
+        self.assertEqual(urlopen.call_count, 1)
+
+    def test_aggregate_success_body_budget_has_a_sentinel(self) -> None:
+        first = graphql_signature_response(
+            [HEAD_SHA],
+            total_count=2,
+            has_next=True,
+            end_cursor="cursor-1",
+        )
+        second = graphql_signature_response(
+            [OLD_SHA],
+            total_count=2,
+            end_cursor="cursor-2",
+        )
+        budget = len(first.raw) + len(second.raw) - 1
+        api = controller.GitHubApi("token", "https://example.invalid")
+        with (
+            mock.patch.object(controller, "MAX_SIGNATURE_BATCH", 1),
+            mock.patch.object(controller, "MAX_API_RESPONSE_BYTES", budget),
+            mock.patch.object(
+                controller.urllib.request,
+                "urlopen",
+                side_effect=[first, second],
+            ),
+            self.assertRaisesRegex(controller.PolicyError, "aggregate commit signature"),
+        ):
+            api.commit_signatures(REPOSITORY, PULL_NUMBER, [HEAD_SHA, OLD_SHA])
+
+    def test_partial_graphql_errors_are_rejected_even_with_data(self) -> None:
+        response = graphql_signature_response([HEAD_SHA], end_cursor="cursor-1")
+        value = json.loads(response.raw)
+        value["errors"] = [{"message": "partial"}]
+        api = controller.GitHubApi("token", "https://example.invalid")
+        with (
+            mock.patch.object(
+                controller.urllib.request,
+                "urlopen",
+                return_value=GraphQlResponse(value),
+            ),
+            self.assertRaisesRegex(controller.PolicyError, "contains errors"),
+        ):
+            api.commit_signatures(REPOSITORY, PULL_NUMBER, [HEAD_SHA])
+
+    def test_missing_extra_duplicate_and_reordered_results_fail_closed(self) -> None:
+        cases = {
+            "missing": [git_signature(sha=HEAD_SHA)],
+            "extra": [
+                git_signature(sha=HEAD_SHA),
+                git_signature(sha=OLD_SHA),
+                git_signature(sha=MAIN_SHA),
+            ],
+            "duplicate": [
+                git_signature(sha=HEAD_SHA),
+                git_signature(sha=HEAD_SHA),
+            ],
+            "reordered": [
+                git_signature(sha=OLD_SHA),
+                git_signature(sha=HEAD_SHA),
+            ],
+        }
+        for label, signatures in cases.items():
+            with self.subTest(case=label):
+                api = controller.GitHubApi("token", "https://example.invalid")
+                with (
+                    mock.patch.object(
+                        controller.urllib.request,
+                        "urlopen",
+                        return_value=GraphQlResponse(
+                            graphql_signature_value(
+                                signatures,
+                                total_count=2,
+                                has_next=False,
+                                end_cursor="cursor-2",
+                            )
+                        ),
+                    ),
+                    self.assertRaises(controller.PolicyError),
+                ):
+                    api.commit_signatures(
+                        REPOSITORY, PULL_NUMBER, [HEAD_SHA, OLD_SHA]
+                    )
+
+    def test_duplicate_requested_oids_fail_before_network_access(self) -> None:
+        api = controller.GitHubApi("token", "https://example.invalid")
+        with (
+            mock.patch.object(controller.urllib.request, "urlopen") as urlopen,
+            self.assertRaisesRegex(controller.PolicyError, "duplicate commit OIDs"),
+        ):
+            api.commit_signatures(REPOSITORY, PULL_NUMBER, [HEAD_SHA, HEAD_SHA])
+        urlopen.assert_not_called()
+
+
+class AppTokenScopeTests(unittest.TestCase):
+    def test_exact_single_repository_inventory_is_required(self) -> None:
+        api = mock.Mock()
+        api.paginate_key.return_value = [{"id": 11, "full_name": REPOSITORY}]
+        controller.require_app_token_repository_scope(api, REPOSITORY)
+        api.paginate_key.assert_called_once_with(
+            "/installation/repositories",
+            "repositories",
+            max_items=2,
+            label="App token repository inventory",
+        )
+
+        for inventory in (
+            [],
+            [
+                {"id": 11, "full_name": REPOSITORY},
+                {"id": 12, "full_name": "NVIDIA/another"},
+            ],
+            [{"id": 11, "full_name": "NVIDIA/another"}],
+            [{"id": 0, "full_name": REPOSITORY}],
+        ):
+            with self.subTest(inventory=inventory):
+                api = mock.Mock()
+                api.paginate_key.return_value = inventory
+                with self.assertRaises(controller.PolicyError):
+                    controller.require_app_token_repository_scope(api, REPOSITORY)
+
+
 class FakeCheckApi:
     def __init__(self, checks=None) -> None:
         self.checks = list(checks or [])
@@ -1506,15 +3414,46 @@ class FakeCheckApi:
         return check
 
 
-def external(run_id: int = 101, attempt: int = 1) -> object:
+def authorization_digest(
+    api: FakeAuthorizationApi | None = None,
+    approval: dict | None = None,
+) -> str:
+    selected_api = api or FakeAuthorizationApi()
+    selected_event = approval or event()
+    selected_api.comment = copy.deepcopy(selected_event["comment"])
+    return controller.authorize(
+        selected_event, policy(), selected_api, environment()
+    ).binding_digest
+
+
+def external(
+    run_id: int = 101,
+    attempt: int = 1,
+    binding_digest: str | None = None,
+) -> object:
     return controller.ExternalId(
         repository=REPOSITORY,
         pull_number=7,
         head_sha=HEAD_SHA,
         base_sha=MAIN_SHA,
         policy_sha=MAIN_SHA,
+        binding_digest=binding_digest or authorization_digest(),
         run_id=run_id,
         run_attempt=attempt,
+    )
+
+
+def job_results(
+    *, workflow_lint: str = "success", candidate_ci: str = "skipped"
+) -> str:
+    return json.dumps(
+        {
+            "commit_policy": "success",
+            "workflow_lint": workflow_lint,
+            "candidate_ci": candidate_ci,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
     )
 
 
@@ -1532,7 +3471,15 @@ def pending_check(check_id: int, binding, slug: str = APP_SLUG) -> dict:
 class CheckRunTests(unittest.TestCase):
     def test_external_id_round_trip_binds_all_fields(self) -> None:
         binding = external()
-        self.assertEqual(controller.ExternalId.decode(binding.encode()), binding)
+        self.assertEqual(
+            controller.ExternalId.decode(
+                binding.encode(),
+                repository=REPOSITORY,
+                base_sha=MAIN_SHA,
+                policy_sha=MAIN_SHA,
+            ),
+            binding,
+        )
         self.assertLessEqual(len(binding.encode()), 255)
 
     def test_retry_closes_prior_app_check_but_not_actions_check(self) -> None:
@@ -1604,11 +3551,7 @@ class CheckRunTests(unittest.TestCase):
             binding,
             COMMENT_ID,
             1,
-            [
-                "commit_policy=success",
-                "workflow_lint=success",
-                "candidate_ci=skipped",
-            ],
+            job_results(),
             APP_SLUG,
         )
         self.assertEqual(app_api.patches[-1][1]["conclusion"], "success")
@@ -1624,42 +3567,40 @@ class CheckRunTests(unittest.TestCase):
                 binding,
                 COMMENT_ID,
                 1,
-                [
-                    "commit_policy=success",
-                    "workflow_lint=skipped",
-                    "candidate_ci=skipped",
-                ],
+                job_results(workflow_lint="skipped"),
                 APP_SLUG,
             )
         self.assertEqual(app_api.patches[-1][1]["conclusion"], "failure")
 
     def test_required_candidate_ci_may_not_be_skipped(self) -> None:
-        binding = external()
+        approval = adoption_event()
+        binding_api = FakeAuthorizationApi()
+        binding_api.set_change(".github/workflows/ci.yml")
+        binding = external(
+            binding_digest=authorization_digest(binding_api, approval)
+        )
         app_api = FakeCheckApi([pending_check(1, binding)])
         auth_api = FakeAuthorizationApi()
         auth_api.set_change(".github/workflows/ci.yml")
+        auth_api.comment = copy.deepcopy(approval["comment"])
 
         with self.assertRaisesRegex(controller.PolicyError, "did not all succeed"):
             controller.finish_check(
                 app_api,
                 auth_api,
                 policy(),
-                event(),
+                approval,
                 environment(),
                 binding,
                 COMMENT_ID,
                 1,
-                [
-                    "commit_policy=success",
-                    "workflow_lint=success",
-                    "candidate_ci=skipped",
-                ],
+                job_results(),
                 APP_SLUG,
             )
 
         self.assertEqual(app_api.patches[-1][1]["conclusion"], "failure")
 
-    def test_success_is_overwritten_if_main_advances_during_reconciliation(self) -> None:
+    def test_success_is_not_published_if_main_advances_before_finalization(self) -> None:
         binding = external()
         app_api = FakeCheckApi([pending_check(1, binding)])
         auth_api = FakeAuthorizationApi()
@@ -1674,6 +3615,34 @@ class CheckRunTests(unittest.TestCase):
         ]
 
         with self.assertRaisesRegex(
+            controller.PolicyError, "workflow policy commit is no longer current main"
+        ):
+            controller.finish_check(
+                app_api,
+                auth_api,
+                policy(),
+                event(),
+                environment(),
+                binding,
+                COMMENT_ID,
+                1,
+                job_results(),
+                APP_SLUG,
+            )
+
+        self.assertEqual(
+            [payload["conclusion"] for _path, payload in app_api.patches],
+            ["failure"],
+        )
+        self.assertEqual(app_api.checks[0]["conclusion"], "failure")
+
+    def test_success_is_overwritten_if_main_advances_during_reconciliation(self) -> None:
+        binding = external()
+        app_api = FakeCheckApi([pending_check(1, binding)])
+        auth_api = FakeAuthorizationApi()
+        auth_api.main_sha_sequence = [MAIN_SHA] * 15 + [OLD_SHA]
+
+        with self.assertRaisesRegex(
             controller.PolicyError, "main changed during final check reconciliation"
         ):
             controller.finish_check(
@@ -1685,11 +3654,7 @@ class CheckRunTests(unittest.TestCase):
                 binding,
                 COMMENT_ID,
                 1,
-                [
-                    "commit_policy=success",
-                    "workflow_lint=success",
-                    "candidate_ci=skipped",
-                ],
+                job_results(),
                 APP_SLUG,
             )
 
@@ -1704,7 +3669,7 @@ class CheckRunTests(unittest.TestCase):
         binding = external()
         app_api = FakeCheckApi([pending_check(1, binding)])
         auth_api = FakeAuthorizationApi()
-        auth_api.main_error_on_read = 7
+        auth_api.main_error_on_read = 16
 
         with self.assertRaisesRegex(controller.PolicyError, "main ref reread failed"):
             controller.finish_check(
@@ -1716,11 +3681,7 @@ class CheckRunTests(unittest.TestCase):
                 binding,
                 COMMENT_ID,
                 1,
-                [
-                    "commit_policy=success",
-                    "workflow_lint=success",
-                    "candidate_ci=skipped",
-                ],
+                job_results(),
                 APP_SLUG,
             )
 
@@ -1730,6 +3691,45 @@ class CheckRunTests(unittest.TestCase):
         )
         self.assertEqual(app_api.patches[0][0], app_api.patches[1][0])
         self.assertEqual(app_api.checks[0]["conclusion"], "failure")
+
+    def test_final_authorization_failures_never_publish_success(self) -> None:
+        current = authorize_fixture(FakeAuthorizationApi())
+        failures = (
+            "authorization comment changed",
+            "authorization comment was deleted",
+            "commenter no longer has write permission",
+            "pull request head changed",
+            "pull request base changed",
+            "pull request is no longer open",
+        )
+        for message in failures:
+            with self.subTest(message=message):
+                binding = external()
+                app_api = FakeCheckApi([pending_check(1, binding)])
+                with (
+                    mock.patch.object(
+                        controller,
+                        "authorize_call",
+                        side_effect=[current, controller.PolicyError(message)],
+                    ),
+                    self.assertRaisesRegex(controller.PolicyError, message),
+                ):
+                    controller.finish_check(
+                        app_api,
+                        FakeAuthorizationApi(),
+                        policy(),
+                        event(),
+                        environment(),
+                        binding,
+                        COMMENT_ID,
+                        1,
+                        job_results(),
+                        APP_SLUG,
+                    )
+                self.assertEqual(
+                    [payload["conclusion"] for _path, payload in app_api.patches],
+                    ["failure"],
+                )
 
     def test_reconciliation_validates_failure_patch_response_binding(self) -> None:
         binding = external()
@@ -1750,11 +3750,7 @@ class CheckRunTests(unittest.TestCase):
                 binding,
                 COMMENT_ID,
                 1,
-                [
-                    "commit_policy=success",
-                    "workflow_lint=success",
-                    "candidate_ci=skipped",
-                ],
+                job_results(),
                 APP_SLUG,
             )
 
