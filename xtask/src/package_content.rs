@@ -95,18 +95,6 @@ fn check_package(root: &Path, package: PackageSpec) -> io::Result<usize> {
     }
 }
 
-#[cfg(all(test, windows))]
-pub(crate) fn check_test_package(root: &Path) -> io::Result<usize> {
-    check_package(
-        root,
-        PackageSpec {
-            name: "candidate-package",
-            inventory_path: "test package inventory",
-            inventory: "Cargo.lock\nCargo.toml\nCargo.toml.orig\nsrc/lib.rs\n",
-        },
-    )
-}
-
 fn package_list_args(package: &str) -> [&str; 6] {
     [
         "package",

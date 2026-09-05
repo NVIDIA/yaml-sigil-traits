@@ -1,1011 +1,422 @@
 name: Publish
 
-# This workflow publishes source crates and creates only annotated tags and
-# immutable, zero-asset GitHub Releases. It retains no executable artifact.
+# A main push may qualify one reviewed release. Manual dispatch is either
+# validation-only or recovery bound to the original source and run attempt.
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       operation:
-        description: Validate or publish an official release.
+        description: Validate protected policy or recover one original main run.
         required: true
         default: validate
         type: choice
         options:
           - validate
-          - publish
-  repository_dispatch:
-    types:
-      - official-release-published
+          - recover
+      source_sha:
+        description: Full source SHA; required for validation and recovery.
+        required: true
+        type: string
+      original_run_id:
+        description: Original push run ID; required only for recovery.
+        required: false
+        type: string
+      original_run_attempt:
+        description: Original push run attempt; required only for recovery.
+        required: false
+        type: string
 
 permissions: {}
 
-env:
-  # Resolve the manifest's explicit `crates-io` publish allowlist by name.
-  CARGO_REGISTRIES_CRATES_IO_INDEX: https://github.com/rust-lang/crates.io-index
-
-# Publication is resumable and its authenticated receiver is serialized behind
-# the originating run. Neither path is payload-controlled.
 concurrency:
-  group: publish-${{ github.repository }}
+  group: yaml-sigil-publish-v2-${{ github.repository }}
   cancel-in-progress: false
 
 jobs:
-  release-readiness:
-    name: Validate source-only release readiness
-    if: >-
-      ${{ github.event_name == 'workflow_dispatch' &&
-          (inputs.operation == 'validate' || inputs.operation == 'publish') }}
+  qualify:
+    name: Qualify exact release source
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
     permissions:
+      actions: read
       contents: read
       pull-requests: read
     outputs:
-      baseline_commit: ${{ steps.baseline.outputs.commit }}
-      baseline_version: ${{ steps.baseline.outputs.version }}
-      captured_release_sha: ${{ steps.capture.outputs.captured_release_sha }}
-      policy_commit: ${{ steps.capture.outputs.policy_commit }}
-      existing_intent: ${{ steps.capture.outputs.existing_intent }}
-      existing_intent_check_id: ${{ steps.capture.outputs.existing_intent_check_id }}
-      existing_intent_digest: ${{ steps.capture.outputs.existing_intent_digest }}
-      plan: ${{ steps.capture.outputs.plan }}
-      plan_digest: ${{ steps.capture.outputs.plan_digest }}
-      registry_state: ${{ steps.capture.outputs.registry_state }}
+      mode: ${{ steps.invocation.outputs.mode }}
+      qualified: ${{ steps.qualify.outputs.qualified }}
+      registry_state: ${{ steps.qualify.outputs.registry_state }}
+      source: ${{ steps.qualify.outputs.source }}
+      validation_only: ${{ steps.qualify.outputs.validation_only }}
+      version: ${{ steps.qualify.outputs.version }}
     steps:
-      - name: Check out dispatch source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-          ref: ${{ github.sha }}
-
-      - name: Validate exact main invocation
-        run: |
-          # Release readiness belongs only to the dispatched protected main.
-          if [[ "${GITHUB_REF}" != "refs/heads/main" \
-            || "$(git rev-parse HEAD)" != "${GITHUB_SHA}" ]]; then
-            echo "Official release operations must use exact main." >&2
-            exit 1
-          fi
-
-      - name: Set up Rust
-        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
-        with:
-          cache: false
-          toolchain: 1.95.0,stable
-
-      - name: Bind archive reproduction Cargo
-        run: |
-          archive_cargo="$(rustup which --toolchain 1.95.0 cargo)"
-          test -x "${archive_cargo}"
-          printf 'YAML_SIGIL_ARCHIVE_CARGO=%s\n' "${archive_cargo}" \
-            >>"${GITHUB_ENV}"
-
-      - name: Install exact cargo-binstall
-        uses: cargo-bins/cargo-binstall@732870f031d2fb36309d0deaf36abcc704a7be65 # v1.20.1
-        with:
-          version: 1.20.1
-
-      - name: Install and verify release analyzers
-        run: cargo +stable xtask release install-tools
-
-      # Preserve current trusted release policy across a recovery checkout.
-      - name: Stage current release validator
-        run: |
-          cargo +stable build --locked --manifest-path xtask/Cargo.toml
-          validator="${RUNNER_TEMP}/yaml-sigil-release-xtask"
-          install -m 700 xtask/target/debug/xtask "${validator}"
-          validator_sha256="$(sha256sum "${validator}" | cut -d ' ' -f 1)"
-          printf 'YAML_SIGIL_RELEASE_XTASK=%s\n' "${validator}" \
-            >>"${GITHUB_ENV}"
-          printf 'YAML_SIGIL_RELEASE_XTASK_SHA256=%s\n' "${validator_sha256}" \
-            >>"${GITHUB_ENV}"
-
-      - name: Verify pinned historical source-only Releases
-        id: legacy
+      - name: Bind event inputs before checkout
+        id: invocation
         env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: >-
-          "${YAML_SIGIL_RELEASE_XTASK}"
-          github release-train verify-legacy
-          --repository "${GITHUB_REPOSITORY}"
-          --policy-commit "${GITHUB_SHA}"
-
-      - name: Configure read-only forge identity
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: cargo +stable xtask github git-identity configure
-
-      - name: Discover fresh or recoverable release source
-        id: discover
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: >-
-          cargo +stable xtask github release-train discover
-          --repository "${GITHUB_REPOSITORY}"
-          --commit "${GITHUB_SHA}"
-
-      - name: Check out captured release source
-        if: ${{ steps.discover.outputs.captured_release_sha != github.sha }}
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-          ref: ${{ steps.discover.outputs.captured_release_sha }}
-
-      # Verify the checkout before changing only local branch metadata. The
-      # branch is never pushed; it supplies pinned release-plz's upstream.
-      - name: Attach exact source to a local release branch
-        env:
-          CAPTURED_SHA: ${{ steps.discover.outputs.captured_release_sha }}
+          DISPATCH_OPERATION: ${{ inputs.operation }}
+          INPUT_ATTEMPT: ${{ inputs.original_run_attempt }}
+          INPUT_RUN_ID: ${{ inputs.original_run_id }}
+          INPUT_SOURCE: ${{ inputs.source_sha }}
+        shell: bash
         run: |
-          test "$(git rev-parse HEAD)" = "${CAPTURED_SHA}"
-          # Pinned release-plz requires a branch with a configured upstream.
-          git switch --force-create release-plz-source "${CAPTURED_SHA}"
-          git branch --set-upstream-to=origin/main release-plz-source
-          test "$(git rev-parse HEAD)" = "${CAPTURED_SHA}"
-          test "$(git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}')" \
-            = "origin/main"
-
-      # Recheck the archive-discovered protected-main ancestor before project
-      # execution.
-      - name: Verify captured source identity
-        env:
-          CAPTURED_SHA: ${{ steps.discover.outputs.captured_release_sha }}
-          REGISTRY_STATE: ${{ steps.discover.outputs.registry_state }}
-        run: |
-          test "$(git rev-parse HEAD)" = "${CAPTURED_SHA}"
-          # A fresh release must still be exact current main before publication.
-          if [[ "${REGISTRY_STATE}" = "absent" ]]; then
-            test "$(sha256sum "${YAML_SIGIL_RELEASE_XTASK}" | cut -d ' ' -f 1)" \
-              = "${YAML_SIGIL_RELEASE_XTASK_SHA256}"
-            "${YAML_SIGIL_RELEASE_XTASK}" release require-current-main \
-              --head "${CAPTURED_SHA}" \
-              --fetch-url "https://github.com/${GITHUB_REPOSITORY}"
-          fi
-
-      - name: Require a committed release version
-        run: |
-          test "$(sha256sum "${YAML_SIGIL_RELEASE_XTASK}" | cut -d ' ' -f 1)" \
-            = "${YAML_SIGIL_RELEASE_XTASK_SHA256}"
-          "${YAML_SIGIL_RELEASE_XTASK}" release-version check
-          git diff --exit-code
-
-      - name: Prepare the official tagged baseline
-        id: baseline
-        env:
-          CAPTURED_SHA: ${{ steps.discover.outputs.captured_release_sha }}
-          GIT_CONFIG_COUNT: 1
-          GIT_CONFIG_KEY_0: remote.origin.pushurl
-          GIT_CONFIG_VALUE_0: disabled://yaml-sigil-release-readiness
-        run: |
-          test "$(sha256sum "${YAML_SIGIL_RELEASE_XTASK}" | cut -d ' ' -f 1)" \
-            = "${YAML_SIGIL_RELEASE_XTASK_SHA256}"
-          current_version="$("${YAML_SIGIL_RELEASE_XTASK}" release-version show)"
-          result="${RUNNER_TEMP}/baseline-result.json"
-          "${YAML_SIGIL_RELEASE_XTASK}" release baseline prepare \
-            --source-root "${GITHUB_WORKSPACE}" \
-            --head "${CAPTURED_SHA}" \
-            --exclude-version "${current_version}" \
-            --output "${RUNNER_TEMP}/official-release-baseline" \
-            --result "${result}" \
-            --expected-fetch-url "https://github.com/${GITHUB_REPOSITORY}" \
-            --expected-push-url "${GIT_CONFIG_VALUE_0}"
-          jq --raw-output \
-            '"commit=\(.commit)",
-             "manifest=\(.manifest)",
-             "version=\(.version)",
-             "inventory=\(.inventory)"' \
-            "${result}" >>"${GITHUB_OUTPUT}"
-
-      - name: Require the tagged baseline on crates.io
-        run: |
-          test "$(sha256sum "${YAML_SIGIL_RELEASE_XTASK}" | cut -d ' ' -f 1)" \
-            = "${YAML_SIGIL_RELEASE_XTASK_SHA256}"
-          "${YAML_SIGIL_RELEASE_XTASK}" release verify-registry \
-            --check-version "${{ steps.baseline.outputs.version }}" \
-            yaml-sigil-traits
-
-      - name: Check release API compatibility
-        run: |
-          test "$(sha256sum "${YAML_SIGIL_RELEASE_XTASK}" | cut -d ' ' -f 1)" \
-            = "${YAML_SIGIL_RELEASE_XTASK_SHA256}"
-          current_version="$("${YAML_SIGIL_RELEASE_XTASK}" release-version show)"
-          intent="$("${YAML_SIGIL_RELEASE_XTASK}" release-version intent \
-            --published "${{ steps.baseline.outputs.version }}")"
-          "${YAML_SIGIL_RELEASE_XTASK}" release-version check-compatibility \
-            --baseline-manifest "${{ steps.baseline.outputs.manifest }}" \
-            --current-manifest Cargo.toml \
-            --package yaml-sigil-traits \
-            --expected-baseline-version "${{ steps.baseline.outputs.version }}" \
-            --expected-current-version "${current_version}" \
-            --intent "${intent}"
-
-      - name: Require the exact source-package inventory
-        run: |
-          test "$(sha256sum "${YAML_SIGIL_RELEASE_XTASK}" | cut -d ' ' -f 1)" \
-            = "${YAML_SIGIL_RELEASE_XTASK_SHA256}"
-          "${YAML_SIGIL_RELEASE_XTASK}" release check-packages yaml-sigil-traits
-
-      - name: Package with Cargo
-        run: cargo +stable package
-
-      - name: Require exact merged release authorization
-        env:
-          CAPTURED_SHA: ${{ steps.discover.outputs.captured_release_sha }}
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          test "$(sha256sum "${YAML_SIGIL_RELEASE_XTASK}" | cut -d ' ' -f 1)" \
-            = "${YAML_SIGIL_RELEASE_XTASK_SHA256}"
-          "${YAML_SIGIL_RELEASE_XTASK}" github release-source authorize \
-            --repository "${GITHUB_REPOSITORY}" \
-            --commit "${CAPTURED_SHA}" \
-            --baseline-version "${{ steps.baseline.outputs.version }}" \
-            --baseline-commit "${{ steps.baseline.outputs.commit }}"
-
-      - name: Prepare source-only publication configuration
-        run: |
-          test "$(sha256sum "${YAML_SIGIL_RELEASE_XTASK}" | cut -d ' ' -f 1)" \
-            = "${YAML_SIGIL_RELEASE_XTASK_SHA256}"
-          "${YAML_SIGIL_RELEASE_XTASK}" release prepare-publication-config \
-            --output "${RUNNER_TEMP}/release-plz-publication.toml"
-
-      - name: Validate release-plz publication plan
-        env:
-          CAPTURED_SHA: ${{ steps.discover.outputs.captured_release_sha }}
-          GIT_TOKEN: ${{ github.token }}
-        run: |
-          test "$(git rev-parse HEAD)" = "${CAPTURED_SHA}"
-          # Dry-run exercises package selection without OIDC or writes.
-          release-plz release \
-            --dry-run \
-            --forge github \
-            --repo-url "https://github.com/${GITHUB_REPOSITORY}" \
-            --config "${RUNNER_TEMP}/release-plz-publication.toml" \
-            --manifest-path Cargo.toml
-          test "$(git rev-parse HEAD)" = "${CAPTURED_SHA}"
-
-      - name: Capture canonical release plan
-        id: capture
-        env:
-          CAPTURED_SHA: ${{ steps.discover.outputs.captured_release_sha }}
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          test "$(sha256sum "${YAML_SIGIL_RELEASE_XTASK}" | cut -d ' ' -f 1)" \
-            = "${YAML_SIGIL_RELEASE_XTASK_SHA256}"
-          "${YAML_SIGIL_RELEASE_XTASK}" github release-train capture \
-            --repository "${GITHUB_REPOSITORY}" \
-            --commit "${CAPTURED_SHA}" \
-            --policy-commit "${GITHUB_SHA}" \
-            --legacy-inventory-sha256 \
-              "${{ steps.legacy.outputs.legacy_inventory_digest }}" \
-            --baseline-version "${{ steps.baseline.outputs.version }}" \
-            --baseline-commit "${{ steps.baseline.outputs.commit }}"
-
-  publication:
-    name: Publish source crate
-    if: >-
-      ${{ github.event_name == 'workflow_dispatch' &&
-          inputs.operation == 'publish' }}
-    needs: release-readiness
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    environment: crates-io
-    permissions:
-      checks: read
-      contents: read
-      pull-requests: read
-      id-token: write
-    outputs:
-      baseline_commit: ${{ steps.baseline.outputs.commit }}
-      baseline_version: ${{ steps.baseline.outputs.version }}
-      captured_release_sha: ${{ steps.capture.outputs.captured_release_sha }}
-      policy_commit: ${{ steps.capture.outputs.policy_commit }}
-      existing_intent: ${{ steps.capture.outputs.existing_intent }}
-      existing_intent_check_id: ${{ steps.capture.outputs.existing_intent_check_id }}
-      existing_intent_digest: ${{ steps.capture.outputs.existing_intent_digest }}
-      plan: ${{ steps.capture.outputs.plan }}
-      plan_digest: ${{ steps.capture.outputs.plan_digest }}
-      registry_state: ${{ steps.capture.outputs.registry_state }}
-    steps:
-      - name: Check out dispatch source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-          ref: ${{ github.sha }}
-
-      - name: Set up Rust
-        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
-        with:
-          cache: false
-          toolchain: 1.95.0,stable
-
-      - name: Bind archive reproduction Cargo
-        run: |
-          archive_cargo="$(rustup which --toolchain 1.95.0 cargo)"
-          test -x "${archive_cargo}"
-          printf 'YAML_SIGIL_ARCHIVE_CARGO=%s\n' "${archive_cargo}" \
-            >>"${GITHUB_ENV}"
-
-      - name: Install exact cargo-binstall
-        uses: cargo-bins/cargo-binstall@732870f031d2fb36309d0deaf36abcc704a7be65 # v1.20.1
-        with:
-          version: 1.20.1
-
-      - name: Install and verify release analyzers
-        run: cargo +stable xtask release install-tools
-
-      # Preserve current trusted release policy across a recovery checkout.
-      - name: Stage current release validator
-        run: |
-          cargo +stable build --locked --manifest-path xtask/Cargo.toml
-          validator="${RUNNER_TEMP}/yaml-sigil-release-xtask"
-          install -m 700 xtask/target/debug/xtask "${validator}"
-          validator_sha256="$(sha256sum "${validator}" | cut -d ' ' -f 1)"
-          printf 'YAML_SIGIL_RELEASE_XTASK=%s\n' "${validator}" \
-            >>"${GITHUB_ENV}"
-          printf 'YAML_SIGIL_RELEASE_XTASK_SHA256=%s\n' "${validator_sha256}" \
-            >>"${GITHUB_ENV}"
-
-      - name: Recheck pinned historical source-only Releases
-        id: legacy
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: >-
-          "${YAML_SIGIL_RELEASE_XTASK}"
-          github release-train verify-legacy
-          --repository "${GITHUB_REPOSITORY}"
-          --policy-commit "${GITHUB_SHA}"
-
-      - name: Configure protected publication forge identity
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: cargo +stable xtask github git-identity configure
-
-      - name: Rediscover fresh or partial release source
-        id: discover
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: >-
-          cargo +stable xtask github release-train discover
-          --repository "${GITHUB_REPOSITORY}"
-          --commit "${GITHUB_SHA}"
-
-      - name: Check out captured release source
-        if: ${{ steps.discover.outputs.captured_release_sha != github.sha }}
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-          ref: ${{ steps.discover.outputs.captured_release_sha }}
-
-      # Verify the checkout before changing only local branch metadata. The
-      # branch is never pushed; it supplies pinned release-plz's upstream.
-      - name: Attach exact source to a local release branch
-        env:
-          CAPTURED_SHA: ${{ steps.discover.outputs.captured_release_sha }}
-        run: |
-          test "$(git rev-parse HEAD)" = "${CAPTURED_SHA}"
-          # Pinned release-plz requires a branch with a configured upstream.
-          git switch --force-create release-plz-source "${CAPTURED_SHA}"
-          git branch --set-upstream-to=origin/main release-plz-source
-          test "$(git rev-parse HEAD)" = "${CAPTURED_SHA}"
-          test "$(git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}')" \
-            = "origin/main"
-
-      - name: Recheck captured source and committed version
-        env:
-          CAPTURED_SHA: ${{ steps.discover.outputs.captured_release_sha }}
-        run: |
-          test "$(git rev-parse HEAD)" = "${CAPTURED_SHA}"
-          test "$(sha256sum "${YAML_SIGIL_RELEASE_XTASK}" | cut -d ' ' -f 1)" \
-            = "${YAML_SIGIL_RELEASE_XTASK_SHA256}"
-          "${YAML_SIGIL_RELEASE_XTASK}" release-version check
-          git diff --exit-code
-
-      - name: Prepare the official tagged baseline
-        id: baseline
-        env:
-          CAPTURED_SHA: ${{ steps.discover.outputs.captured_release_sha }}
-          GIT_CONFIG_COUNT: 1
-          GIT_CONFIG_KEY_0: remote.origin.pushurl
-          GIT_CONFIG_VALUE_0: disabled://yaml-sigil-release-publication
-        run: |
-          test "$(sha256sum "${YAML_SIGIL_RELEASE_XTASK}" | cut -d ' ' -f 1)" \
-            = "${YAML_SIGIL_RELEASE_XTASK_SHA256}"
-          current_version="$("${YAML_SIGIL_RELEASE_XTASK}" release-version show)"
-          result="${RUNNER_TEMP}/baseline-result.json"
-          "${YAML_SIGIL_RELEASE_XTASK}" release baseline prepare \
-            --source-root "${GITHUB_WORKSPACE}" \
-            --head "${CAPTURED_SHA}" \
-            --exclude-version "${current_version}" \
-            --output "${RUNNER_TEMP}/official-release-baseline" \
-            --result "${result}" \
-            --expected-fetch-url "https://github.com/${GITHUB_REPOSITORY}" \
-            --expected-push-url "${GIT_CONFIG_VALUE_0}"
-          jq --raw-output \
-            '"commit=\(.commit)",
-             "manifest=\(.manifest)",
-             "version=\(.version)",
-             "inventory=\(.inventory)"' \
-            "${result}" >>"${GITHUB_OUTPUT}"
-
-      - name: Repeat publication authority and package checks
-        env:
-          CAPTURED_SHA: ${{ steps.discover.outputs.captured_release_sha }}
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          test "$(sha256sum "${YAML_SIGIL_RELEASE_XTASK}" | cut -d ' ' -f 1)" \
-            = "${YAML_SIGIL_RELEASE_XTASK_SHA256}"
-          "${YAML_SIGIL_RELEASE_XTASK}" release verify-registry \
-            --check-version "${{ steps.baseline.outputs.version }}" \
-            yaml-sigil-traits
-          current_version="$("${YAML_SIGIL_RELEASE_XTASK}" release-version show)"
-          intent="$("${YAML_SIGIL_RELEASE_XTASK}" release-version intent \
-            --published "${{ steps.baseline.outputs.version }}")"
-          "${YAML_SIGIL_RELEASE_XTASK}" release-version check-compatibility \
-            --baseline-manifest "${{ steps.baseline.outputs.manifest }}" \
-            --current-manifest Cargo.toml \
-            --package yaml-sigil-traits \
-            --expected-baseline-version "${{ steps.baseline.outputs.version }}" \
-            --expected-current-version "${current_version}" \
-            --intent "${intent}"
-          "${YAML_SIGIL_RELEASE_XTASK}" release check-packages yaml-sigil-traits
-          cargo +stable package
-          test "$(sha256sum "${YAML_SIGIL_RELEASE_XTASK}" | cut -d ' ' -f 1)" \
-            = "${YAML_SIGIL_RELEASE_XTASK_SHA256}"
-          "${YAML_SIGIL_RELEASE_XTASK}" github release-source authorize \
-            --repository "${GITHUB_REPOSITORY}" \
-            --commit "${CAPTURED_SHA}" \
-            --baseline-version "${{ steps.baseline.outputs.version }}" \
-            --baseline-commit "${{ steps.baseline.outputs.commit }}"
-
-      - name: Prepare source-only publication configuration
-        run: |
-          test "$(sha256sum "${YAML_SIGIL_RELEASE_XTASK}" | cut -d ' ' -f 1)" \
-            = "${YAML_SIGIL_RELEASE_XTASK_SHA256}"
-          "${YAML_SIGIL_RELEASE_XTASK}" release prepare-publication-config \
-            --output "${RUNNER_TEMP}/release-plz-publication.toml"
-
-      - name: Capture canonical publication plan
-        id: capture
-        env:
-          CAPTURED_SHA: ${{ steps.discover.outputs.captured_release_sha }}
-          GH_TOKEN: ${{ github.token }}
-          REGISTRY_STATE: ${{ steps.discover.outputs.registry_state }}
-        run: |
-          # A fresh plan is captured only from exact current protected main.
-          if [[ "${REGISTRY_STATE}" = "absent" ]]; then
-            test "$(sha256sum "${YAML_SIGIL_RELEASE_XTASK}" | cut -d ' ' -f 1)" \
-              = "${YAML_SIGIL_RELEASE_XTASK_SHA256}"
-            "${YAML_SIGIL_RELEASE_XTASK}" release require-current-main \
-              --head "${CAPTURED_SHA}" \
-              --fetch-url "https://github.com/${GITHUB_REPOSITORY}"
-          fi
-          test "$(git rev-parse HEAD)" = "${CAPTURED_SHA}"
-          test "$(sha256sum "${YAML_SIGIL_RELEASE_XTASK}" | cut -d ' ' -f 1)" \
-            = "${YAML_SIGIL_RELEASE_XTASK_SHA256}"
-          "${YAML_SIGIL_RELEASE_XTASK}" github release-train capture \
-            --repository "${GITHUB_REPOSITORY}" \
-            --commit "${CAPTURED_SHA}" \
-            --policy-commit "${GITHUB_SHA}" \
-            --legacy-inventory-sha256 \
-              "${{ steps.legacy.outputs.legacy_inventory_digest }}" \
-            --baseline-version "${{ steps.baseline.outputs.version }}" \
-            --baseline-commit "${{ steps.baseline.outputs.commit }}"
-          test "$(git rev-parse HEAD)" = "${CAPTURED_SHA}"
-
-      - name: Require the frozen readiness plan to remain exact
-        env:
-          BASELINE_COMMIT: ${{ steps.baseline.outputs.commit }}
-          BASELINE_VERSION: ${{ steps.baseline.outputs.version }}
-          CAPTURED_SHA: ${{ steps.capture.outputs.captured_release_sha }}
-          PLAN: ${{ steps.capture.outputs.plan }}
-          PLAN_DIGEST: ${{ steps.capture.outputs.plan_digest }}
-          POLICY_COMMIT: ${{ steps.capture.outputs.policy_commit }}
-          READINESS_BASELINE_COMMIT: ${{ needs.release-readiness.outputs.baseline_commit }}
-          READINESS_BASELINE_VERSION: ${{ needs.release-readiness.outputs.baseline_version }}
-          READINESS_CAPTURED_SHA: ${{ needs.release-readiness.outputs.captured_release_sha }}
-          READINESS_PLAN: ${{ needs.release-readiness.outputs.plan }}
-          READINESS_PLAN_DIGEST: ${{ needs.release-readiness.outputs.plan_digest }}
-          READINESS_POLICY_COMMIT: ${{ needs.release-readiness.outputs.policy_commit }}
-          READINESS_REGISTRY_STATE: ${{ needs.release-readiness.outputs.registry_state }}
-          REGISTRY_STATE: ${{ steps.capture.outputs.registry_state }}
-        run: |
-          test "${BASELINE_COMMIT}" = "${READINESS_BASELINE_COMMIT}"
-          test "${BASELINE_VERSION}" = "${READINESS_BASELINE_VERSION}"
-          test "${CAPTURED_SHA}" = "${READINESS_CAPTURED_SHA}"
-          test "${PLAN}" = "${READINESS_PLAN}"
-          test "${PLAN_DIGEST}" = "${READINESS_PLAN_DIGEST}"
-          test "${POLICY_COMMIT}" = "${READINESS_POLICY_COMMIT}"
-          test "${REGISTRY_STATE}" = "${READINESS_REGISTRY_STATE}"
-
-      # This is the last read-only gate before release-plz receives registry
-      # authority. It requires both App attestations and current protected main.
-      - name: Await exact pre-publication App authority
-        id: authority
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PLAN: ${{ steps.capture.outputs.plan }}
-          PLAN_DIGEST: ${{ steps.capture.outputs.plan_digest }}
-          POLICY_COMMIT: ${{ steps.capture.outputs.policy_commit }}
-        run: >-
-          "${YAML_SIGIL_RELEASE_XTASK}"
-          github release-train await-release-authority
-          --repository "${GITHUB_REPOSITORY}"
-          --plan "${PLAN}"
-          --plan-digest "${PLAN_DIGEST}"
-          --policy-commit "${POLICY_COMMIT}"
-          --run-id "${GITHUB_RUN_ID}"
-          --run-attempt "${GITHUB_RUN_ATTEMPT}"
-
-      - name: Publish missing source package and await exact registry state
-        id: publish
-        env:
-          CAPTURED_SHA: ${{ steps.capture.outputs.captured_release_sha }}
-          GH_TOKEN: ${{ github.token }}
-          GIT_TOKEN: ${{ github.token }}
-          PLAN: ${{ steps.capture.outputs.plan }}
-          PLAN_DIGEST: ${{ steps.capture.outputs.plan_digest }}
-          REGISTRY_STATE: ${{ steps.capture.outputs.registry_state }}
-        run: |
-          publisher_status=0
-          # Complete recovery performs no registry mutation; other prefixes may.
-          case "${REGISTRY_STATE}" in
-            complete)
-              echo "The exact crate is already published; skipping registry mutation."
+          set -euo pipefail
+          test "${GITHUB_REF}" = "refs/heads/main"
+          # Select only a current-main push, validation, or fully bounded recovery.
+          case "${GITHUB_EVENT_NAME}" in
+            push)
+              test -z "${INPUT_SOURCE}${INPUT_RUN_ID}${INPUT_ATTEMPT}"
+              mode=push
+              source="${GITHUB_SHA}"
               ;;
-            absent|partial)
-              test "$(git rev-parse HEAD)" = "${CAPTURED_SHA}"
-              set +e
-              # Pinned release-plz has source-crate publication authority only.
-              release-plz release \
-                --forge github \
-                --repo-url "https://github.com/${GITHUB_REPOSITORY}" \
-                --config "${RUNNER_TEMP}/release-plz-publication.toml" \
-                --manifest-path Cargo.toml
-              publisher_status="$?"
-              set -e
-              test "$(git rev-parse HEAD)" = "${CAPTURED_SHA}"
+            workflow_dispatch)
+              # Dispatch validation has no recovery coordinates; recovery has all three.
+              case "${DISPATCH_OPERATION}" in
+                validate)
+                  [[ "${INPUT_SOURCE}" =~ ^[0-9a-f]{40}$ ]]
+                  test "${INPUT_SOURCE}" = "${GITHUB_SHA}"
+                  test -z "${INPUT_RUN_ID}${INPUT_ATTEMPT}"
+                  mode=validate
+                  source="${INPUT_SOURCE}"
+                  ;;
+                recover)
+                  [[ "${INPUT_SOURCE}" =~ ^[0-9a-f]{40}$ ]]
+                  [[ "${INPUT_RUN_ID}" =~ ^[1-9][0-9]*$ ]]
+                  [[ "${INPUT_ATTEMPT}" =~ ^[1-9][0-9]*$ ]]
+                  mode=recover
+                  source="${INPUT_SOURCE}"
+                  ;;
+                *)
+                  echo "Unsupported publication operation." >&2
+                  exit 1
+                  ;;
+              esac
               ;;
             *)
-              echo "The captured registry state is invalid." >&2
+              echo "Unsupported publication event." >&2
               exit 1
               ;;
           esac
-          test "$(sha256sum "${YAML_SIGIL_RELEASE_XTASK}" | cut -d ' ' -f 1)" \
-            = "${YAML_SIGIL_RELEASE_XTASK_SHA256}"
-          "${YAML_SIGIL_RELEASE_XTASK}" github release-train wait \
-            --repository "${GITHUB_REPOSITORY}" \
-            --plan "${PLAN}" \
-            --plan-digest "${PLAN_DIGEST}"
-          # Exact complete registry state, not the publisher exit alone, wins.
-          if [[ "${publisher_status}" -ne 0 ]]; then
-            echo "release-plz exited ${publisher_status}; exact registry confirmation recovered the run."
-          fi
-          printf 'publisher_status=%s\n' "${publisher_status}" >>"${GITHUB_OUTPUT}"
+          printf 'mode=%s\nsource=%s\n' "${mode}" "${source}" >> "${GITHUB_OUTPUT}"
 
-  release-intent:
-    name: Attest release finalization intent
-    if: >-
-      ${{ needs.release-readiness.result == 'success' &&
-          needs.release-readiness.outputs.plan != '' &&
-          (inputs.operation == 'validate' || inputs.operation == 'publish') }}
-    needs: release-readiness
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    environment: protected-automation
-    permissions:
-      actions: read
-      checks: read
-      contents: read
-      deployments: read
-      pull-requests: read
-    outputs:
-      binary_sha256: ${{ steps.compile.outputs.binary_sha256 }}
-      intent: ${{ steps.create-intent.outputs.intent }}
-      intent_check_id: ${{ steps.create-intent.outputs.intent_check_id }}
-      intent_digest: ${{ steps.create-intent.outputs.intent_digest }}
-      intent_external_id: ${{ steps.create-intent.outputs.intent_external_id }}
-      settings_authorization: ${{ steps.create-settings.outputs.settings_authorization }}
-      settings_authorization_check_id: ${{ steps.create-settings.outputs.settings_authorization_check_id }}
-      settings_authorization_digest: ${{ steps.create-settings.outputs.settings_authorization_digest }}
-      settings_authorization_external_id: ${{ steps.create-settings.outputs.settings_authorization_external_id }}
-    steps:
+      # The dispatch workflow itself always comes from protected current main.
       - name: Check out protected release policy
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
-          ref: ${{ needs.release-readiness.outputs.policy_commit }}
+          ref: ${{ github.sha }}
 
-      - name: Verify exact policy checkout
-        env:
-          POLICY_COMMIT: ${{ needs.release-readiness.outputs.policy_commit }}
-        run: test "$(git rev-parse HEAD)" = "${POLICY_COMMIT}"
-
-      - name: Set up Rust
+      - name: Set up Rust 1.98.0
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           cache: false
-          toolchain: 1.95.0,stable
+          toolchain: 1.98.0
 
-      - name: Stage protected typed release attestor
-        id: compile
+      - name: Compile protected typed qualifier
         run: |
-          cargo +stable build --locked --release --manifest-path xtask/Cargo.toml
-          validator="${RUNNER_TEMP}/yaml-sigil-release-xtask"
-          install -m 700 xtask/target/release/xtask "${validator}"
-          validator_sha256="$(sha256sum "${validator}" | cut -d' ' -f1)"
-          printf 'YAML_SIGIL_RELEASE_XTASK=%s\n' "${validator}" \
-            >>"${GITHUB_ENV}"
-          printf 'YAML_SIGIL_RELEASE_XTASK_SHA256=%s\n' "${validator_sha256}" \
-            >>"${GITHUB_ENV}"
-          printf 'binary_sha256=%s\n' "${validator_sha256}" \
-            >>"${GITHUB_OUTPUT}"
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
+          git rev-parse HEAD > "${RUNNER_TEMP}/release-policy.sha"
+          cargo build --locked --release --manifest-path xtask/Cargo.toml
+          install -m 0700 xtask/target/release/xtask "${RUNNER_TEMP}/release-xtask"
+          sha256sum "${RUNNER_TEMP}/release-xtask" > "${RUNNER_TEMP}/release-xtask.sha256"
 
-      # The repository-admin reviewer performs the privileged live read with
-      # their existing gh identity, then copies the exact approval_comment.
-      - name: Display repository-admin settings evidence request
-        env:
-          POLICY_COMMIT: ${{ needs.release-readiness.outputs.policy_commit }}
-        run: >-
-          "${YAML_SIGIL_RELEASE_XTASK}"
-          github release-train settings-request
-          --repository "${GITHUB_REPOSITORY}"
-          --policy-commit "${POLICY_COMMIT}"
-          --run-id "${GITHUB_RUN_ID}"
-          --run-attempt "${GITHUB_RUN_ATTEMPT}"
-
-      - name: Authenticate the exact crates.io approval
-        id: settings-review
-        env:
-          GH_TOKEN: ${{ github.token }}
-          POLICY_COMMIT: ${{ needs.release-readiness.outputs.policy_commit }}
-        run: >-
-          "${YAML_SIGIL_RELEASE_XTASK}"
-          github release-train await-settings-review
-          --repository "${GITHUB_REPOSITORY}"
-          --policy-commit "${POLICY_COMMIT}"
-          --run-id "${GITHUB_RUN_ID}"
-          --run-attempt "${GITHUB_RUN_ATTEMPT}"
-
-      - name: Check out captured trusted source
+      - name: Check out exact release source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
-          ref: ${{ needs.release-readiness.outputs.captured_release_sha }}
+          ref: ${{ steps.invocation.outputs.source }}
 
-      - name: Verify exact captured checkout
-        env:
-          CAPTURED_SHA: ${{ needs.release-readiness.outputs.captured_release_sha }}
-        run: test "$(git rev-parse HEAD)" = "${CAPTURED_SHA}"
-
-      - name: Bind archive reproduction Cargo
-        run: |
-          archive_cargo="$(rustup which --toolchain 1.95.0 cargo)"
-          test -x "${archive_cargo}"
-          printf 'YAML_SIGIL_ARCHIVE_CARGO=%s\n' "${archive_cargo}" \
-            >>"${GITHUB_ENV}"
-
-      - name: Recompute release plan
+      - name: Qualify release or ordinary no-op
+        id: qualify
         env:
           GH_TOKEN: ${{ github.token }}
-          PLAN: ${{ needs.release-readiness.outputs.plan }}
-          PLAN_DIGEST: ${{ needs.release-readiness.outputs.plan_digest }}
+          MODE: ${{ steps.invocation.outputs.mode }}
+          ORIGINAL_ATTEMPT: ${{ inputs.original_run_attempt }}
+          ORIGINAL_RUN_ID: ${{ inputs.original_run_id }}
+          SOURCE_SHA: ${{ steps.invocation.outputs.source }}
+        shell: bash
         run: |
-          test "$(sha256sum "${YAML_SIGIL_RELEASE_XTASK}" | cut -d' ' -f1)" \
-            = "${YAML_SIGIL_RELEASE_XTASK_SHA256}"
-          "${YAML_SIGIL_RELEASE_XTASK}" github release-train verify \
-            --repository "${GITHUB_REPOSITORY}" \
-            --plan "${PLAN}" \
-            --plan-digest "${PLAN_DIGEST}" \
-            --baseline-version "${{ needs.release-readiness.outputs.baseline_version }}" \
-            --baseline-commit "${{ needs.release-readiness.outputs.baseline_commit }}"
-
-      - name: Preserve or prepare the durable original intent
-        id: prepare-intent
-        env:
-          EXISTING_INTENT: ${{ needs.release-readiness.outputs.existing_intent }}
-          EXISTING_INTENT_CHECK_ID: ${{ needs.release-readiness.outputs.existing_intent_check_id }}
-          EXISTING_INTENT_DIGEST: ${{ needs.release-readiness.outputs.existing_intent_digest }}
-          GH_TOKEN: ${{ github.token }}
-          PLAN: ${{ needs.release-readiness.outputs.plan }}
-          PLAN_DIGEST: ${{ needs.release-readiness.outputs.plan_digest }}
-          SETTINGS_EVIDENCE: ${{ steps.settings-review.outputs.settings_evidence }}
-          SETTINGS_REVIEW_ID: ${{ steps.settings-review.outputs.settings_review_id }}
-          SETTINGS_REVIEWER_ID: ${{ steps.settings-review.outputs.settings_reviewer_id }}
-          SETTINGS_REVIEWER_LOGIN: ${{ steps.settings-review.outputs.settings_reviewer_login }}
-        run: |
-          test "$(sha256sum "${YAML_SIGIL_RELEASE_XTASK}" | cut -d' ' -f1)" \
-            = "${YAML_SIGIL_RELEASE_XTASK_SHA256}"
-          # Recovery retains the original plan and intent; a fresh train binds
-          # the same reviewed settings to its first durable intent.
-          case "${EXISTING_INTENT}" in
-            '')
-              "${YAML_SIGIL_RELEASE_XTASK}" github release-train prepare-intent \
-                --plan "${PLAN}" \
-                --plan-digest "${PLAN_DIGEST}" \
-                --origin-run-id "${GITHUB_RUN_ID}" \
-                --origin-run-attempt "${GITHUB_RUN_ATTEMPT}" \
-                --settings-evidence "${SETTINGS_EVIDENCE}" \
-                --settings-review-id "${SETTINGS_REVIEW_ID}" \
-                --settings-reviewer-id "${SETTINGS_REVIEWER_ID}" \
-                --settings-reviewer-login "${SETTINGS_REVIEWER_LOGIN}"
+          set -euo pipefail
+          sha256sum --check "${RUNNER_TEMP}/release-xtask.sha256"
+          test "$(cat "${RUNNER_TEMP}/release-policy.sha")" = "${GITHUB_SHA}"
+          test "$(git rev-parse HEAD)" = "${SOURCE_SHA}"
+          args=(github release qualify --mode "${MODE}" --source "${SOURCE_SHA}")
+          # Recovery alone binds the original run and attempt.
+          case "${MODE}" in
+            recover)
+              args+=(--original-run-id "${ORIGINAL_RUN_ID}")
+              args+=(--original-run-attempt "${ORIGINAL_ATTEMPT}")
+              ;;
+            push|validate)
               ;;
             *)
-              test "$(printf '%s' "${EXISTING_INTENT}" | sha256sum | cut -d' ' -f1)" \
-                = "${EXISTING_INTENT_DIGEST}"
-              "${YAML_SIGIL_RELEASE_XTASK}" github release-train verify-intent \
-                --repository "${GITHUB_REPOSITORY}" \
-                --plan "${PLAN}" \
-                --plan-digest "${PLAN_DIGEST}" \
-                --intent "${EXISTING_INTENT}" \
-                --check-id "${EXISTING_INTENT_CHECK_ID}"
+              exit 1
               ;;
           esac
+          "${RUNNER_TEMP}/release-xtask" "${args[@]}"
 
-      - name: Prepare current-policy settings authorization
-        id: prepare-settings
-        env:
-          PLAN: ${{ needs.release-readiness.outputs.plan }}
-          PLAN_DIGEST: ${{ needs.release-readiness.outputs.plan_digest }}
-          POLICY_COMMIT: ${{ needs.release-readiness.outputs.policy_commit }}
-          SETTINGS_EVIDENCE: ${{ steps.settings-review.outputs.settings_evidence }}
-          SETTINGS_REVIEW_ID: ${{ steps.settings-review.outputs.settings_review_id }}
-          SETTINGS_REVIEWER_ID: ${{ steps.settings-review.outputs.settings_reviewer_id }}
-          SETTINGS_REVIEWER_LOGIN: ${{ steps.settings-review.outputs.settings_reviewer_login }}
-        run: >-
-          "${YAML_SIGIL_RELEASE_XTASK}"
-          github release-train prepare-settings-authorization
-          --repository "${GITHUB_REPOSITORY}"
-          --plan "${PLAN}"
-          --plan-digest "${PLAN_DIGEST}"
-          --policy-commit "${POLICY_COMMIT}"
-          --run-id "${GITHUB_RUN_ID}"
-          --run-attempt "${GITHUB_RUN_ATTEMPT}"
-          --settings-evidence "${SETTINGS_EVIDENCE}"
-          --settings-review-id "${SETTINGS_REVIEW_ID}"
-          --settings-reviewer-id "${SETTINGS_REVIEWER_ID}"
-          --settings-reviewer-login "${SETTINGS_REVIEWER_LOGIN}"
-
-      # Source is no longer needed once both canonical attestations exist.
-      - name: Discard source checkout before token minting
-        run: |
-          rm -rf "${GITHUB_WORKSPACE}"
-          mkdir -m 700 "${GITHUB_WORKSPACE}"
-          test "$(sha256sum "${YAML_SIGIL_RELEASE_XTASK}" | cut -d' ' -f1)" \
-            = "${YAML_SIGIL_RELEASE_XTASK_SHA256}"
-
-      - name: Create checks-only repository token
-        id: app-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          client-id: ${{ vars.YAML_SIGIL_RELEASE_PR_APP_CLIENT_ID }}
-          private-key: ${{ secrets.YAML_SIGIL_RELEASE_PR_APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-          repositories: ${{ github.event.repository.name }}
-          permission-checks: write
-
-      - name: Create current-policy settings authorization Check
-        id: create-settings
-        working-directory: ${{ runner.temp }}
-        env:
-          AUTHORIZATION: ${{ steps.prepare-settings.outputs.settings_authorization }}
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          PLAN: ${{ needs.release-readiness.outputs.plan }}
-          PLAN_DIGEST: ${{ needs.release-readiness.outputs.plan_digest }}
-          POLICY_COMMIT: ${{ needs.release-readiness.outputs.policy_commit }}
-        run: >-
-          "${YAML_SIGIL_RELEASE_XTASK}"
-          github release-train create-settings-authorization
-          --repository "${GITHUB_REPOSITORY}"
-          --plan "${PLAN}"
-          --plan-digest "${PLAN_DIGEST}"
-          --policy-commit "${POLICY_COMMIT}"
-          --run-id "${GITHUB_RUN_ID}"
-          --run-attempt "${GITHUB_RUN_ATTEMPT}"
-          --authorization "${AUTHORIZATION}"
-          --expected-app-slug "${{ steps.app-token.outputs.app-slug }}"
-          --expected-installation-id "${{ steps.app-token.outputs.installation-id }}"
-
-      - name: Create or verify durable original intent Check
-        id: create-intent
-        working-directory: ${{ runner.temp }}
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          INTENT: ${{ steps.prepare-intent.outputs.intent }}
-          PLAN: ${{ needs.release-readiness.outputs.plan }}
-          PLAN_DIGEST: ${{ needs.release-readiness.outputs.plan_digest }}
-        run: >-
-          "${YAML_SIGIL_RELEASE_XTASK}"
-          github release-train create-intent
-          --repository "${GITHUB_REPOSITORY}"
-          --plan "${PLAN}"
-          --plan-digest "${PLAN_DIGEST}"
-          --intent "${INTENT}"
-          --expected-app-slug "${{ steps.app-token.outputs.app-slug }}"
-          --expected-installation-id "${{ steps.app-token.outputs.installation-id }}"
-
-  authority-validation:
-    name: Validate release authority handshake
+  publish:
+    name: Publish source crate
     if: >-
-      ${{ needs.release-readiness.result == 'success' &&
-          needs.release-readiness.outputs.plan != '' &&
-          inputs.operation == 'validate' }}
-    needs: release-readiness
+      ${{ needs.qualify.outputs.qualified == 'true' &&
+          needs.qualify.outputs.registry_state == 'absent' }}
+    needs: qualify
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: crates-io
     permissions:
-      checks: read
       contents: read
+      id-token: write
+      pull-requests: read
     steps:
-      - name: Check out exact protected release policy
+      # This checkout is protected current-main policy, never historical
+      # recovery source. The compiled qualifier survives the source checkout.
+      - name: Check out protected publication policy
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
-          ref: ${{ needs.release-readiness.outputs.policy_commit }}
+          ref: ${{ github.sha }}
 
-      - name: Verify exact policy checkout
-        env:
-          POLICY_COMMIT: ${{ needs.release-readiness.outputs.policy_commit }}
-        run: test "$(git rev-parse HEAD)" = "${POLICY_COMMIT}"
-
-      - name: Set up current trusted Rust
+      - name: Set up Rust 1.98.0
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           cache: false
-          toolchain: stable
+          toolchain: 1.98.0
 
-      - name: Compile validation-only authority verifier
-        run: cargo +stable build --locked --release --manifest-path xtask/Cargo.toml
+      - name: Compile protected typed requalifier
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
+          git rev-parse HEAD > "${RUNNER_TEMP}/release-policy.sha"
+          cargo build --locked --release --manifest-path xtask/Cargo.toml
+          install -m 0700 xtask/target/release/xtask "${RUNNER_TEMP}/release-xtask"
+          sha256sum "${RUNNER_TEMP}/release-xtask" > "${RUNNER_TEMP}/release-xtask.sha256"
 
-      # This reproduces the final release authority gate without OIDC,
-      # release-plz, registry access, tags, Releases, or retained artifacts.
-      - name: Require exact validation-only App authority
+      - name: Check out exact qualified source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ needs.qualify.outputs.source }}
+
+      - name: Install exact cargo-binstall
+        uses: cargo-bins/cargo-binstall@732870f031d2fb36309d0deaf36abcc704a7be65 # v1.20.1
+        with:
+          version: 1.20.1
+
+      - name: Install pinned release-plz
+        run: |
+          # Install the sole Cargo publisher at the reviewed version.
+          cargo binstall --force --locked --no-confirm release-plz@0.3.160
+
+      - name: Requalify exact source after approval
+        id: requalify
         env:
           GH_TOKEN: ${{ github.token }}
-          PLAN: ${{ needs.release-readiness.outputs.plan }}
-          PLAN_DIGEST: ${{ needs.release-readiness.outputs.plan_digest }}
-          POLICY_COMMIT: ${{ needs.release-readiness.outputs.policy_commit }}
-        run: >-
-          cargo +stable xtask github release-train await-release-authority
-          --repository "${GITHUB_REPOSITORY}"
-          --plan "${PLAN}"
-          --plan-digest "${PLAN_DIGEST}"
-          --policy-commit "${POLICY_COMMIT}"
-          --run-id "${GITHUB_RUN_ID}"
-          --run-attempt "${GITHUB_RUN_ATTEMPT}"
+          MODE: ${{ needs.qualify.outputs.mode }}
+          ORIGINAL_ATTEMPT: ${{ inputs.original_run_attempt }}
+          ORIGINAL_RUN_ID: ${{ inputs.original_run_id }}
+          POLICY_SHA: ${{ github.sha }}
+          SOURCE_SHA: ${{ needs.qualify.outputs.source }}
+        run: |
+          set -euo pipefail
+          sha256sum --check "${RUNNER_TEMP}/release-xtask.sha256"
+          test "$(cat "${RUNNER_TEMP}/release-policy.sha")" = "${POLICY_SHA}"
+          test "$(git rev-parse HEAD)" = "${SOURCE_SHA}"
+          # Refuse any release-plz executable other than the requested pin.
+          test "$(release-plz --version)" = "release-plz 0.3.160"
+          git -c credential.helper= fetch --no-tags --no-recurse-submodules \
+            origin "+refs/heads/main:refs/remotes/origin/policy-main"
+          test "$(git rev-parse refs/remotes/origin/policy-main)" = "${POLICY_SHA}"
+          git update-ref refs/remotes/origin/main "${SOURCE_SHA}"
+          git switch --force-create main "${SOURCE_SHA}"
+          git branch --set-upstream-to=origin/main main
+          test "$(git rev-parse main)" = "${SOURCE_SHA}"
+          test "$(git rev-parse refs/remotes/origin/main)" = "${SOURCE_SHA}"
+          # Fresh pushes freeze live main; recovery rebinds only its historical
+          # source and original run coordinates under current protected policy.
+          case "${MODE}" in
+            push)
+              test "${POLICY_SHA}" = "${SOURCE_SHA}"
+              "${RUNNER_TEMP}/release-xtask" github release qualify \
+                --mode publish --source "${SOURCE_SHA}"
+              ;;
+            recover)
+              git merge-base --is-ancestor "${SOURCE_SHA}" "${POLICY_SHA}"
+              "${RUNNER_TEMP}/release-xtask" github release qualify \
+                --mode recover --source "${SOURCE_SHA}" \
+                --original-run-id "${ORIGINAL_RUN_ID}" \
+                --original-run-attempt "${ORIGINAL_ATTEMPT}"
+              ;;
+            *)
+              exit 1
+              ;;
+          esac
 
-  release-finalizer:
-    name: Create immutable source-only release objects
+      - name: Publish exact source with Trusted Publishing
+        if: ${{ steps.requalify.outputs.registry_state == 'absent' }}
+        env:
+          MODE: ${{ needs.qualify.outputs.mode }}
+          POLICY_SHA: ${{ github.sha }}
+          SOURCE_SHA: ${{ needs.qualify.outputs.source }}
+        run: |
+          set -euo pipefail
+          git -c credential.helper= fetch --no-tags --no-recurse-submodules \
+            origin "+refs/heads/main:refs/remotes/origin/publication-main"
+          test "$(git rev-parse refs/remotes/origin/publication-main)" = "${POLICY_SHA}"
+          # The fresh push must still be main; recovery may use only a retained
+          # ancestor of the exact protected policy that compiled the qualifier.
+          case "${MODE}" in
+            push)
+              test "${SOURCE_SHA}" = "${POLICY_SHA}"
+              ;;
+            recover)
+              git merge-base --is-ancestor "${SOURCE_SHA}" "${POLICY_SHA}"
+              ;;
+            *)
+              exit 1
+              ;;
+          esac
+          # Qualified release-plz is the sole Cargo publisher and receives the
+          # read-only repository token plus this job's Trusted Publishing OIDC.
+          GIT_TOKEN="${{ github.token }}" release-plz release \
+            --config .release-plz.toml \
+            --manifest-path Cargo.toml
+
+  await_publication:
+    name: Await exact crates.io source
     if: >-
-      ${{ needs.publication.result == 'success' &&
-          needs.release-intent.result == 'success' }}
+      ${{ always() && needs.qualify.result == 'success' &&
+          needs.qualify.outputs.qualified == 'true' &&
+          (needs.publish.result == 'success' || needs.publish.result == 'skipped') }}
     needs:
-      - publication
-      - release-intent
+      - qualify
+      - publish
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Check out protected registry policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Set up Rust 1.98.0
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache: false
+          toolchain: 1.98.0
+
+      - name: Compile protected registry validator
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
+          git rev-parse HEAD > "${RUNNER_TEMP}/release-policy.sha"
+          cargo build --locked --release --manifest-path xtask/Cargo.toml
+          install -m 0700 xtask/target/release/xtask "${RUNNER_TEMP}/release-xtask"
+          sha256sum "${RUNNER_TEMP}/release-xtask" > "${RUNNER_TEMP}/release-xtask.sha256"
+
+      - name: Check out exact qualified source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ needs.qualify.outputs.source }}
+
+      - name: Rebind protected policy and source lineage
+        env:
+          POLICY_SHA: ${{ github.sha }}
+          SOURCE_SHA: ${{ needs.qualify.outputs.source }}
+        run: |
+          set -euo pipefail
+          git -c credential.helper= fetch --no-tags --no-recurse-submodules \
+            origin "+refs/heads/main:refs/remotes/origin/policy-main"
+          test "$(cat "${RUNNER_TEMP}/release-policy.sha")" = "${POLICY_SHA}"
+          test "$(git rev-parse refs/remotes/origin/policy-main)" = "${POLICY_SHA}"
+          git merge-base --is-ancestor "${SOURCE_SHA}" "${POLICY_SHA}"
+
+      # This credential-free phase owns the bounded registry wait. The App
+      # token is minted only in the dependent finalizer after this succeeds.
+      - name: Await exact published archive
+        env:
+          SOURCE_SHA: ${{ needs.qualify.outputs.source }}
+          VERSION: ${{ needs.qualify.outputs.version }}
+        run: |
+          set -euo pipefail
+          sha256sum --check "${RUNNER_TEMP}/release-xtask.sha256"
+          test "$(git rev-parse HEAD)" = "${SOURCE_SHA}"
+          "${RUNNER_TEMP}/release-xtask" github release finalize \
+            --phase await --source "${SOURCE_SHA}" --version "${VERSION}"
+
+  finalize:
+    name: Finalize immutable source-only Release
+    if: >-
+      ${{ always() && needs.qualify.result == 'success' &&
+          needs.qualify.outputs.qualified == 'true' &&
+          needs.await_publication.result == 'success' }}
+    needs:
+      - await_publication
+      - qualify
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # The required reviewer attests the fresh repository-admin settings
+    # readback after exact registry visibility and before App authorization.
     environment: protected-automation
     permissions:
-      checks: read
       contents: read
-      pull-requests: read
-    outputs:
-      binary_sha256: ${{ steps.compile.outputs.binary_sha256 }}
-      complete: ${{ steps.finalize.outputs.complete }}
-      finalized_entries: ${{ steps.finalize.outputs.finalized_entries }}
-      notification_required: ${{ steps.finalize.outputs.notification_required }}
     steps:
-      - name: Check out protected release policy
+      - name: Check out protected finalizer policy
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
-          ref: ${{ needs.publication.outputs.policy_commit }}
+          ref: ${{ github.sha }}
 
-      - name: Verify exact policy checkout
-        env:
-          POLICY_COMMIT: ${{ needs.publication.outputs.policy_commit }}
-        run: test "$(git rev-parse HEAD)" = "${POLICY_COMMIT}"
-
-      - name: Set up Rust
+      - name: Set up Rust 1.98.0
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           cache: false
-          toolchain: 1.95.0,stable
+          toolchain: 1.98.0
 
-      - name: Recheck pinned historical source-only Releases
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-          POLICY_COMMIT: ${{ needs.publication.outputs.policy_commit }}
-        run: >-
-          cargo +stable xtask github release-train verify-legacy
-          --repository "${GITHUB_REPOSITORY}"
-          --policy-commit "${POLICY_COMMIT}"
-
-      - name: Stage protected checkout-independent finalizer
+      - name: Compile protected typed finalizer
         run: |
-          cargo +stable build --locked --release --manifest-path xtask/Cargo.toml
-          validator="${RUNNER_TEMP}/yaml-sigil-release-xtask"
-          install -m 700 xtask/target/release/xtask "${validator}"
-          validator_sha256="$(sha256sum "${validator}" | cut -d' ' -f1)"
-          printf 'YAML_SIGIL_RELEASE_XTASK=%s\n' "${validator}" \
-            >>"${GITHUB_ENV}"
-          printf 'YAML_SIGIL_RELEASE_XTASK_SHA256=%s\n' "${validator_sha256}" \
-            >>"${GITHUB_ENV}"
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
+          git rev-parse HEAD > "${RUNNER_TEMP}/release-policy.sha"
+          cargo build --locked --release --manifest-path xtask/Cargo.toml
+          install -m 0700 xtask/target/release/xtask "${RUNNER_TEMP}/release-xtask"
+          sha256sum "${RUNNER_TEMP}/release-xtask" > "${RUNNER_TEMP}/release-xtask.sha256"
 
-      - name: Check out captured trusted source
+      - name: Check out exact qualified source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
-          ref: ${{ needs.publication.outputs.captured_release_sha }}
+          ref: ${{ needs.qualify.outputs.source }}
 
-      - name: Verify exact captured checkout
+      # Avoid minting the App token if current protected policy or the retained
+      # historical source lineage changed while registry visibility settled.
+      - name: Rebind protected finalizer policy
         env:
-          CAPTURED_SHA: ${{ needs.publication.outputs.captured_release_sha }}
-        run: test "$(git rev-parse HEAD)" = "${CAPTURED_SHA}"
-
-      - name: Bind archive reproduction Cargo
+          POLICY_SHA: ${{ github.sha }}
+          SOURCE_SHA: ${{ needs.qualify.outputs.source }}
         run: |
-          archive_cargo="$(rustup which --toolchain 1.95.0 cargo)"
-          test -x "${archive_cargo}"
-          printf 'YAML_SIGIL_ARCHIVE_CARGO=%s\n' "${archive_cargo}" \
-            >>"${GITHUB_ENV}"
+          set -euo pipefail
+          git -c credential.helper= fetch --no-tags --no-recurse-submodules \
+            origin "+refs/heads/main:refs/remotes/origin/policy-main"
+          test "$(cat "${RUNNER_TEMP}/release-policy.sha")" = "${POLICY_SHA}"
+          test "$(git rev-parse refs/remotes/origin/policy-main)" = "${POLICY_SHA}"
+          git merge-base --is-ancestor "${SOURCE_SHA}" "${POLICY_SHA}"
 
-      - name: Recompute plan and verify both App authorities
-        env:
-          AUTHORIZATION: ${{ needs.release-intent.outputs.settings_authorization }}
-          GH_TOKEN: ${{ github.token }}
-          INTENT: ${{ needs.release-intent.outputs.intent }}
-          PLAN: ${{ needs.publication.outputs.plan }}
-          PLAN_DIGEST: ${{ needs.publication.outputs.plan_digest }}
-          POLICY_COMMIT: ${{ needs.publication.outputs.policy_commit }}
-        run: |
-          test "$(sha256sum "${YAML_SIGIL_RELEASE_XTASK}" | cut -d' ' -f1)" \
-            = "${YAML_SIGIL_RELEASE_XTASK_SHA256}"
-          "${YAML_SIGIL_RELEASE_XTASK}" github release-train verify \
-            --repository "${GITHUB_REPOSITORY}" \
-            --plan "${PLAN}" \
-            --plan-digest "${PLAN_DIGEST}" \
-            --baseline-version "${{ needs.publication.outputs.baseline_version }}" \
-            --baseline-commit "${{ needs.publication.outputs.baseline_commit }}"
-          "${YAML_SIGIL_RELEASE_XTASK}" github release-train verify-intent \
-            --repository "${GITHUB_REPOSITORY}" \
-            --plan "${PLAN}" \
-            --plan-digest "${PLAN_DIGEST}" \
-            --intent "${INTENT}" \
-            --check-id "${{ needs.release-intent.outputs.intent_check_id }}"
-          "${YAML_SIGIL_RELEASE_XTASK}" \
-            github release-train verify-settings-authorization \
-            --repository "${GITHUB_REPOSITORY}" \
-            --plan "${PLAN}" \
-            --plan-digest "${PLAN_DIGEST}" \
-            --policy-commit "${POLICY_COMMIT}" \
-            --run-id "${GITHUB_RUN_ID}" \
-            --run-attempt "${GITHUB_RUN_ATTEMPT}" \
-            --authorization "${AUTHORIZATION}" \
-            --check-id \
-              "${{ needs.release-intent.outputs.settings_authorization_check_id }}"
-
-      - name: Bind checkout-independent finalizer
-        id: compile
-        run: |
-          binary_sha256="$(sha256sum "${YAML_SIGIL_RELEASE_XTASK}" | cut -d' ' -f1)"
-          test "${binary_sha256}" = "${YAML_SIGIL_RELEASE_XTASK_SHA256}"
-          printf 'binary_sha256=%s\n' "${binary_sha256}" >>"${GITHUB_OUTPUT}"
-          rm -rf "${GITHUB_WORKSPACE}"
-          mkdir -m 700 "${GITHUB_WORKSPACE}"
-          test "$(sha256sum "${YAML_SIGIL_RELEASE_XTASK}" | cut -d' ' -f1)" \
-            = "${binary_sha256}"
-
-      - name: Create finalizer repository token
+      - name: Create repository-scoped App token
         id: app-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
@@ -1013,133 +424,18 @@ jobs:
           private-key: ${{ secrets.YAML_SIGIL_RELEASE_PR_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
-          permission-checks: read
           permission-contents: write
 
-      - name: Finalize exact published registry prefix
-        id: finalize
-        working-directory: ${{ runner.temp }}
+      - name: Reconcile exact tag and Release
         env:
-          AUTHORIZATION: ${{ needs.release-intent.outputs.settings_authorization }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          INTENT: ${{ needs.release-intent.outputs.intent }}
-          PLAN: ${{ needs.publication.outputs.plan }}
-          PLAN_DIGEST: ${{ needs.publication.outputs.plan_digest }}
-          POLICY_COMMIT: ${{ needs.publication.outputs.policy_commit }}
-        run: >-
-          "${YAML_SIGIL_RELEASE_XTASK}"
-          github release-train finalize
-          --repository "${GITHUB_REPOSITORY}"
-          --plan "${PLAN}"
-          --plan-digest "${PLAN_DIGEST}"
-          --policy-commit "${POLICY_COMMIT}"
-          --run-id "${GITHUB_RUN_ID}"
-          --run-attempt "${GITHUB_RUN_ATTEMPT}"
-          --intent "${INTENT}"
-          --intent-check-id "${{ needs.release-intent.outputs.intent_check_id }}"
-          --settings-authorization "${AUTHORIZATION}"
-          --settings-authorization-check-id
-          "${{ needs.release-intent.outputs.settings_authorization_check_id }}"
-          --expected-app-slug "${{ steps.app-token.outputs.app-slug }}"
-          --expected-installation-id "${{ steps.app-token.outputs.installation-id }}"
-
-  release-notification:
-    name: Emit complete release train notification
-    if: >-
-      ${{ needs.release-finalizer.result == 'success' &&
-          needs.release-finalizer.outputs.complete == 'true' &&
-          needs.release-finalizer.outputs.notification_required == 'true' }}
-    needs:
-      - publication
-      - release-intent
-      - release-finalizer
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    environment: protected-automation
-    permissions:
-      contents: read
-    steps:
-      - name: Check out exact protected release policy
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-          ref: ${{ needs.publication.outputs.policy_commit }}
-
-      - name: Verify exact protected release policy
-        env:
-          POLICY_COMMIT: ${{ needs.publication.outputs.policy_commit }}
-        run: test "$(git rev-parse HEAD)" = "${POLICY_COMMIT}"
-
-      - name: Set up Rust
-        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
-        with:
-          cache: false
-          toolchain: stable
-
-      # Compile only exact protected-main Rust policy before token minting.
-      - name: Compile protected typed notifier
+          SOURCE_SHA: ${{ needs.qualify.outputs.source }}
+          VERSION: ${{ needs.qualify.outputs.version }}
         run: |
-          cargo +stable build --locked --release --manifest-path xtask/Cargo.toml
-          install -m 700 xtask/target/release/xtask \
-            "${RUNNER_TEMP}/yaml-sigil-release-xtask"
-          binary_sha256="$(sha256sum "${RUNNER_TEMP}/yaml-sigil-release-xtask" \
-            | cut -d' ' -f1)"
-          test "$(sha256sum "${RUNNER_TEMP}/yaml-sigil-release-xtask" \
-            | cut -d' ' -f1)" = "${binary_sha256}"
-
-      - name: Create notification-only repository token
-        id: app-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          client-id: ${{ vars.YAML_SIGIL_RELEASE_PR_APP_CLIENT_ID }}
-          private-key: ${{ secrets.YAML_SIGIL_RELEASE_PR_APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-          repositories: ${{ github.event.repository.name }}
-          permission-checks: read
-          permission-contents: write
-
-      - name: Dispatch exact complete release train
-        working-directory: ${{ runner.temp }}
-        env:
-          AUTHORIZATION: ${{ needs.release-intent.outputs.settings_authorization }}
-          FINALIZED_ENTRIES: ${{ needs.release-finalizer.outputs.finalized_entries }}
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          INTENT: ${{ needs.release-intent.outputs.intent }}
-          PLAN: ${{ needs.publication.outputs.plan }}
-          PLAN_DIGEST: ${{ needs.publication.outputs.plan_digest }}
-          POLICY_COMMIT: ${{ needs.publication.outputs.policy_commit }}
-        run: >-
-          "${RUNNER_TEMP}/yaml-sigil-release-xtask"
-          github release-train notify
-          --repository "${GITHUB_REPOSITORY}"
-          --plan "${PLAN}"
-          --plan-digest "${PLAN_DIGEST}"
-          --policy-commit "${POLICY_COMMIT}"
-          --run-id "${GITHUB_RUN_ID}"
-          --run-attempt "${GITHUB_RUN_ATTEMPT}"
-          --intent "${INTENT}"
-          --intent-check-id "${{ needs.release-intent.outputs.intent_check_id }}"
-          --settings-authorization "${AUTHORIZATION}"
-          --settings-authorization-check-id
-          "${{ needs.release-intent.outputs.settings_authorization_check_id }}"
-          --finalized-entries "${FINALIZED_ENTRIES}"
-          --expected-app-slug "${{ steps.app-token.outputs.app-slug }}"
-          --expected-installation-id "${{ steps.app-token.outputs.installation-id }}"
-
-  release-proposal:
-    name: Receive authenticated release notification
-    if: >-
-      ${{ github.event_name == 'repository_dispatch' &&
-          github.event.action == 'official-release-published' }}
-    permissions:
-      actions: read
-      checks: read
-      contents: read
-      pull-requests: read
-    uses: ./.github/workflows/release-proposal.yml
-    with:
-      source-event: repository_dispatch
-      mode: next-candidate
-      bump: patch
-    secrets: inherit
+          set -euo pipefail
+          sha256sum --check "${RUNNER_TEMP}/release-xtask.sha256"
+          test "$(git rev-parse HEAD)" = "${SOURCE_SHA}"
+          "${RUNNER_TEMP}/release-xtask" github release finalize \
+            --phase reconcile --source "${SOURCE_SHA}" \
+            --version "${VERSION}"

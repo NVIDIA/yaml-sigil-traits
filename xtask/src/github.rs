@@ -1,1204 +1,2497 @@
 // SPDX-FileCopyrightText: Copyright 2026 NVIDIA CORPORATION & AFFILIATES
 // SPDX-License-Identifier: Apache-2.0
 
-//! Bounded, provider-specific release automation for GitHub.
+//! Typed GitHub qualification and source-only release finalization.
 
-mod consts;
-mod identity;
-mod intent;
-mod local_validation;
-mod models;
-mod release_objects;
-mod release_pr;
-mod release_settings;
-mod release_train;
-mod source;
 mod transport;
 
 use std::collections::BTreeSet;
 use std::env;
 use std::fs::OpenOptions;
-use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::io::Write as _;
+use std::path::Path;
+use std::thread;
+use std::time::Duration;
 
-use crate::bounded_process::{self, OutputLimits};
 use clap::{Args, Subcommand, ValueEnum};
+use semver::Version;
 use serde::Deserialize;
-use transport::{GhCli, Transport};
+use serde_json::{Value, json};
 
-use consts::RepositoryPolicy;
-pub(crate) use consts::{
-    APP_EMAIL, APP_ID, APP_LOGIN, APP_SLUG, MAX_FILE_BYTES, RELEASE_BRANCH, WEB_FLOW_EMAIL,
-    WEB_FLOW_ID, WEB_FLOW_LOGIN, WEB_FLOW_NAME,
-};
+use crate::crate_archive::{CratesIo, Registry, archive_vcs_commit, is_checksum, require_archive};
+use crate::release;
+use crate::release_policy::TRAITS_PACKAGE;
+use crate::safe_file;
+use transport::{GhCli, Transport, percent_encode};
+
+const REPOSITORY: &str = "NVIDIA/yaml-sigil-traits";
+const RELEASE_WORKFLOW_PATH: &str = ".github/workflows/publish.yml";
+const RELEASE_WORKFLOW_ID: u64 = 337_393_638;
+const RELEASE_BRANCH_PREFIX: &str = "release-plz-manual-";
+const APP_SLUG: &str = "nvidia-yamlsigil-release-pr";
+const APP_LOGIN: &str = "nvidia-yamlsigil-release-pr[bot]";
+const APP_ID: u64 = 318_780_254;
+const APP_EMAIL: &str = "318780254+nvidia-yamlsigil-release-pr[bot]@users.noreply.github.com";
+const RELEASE_SIGNER_LOGIN: &str = "ddurst-nvidia";
+const RELEASE_SIGNER_ID: u64 = 267_424_412;
+const RELEASE_AUTHOR_NAME: &str = "ddurst";
+const RELEASE_AUTHOR_EMAIL: &str = "267424412+ddurst-nvidia@users.noreply.github.com";
+const DCO_TRAILER: &str =
+    "Signed-off-by: ddurst <267424412+ddurst-nvidia@users.noreply.github.com>";
+const RELEASE_PATHS: &[&str] = &["CHANGELOG.md", "Cargo.toml"];
+const RELEASE_SIGNATURE_QUERY: &str = r#"
+query($owner:String!,$name:String!,$number:Int!){
+  repository(owner:$owner,name:$name){
+    pullRequest(number:$number){
+      commits(first:2){
+        totalCount
+        nodes{
+          commit{
+            oid
+            signature{
+              __typename
+              email
+              isValid
+              state
+              wasSignedByGitHub
+              signer{databaseId login __typename}
+            }
+          }
+        }
+        pageInfo{hasNextPage}
+      }
+    }
+  }
+}
+"#;
 
 #[derive(Args)]
-pub struct GithubArgs {
+pub(crate) struct GithubArgs {
     #[command(subcommand)]
     command: GithubCommand,
 }
 
 #[derive(Subcommand)]
-// This one-shot CLI keeps its typed security-sensitive subcommands intact;
-// heap indirection would not improve its bounded lifetime or authority model.
-#[allow(clippy::large_enum_variant)]
 enum GithubCommand {
-    /// Configure a token-derived repository-local Git identity.
-    GitIdentity(GitIdentityArgs),
-    /// Resolve, create, update, or finalize the release pull request.
-    ReleasePr(ReleasePrArgs),
-    /// Authorize one exact integrated release proposal.
-    ReleaseSource(ReleaseSourceArgs),
-    /// Verify or recover source-only official release objects.
-    ReleaseObjects(ReleaseObjectsArgs),
-    /// Capture, attest, finalize, or notify one source-only release train.
-    ReleaseTrain(ReleaseTrainArgs),
+    /// Operate on one source-only release.
+    Release(GithubReleaseArgs),
 }
 
 #[derive(Args)]
-struct GitIdentityArgs {
+struct GithubReleaseArgs {
     #[command(subcommand)]
-    command: GitIdentityCommand,
+    command: GithubReleaseCommand,
 }
 
 #[derive(Subcommand)]
-enum GitIdentityCommand {
-    /// Configure token-derived identity; local use requires a repository.
-    Configure {
-        /// Explicit local repository identity; forbidden in GitHub Actions.
-        #[arg(long, value_name = "OWNER/REPO")]
-        repository: Option<String>,
-    },
-}
-
-#[derive(Args)]
-struct ReleasePrArgs {
-    #[command(subcommand)]
-    command: ReleasePrCommand,
-}
-
-#[derive(Subcommand)]
-enum ReleasePrCommand {
-    /// Resolve one bounded App-owned release proposal.
-    ResolveIntent,
-    /// Create or finalize an exact App-signed release proposal.
-    Apply {
-        /// Mutation phase authorized by the surrounding workflow.
+enum GithubReleaseCommand {
+    /// Qualify a main push, validation dispatch, or same-source recovery.
+    Qualify {
         #[arg(long, value_enum)]
-        phase: ReleasePrPhase,
-    },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-pub(super) enum ReleasePrPhase {
-    Update,
-    Finalize,
-}
-
-#[derive(Args)]
-struct ReleaseSourceArgs {
-    #[command(subcommand)]
-    command: ReleaseSourceCommand,
-}
-
-#[derive(Subcommand)]
-enum ReleaseSourceCommand {
-    /// Authorize one exact integrated release proposal.
-    Authorize {
-        #[arg(long, value_name = "OWNER/REPO")]
-        repository: String,
+        mode: QualificationMode,
         #[arg(long, value_name = "SHA")]
-        commit: String,
+        source: String,
         #[arg(long)]
-        baseline_version: String,
-        #[arg(long, value_name = "SHA")]
-        baseline_commit: String,
+        original_run_id: Option<u64>,
+        #[arg(long)]
+        original_run_attempt: Option<u64>,
     },
-}
-
-#[derive(Args)]
-struct ReleaseObjectsArgs {
-    #[command(subcommand)]
-    command: ReleaseObjectsCommand,
-}
-
-#[derive(Subcommand)]
-enum ReleaseObjectsCommand {
-    /// Reconcile source-only release objects before or after publication.
-    Reconcile {
-        #[arg(long, value_enum)]
-        mode: ReconcileMode,
-        #[arg(long, value_name = "OWNER/REPO")]
-        repository: String,
-        #[arg(long)]
-        version: String,
-        #[arg(long, value_name = "SHA")]
-        commit: String,
-    },
-}
-
-#[derive(Args)]
-struct ReleaseTrainArgs {
-    #[command(subcommand)]
-    command: ReleaseTrainCommand,
-}
-
-#[derive(Subcommand)]
-enum ReleaseTrainCommand {
-    /// Discover fresh or partial-publication source before plan capture.
-    Discover {
-        #[arg(long)]
-        repository: String,
-        #[arg(long)]
-        commit: String,
-    },
-    /// Capture one canonical release plan from exact protected source.
-    Capture {
-        #[arg(long)]
-        repository: String,
-        #[arg(long)]
-        commit: String,
-        #[arg(long)]
-        policy_commit: String,
-        #[arg(long)]
-        legacy_inventory_sha256: String,
-        #[arg(long)]
-        baseline_version: String,
-        #[arg(long)]
-        baseline_commit: String,
-    },
-    /// Recompute a captured plan and permit only exact registry progression.
-    Verify {
-        #[arg(long)]
-        repository: String,
-        #[arg(long)]
-        plan: String,
-        #[arg(long)]
-        plan_digest: String,
-        #[arg(long)]
-        baseline_version: String,
-        #[arg(long)]
-        baseline_commit: String,
-    },
-    /// Wait at most 20 minutes for the complete planned registry train.
-    Wait {
-        #[arg(long)]
-        repository: String,
-        #[arg(long)]
-        plan: String,
-        #[arg(long)]
-        plan_digest: String,
-    },
-    /// Verify the exact protected historical Release inventory.
-    VerifyLegacy {
-        #[arg(long)]
-        repository: String,
-        #[arg(long)]
-        policy_commit: String,
-    },
-    /// Display the exact repository-admin settings-evidence request.
-    SettingsRequest {
-        #[arg(long)]
-        repository: String,
-        #[arg(long)]
-        policy_commit: String,
-        #[arg(long)]
-        run_id: String,
-        #[arg(long)]
-        run_attempt: String,
-    },
-    /// Re-read and validate release settings for one active workflow run.
-    SettingsPreflight {
-        #[arg(long)]
-        repository: String,
-        #[arg(long)]
-        policy_commit: String,
-        #[arg(long)]
-        run_id: String,
-        #[arg(long)]
-        run_attempt: String,
-    },
-    /// Await and authenticate this run's repository-admin settings review.
-    AwaitSettingsReview {
-        #[arg(long)]
-        repository: String,
-        #[arg(long)]
-        policy_commit: String,
-        #[arg(long)]
-        run_id: String,
-        #[arg(long)]
-        run_attempt: String,
-    },
-    /// Authenticate and validate one complete release-train notification.
-    Receive {
-        #[arg(long)]
-        event: PathBuf,
-        #[arg(long)]
-        repository: String,
-        #[arg(long)]
-        policy_commit: String,
-    },
-    /// Exercise the complete local validation-only release path.
-    LocalValidate {
-        /// Repository-relative, bounded validation manifest.
-        #[arg(long)]
-        manifest: PathBuf,
-        /// Caller-selected reviewed release-plz executable outside the checkout.
-        #[arg(long, value_name = "PATH")]
-        release_plz: PathBuf,
-        /// SHA-256 of the reviewed release-plz executable bytes.
-        #[arg(long, value_name = "SHA256")]
-        release_plz_sha256: String,
-    },
-    /// Prepare the canonical release-train intent before token minting.
-    PrepareIntent {
-        #[arg(long)]
-        plan: String,
-        #[arg(long)]
-        plan_digest: String,
-        #[arg(long)]
-        origin_run_id: String,
-        #[arg(long)]
-        origin_run_attempt: String,
-        #[arg(long)]
-        settings_evidence: String,
-        #[arg(long)]
-        settings_review_id: String,
-        #[arg(long)]
-        settings_reviewer_id: String,
-        #[arg(long)]
-        settings_reviewer_login: String,
-    },
-    /// Prepare one run-scoped authorization from reviewed live settings.
-    PrepareSettingsAuthorization {
-        #[arg(long)]
-        repository: String,
-        #[arg(long)]
-        plan: String,
-        #[arg(long)]
-        plan_digest: String,
-        #[arg(long)]
-        policy_commit: String,
-        #[arg(long)]
-        run_id: String,
-        #[arg(long)]
-        run_attempt: String,
-        #[arg(long)]
-        settings_evidence: String,
-        #[arg(long)]
-        settings_review_id: String,
-        #[arg(long)]
-        settings_reviewer_id: String,
-        #[arg(long)]
-        settings_reviewer_login: String,
-    },
-    /// Create or verify the App-authored settings authorization Check.
-    CreateSettingsAuthorization {
-        #[arg(long)]
-        repository: String,
-        #[arg(long)]
-        plan: String,
-        #[arg(long)]
-        plan_digest: String,
-        #[arg(long)]
-        policy_commit: String,
-        #[arg(long)]
-        run_id: String,
-        #[arg(long)]
-        run_attempt: String,
-        #[arg(long)]
-        authorization: String,
-        #[arg(long)]
-        expected_app_slug: String,
-        #[arg(long)]
-        expected_installation_id: String,
-    },
-    /// Re-read and verify one fresh App-owned settings authorization.
-    VerifySettingsAuthorization {
-        #[arg(long)]
-        repository: String,
-        #[arg(long)]
-        plan: String,
-        #[arg(long)]
-        plan_digest: String,
-        #[arg(long)]
-        policy_commit: String,
-        #[arg(long)]
-        run_id: String,
-        #[arg(long)]
-        run_attempt: String,
-        #[arg(long)]
-        authorization: String,
-        #[arg(long)]
-        check_id: String,
-    },
-    /// Wait for the original intent and this run's fresh settings authority.
-    AwaitReleaseAuthority {
-        #[arg(long)]
-        repository: String,
-        #[arg(long)]
-        plan: String,
-        #[arg(long)]
-        plan_digest: String,
-        #[arg(long)]
-        policy_commit: String,
-        #[arg(long)]
-        run_id: String,
-        #[arg(long)]
-        run_attempt: String,
-    },
-    /// Create or verify the App-authored release-train intent Check.
-    CreateIntent {
-        #[arg(long)]
-        repository: String,
-        #[arg(long)]
-        plan: String,
-        #[arg(long)]
-        plan_digest: String,
-        #[arg(long)]
-        intent: String,
-        #[arg(long)]
-        expected_app_slug: String,
-        #[arg(long)]
-        expected_installation_id: String,
-    },
-    /// Re-read and verify the exact durable intent with a read-only token.
-    VerifyIntent {
-        #[arg(long)]
-        repository: String,
-        #[arg(long)]
-        plan: String,
-        #[arg(long)]
-        plan_digest: String,
-        #[arg(long)]
-        intent: String,
-        #[arg(long)]
-        check_id: String,
-    },
-    /// Finalize the exact published registry prefix with a contents-only token.
+    /// Reconcile the deterministic tag and immutable zero-asset Release.
     Finalize {
+        #[arg(long, value_name = "SHA")]
+        source: String,
         #[arg(long)]
-        repository: String,
-        #[arg(long)]
-        plan: String,
-        #[arg(long)]
-        plan_digest: String,
-        #[arg(long)]
-        policy_commit: String,
-        #[arg(long)]
-        run_id: String,
-        #[arg(long)]
-        run_attempt: String,
-        #[arg(long)]
-        intent: String,
-        #[arg(long)]
-        intent_check_id: String,
-        #[arg(long)]
-        settings_authorization: String,
-        #[arg(long)]
-        settings_authorization_check_id: String,
-        #[arg(long)]
-        expected_app_slug: String,
-        #[arg(long)]
-        expected_installation_id: String,
-    },
-    /// Emit one closed complete-train repository dispatch.
-    Notify {
-        #[arg(long)]
-        repository: String,
-        #[arg(long)]
-        plan: String,
-        #[arg(long)]
-        plan_digest: String,
-        #[arg(long)]
-        policy_commit: String,
-        #[arg(long)]
-        run_id: String,
-        #[arg(long)]
-        run_attempt: String,
-        #[arg(long)]
-        intent: String,
-        #[arg(long)]
-        intent_check_id: String,
-        #[arg(long)]
-        settings_authorization: String,
-        #[arg(long)]
-        settings_authorization_check_id: String,
-        #[arg(long)]
-        finalized_entries: String,
-        #[arg(long)]
-        expected_app_slug: String,
-        #[arg(long)]
-        expected_installation_id: String,
+        version: Version,
+        #[arg(long, value_enum)]
+        phase: FinalizationPhase,
     },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-pub(super) enum ReconcileMode {
-    Prepublish,
+enum QualificationMode {
+    Push,
+    Validate,
     Recover,
+    Publish,
 }
 
-impl ReconcileMode {
-    pub(super) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Prepublish => "prepublish",
-            Self::Recover => "recover",
-        }
-    }
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum FinalizationPhase {
+    Await,
+    Reconcile,
 }
 
-pub fn run(root: &Path, args: GithubArgs) -> Result<(), String> {
-    if let GithubCommand::ReleaseTrain(args) = &args.command {
-        match &args.command {
-            ReleaseTrainCommand::LocalValidate {
-                manifest,
-                release_plz,
-                release_plz_sha256,
-            } => return local_validation::run(root, manifest, release_plz, release_plz_sha256),
-            ReleaseTrainCommand::PrepareIntent {
-                plan,
-                plan_digest,
-                origin_run_id,
-                origin_run_attempt,
-                settings_evidence,
-                settings_review_id,
-                settings_reviewer_id,
-                settings_reviewer_login,
-            } => {
-                return release_train::prepare_intent_command(
-                    root,
-                    release_train::PrepareIntentInput {
-                        plan,
-                        plan_digest,
-                        origin_run_id,
-                        origin_run_attempt,
-                        settings_evidence,
-                        settings_review_id,
-                        settings_reviewer_id,
-                        settings_reviewer_login,
-                    },
-                );
-            }
-            ReleaseTrainCommand::PrepareSettingsAuthorization {
-                repository,
-                plan,
-                plan_digest,
-                policy_commit,
-                run_id,
-                run_attempt,
-                settings_evidence,
-                settings_review_id,
-                settings_reviewer_id,
-                settings_reviewer_login,
-            } => {
-                return release_train::prepare_settings_authorization_command(
-                    release_train::PrepareSettingsAuthorizationInput {
-                        repository,
-                        plan,
-                        plan_digest,
-                        policy_commit,
-                        run_id,
-                        run_attempt,
-                        settings_evidence,
-                        settings_review_id,
-                        settings_reviewer_id,
-                        settings_reviewer_login,
-                    },
-                );
-            }
-            ReleaseTrainCommand::SettingsRequest {
-                repository,
-                policy_commit,
-                run_id,
-                run_attempt,
-            } => {
-                return release_settings::request_command(
-                    root,
-                    repository,
-                    policy_commit,
-                    run_id,
-                    run_attempt,
-                );
-            }
-            _ => {}
-        }
-    }
-    require_token()?;
-    let mut github = GhCli::new()?;
+pub(crate) fn run(root: &Path, args: GithubArgs) -> Result<(), String> {
+    let GithubCommand::Release(args) = args.command;
     match args.command {
-        GithubCommand::GitIdentity(args) => match args.command {
-            GitIdentityCommand::Configure { repository } => {
-                identity::configure_command(root, repository.as_deref(), &mut github)
-            }
-        },
-        GithubCommand::ReleasePr(args) => match args.command {
-            ReleasePrCommand::ResolveIntent => intent::resolve(root, &mut github),
-            ReleasePrCommand::Apply { phase } => release_pr::apply(root, phase, &mut github),
-        },
-        GithubCommand::ReleaseSource(args) => match args.command {
-            ReleaseSourceCommand::Authorize {
-                repository,
-                commit,
-                baseline_version,
-                baseline_commit,
-            } => source::authorize_command(
+        GithubReleaseCommand::Qualify {
+            mode,
+            source,
+            original_run_id,
+            original_run_attempt,
+        } => {
+            let context = Context::from_env(root, &source)?;
+            require_api_token()?;
+            let mut github = GhCli::new()?;
+            let mut registry = CratesIo::new();
+            let result = qualify(
                 root,
-                &repository,
-                &commit,
-                &baseline_version,
-                &baseline_commit,
                 &mut github,
-            ),
-        },
-        GithubCommand::ReleaseObjects(args) => match args.command {
-            ReleaseObjectsCommand::Reconcile {
+                &mut registry,
+                &context,
                 mode,
-                repository,
-                version,
-                commit,
-            } => release_objects::reconcile_command(
-                root,
-                mode,
-                &repository,
-                &version,
-                &commit,
-                &mut github,
-            ),
-        },
-        GithubCommand::ReleaseTrain(args) => match args.command {
-            ReleaseTrainCommand::Discover { repository, commit } => {
-                release_train::discover_command(root, &repository, &commit, &mut github)
+                original_run_id,
+                original_run_attempt,
+            )?;
+            result.write_outputs()
+        }
+        GithubReleaseCommand::Finalize {
+            source,
+            version,
+            phase,
+        } => {
+            let context = Context::from_env(root, &source)?;
+            let mut registry = CratesIo::new();
+            match phase {
+                FinalizationPhase::Await => {
+                    await_publication(root, &mut registry, &context, &version)
+                }
+                FinalizationPhase::Reconcile => {
+                    require_api_token()?;
+                    let observed_slug = env::var("APP_SLUG")
+                        .map_err(|_| "APP_SLUG is required for finalization".to_string())?;
+                    let mut github = GhCli::new()?;
+                    finalize(
+                        root,
+                        &mut github,
+                        &mut registry,
+                        &context,
+                        &version,
+                        &observed_slug,
+                    )
+                }
             }
-            ReleaseTrainCommand::Capture {
-                repository,
-                commit,
-                policy_commit,
-                legacy_inventory_sha256,
-                baseline_version,
-                baseline_commit,
-            } => release_train::capture_command(
-                root,
-                release_train::CaptureInput {
-                    repository: &repository,
-                    commit: &commit,
-                    policy_commit: &policy_commit,
-                    legacy_inventory_sha256: &legacy_inventory_sha256,
-                    baseline_version: &baseline_version,
-                    baseline_commit: &baseline_commit,
-                },
-                &mut github,
-            ),
-            ReleaseTrainCommand::Verify {
-                repository,
-                plan,
-                plan_digest,
-                baseline_version,
-                baseline_commit,
-            } => release_train::verify_command(
-                root,
-                &repository,
-                &plan,
-                &plan_digest,
-                &baseline_version,
-                &baseline_commit,
-                &mut github,
-            ),
-            ReleaseTrainCommand::Wait {
-                repository,
-                plan,
-                plan_digest,
-            } => release_train::wait_command(&repository, &plan, &plan_digest),
-            ReleaseTrainCommand::VerifyLegacy {
-                repository,
-                policy_commit,
-            } => {
-                release_train::verify_legacy_command(root, &repository, &policy_commit, &mut github)
-            }
-            ReleaseTrainCommand::SettingsPreflight {
-                repository,
-                policy_commit,
-                run_id,
-                run_attempt,
-            } => release_settings::preflight_command(
-                root,
-                &repository,
-                &policy_commit,
-                &run_id,
-                &run_attempt,
-                &mut github,
-            ),
-            ReleaseTrainCommand::SettingsRequest { .. } => {
-                unreachable!("settings request is handled before credential selection")
-            }
-            ReleaseTrainCommand::AwaitSettingsReview {
-                repository,
-                policy_commit,
-                run_id,
-                run_attempt,
-            } => release_settings::await_review_command(
-                root,
-                &repository,
-                &policy_commit,
-                &run_id,
-                &run_attempt,
-                &mut github,
-            ),
-            ReleaseTrainCommand::Receive {
-                event,
-                repository,
-                policy_commit,
-            } => release_train::receive_command(
-                root,
-                release_train::ReceiveInput {
-                    event: &event,
-                    repository: &repository,
-                    policy_commit: &policy_commit,
-                },
-                &mut github,
-            ),
-            ReleaseTrainCommand::LocalValidate {
-                manifest,
-                release_plz,
-                release_plz_sha256,
-            } => local_validation::run(root, &manifest, &release_plz, &release_plz_sha256),
-            ReleaseTrainCommand::PrepareIntent {
-                plan,
-                plan_digest,
-                origin_run_id,
-                origin_run_attempt,
-                settings_evidence,
-                settings_review_id,
-                settings_reviewer_id,
-                settings_reviewer_login,
-            } => release_train::prepare_intent_command(
-                root,
-                release_train::PrepareIntentInput {
-                    plan: &plan,
-                    plan_digest: &plan_digest,
-                    origin_run_id: &origin_run_id,
-                    origin_run_attempt: &origin_run_attempt,
-                    settings_evidence: &settings_evidence,
-                    settings_review_id: &settings_review_id,
-                    settings_reviewer_id: &settings_reviewer_id,
-                    settings_reviewer_login: &settings_reviewer_login,
-                },
-            ),
-            ReleaseTrainCommand::PrepareSettingsAuthorization {
-                repository,
-                plan,
-                plan_digest,
-                policy_commit,
-                run_id,
-                run_attempt,
-                settings_evidence,
-                settings_review_id,
-                settings_reviewer_id,
-                settings_reviewer_login,
-            } => release_train::prepare_settings_authorization_command(
-                release_train::PrepareSettingsAuthorizationInput {
-                    repository: &repository,
-                    plan: &plan,
-                    plan_digest: &plan_digest,
-                    policy_commit: &policy_commit,
-                    run_id: &run_id,
-                    run_attempt: &run_attempt,
-                    settings_evidence: &settings_evidence,
-                    settings_review_id: &settings_review_id,
-                    settings_reviewer_id: &settings_reviewer_id,
-                    settings_reviewer_login: &settings_reviewer_login,
-                },
-            ),
-            ReleaseTrainCommand::CreateSettingsAuthorization {
-                repository,
-                plan,
-                plan_digest,
-                policy_commit,
-                run_id,
-                run_attempt,
-                authorization,
-                expected_app_slug,
-                expected_installation_id,
-            } => release_train::create_settings_authorization_command(
-                release_train::CreateSettingsAuthorizationInput {
-                    repository: &repository,
-                    plan: &plan,
-                    plan_digest: &plan_digest,
-                    policy_commit: &policy_commit,
-                    run_id: &run_id,
-                    run_attempt: &run_attempt,
-                    authorization: &authorization,
-                    expected_app_slug: &expected_app_slug,
-                    expected_installation_id: &expected_installation_id,
-                },
-                &mut github,
-            ),
-            ReleaseTrainCommand::VerifySettingsAuthorization {
-                repository,
-                plan,
-                plan_digest,
-                policy_commit,
-                run_id,
-                run_attempt,
-                authorization,
-                check_id,
-            } => release_train::verify_settings_authorization_command(
-                release_train::VerifySettingsAuthorizationInput {
-                    repository: &repository,
-                    plan: &plan,
-                    plan_digest: &plan_digest,
-                    policy_commit: &policy_commit,
-                    run_id: &run_id,
-                    run_attempt: &run_attempt,
-                    authorization: &authorization,
-                    check_id: &check_id,
-                },
-                &mut github,
-            ),
-            ReleaseTrainCommand::AwaitReleaseAuthority {
-                repository,
-                plan,
-                plan_digest,
-                policy_commit,
-                run_id,
-                run_attempt,
-            } => release_train::await_release_authority_command(
-                root,
-                release_train::AwaitReleaseAuthorityInput {
-                    repository: &repository,
-                    plan: &plan,
-                    plan_digest: &plan_digest,
-                    policy_commit: &policy_commit,
-                    run_id: &run_id,
-                    run_attempt: &run_attempt,
-                },
-                &mut github,
-            ),
-            ReleaseTrainCommand::CreateIntent {
-                repository,
-                plan,
-                plan_digest,
-                intent,
-                expected_app_slug,
-                expected_installation_id,
-            } => release_train::create_intent_command(
-                release_train::CreateIntentInput {
-                    repository: &repository,
-                    plan: &plan,
-                    plan_digest: &plan_digest,
-                    intent: &intent,
-                    expected_app_slug: &expected_app_slug,
-                    expected_installation_id: &expected_installation_id,
-                },
-                &mut github,
-            ),
-            ReleaseTrainCommand::VerifyIntent {
-                repository,
-                plan,
-                plan_digest,
-                intent,
-                check_id,
-            } => release_train::verify_intent_command(
-                &repository,
-                &plan,
-                &plan_digest,
-                &intent,
-                &check_id,
-                &mut github,
-            ),
-            ReleaseTrainCommand::Finalize {
-                repository,
-                plan,
-                plan_digest,
-                policy_commit,
-                run_id,
-                run_attempt,
-                intent,
-                intent_check_id,
-                settings_authorization,
-                settings_authorization_check_id,
-                expected_app_slug,
-                expected_installation_id,
-            } => release_train::finalize_command(
-                release_train::FinalizeInput {
-                    repository: &repository,
-                    plan: &plan,
-                    plan_digest: &plan_digest,
-                    policy_commit: &policy_commit,
-                    run_id: &run_id,
-                    run_attempt: &run_attempt,
-                    intent: &intent,
-                    intent_check_id: &intent_check_id,
-                    settings_authorization: &settings_authorization,
-                    settings_authorization_check_id: &settings_authorization_check_id,
-                    expected_app_slug: &expected_app_slug,
-                    expected_installation_id: &expected_installation_id,
-                },
-                &mut github,
-            ),
-            ReleaseTrainCommand::Notify {
-                repository,
-                plan,
-                plan_digest,
-                policy_commit,
-                run_id,
-                run_attempt,
-                intent,
-                intent_check_id,
-                settings_authorization,
-                settings_authorization_check_id,
-                finalized_entries,
-                expected_app_slug,
-                expected_installation_id,
-            } => release_train::notify_command(
-                release_train::NotifyInput {
-                    repository: &repository,
-                    plan: &plan,
-                    plan_digest: &plan_digest,
-                    policy_commit: &policy_commit,
-                    run_id: &run_id,
-                    run_attempt: &run_attempt,
-                    intent: &intent,
-                    intent_check_id: &intent_check_id,
-                    settings_authorization: &settings_authorization,
-                    settings_authorization_check_id: &settings_authorization_check_id,
-                    finalized_entries: &finalized_entries,
-                    expected_app_slug: &expected_app_slug,
-                    expected_installation_id: &expected_installation_id,
-                },
-                &mut github,
-            ),
-        },
+        }
     }
 }
 
-fn require_token() -> Result<(), String> {
-    if env::var_os("GH_TOKEN").is_some() || env::var_os("GITHUB_TOKEN").is_some() {
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Context {
+    source: String,
+    event: String,
+    sha: String,
+}
+
+impl Context {
+    fn from_env(root: &Path, source: &str) -> Result<Self, String> {
+        require_sha(source, "release source")?;
+        if env::var("GITHUB_ACTIONS").as_deref() != Ok("true") {
+            return Err("GitHub release commands run only in GitHub Actions".to_string());
+        }
+        if env::var("GITHUB_REPOSITORY").as_deref() != Ok(REPOSITORY) {
+            return Err("GITHUB_REPOSITORY does not match compiled policy".to_string());
+        }
+        let event = env::var("GITHUB_EVENT_NAME")
+            .map_err(|_| "GITHUB_EVENT_NAME is required".to_string())?;
+        let sha = env::var("GITHUB_SHA").map_err(|_| "GITHUB_SHA is required".to_string())?;
+        require_sha(&sha, "workflow SHA")?;
+        crate::crate_archive::require_clean_source(root, source)?;
+        Ok(Self {
+            source: source.to_string(),
+            event,
+            sha,
+        })
+    }
+}
+
+fn require_api_token() -> Result<(), String> {
+    if env::var_os("GH_TOKEN").is_some_and(|value| !value.is_empty()) {
         Ok(())
     } else {
-        Err("GH_TOKEN or GITHUB_TOKEN is required in the environment".to_string())
+        Err("GH_TOKEN is required and must be supplied through the environment".to_string())
     }
 }
 
-pub(super) fn env_required(name: &str) -> Result<String, String> {
-    let value = env::var(name).map_err(|_| format!("{name} is required"))?;
-    if value.is_empty() || value.contains(['\0', '\r', '\n']) {
-        return Err(format!("{name} must be one nonempty line"));
-    }
-    Ok(value)
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Qualification {
+    qualified: bool,
+    source: String,
+    version: Option<String>,
+    registry_state: &'static str,
+    validation_only: bool,
 }
 
-pub(super) fn env_bool(name: &str) -> Result<bool, String> {
-    match env_required(name)?.as_str() {
-        "true" => Ok(true),
-        "false" => Ok(false),
-        _ => Err(format!("{name} must be true or false")),
+impl Qualification {
+    fn ordinary(source: &str) -> Self {
+        Self {
+            qualified: false,
+            source: source.to_string(),
+            version: None,
+            registry_state: "not-applicable",
+            validation_only: false,
+        }
+    }
+
+    fn validation(source: &str) -> Self {
+        Self {
+            qualified: false,
+            source: source.to_string(),
+            version: None,
+            registry_state: "not-applicable",
+            validation_only: true,
+        }
+    }
+
+    fn write_outputs(&self) -> Result<(), String> {
+        let path =
+            env::var_os("GITHUB_OUTPUT").ok_or_else(|| "GITHUB_OUTPUT is required".to_string())?;
+        let mut output = OpenOptions::new()
+            .append(true)
+            .open(path)
+            .map_err(|error| format!("open GITHUB_OUTPUT: {error}"))?;
+        for (name, value) in [
+            ("qualified", self.qualified.to_string()),
+            ("source", self.source.clone()),
+            ("version", self.version.clone().unwrap_or_default()),
+            ("registry_state", self.registry_state.to_string()),
+            ("validation_only", self.validation_only.to_string()),
+        ] {
+            if value.contains(['\r', '\n']) {
+                return Err("release output contains a line break".to_string());
+            }
+            writeln!(output, "{name}={value}")
+                .map_err(|error| format!("write GITHUB_OUTPUT: {error}"))?;
+        }
+        Ok(())
     }
 }
 
-pub(super) fn repository_policy_for_root(
+fn qualify(
     root: &Path,
-    repository: &str,
-) -> Result<&'static RepositoryPolicy, String> {
-    let provider = consts::repository_policy(repository)
-        .ok_or_else(|| "GitHub repository has no compiled release policy".to_string())?;
-    let local = crate::release_policy::detect(root)?;
-    let expected = consts::repository_for_family(local.family)
-        .ok_or_else(|| "local release family has no compiled GitHub policy".to_string())?;
-    if provider != expected {
-        return Err("GitHub repository identity disagrees with local release policy".to_string());
+    github: &mut impl Transport,
+    registry: &mut impl Registry,
+    context: &Context,
+    mode: QualificationMode,
+    original_run_id: Option<u64>,
+    original_run_attempt: Option<u64>,
+) -> Result<Qualification, String> {
+    release::check_manifest(root)?;
+    require_live_policy_main(github, &context.sha)?;
+    match mode {
+        QualificationMode::Validate => {
+            if context.event != "workflow_dispatch"
+                || context.sha != context.source
+                || original_run_id.is_some()
+                || original_run_attempt.is_some()
+            {
+                return Err(
+                    "validation requires one unbound exact-source workflow dispatch".to_string(),
+                );
+            }
+            return Ok(Qualification::validation(&context.source));
+        }
+        QualificationMode::Push => {
+            if context.event != "push"
+                || context.sha != context.source
+                || original_run_id.is_some()
+                || original_run_attempt.is_some()
+            {
+                return Err("fresh qualification requires the exact push source".to_string());
+            }
+        }
+        QualificationMode::Recover => {
+            if context.event != "workflow_dispatch" {
+                return Err("recovery requires workflow_dispatch".to_string());
+            }
+            let run_id = original_run_id
+                .filter(|value| *value > 0)
+                .ok_or_else(|| "recovery requires original_run_id".to_string())?;
+            let attempt = original_run_attempt
+                .filter(|value| *value > 0)
+                .ok_or_else(|| "recovery requires original_run_attempt".to_string())?;
+            validate_original_run(github, &context.source, run_id, attempt)?;
+            require_ancestor_of_policy(github, &context.source, &context.sha)?;
+        }
+        QualificationMode::Publish => {
+            if context.event != "push"
+                || original_run_id.is_some()
+                || original_run_attempt.is_some()
+            {
+                return Err("post-approval publication requalification is malformed".to_string());
+            }
+            require_live_policy_main(github, &context.source)?;
+        }
     }
-    Ok(provider)
+
+    let pulls: Vec<PullRequest> = github.get(&format!(
+        "repos/{REPOSITORY}/commits/{}/pulls?per_page=100&page=1",
+        context.source
+    ))?;
+    let Some(release_pr) = select_merged_pull_request(&pulls, &context.source)? else {
+        if mode == QualificationMode::Push {
+            return Ok(Qualification::ordinary(&context.source));
+        }
+        return Err("recovery source is not a canonical release PR merge".to_string());
+    };
+    if !release_pr.head.reference.starts_with(RELEASE_BRANCH_PREFIX) {
+        if mode == QualificationMode::Push {
+            return Ok(Qualification::ordinary(&context.source));
+        }
+        return Err("recovery source did not use a manual release branch".to_string());
+    }
+
+    let branch_version = release_pr
+        .head
+        .reference
+        .strip_prefix(RELEASE_BRANCH_PREFIX)
+        .expect("prefix checked");
+    let version = Version::parse(branch_version)
+        .map_err(|error| format!("release branch version is invalid: {error}"))?;
+    if !version.build.is_empty() || release::manifest_version(root)? != version {
+        return Err("release branch and manifest versions differ".to_string());
+    }
+
+    let source_commit: Commit =
+        github.get(&format!("repos/{REPOSITORY}/commits/{}", context.source))?;
+    validate_commit(&source_commit, &context.source, true)?;
+    let head_commit: Commit = github.get(&format!(
+        "repos/{REPOSITORY}/commits/{}",
+        release_pr.head.sha
+    ))?;
+    validate_release_head(&source_commit, &head_commit, release_pr)?;
+    let head_signature =
+        read_release_head_signature(github, release_pr.number, &release_pr.head.sha)?;
+    validate_release_head_signature(&head_commit, &head_signature)?;
+
+    let registry_state = match registry
+        .exact_version(TRAITS_PACKAGE.package, &version.to_string())?
+    {
+        None => "absent",
+        Some(record) => {
+            if record.num != version.to_string() || record.yanked || !is_checksum(&record.checksum)
+            {
+                return Err("crates.io returned a conflicting release record".to_string());
+            }
+            require_archive(
+                registry,
+                &TRAITS_PACKAGE,
+                &version.to_string(),
+                &context.source,
+            )?;
+            "published"
+        }
+    };
+    if mode == QualificationMode::Publish && registry_state != "absent" {
+        return Err("release appeared on crates.io during environment approval".to_string());
+    }
+
+    Ok(Qualification {
+        qualified: true,
+        source: context.source.clone(),
+        version: Some(version.to_string()),
+        registry_state,
+        validation_only: false,
+    })
 }
 
-pub(super) fn workflow_repository(root: &Path) -> Result<&'static RepositoryPolicy, String> {
-    if env_required("GITHUB_ACTIONS")? != "true" {
-        return Err("GitHub workflow commands require GITHUB_ACTIONS=true".to_string());
-    }
-    let repository = env_required("GITHUB_REPOSITORY")?;
-    repository_policy_for_root(root, &repository)
+fn validate_original_run(
+    github: &mut impl Transport,
+    source: &str,
+    run_id: u64,
+    attempt: u64,
+) -> Result<(), String> {
+    let workflow: Workflow = github.get(&format!(
+        "repos/{REPOSITORY}/actions/workflows/{RELEASE_WORKFLOW_ID}"
+    ))?;
+    let run: WorkflowRun = github.get(&format!(
+        "repos/{REPOSITORY}/actions/runs/{run_id}/attempts/{attempt}"
+    ))?;
+    let current_run: WorkflowRun =
+        github.get(&format!("repos/{REPOSITORY}/actions/runs/{run_id}"))?;
+    let artifacts: ArtifactInventory = github.get(&format!(
+        "repos/{REPOSITORY}/actions/runs/{run_id}/artifacts?per_page=1"
+    ))?;
+    validate_original_run_payload(
+        &workflow,
+        &run,
+        &current_run,
+        &artifacts,
+        source,
+        run_id,
+        attempt,
+    )
 }
 
-pub(super) fn is_sha(value: &str) -> bool {
+fn validate_original_run_payload(
+    workflow: &Workflow,
+    run: &WorkflowRun,
+    current_run: &WorkflowRun,
+    artifacts: &ArtifactInventory,
+    source: &str,
+    run_id: u64,
+    attempt: u64,
+) -> Result<(), String> {
+    if workflow.id != RELEASE_WORKFLOW_ID
+        || workflow.path != RELEASE_WORKFLOW_PATH
+        || workflow.state != "active"
+    {
+        return Err("replacement publication workflow identity differs".to_string());
+    }
+    if !original_run_matches(workflow, run, source, run_id, attempt)
+        || !original_run_matches(workflow, current_run, source, run_id, attempt)
+        || run.status != current_run.status
+        || run.conclusion != current_run.conclusion
+    {
+        return Err("original publication run does not bind the recovery source".to_string());
+    }
+    if artifacts.total_count != 0 || !artifacts.artifacts.is_empty() {
+        return Err("original publication run retained an artifact".to_string());
+    }
+    Ok(())
+}
+
+fn original_run_matches(
+    workflow: &Workflow,
+    run: &WorkflowRun,
+    source: &str,
+    run_id: u64,
+    attempt: u64,
+) -> bool {
+    run.id == run_id
+        && run.run_attempt == attempt
+        && run.workflow_id == workflow.id
+        && run.path == RELEASE_WORKFLOW_PATH
+        && run.event == "push"
+        && run.status == "completed"
+        && matches!(
+            run.conclusion.as_deref(),
+            Some("success" | "failure" | "cancelled" | "timed_out" | "action_required")
+        )
+        && run.head_branch.as_deref() == Some("main")
+        && run.head_sha == source
+        && run.repository.full_name == REPOSITORY
+}
+
+fn select_merged_pull_request<'a>(
+    pulls: &'a [PullRequest],
+    source: &str,
+) -> Result<Option<&'a PullRequest>, String> {
+    if pulls.len() >= 100 {
+        return Err("commit association inventory is incomplete or oversized".to_string());
+    }
+    let matches: Vec<_> = pulls
+        .iter()
+        .filter(|pull| {
+            pull.number > 0
+                && pull.state == "closed"
+                && pull.merged_at.is_some()
+                && pull.merge_commit_sha.as_deref() == Some(source)
+                && pull.base.reference == "main"
+                && pull.base.repository().full_name == REPOSITORY
+        })
+        .collect();
+    if matches.len() > 1 {
+        return Err("release source has ambiguous pull request associations".to_string());
+    }
+    Ok(matches.into_iter().next())
+}
+
+fn validate_release_head(source: &Commit, head: &Commit, pull: &PullRequest) -> Result<(), String> {
+    if pull.head.repository().full_name != REPOSITORY
+        || head.sha != pull.head.sha
+        || source.parents.len() != 1
+        || head.parents.len() != 1
+        || head.parents[0].sha != pull.base.sha
+        || source.parents[0].sha != pull.base.sha
+        || source.commit.tree.sha != head.commit.tree.sha
+    {
+        return Err("release PR is not one current commit with the exact merged tree".to_string());
+    }
+    validate_commit(head, &pull.head.sha, true)
+}
+
+fn read_release_head_signature(
+    github: &mut impl Transport,
+    pull_number: u64,
+    expected_oid: &str,
+) -> Result<VerifiedSignature, String> {
+    if pull_number == 0 {
+        return Err("release pull request number is invalid".to_string());
+    }
+    require_sha(expected_oid, "release pull request head")?;
+    let payload = json!({
+        "query": RELEASE_SIGNATURE_QUERY,
+        "variables": {
+            "owner": "NVIDIA",
+            "name": "yaml-sigil-traits",
+            "number": pull_number,
+        },
+    });
+    let response: SignatureEnvelope = github.graphql(&payload)?;
+    if response.errors.is_some() {
+        return Err("release signature query returned errors".to_string());
+    }
+    let repository = response
+        .data
+        .repository
+        .ok_or_else(|| "release signature repository is missing".to_string())?;
+    let pull = repository
+        .pull_request
+        .ok_or_else(|| "release signature pull request is missing".to_string())?;
+    let commits = pull.commits;
+    if commits.total_count != 1
+        || commits.nodes.len() != 1
+        || commits.page_info.has_next_page
+        || commits.nodes[0].commit.oid != expected_oid
+    {
+        return Err("release signature inventory is incomplete or changed".to_string());
+    }
+    commits
+        .nodes
+        .into_iter()
+        .next()
+        .and_then(|node| node.commit.signature)
+        .ok_or_else(|| "release pull request head signer is missing".to_string())
+}
+
+fn validate_release_head_signature(
+    commit: &Commit,
+    signature: &VerifiedSignature,
+) -> Result<(), String> {
+    if !matches!(
+        signature.kind.as_str(),
+        "GpgSignature" | "SshSignature" | "SmimeSignature"
+    ) || !signature.is_valid
+        || signature.state != "VALID"
+        || signature.was_signed_by_github
+    {
+        return Err("release pull request head is not directly GitHub Verified".to_string());
+    }
+    let signer = signature
+        .signer
+        .as_ref()
+        .ok_or_else(|| "release pull request head signer is missing".to_string())?;
+    if signer.database_id != Some(RELEASE_SIGNER_ID)
+        || signer.login != RELEASE_SIGNER_LOGIN
+        || signer.kind != "User"
+    {
+        return Err("release pull request head signer identity differs".to_string());
+    }
+    let expected_account = |value: Option<&User>, label: &str| -> Result<(), String> {
+        let account = value.ok_or_else(|| format!("release {label} account is missing"))?;
+        if account.id != RELEASE_SIGNER_ID
+            || account.login != RELEASE_SIGNER_LOGIN
+            || account.kind != "User"
+        {
+            return Err(format!(
+                "release {label} does not match the verified signer"
+            ));
+        }
+        Ok(())
+    };
+    expected_account(commit.author.as_ref(), "author")?;
+    expected_account(commit.committer.as_ref(), "committer")?;
+
+    let signature_email = signature
+        .email
+        .as_deref()
+        .ok_or_else(|| "release signature email is missing".to_string())?;
+    if commit.commit.author.name != RELEASE_AUTHOR_NAME
+        || commit.commit.author.email != RELEASE_AUTHOR_EMAIL
+        || commit.commit.author.email != signature_email
+        || commit.commit.committer.email != signature_email
+    {
+        return Err("release signature email or raw author identity differs".to_string());
+    }
+    let author_dco = format!(
+        "Signed-off-by: {} <{}>",
+        commit.commit.author.name, commit.commit.author.email
+    );
+    if author_dco != DCO_TRAILER || !commit.commit.message.lines().any(|line| line == author_dco) {
+        return Err("release commit lacks the exact raw-author DCO sign-off".to_string());
+    }
+    Ok(())
+}
+
+fn validate_commit(
+    commit: &Commit,
+    expected_sha: &str,
+    require_release_paths: bool,
+) -> Result<(), String> {
+    if commit.sha != expected_sha
+        || commit.parents.len() != 1
+        || !is_sha(&commit.commit.tree.sha)
+        || !commit.commit.verification.verified
+        || commit.commit.verification.reason != "valid"
+        || !commit
+            .commit
+            .message
+            .lines()
+            .any(|line| line == DCO_TRAILER)
+    {
+        return Err("release commit signature, parent, or DCO binding differs".to_string());
+    }
+    if require_release_paths {
+        if commit.files.len() != RELEASE_PATHS.len()
+            || commit.files.iter().any(|file| {
+                file.status != "modified" || file.previous_filename.as_deref().is_some()
+            })
+        {
+            return Err("release commit file status differs from exact modifications".to_string());
+        }
+        let actual: BTreeSet<_> = commit
+            .files
+            .iter()
+            .map(|file| file.filename.as_str())
+            .collect();
+        let expected: BTreeSet<_> = RELEASE_PATHS.iter().copied().collect();
+        if actual != expected {
+            return Err("release commit changed files outside the release transaction".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn validate_source_version(root: &Path, version: &Version) -> Result<(), String> {
+    if version.build.is_empty() && release::manifest_version(root)? == *version {
+        Ok(())
+    } else {
+        Err("finalizer version differs from exact source".to_string())
+    }
+}
+
+fn verify_published_source(
+    registry: &mut impl Registry,
+    context: &Context,
+    version: &Version,
+) -> Result<(), String> {
+    let (_, archive, _) = require_archive(
+        registry,
+        &TRAITS_PACKAGE,
+        &version.to_string(),
+        &context.source,
+    )?;
+    if archive_vcs_commit(&archive, &TRAITS_PACKAGE, &version.to_string())? != context.source {
+        return Err("published archive VCS source differs".to_string());
+    }
+    Ok(())
+}
+
+fn await_publication(
+    root: &Path,
+    registry: &mut impl Registry,
+    context: &Context,
+    version: &Version,
+) -> Result<(), String> {
+    validate_source_version(root, version)?;
+    wait_for_registry(registry, &version.to_string())?;
+    verify_published_source(registry, context, version)
+}
+
+fn finalize(
+    root: &Path,
+    github: &mut impl Transport,
+    registry: &mut impl Registry,
+    context: &Context,
+    version: &Version,
+    observed_slug: &str,
+) -> Result<(), String> {
+    validate_source_version(root, version)?;
+    // The App-authorized phase must still be executing the protected policy
+    // that started this workflow, even when the release source is historical.
+    require_live_policy_main(github, &context.sha)?;
+    require_ancestor_of_policy(github, &context.source, &context.sha)?;
+    // Recheck the exact registry archive immediately in the App-authorized
+    // phase; the preceding credential-free phase owns the bounded wait.
+    verify_published_source(registry, context, version)?;
+    verify_app_scope(github, observed_slug)?;
+
+    let commit: Commit = github.get(&format!("repos/{REPOSITORY}/commits/{}", context.source))?;
+    validate_commit(&commit, &context.source, true)?;
+    let body = release_body(root, version)?;
+    let spec = ReleaseSpec {
+        version: version.clone(),
+        tag: TRAITS_PACKAGE.tag(&version.to_string()),
+        body,
+        source: context.source.clone(),
+        tagger_date: commit.commit.committer.date.clone(),
+    };
+
+    // Close the read/mutation gap: current protected policy and the retained
+    // source lineage must still be exact immediately before the first write.
+    require_ancestor_of_policy(github, &context.source, &context.sha)?;
+    require_live_policy_main(github, &context.sha)?;
+    let tag_object_sha = reconcile_tag(github, &spec, &context.sha)?;
+    reconcile_release(github, &spec, &tag_object_sha, &context.sha)?;
+    eprintln!(
+        "github: finalized immutable zero-asset {} at {}",
+        spec.tag, spec.source
+    );
+    Ok(())
+}
+
+fn wait_for_registry(registry: &mut impl Registry, version: &str) -> Result<(), String> {
+    const ATTEMPTS: usize = 60;
+    for attempt in 1..=ATTEMPTS {
+        if registry
+            .exact_version(TRAITS_PACKAGE.package, version)?
+            .is_some()
+        {
+            return Ok(());
+        }
+        if attempt == ATTEMPTS {
+            return Err(format!(
+                "crates.io did not expose {} {version} within ten minutes",
+                TRAITS_PACKAGE.package
+            ));
+        }
+        thread::sleep(Duration::from_secs(10));
+    }
+    unreachable!("bounded registry wait always returns")
+}
+
+fn verify_app_scope(github: &mut impl Transport, observed_slug: &str) -> Result<(), String> {
+    if observed_slug != APP_SLUG {
+        return Err("finalizer App slug differs from compiled policy".to_string());
+    }
+    let installation: InstallationRepositories =
+        github.get("installation/repositories?per_page=100")?;
+    validate_app_scope_payload(&installation)
+}
+
+fn validate_app_scope_payload(installation: &InstallationRepositories) -> Result<(), String> {
+    let names: Vec<_> = installation
+        .repositories
+        .iter()
+        .map(|repository| repository.full_name.as_str())
+        .collect();
+    if installation.total_count != 1 || names != [REPOSITORY] {
+        return Err("finalizer token is not scoped to exactly this repository".to_string());
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ReleaseSpec {
+    version: Version,
+    tag: String,
+    body: String,
+    source: String,
+    tagger_date: String,
+}
+
+impl ReleaseSpec {
+    fn tag_message(&self) -> String {
+        format!("Release {} {}", TRAITS_PACKAGE.package, self.version)
+    }
+}
+
+fn reconcile_tag(
+    github: &mut impl Transport,
+    spec: &ReleaseSpec,
+    policy_sha: &str,
+) -> Result<String, String> {
+    if let Some(object_sha) = inspect_tag(github, spec)? {
+        return Ok(object_sha);
+    }
+    require_ancestor_of_policy(github, &spec.source, policy_sha)?;
+    require_live_policy_main(github, policy_sha)?;
+    let object: AnnotatedTag = github.mutate(
+        "POST",
+        &format!("repos/{REPOSITORY}/git/tags"),
+        &json!({
+            "tag": spec.tag,
+            "message": spec.tag_message(),
+            "object": spec.source,
+            "type": "commit",
+            "tagger": {
+                "name": APP_LOGIN,
+                "email": APP_EMAIL,
+                "date": spec.tagger_date,
+            },
+        }),
+    )?;
+    validate_tag_object(&object, spec)?;
+    // The annotated object is not reachable until its ref exists. Rebind
+    // current policy once more so a move between the two POSTs cannot expose
+    // a tag authorized by stale policy.
+    require_ancestor_of_policy(github, &spec.source, policy_sha)?;
+    require_live_policy_main(github, policy_sha)?;
+    let mutation: Result<GitRef, String> = github.mutate(
+        "POST",
+        &format!("repos/{REPOSITORY}/git/refs"),
+        &json!({"ref": format!("refs/tags/{}", spec.tag), "sha": object.sha}),
+    );
+    if let Err(error) = mutation {
+        let retained = inspect_tag(github, spec)?;
+        if retained.as_deref() != Some(object.sha.as_str()) {
+            return Err(error);
+        }
+    }
+    if inspect_tag(github, spec)?.as_deref() != Some(object.sha.as_str()) {
+        return Err("GitHub did not retain the exact annotated tag".to_string());
+    }
+    Ok(object.sha)
+}
+
+fn inspect_tag(github: &mut impl Transport, spec: &ReleaseSpec) -> Result<Option<String>, String> {
+    let path = format!(
+        "repos/{REPOSITORY}/git/ref/tags/{}",
+        percent_encode(&spec.tag)
+    );
+    let Some(reference): Option<GitRef> = github.get_optional(&path)? else {
+        return Ok(None);
+    };
+    if reference.name != format!("refs/tags/{}", spec.tag)
+        || reference.object.kind != "tag"
+        || !is_sha(&reference.object.sha)
+    {
+        return Err("release tag ref is not one annotated tag".to_string());
+    }
+    let object: AnnotatedTag = github.get(&format!(
+        "repos/{REPOSITORY}/git/tags/{}",
+        reference.object.sha
+    ))?;
+    validate_tag_object(&object, spec)?;
+    if object.sha != reference.object.sha {
+        return Err("annotated tag object readback differs".to_string());
+    }
+    Ok(Some(reference.object.sha))
+}
+
+fn require_exact_tag_object(
+    github: &mut impl Transport,
+    spec: &ReleaseSpec,
+    expected_object_sha: &str,
+) -> Result<(), String> {
+    require_sha(expected_object_sha, "annotated tag object")?;
+    match inspect_tag(github, spec)? {
+        Some(observed) if observed == expected_object_sha => Ok(()),
+        Some(_) => Err("annotated tag ref changed to another object".to_string()),
+        None => Err("the exact annotated tag is missing".to_string()),
+    }
+}
+
+fn validate_tag_object(object: &AnnotatedTag, spec: &ReleaseSpec) -> Result<(), String> {
+    if !is_sha(&object.sha)
+        || object.tag != spec.tag
+        || object.message != spec.tag_message()
+        || object.object.kind != "commit"
+        || object.object.sha != spec.source
+        || object.tagger.name != APP_LOGIN
+        || object.tagger.email != APP_EMAIL
+        || object.tagger.date != spec.tagger_date
+    {
+        return Err("annotated tag conflicts with deterministic release policy".to_string());
+    }
+    Ok(())
+}
+
+fn reconcile_release(
+    github: &mut impl Transport,
+    spec: &ReleaseSpec,
+    tag_object_sha: &str,
+    policy_sha: &str,
+) -> Result<(), String> {
+    if inspect_release(github, spec)? {
+        require_exact_tag_object(github, spec, tag_object_sha)?;
+        return Ok(());
+    }
+    require_ancestor_of_policy(github, &spec.source, policy_sha)?;
+    require_live_policy_main(github, policy_sha)?;
+    require_exact_tag_object(github, spec, tag_object_sha)?;
+    let mutation: Result<GitHubRelease, String> = github.mutate(
+        "POST",
+        &format!("repos/{REPOSITORY}/releases"),
+        &json!({
+            "tag_name": spec.tag,
+            "target_commitish": spec.source,
+            "name": spec.tag,
+            "body": spec.body,
+            "draft": false,
+            "prerelease": !spec.version.pre.is_empty(),
+            "generate_release_notes": false,
+        }),
+    );
+    match mutation {
+        Ok(release) => validate_release(&release, spec)?,
+        Err(_error) if inspect_release(github, spec)? => {}
+        Err(error) => return Err(error),
+    }
+    if !inspect_release(github, spec)? {
+        return Err("GitHub did not retain the immutable zero-asset Release".to_string());
+    }
+    require_exact_tag_object(github, spec, tag_object_sha)?;
+    Ok(())
+}
+
+fn inspect_release(github: &mut impl Transport, spec: &ReleaseSpec) -> Result<bool, String> {
+    let path = format!(
+        "repos/{REPOSITORY}/releases/tags/{}",
+        percent_encode(&spec.tag)
+    );
+    let Some(release): Option<GitHubRelease> = github.get_optional(&path)? else {
+        return Ok(false);
+    };
+    validate_release(&release, spec)?;
+    Ok(true)
+}
+
+fn validate_release(release: &GitHubRelease, spec: &ReleaseSpec) -> Result<(), String> {
+    if release.id == 0
+        || release.tag_name != spec.tag
+        || release.target_commitish != spec.source
+        || release.name != spec.tag
+        || release.body != spec.body
+        || release.draft
+        || release.prerelease != !spec.version.pre.is_empty()
+        || !release.immutable
+        || release.author.login != APP_LOGIN
+        || release.author.id != APP_ID
+        || release.author.kind != "Bot"
+        || !release.assets.is_empty()
+    {
+        return Err("GitHub Release is not exact, immutable, and zero-asset".to_string());
+    }
+    Ok(())
+}
+
+fn release_body(root: &Path, version: &Version) -> Result<String, String> {
+    let changelog = safe_file::read_manifest(root, Path::new(TRAITS_PACKAGE.changelog))
+        .map_err(|error| format!("read changelog: {error}"))?;
+    let heading = format!("## [{version}]");
+    let mut inside = false;
+    let mut lines = Vec::new();
+    for line in changelog.lines() {
+        if is_changelog_heading(line, &heading) {
+            if inside {
+                return Err("release changelog heading is duplicated".to_string());
+            }
+            inside = true;
+            continue;
+        }
+        if inside && line.starts_with("## ") {
+            break;
+        }
+        if inside {
+            lines.push(line);
+        }
+    }
+    if !inside {
+        return Err("release changelog heading is missing".to_string());
+    }
+    let body = lines.join("\n").trim().to_string();
+    if body.is_empty() {
+        return Err("release changelog section is empty".to_string());
+    }
+    Ok(format!("{body}\n"))
+}
+
+fn is_changelog_heading(line: &str, heading: &str) -> bool {
+    line.strip_prefix(heading).is_some_and(|suffix| {
+        suffix.is_empty() || suffix.starts_with('(') || suffix.starts_with(" - ")
+    })
+}
+
+fn require_live_policy_main(github: &mut impl Transport, policy_sha: &str) -> Result<(), String> {
+    let reference: GitRef = github.get(&format!("repos/{REPOSITORY}/git/ref/heads/main"))?;
+    if reference.name != "refs/heads/main"
+        || reference.object.kind != "commit"
+        || reference.object.sha != policy_sha
+    {
+        return Err("protected main differs from the staged policy SHA".to_string());
+    }
+    Ok(())
+}
+
+fn require_ancestor_of_policy(
+    github: &mut impl Transport,
+    source: &str,
+    policy_sha: &str,
+) -> Result<(), String> {
+    let comparison: Comparison = github.get(&format!(
+        "repos/{REPOSITORY}/compare/{source}...{policy_sha}?per_page=1&page=1"
+    ))?;
+    let status_is_exact = if source == policy_sha {
+        comparison.status == "identical"
+    } else {
+        comparison.status == "ahead"
+    };
+    if !status_is_exact
+        || comparison.base_commit.sha != source
+        || comparison.merge_base_commit.sha != source
+    {
+        return Err("release source is not on the protected current-main lineage".to_string());
+    }
+    Ok(())
+}
+
+fn require_sha(value: &str, label: &str) -> Result<(), String> {
+    if is_sha(value) {
+        Ok(())
+    } else {
+        Err(format!("{label} must be a lowercase 40-character SHA"))
+    }
+}
+
+fn is_sha(value: &str) -> bool {
     value.len() == 40
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
-pub(super) fn is_positive_integer(value: &str) -> bool {
-    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) && !value.starts_with('0')
+#[derive(Clone, Debug, Deserialize)]
+struct Repository {
+    full_name: String,
 }
 
-pub(super) fn require_captured_ancestry(
-    github: &mut impl Transport,
-    repository: &str,
-    release_sha: &str,
-) -> Result<(), String> {
-    #[derive(Deserialize)]
-    struct Comparison {
-        status: String,
-        base_commit: CommitIdentity,
-        merge_base_commit: CommitIdentity,
-    }
-    #[derive(Deserialize)]
-    struct CommitIdentity {
-        sha: String,
-    }
-
-    if !is_sha(release_sha) {
-        return Err("captured release SHA is invalid".to_string());
-    }
-    let comparison: Comparison =
-        github.get(&format!("repos/{repository}/compare/{release_sha}...main"))?;
-    if !matches!(comparison.status.as_str(), "ahead" | "identical")
-        || comparison.base_commit.sha != release_sha
-        || comparison.merge_base_commit.sha != release_sha
-    {
-        return Err("captured release SHA is no longer protected-main ancestry".to_string());
-    }
-    Ok(())
+#[derive(Clone, Debug, Deserialize)]
+struct PullSide {
+    #[serde(rename = "ref")]
+    reference: String,
+    sha: String,
+    repo: Repository,
 }
 
-pub(super) fn append_outputs(values: &[(&str, &str)]) -> Result<(), String> {
-    let path = PathBuf::from(env_required("GITHUB_OUTPUT")?);
-    append_outputs_to(&path, values)
-}
-
-fn append_outputs_to(path: &Path, values: &[(&str, &str)]) -> Result<(), String> {
-    let mut names = BTreeSet::new();
-    let mut bytes = 0_usize;
-    for (name, value) in values {
-        bytes = bytes
-            .checked_add(name.len())
-            .and_then(|size| size.checked_add(value.len()))
-            .and_then(|size| size.checked_add(2))
-            .ok_or_else(|| "workflow output byte count overflowed".to_string())?;
-        if name.is_empty()
-            || !name
-                .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
-            || !names.insert(*name)
-            || value.contains(['\0', '\r', '\n'])
-            || bytes > MAX_FILE_BYTES as usize
-        {
-            return Err(
-                "workflow output contains an invalid, duplicate, or oversized entry".to_string(),
-            );
-        }
-    }
-    let mut output = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|error| format!("open workflow output {}: {error}", path.display()))?;
-    for (name, value) in values {
-        writeln!(output, "{name}={value}")
-            .map_err(|error| format!("write workflow output {}: {error}", path.display()))?;
-    }
-    Ok(())
-}
-
-pub(super) fn command_output(root: &Path, program: &str, args: &[&str]) -> Result<Output, String> {
-    let mut command = Command::new(program);
-    command.current_dir(root).args(args);
-    bounded_process::output(
-        &mut command,
-        OutputLimits {
-            stdout: transport::MAX_RESPONSE_BYTES,
-            stderr: transport::MAX_ERROR_BYTES,
-        },
-    )
-    .map_err(|error| format!("run {program}: {error}"))
-}
-
-pub(super) fn git_output(root: &Path, args: &[&str]) -> Result<String, String> {
-    let output = command_output(root, "git", args)?;
-    if !output.status.success() {
-        return Err(format!(
-            "git {} failed: {}",
-            args.join(" "),
-            output_detail(&output)
-        ));
-    }
-    String::from_utf8(output.stdout)
-        .map_err(|_| format!("git {} returned non-UTF-8 output", args.join(" ")))
-}
-
-pub(super) fn git_line(root: &Path, args: &[&str]) -> Result<String, String> {
-    let output = git_output(root, args)?;
-    let line = output
-        .strip_suffix("\r\n")
-        .or_else(|| output.strip_suffix('\n'))
-        .unwrap_or(&output);
-    if line.is_empty() || line.contains(['\r', '\n']) {
-        return Err(format!(
-            "git {} did not return one exact line",
-            args.join(" ")
-        ));
-    }
-    Ok(line.to_string())
-}
-
-pub(super) fn output_detail(output: &Output) -> String {
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    if stderr.is_empty() {
-        String::from_utf8_lossy(&output.stdout).trim().to_string()
-    } else {
-        stderr
+impl PullSide {
+    fn repository(&self) -> &Repository {
+        &self.repo
     }
 }
 
-pub(super) fn validate_ref_component(value: &str, label: &str) -> Result<(), String> {
-    if value.is_empty()
-        || value.starts_with('-')
-        || value.contains(['\0', '\r', '\n', ' ', '~', '^', ':', '?', '*', '[', '\\'])
-        || value.contains("..")
-        || value.contains("@{")
-        || value.ends_with('.')
-        || value.ends_with('/')
-        || value.starts_with('/')
-    {
-        Err(format!("{label} is not a safe Git ref component"))
-    } else {
-        Ok(())
-    }
+#[derive(Clone, Debug, Deserialize)]
+struct PullRequest {
+    number: u64,
+    state: String,
+    merged_at: Option<String>,
+    merge_commit_sha: Option<String>,
+    base: PullSide,
+    head: PullSide,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct Commit {
+    sha: String,
+    author: Option<User>,
+    committer: Option<User>,
+    commit: CommitBody,
+    parents: Vec<GitObject>,
+    files: Vec<CommitFile>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct CommitBody {
+    message: String,
+    author: GitSignature,
+    committer: GitSignature,
+    tree: GitObject,
+    verification: Verification,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct Verification {
+    verified: bool,
+    reason: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct SignatureEnvelope {
+    data: SignatureData,
+    #[serde(default)]
+    errors: Option<Value>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct SignatureData {
+    repository: Option<SignatureRepository>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct SignatureRepository {
+    #[serde(rename = "pullRequest")]
+    pull_request: Option<SignaturePullRequest>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct SignaturePullRequest {
+    commits: SignatureCommitConnection,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct SignatureCommitConnection {
+    #[serde(rename = "totalCount")]
+    total_count: usize,
+    nodes: Vec<SignatureNode>,
+    #[serde(rename = "pageInfo")]
+    page_info: SignaturePageInfo,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct SignaturePageInfo {
+    #[serde(rename = "hasNextPage")]
+    has_next_page: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct SignatureNode {
+    commit: SignatureCommit,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct SignatureCommit {
+    oid: String,
+    signature: Option<VerifiedSignature>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct VerifiedSignature {
+    #[serde(rename = "__typename")]
+    kind: String,
+    email: Option<String>,
+    #[serde(rename = "isValid")]
+    is_valid: bool,
+    state: String,
+    #[serde(rename = "wasSignedByGitHub")]
+    was_signed_by_github: bool,
+    signer: Option<SignatureSigner>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct SignatureSigner {
+    #[serde(rename = "databaseId")]
+    database_id: Option<u64>,
+    login: String,
+    #[serde(rename = "__typename")]
+    kind: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct CommitFile {
+    filename: String,
+    status: String,
+    #[serde(default)]
+    previous_filename: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct Comparison {
+    status: String,
+    base_commit: GitObject,
+    merge_base_commit: GitObject,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct GitObject {
+    sha: String,
+    #[serde(rename = "type", default)]
+    kind: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct GitRef {
+    #[serde(rename = "ref")]
+    name: String,
+    object: GitObject,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct Workflow {
+    id: u64,
+    path: String,
+    state: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct WorkflowRun {
+    id: u64,
+    run_attempt: u64,
+    workflow_id: u64,
+    path: String,
+    event: String,
+    status: String,
+    conclusion: Option<String>,
+    head_branch: Option<String>,
+    head_sha: String,
+    repository: Repository,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ArtifactInventory {
+    total_count: usize,
+    artifacts: Vec<Value>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct InstallationRepositories {
+    total_count: usize,
+    repositories: Vec<Repository>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct User {
+    login: String,
+    id: u64,
+    #[serde(rename = "type")]
+    kind: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct AnnotatedTag {
+    sha: String,
+    tag: String,
+    message: String,
+    object: GitObject,
+    tagger: GitSignature,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct GitSignature {
+    name: String,
+    email: String,
+    date: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct GitHubRelease {
+    id: u64,
+    tag_name: String,
+    target_commitish: String,
+    name: String,
+    body: String,
+    draft: bool,
+    prerelease: bool,
+    immutable: bool,
+    author: User,
+    assets: Vec<Value>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::github::transport::fake::{Expected, FakeTransport};
-    use serde_json::json;
 
-    #[test]
-    fn exact_identifiers_are_strict() {
-        assert!(is_sha("0123456789abcdef0123456789abcdef01234567"));
-        assert!(!is_sha("0123456789ABCDEF0123456789ABCDEF01234567"));
-        assert!(is_positive_integer("42"));
-        assert!(!is_positive_integer("0"));
-        assert!(validate_ref_component("release-plz-next", "branch").is_ok());
-        assert!(validate_ref_component("../main", "branch").is_err());
+    use std::collections::BTreeMap;
+
+    struct FakeGithub {
+        responses: BTreeMap<String, Value>,
+    }
+
+    impl Transport for FakeGithub {
+        fn get<T: serde::de::DeserializeOwned>(&mut self, path: &str) -> Result<T, String> {
+            let value = self
+                .responses
+                .get(path)
+                .cloned()
+                .ok_or_else(|| format!("unexpected GitHub read: {path}"))?;
+            serde_json::from_value(value).map_err(|error| error.to_string())
+        }
+
+        fn get_optional<T: serde::de::DeserializeOwned>(
+            &mut self,
+            path: &str,
+        ) -> Result<Option<T>, String> {
+            self.responses
+                .get(path)
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|error| error.to_string())
+        }
+
+        fn graphql<T: serde::de::DeserializeOwned, P: serde::Serialize>(
+            &mut self,
+            payload: &P,
+        ) -> Result<T, String> {
+            let request = serde_json::to_value(payload).map_err(|error| error.to_string())?;
+            if request
+                != json!({
+                    "query": RELEASE_SIGNATURE_QUERY,
+                    "variables": {
+                        "owner": "NVIDIA",
+                        "name": "yaml-sigil-traits",
+                        "number": 7,
+                    },
+                })
+            {
+                return Err("unexpected GitHub GraphQL request".to_string());
+            }
+            let value = self
+                .responses
+                .get("graphql:release-signature")
+                .cloned()
+                .ok_or_else(|| "unexpected GitHub GraphQL read".to_string())?;
+            serde_json::from_value(value).map_err(|error| error.to_string())
+        }
+
+        fn mutate<T: serde::de::DeserializeOwned, P: serde::Serialize>(
+            &mut self,
+            _method: &str,
+            path: &str,
+            _payload: &P,
+        ) -> Result<T, String> {
+            Err(format!("unexpected GitHub mutation: {path}"))
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingRegistry {
+        exact_version_calls: usize,
+    }
+
+    impl Registry for CountingRegistry {
+        fn exact_version(
+            &mut self,
+            _package: &str,
+            _version: &str,
+        ) -> Result<Option<crate::crate_archive::RegistryVersion>, String> {
+            self.exact_version_calls += 1;
+            Err("unexpected registry read".to_string())
+        }
+
+        fn download(&mut self, _package: &str, _version: &str) -> Result<Vec<u8>, String> {
+            Err("unexpected registry download".to_string())
+        }
+    }
+
+    struct TagMutationGapGithub {
+        main_reads: usize,
+        tag_posts: usize,
+        ref_posts: usize,
+        policy: String,
+        moved: String,
+        spec: ReleaseSpec,
+    }
+
+    impl Transport for TagMutationGapGithub {
+        fn get<T: serde::de::DeserializeOwned>(&mut self, path: &str) -> Result<T, String> {
+            let main_path = format!("repos/{REPOSITORY}/git/ref/heads/main");
+            let compare_path = format!(
+                "repos/{REPOSITORY}/compare/{}...{}?per_page=1&page=1",
+                self.spec.source, self.policy
+            );
+            let value = if path == main_path {
+                let sha = if self.main_reads == 0 {
+                    &self.policy
+                } else {
+                    &self.moved
+                };
+                self.main_reads += 1;
+                json!({
+                    "ref": "refs/heads/main",
+                    "object": {"type": "commit", "sha": sha},
+                })
+            } else if path == compare_path {
+                json!({
+                    "status": "ahead",
+                    "base_commit": {"sha": self.spec.source},
+                    "merge_base_commit": {"sha": self.spec.source},
+                })
+            } else {
+                return Err(format!("unexpected GitHub read: {path}"));
+            };
+            serde_json::from_value(value).map_err(|error| error.to_string())
+        }
+
+        fn get_optional<T: serde::de::DeserializeOwned>(
+            &mut self,
+            path: &str,
+        ) -> Result<Option<T>, String> {
+            let expected = format!("repos/{REPOSITORY}/git/ref/tags/{}", self.spec.tag);
+            if path == expected {
+                Ok(None)
+            } else {
+                Err(format!("unexpected optional GitHub read: {path}"))
+            }
+        }
+
+        fn mutate<T: serde::de::DeserializeOwned, P: serde::Serialize>(
+            &mut self,
+            method: &str,
+            path: &str,
+            _payload: &P,
+        ) -> Result<T, String> {
+            if method != "POST" {
+                return Err(format!("unexpected GitHub mutation method: {method}"));
+            }
+            if path == format!("repos/{REPOSITORY}/git/tags") {
+                self.tag_posts += 1;
+                serde_json::from_value(json!({
+                    "sha": "d".repeat(40),
+                    "tag": self.spec.tag,
+                    "message": self.spec.tag_message(),
+                    "object": {"type": "commit", "sha": self.spec.source},
+                    "tagger": {
+                        "name": APP_LOGIN,
+                        "email": APP_EMAIL,
+                        "date": self.spec.tagger_date,
+                    },
+                }))
+                .map_err(|error| error.to_string())
+            } else if path == format!("repos/{REPOSITORY}/git/refs") {
+                self.ref_posts += 1;
+                Err("unexpected visible tag-ref mutation".to_string())
+            } else {
+                Err(format!("unexpected GitHub mutation: {path}"))
+            }
+        }
+    }
+
+    struct ReleaseMutationGapGithub {
+        compare_reads: usize,
+        main_reads: usize,
+        release_posts: usize,
+        policy: String,
+        moved: String,
+        spec: ReleaseSpec,
+    }
+
+    impl Transport for ReleaseMutationGapGithub {
+        fn get<T: serde::de::DeserializeOwned>(&mut self, path: &str) -> Result<T, String> {
+            let main_path = format!("repos/{REPOSITORY}/git/ref/heads/main");
+            let compare_path = format!(
+                "repos/{REPOSITORY}/compare/{}...{}?per_page=1&page=1",
+                self.spec.source, self.policy
+            );
+            let value = if path == compare_path {
+                self.compare_reads += 1;
+                json!({
+                    "status": "ahead",
+                    "base_commit": {"sha": self.spec.source},
+                    "merge_base_commit": {"sha": self.spec.source},
+                })
+            } else if path == main_path {
+                self.main_reads += 1;
+                if self.compare_reads != 1 {
+                    return Err("live-main read did not follow the ancestry read".to_string());
+                }
+                json!({
+                    "ref": "refs/heads/main",
+                    "object": {"type": "commit", "sha": self.moved},
+                })
+            } else {
+                return Err(format!("unexpected GitHub read: {path}"));
+            };
+            serde_json::from_value(value).map_err(|error| error.to_string())
+        }
+
+        fn get_optional<T: serde::de::DeserializeOwned>(
+            &mut self,
+            path: &str,
+        ) -> Result<Option<T>, String> {
+            let expected = format!("repos/{REPOSITORY}/releases/tags/{}", self.spec.tag);
+            if path == expected {
+                Ok(None)
+            } else {
+                Err(format!("unexpected optional GitHub read: {path}"))
+            }
+        }
+
+        fn mutate<T: serde::de::DeserializeOwned, P: serde::Serialize>(
+            &mut self,
+            method: &str,
+            path: &str,
+            _payload: &P,
+        ) -> Result<T, String> {
+            if method == "POST" && path == format!("repos/{REPOSITORY}/releases") {
+                self.release_posts += 1;
+                Err("unexpected Release mutation".to_string())
+            } else {
+                Err(format!("unexpected GitHub mutation: {path}"))
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum TagDriftAfterRelease {
+        Deleted,
+        LightweightReplacement,
+        ObjectReplacement,
+        SemanticallyIdenticalObjectReplacement,
+        SourceDrift,
+    }
+
+    struct ReleaseTagMutationGapGithub {
+        policy: String,
+        release_posts: usize,
+        release_reads: usize,
+        tag_reads: usize,
+        tag_object_sha: String,
+        drift: TagDriftAfterRelease,
+        spec: ReleaseSpec,
+    }
+
+    impl Transport for ReleaseTagMutationGapGithub {
+        fn get<T: serde::de::DeserializeOwned>(&mut self, path: &str) -> Result<T, String> {
+            let compare_path = format!(
+                "repos/{REPOSITORY}/compare/{}...{}?per_page=1&page=1",
+                self.spec.source, self.policy
+            );
+            let main_path = format!("repos/{REPOSITORY}/git/ref/heads/main");
+            let object_path = format!("repos/{REPOSITORY}/git/tags/{}", self.tag_object_sha);
+            let value = if path == compare_path {
+                json!({
+                    "status": "ahead",
+                    "base_commit": {"sha": self.spec.source},
+                    "merge_base_commit": {"sha": self.spec.source},
+                })
+            } else if path == main_path {
+                json!({
+                    "ref": "refs/heads/main",
+                    "object": {"type": "commit", "sha": self.policy},
+                })
+            } else if path == object_path && self.release_posts == 0 {
+                annotated_tag_json(&self.spec, &self.tag_object_sha)
+            } else if path == format!("repos/{REPOSITORY}/git/tags/{}", "e".repeat(40))
+                && self.release_posts > 0
+            {
+                let mut replacement = annotated_tag_json(&self.spec, &"e".repeat(40));
+                match self.drift {
+                    TagDriftAfterRelease::ObjectReplacement => {
+                        replacement["message"] = json!("replacement tag object");
+                    }
+                    TagDriftAfterRelease::SemanticallyIdenticalObjectReplacement => {}
+                    TagDriftAfterRelease::SourceDrift => {
+                        replacement["object"]["sha"] = json!("f".repeat(40));
+                    }
+                    TagDriftAfterRelease::Deleted
+                    | TagDriftAfterRelease::LightweightReplacement => {
+                        return Err("unexpected replacement tag object read".to_string());
+                    }
+                }
+                replacement
+            } else {
+                return Err(format!("unexpected GitHub read: {path}"));
+            };
+            serde_json::from_value(value).map_err(|error| error.to_string())
+        }
+
+        fn get_optional<T: serde::de::DeserializeOwned>(
+            &mut self,
+            path: &str,
+        ) -> Result<Option<T>, String> {
+            let release_path = format!("repos/{REPOSITORY}/releases/tags/{}", self.spec.tag);
+            let tag_path = format!("repos/{REPOSITORY}/git/ref/tags/{}", self.spec.tag);
+            let value = if path == release_path {
+                self.release_reads += 1;
+                (self.release_posts > 0).then(|| github_release_json(&self.spec))
+            } else if path == tag_path {
+                self.tag_reads += 1;
+                if self.release_posts == 0 {
+                    Some(tag_reference_json(&self.spec, &self.tag_object_sha))
+                } else {
+                    match self.drift {
+                        TagDriftAfterRelease::Deleted => None,
+                        TagDriftAfterRelease::LightweightReplacement => Some(json!({
+                            "ref": format!("refs/tags/{}", self.spec.tag),
+                            "object": {"type": "commit", "sha": self.spec.source},
+                        })),
+                        TagDriftAfterRelease::ObjectReplacement
+                        | TagDriftAfterRelease::SemanticallyIdenticalObjectReplacement
+                        | TagDriftAfterRelease::SourceDrift => Some(json!({
+                            "ref": format!("refs/tags/{}", self.spec.tag),
+                            "object": {"type": "tag", "sha": "e".repeat(40)},
+                        })),
+                    }
+                }
+            } else {
+                return Err(format!("unexpected optional GitHub read: {path}"));
+            };
+            value
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|error| error.to_string())
+        }
+
+        fn mutate<T: serde::de::DeserializeOwned, P: serde::Serialize>(
+            &mut self,
+            method: &str,
+            path: &str,
+            _payload: &P,
+        ) -> Result<T, String> {
+            if method == "POST" && path == format!("repos/{REPOSITORY}/releases") {
+                self.release_posts += 1;
+                serde_json::from_value(github_release_json(&self.spec))
+                    .map_err(|error| error.to_string())
+            } else {
+                Err(format!("unexpected GitHub mutation: {path}"))
+            }
+        }
+    }
+
+    fn main_only_github(main: &str, pulls: Value) -> FakeGithub {
+        FakeGithub {
+            responses: BTreeMap::from([
+                (
+                    format!("repos/{REPOSITORY}/git/ref/heads/main"),
+                    json!({
+                        "ref": "refs/heads/main",
+                        "object": {"type": "commit", "sha": main},
+                    }),
+                ),
+                (
+                    format!("repos/{REPOSITORY}/commits/{main}/pulls?per_page=100&page=1"),
+                    pulls,
+                ),
+            ]),
+        }
+    }
+
+    fn repository() -> Repository {
+        Repository {
+            full_name: REPOSITORY.to_string(),
+        }
+    }
+
+    fn side(reference: &str, sha: &str) -> PullSide {
+        PullSide {
+            reference: reference.to_string(),
+            sha: sha.to_string(),
+            repo: repository(),
+        }
+    }
+
+    fn pull(source: &str) -> PullRequest {
+        PullRequest {
+            number: 7,
+            state: "closed".to_string(),
+            merged_at: Some("2026-09-04T00:00:00Z".to_string()),
+            merge_commit_sha: Some(source.to_string()),
+            base: side("main", &"b".repeat(40)),
+            head: side("release-plz-manual-0.4.0-rc.3", &"c".repeat(40)),
+        }
+    }
+
+    fn commit(sha: &str, parent: &str, files: &[&str]) -> Commit {
+        Commit {
+            sha: sha.to_string(),
+            author: Some(User {
+                login: RELEASE_SIGNER_LOGIN.to_string(),
+                id: RELEASE_SIGNER_ID,
+                kind: "User".to_string(),
+            }),
+            committer: Some(User {
+                login: RELEASE_SIGNER_LOGIN.to_string(),
+                id: RELEASE_SIGNER_ID,
+                kind: "User".to_string(),
+            }),
+            commit: CommitBody {
+                message: format!("chore(release): prepare\n\n{DCO_TRAILER}"),
+                author: GitSignature {
+                    name: RELEASE_AUTHOR_NAME.to_string(),
+                    email: RELEASE_AUTHOR_EMAIL.to_string(),
+                    date: "2026-09-04T00:00:00Z".to_string(),
+                },
+                committer: GitSignature {
+                    name: RELEASE_AUTHOR_NAME.to_string(),
+                    email: RELEASE_AUTHOR_EMAIL.to_string(),
+                    date: "2026-09-04T00:00:00Z".to_string(),
+                },
+                tree: GitObject {
+                    sha: "e".repeat(40),
+                    kind: "tree".to_string(),
+                },
+                verification: Verification {
+                    verified: true,
+                    reason: "valid".to_string(),
+                },
+            },
+            parents: vec![GitObject {
+                sha: parent.to_string(),
+                kind: "commit".to_string(),
+            }],
+            files: files
+                .iter()
+                .map(|filename| CommitFile {
+                    filename: (*filename).to_string(),
+                    status: "modified".to_string(),
+                    previous_filename: None,
+                })
+                .collect(),
+        }
+    }
+
+    fn release_signature() -> VerifiedSignature {
+        VerifiedSignature {
+            kind: "SshSignature".to_string(),
+            email: Some(RELEASE_AUTHOR_EMAIL.to_string()),
+            is_valid: true,
+            state: "VALID".to_string(),
+            was_signed_by_github: false,
+            signer: Some(SignatureSigner {
+                database_id: Some(RELEASE_SIGNER_ID),
+                login: RELEASE_SIGNER_LOGIN.to_string(),
+                kind: "User".to_string(),
+            }),
+        }
+    }
+
+    fn release_signature_response(head: &str) -> Value {
+        json!({
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "commits": {
+                            "totalCount": 1,
+                            "nodes": [{
+                                "commit": {
+                                    "oid": head,
+                                    "signature": {
+                                        "__typename": "SshSignature",
+                                        "email": RELEASE_AUTHOR_EMAIL,
+                                        "isValid": true,
+                                        "state": "VALID",
+                                        "wasSignedByGitHub": false,
+                                        "signer": {
+                                            "databaseId": RELEASE_SIGNER_ID,
+                                            "login": RELEASE_SIGNER_LOGIN,
+                                            "__typename": "User",
+                                        },
+                                    },
+                                },
+                            }],
+                            "pageInfo": {"hasNextPage": false},
+                        },
+                    },
+                },
+            },
+        })
+    }
+
+    fn workflow() -> Workflow {
+        Workflow {
+            id: RELEASE_WORKFLOW_ID,
+            path: RELEASE_WORKFLOW_PATH.to_string(),
+            state: "active".to_string(),
+        }
+    }
+
+    fn workflow_run(source: &str) -> WorkflowRun {
+        WorkflowRun {
+            id: 789,
+            run_attempt: 2,
+            workflow_id: RELEASE_WORKFLOW_ID,
+            path: RELEASE_WORKFLOW_PATH.to_string(),
+            event: "push".to_string(),
+            status: "completed".to_string(),
+            conclusion: Some("failure".to_string()),
+            head_branch: Some("main".to_string()),
+            head_sha: source.to_string(),
+            repository: repository(),
+        }
+    }
+
+    fn no_artifacts() -> ArtifactInventory {
+        ArtifactInventory {
+            total_count: 0,
+            artifacts: Vec::new(),
+        }
+    }
+
+    fn release_spec() -> ReleaseSpec {
+        ReleaseSpec {
+            version: Version::parse("0.4.0-rc.3").unwrap(),
+            tag: "v0.4.0-rc.3".to_string(),
+            body: "notes\n".to_string(),
+            source: "a".repeat(40),
+            tagger_date: "2026-09-04T00:00:00Z".to_string(),
+        }
+    }
+
+    fn annotated_tag_json(spec: &ReleaseSpec, object_sha: &str) -> Value {
+        json!({
+            "sha": object_sha,
+            "tag": spec.tag,
+            "message": spec.tag_message(),
+            "object": {"type": "commit", "sha": spec.source},
+            "tagger": {
+                "name": APP_LOGIN,
+                "email": APP_EMAIL,
+                "date": spec.tagger_date,
+            },
+        })
+    }
+
+    fn tag_reference_json(spec: &ReleaseSpec, object_sha: &str) -> Value {
+        json!({
+            "ref": format!("refs/tags/{}", spec.tag),
+            "object": {"type": "tag", "sha": object_sha},
+        })
+    }
+
+    fn github_release(spec: &ReleaseSpec) -> GitHubRelease {
+        GitHubRelease {
+            id: 1,
+            tag_name: spec.tag.clone(),
+            target_commitish: spec.source.clone(),
+            name: spec.tag.clone(),
+            body: spec.body.clone(),
+            draft: false,
+            prerelease: true,
+            immutable: true,
+            author: User {
+                login: APP_LOGIN.to_string(),
+                id: APP_ID,
+                kind: "Bot".to_string(),
+            },
+            assets: Vec::new(),
+        }
+    }
+
+    fn github_release_json(spec: &ReleaseSpec) -> Value {
+        json!({
+            "id": 1,
+            "tag_name": spec.tag,
+            "target_commitish": spec.source,
+            "name": spec.tag,
+            "body": spec.body,
+            "draft": false,
+            "prerelease": true,
+            "immutable": true,
+            "author": {
+                "login": APP_LOGIN,
+                "id": APP_ID,
+                "type": "Bot",
+            },
+            "assets": [],
+        })
     }
 
     #[test]
-    fn captured_source_accepts_current_or_ancestor_main() {
-        let release_sha = "a".repeat(40);
-        let path = format!("repos/example/project/compare/{release_sha}...main");
-        for status in ["identical", "ahead"] {
-            let mut github = FakeTransport::new([Expected::json(
-                "GET",
-                &path,
-                json!({
-                    "status": status,
-                    "base_commit": {"sha": release_sha},
-                    "merge_base_commit": {"sha": release_sha},
-                }),
-            )]);
-            require_captured_ancestry(&mut github, "example/project", &release_sha).unwrap();
-            github.finish();
+    fn pull_association_is_exact_and_unambiguous() {
+        let source = "a".repeat(40);
+        let valid = pull(&source);
+        assert_eq!(
+            select_merged_pull_request(std::slice::from_ref(&valid), &source)
+                .unwrap()
+                .map(|pull| pull.number),
+            Some(7)
+        );
+        assert!(select_merged_pull_request(&[valid.clone(), valid], &source).is_err());
+        assert!(select_merged_pull_request(&vec![pull(&source); 100], &source).is_err());
+        assert!(
+            select_merged_pull_request(&[pull(&"d".repeat(40))], &source)
+                .unwrap()
+                .is_none()
+        );
+
+        let mut wrong_base = pull(&source);
+        wrong_base.base.reference = "develop".to_string();
+        assert!(
+            select_merged_pull_request(&[wrong_base], &source)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn ordinary_main_push_is_a_noop_before_registry_reconciliation() {
+        let source = "a".repeat(40);
+        let mut github = main_only_github(&source, json!([]));
+        let mut registry = CountingRegistry::default();
+        let context = Context {
+            source: source.clone(),
+            event: "push".to_string(),
+            sha: source,
+        };
+
+        let result = qualify(
+            &crate::workspace_root(),
+            &mut github,
+            &mut registry,
+            &context,
+            QualificationMode::Push,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(!result.qualified);
+        assert_eq!(registry.exact_version_calls, 0);
+    }
+
+    #[test]
+    fn post_approval_requalification_rejects_moved_main_before_registry_reads() {
+        let source = "a".repeat(40);
+        let policy = "b".repeat(40);
+        let moved = "c".repeat(40);
+        let mut github = main_only_github(&moved, json!([]));
+        let mut registry = CountingRegistry::default();
+        let context = Context {
+            source: source.clone(),
+            event: "push".to_string(),
+            sha: policy,
+        };
+
+        assert!(
+            qualify(
+                &crate::workspace_root(),
+                &mut github,
+                &mut registry,
+                &context,
+                QualificationMode::Publish,
+                None,
+                None,
+            )
+            .is_err()
+        );
+        assert_eq!(registry.exact_version_calls, 0);
+    }
+
+    #[test]
+    fn live_main_must_equal_staged_policy_sha() {
+        let policy = "a".repeat(40);
+        let mut exact = main_only_github(&policy, json!([]));
+        require_live_policy_main(&mut exact, &policy).unwrap();
+
+        let mut moved = main_only_github(&"b".repeat(40), json!([]));
+        assert!(require_live_policy_main(&mut moved, &policy).is_err());
+    }
+
+    #[test]
+    fn recovery_source_must_be_on_exact_policy_lineage() {
+        let source = "a".repeat(40);
+        let policy = "b".repeat(40);
+        let path = format!("repos/{REPOSITORY}/compare/{source}...{policy}?per_page=1&page=1");
+        let comparison = |status: &str, base: &str, merge_base: &str| {
+            json!({
+                "status": status,
+                "base_commit": {"sha": base},
+                "merge_base_commit": {"sha": merge_base},
+            })
+        };
+
+        let mut github = FakeGithub {
+            responses: BTreeMap::from([(path.clone(), comparison("ahead", &source, &source))]),
+        };
+        require_ancestor_of_policy(&mut github, &source, &policy).unwrap();
+
+        let mut identical = FakeGithub {
+            responses: BTreeMap::from([(
+                format!("repos/{REPOSITORY}/compare/{source}...{source}?per_page=1&page=1"),
+                comparison("identical", &source, &source),
+            )]),
+        };
+        require_ancestor_of_policy(&mut identical, &source, &source).unwrap();
+
+        for invalid in [
+            comparison("behind", &source, &source),
+            comparison("ahead", &policy, &source),
+            comparison("ahead", &source, &"d".repeat(40)),
+        ] {
+            let mut github = FakeGithub {
+                responses: BTreeMap::from([(path.clone(), invalid)]),
+            };
+            assert!(require_ancestor_of_policy(&mut github, &source, &policy).is_err());
         }
     }
 
     #[test]
-    fn captured_source_rejects_nonancestor_compare_binding() {
-        let release_sha = "a".repeat(40);
-        let path = format!("repos/example/project/compare/{release_sha}...main");
-        let mut github = FakeTransport::new([Expected::json(
-            "GET",
-            &path,
-            json!({
-                "status": "diverged",
-                "base_commit": {"sha": release_sha},
-                "merge_base_commit": {"sha": "b".repeat(40)},
-            }),
-        )]);
-        assert_eq!(
-            require_captured_ancestry(&mut github, "example/project", &release_sha).unwrap_err(),
-            "captured release SHA is no longer protected-main ancestry"
-        );
-        github.finish();
+    fn release_commits_reject_each_binding_drift() {
+        let source = "a".repeat(40);
+        let mut value = commit(&source, &"b".repeat(40), RELEASE_PATHS);
+        validate_commit(&value, &source, true).unwrap();
+
+        value.commit.verification.verified = false;
+        assert!(validate_commit(&value, &source, true).is_err());
+        value.commit.verification.verified = true;
+        value.commit.message = "unsigned-off release".to_string();
+        assert!(validate_commit(&value, &source, true).is_err());
+        value.commit.message = format!("release\n\n{DCO_TRAILER}");
+        value.files.push(CommitFile {
+            filename: "src/lib.rs".to_string(),
+            status: "modified".to_string(),
+            previous_filename: None,
+        });
+        assert!(validate_commit(&value, &source, true).is_err());
+
+        value = commit(&source, &"b".repeat(40), RELEASE_PATHS);
+        value.files[0].status = "removed".to_string();
+        assert!(validate_commit(&value, &source, true).is_err());
     }
 
     #[test]
-    fn workflow_output_is_exact_and_rejects_the_whole_invalid_batch() {
-        let temporary = tempfile::tempdir().unwrap();
-        let path = temporary.path().join("github-output");
-        append_outputs_to(&path, &[("alpha", "one"), ("beta_value2", "two")]).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            "alpha=one\nbeta_value2=two\n"
-        );
-        let original = std::fs::read(&path).unwrap();
-        assert!(append_outputs_to(&path, &[("valid", "value"), ("INVALID", "value")]).is_err());
-        assert!(append_outputs_to(&path, &[("same", "one"), ("same", "two")]).is_err());
-        assert_eq!(std::fs::read(&path).unwrap(), original);
+    fn release_head_requires_exact_verified_signer_author_and_dco() {
+        let source = "a".repeat(40);
+        let valid = commit(&source, &"b".repeat(40), RELEASE_PATHS);
+        let signature = release_signature();
+        validate_release_head_signature(&valid, &signature).unwrap();
+
+        let mut wrong = signature.clone();
+        wrong.signer.as_mut().unwrap().database_id = Some(RELEASE_SIGNER_ID + 1);
+        assert!(validate_release_head_signature(&valid, &wrong).is_err());
+
+        wrong = signature.clone();
+        wrong.signer.as_mut().unwrap().login = "lookalike".to_string();
+        assert!(validate_release_head_signature(&valid, &wrong).is_err());
+
+        wrong = signature.clone();
+        wrong.email = Some("lookalike@example.invalid".to_string());
+        assert!(validate_release_head_signature(&valid, &wrong).is_err());
+
+        wrong = signature.clone();
+        wrong.was_signed_by_github = true;
+        assert!(validate_release_head_signature(&valid, &wrong).is_err());
+
+        wrong = signature.clone();
+        wrong.is_valid = false;
+        assert!(validate_release_head_signature(&valid, &wrong).is_err());
+
+        wrong = signature.clone();
+        wrong.signer.as_mut().unwrap().kind = "Bot".to_string();
+        assert!(validate_release_head_signature(&valid, &wrong).is_err());
+
+        wrong = signature.clone();
+        wrong.signer = None;
+        assert!(validate_release_head_signature(&valid, &wrong).is_err());
+
+        let mut missing_account = valid.clone();
+        missing_account.author = None;
+        assert!(validate_release_head_signature(&missing_account, &signature).is_err());
+
+        let mut wrong_account = valid.clone();
+        wrong_account.committer.as_mut().unwrap().id += 1;
+        assert!(validate_release_head_signature(&wrong_account, &signature).is_err());
+
+        let mut wrong_raw_author = valid.clone();
+        wrong_raw_author.commit.author.name = "Lookalike".to_string();
+        assert!(validate_release_head_signature(&wrong_raw_author, &signature).is_err());
+
+        let mut wrong_raw_committer = valid.clone();
+        wrong_raw_committer.commit.committer.email = "lookalike@example.invalid".to_string();
+        assert!(validate_release_head_signature(&wrong_raw_committer, &signature).is_err());
+
+        let mut forged_dco = valid;
+        forged_dco.commit.message =
+            format!("chore(release): prepare\n\nSigned-off-by: Lookalike <{RELEASE_AUTHOR_EMAIL}>");
+        assert!(validate_release_head_signature(&forged_dco, &signature).is_err());
     }
 
-    fn test_root() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
+    #[test]
+    fn release_signature_query_is_exact_and_complete() {
+        let head = "c".repeat(40);
+        let mut github = FakeGithub {
+            responses: BTreeMap::from([(
+                "graphql:release-signature".to_string(),
+                release_signature_response(&head),
+            )]),
+        };
+        let signature = read_release_head_signature(&mut github, 7, &head).unwrap();
+        assert_eq!(
+            signature.signer.unwrap().database_id,
+            Some(RELEASE_SIGNER_ID)
+        );
+
+        let mut incomplete = release_signature_response(&head);
+        incomplete["data"]["repository"]["pullRequest"]["commits"]["totalCount"] = json!(2);
+        let mut github = FakeGithub {
+            responses: BTreeMap::from([("graphql:release-signature".to_string(), incomplete)]),
+        };
+        assert!(read_release_head_signature(&mut github, 7, &head).is_err());
+
+        let mut null = release_signature_response(&head);
+        null["data"]["repository"]["pullRequest"]["commits"]["nodes"][0]["commit"]["signature"]["signer"] =
+            Value::Null;
+        let response: SignatureEnvelope = serde_json::from_value(null).unwrap();
+        let commits = response
+            .data
+            .repository
             .unwrap()
-            .to_path_buf()
-    }
-
-    fn test_repository(root: &Path) -> &'static str {
-        let family = crate::release_policy::detect(root).unwrap().family;
-        consts::repository_for_family(family).unwrap().full_name
-    }
-
-    #[test]
-    fn settings_request_does_not_require_github_credentials() {
-        let root = test_root();
-        let output = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--ignored",
-                "--exact",
-                "github::tests::settings_request_without_github_credentials_child",
-                "--nocapture",
-                "--quiet",
-            ])
-            .env_remove("GH_TOKEN")
-            .env_remove("GITHUB_TOKEN")
-            // Protected CI presents the verified candidate checkout read-only
-            // under another owner. Trust only that exact test root for this
-            // child invocation; the setting is not inherited from candidate
-            // repository configuration.
-            .env("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")
-            .env("GIT_CONFIG_COUNT", "1")
-            .env("GIT_CONFIG_KEY_0", "safe.directory")
-            .env("GIT_CONFIG_VALUE_0", root)
-            .output()
-            .unwrap();
+            .pull_request
+            .unwrap()
+            .commits;
+        let signature = commits.nodes[0].commit.signature.as_ref().unwrap();
         assert!(
-            output.status.success(),
-            "credential-free settings request failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            validate_release_head_signature(
+                &commit(&head, &"b".repeat(40), RELEASE_PATHS),
+                signature
+            )
+            .is_err()
         );
     }
 
     #[test]
-    #[ignore = "spawned explicitly by the credential-free settings-request regression"]
-    fn settings_request_without_github_credentials_child() {
-        assert!(std::env::var_os("GH_TOKEN").is_none());
-        assert!(std::env::var_os("GITHUB_TOKEN").is_none());
-        let root = test_root();
-        let repository = test_repository(&root).to_string();
-        let policy_commit = git_line(&root, &["rev-parse", "HEAD"]).unwrap();
-        run(
-            &root,
-            GithubArgs {
-                command: GithubCommand::ReleaseTrain(ReleaseTrainArgs {
-                    command: ReleaseTrainCommand::SettingsRequest {
-                        repository,
-                        policy_commit,
-                        run_id: "123456".to_string(),
-                        run_attempt: "2".to_string(),
-                    },
-                }),
-            },
-        )
-        .unwrap();
+    fn release_head_must_be_one_commit_current_with_base() {
+        let source = "a".repeat(40);
+        let pull = pull(&source);
+        let merged = commit(&source, &pull.base.sha, RELEASE_PATHS);
+        let mut head = commit(&pull.head.sha, &pull.base.sha, RELEASE_PATHS);
+        validate_release_head(&merged, &head, &pull).unwrap();
+        let wrong_merged_parent = commit(&source, &"d".repeat(40), RELEASE_PATHS);
+        assert!(validate_release_head(&wrong_merged_parent, &head, &pull).is_err());
+        head.parents[0].sha = "d".repeat(40);
+        assert!(validate_release_head(&merged, &head, &pull).is_err());
+        head = commit(&pull.head.sha, &pull.base.sha, &["src/lib.rs"]);
+        assert!(validate_release_head(&merged, &head, &pull).is_err());
+        head = commit(&pull.head.sha, &pull.base.sha, RELEASE_PATHS);
+        head.commit.tree.sha = "f".repeat(40);
+        assert!(validate_release_head(&merged, &head, &pull).is_err());
+    }
+
+    #[test]
+    fn release_objects_reject_assets_and_mutability() {
+        let spec = release_spec();
+        let mut release = github_release(&spec);
+        validate_release(&release, &spec).unwrap();
+        release.assets.push(json!({"id": 1}));
+        assert!(validate_release(&release, &spec).is_err());
+        release.assets.clear();
+        release.immutable = false;
+        assert!(validate_release(&release, &spec).is_err());
+    }
+
+    #[test]
+    fn finalizer_accepts_only_exact_existing_objects() {
+        let spec = release_spec();
+        let tag_object_sha = "d".repeat(40);
+        let tag_path = format!("repos/{REPOSITORY}/git/ref/tags/{}", spec.tag);
+        let object_path = format!("repos/{REPOSITORY}/git/tags/{tag_object_sha}");
+        let release_path = format!("repos/{REPOSITORY}/releases/tags/{}", spec.tag);
+        let tag = annotated_tag_json(&spec, &tag_object_sha);
+        let reference = tag_reference_json(&spec, &tag_object_sha);
+        let release = github_release_json(&spec);
+        let mut exact = FakeGithub {
+            responses: BTreeMap::from([
+                (tag_path.clone(), reference.clone()),
+                (object_path.clone(), tag.clone()),
+                (release_path.clone(), release.clone()),
+            ]),
+        };
+        assert!(inspect_tag(&mut exact, &spec).unwrap().is_some());
+        assert!(inspect_release(&mut exact, &spec).unwrap());
+        assert_eq!(
+            reconcile_tag(&mut exact, &spec, &"b".repeat(40)).unwrap(),
+            tag_object_sha
+        );
+        reconcile_release(&mut exact, &spec, &tag_object_sha, &"b".repeat(40)).unwrap();
+
+        let mut missing = FakeGithub {
+            responses: BTreeMap::new(),
+        };
+        assert!(inspect_tag(&mut missing, &spec).unwrap().is_none());
+        assert!(!inspect_release(&mut missing, &spec).unwrap());
+
+        let mut conflicting_tag = tag;
+        conflicting_tag["object"]["sha"] = json!("e".repeat(40));
+        let mut conflict = FakeGithub {
+            responses: BTreeMap::from([
+                (tag_path, reference),
+                (object_path, conflicting_tag),
+                (release_path, release),
+            ]),
+        };
+        assert!(inspect_tag(&mut conflict, &spec).is_err());
+        let mut conflicting_release = github_release(&spec);
+        conflicting_release.body = "different\n".to_string();
+        assert!(validate_release(&conflicting_release, &spec).is_err());
+    }
+
+    #[test]
+    fn existing_release_path_requires_exact_retained_tag() {
+        let spec = release_spec();
+        let expected_tag_object = "d".repeat(40);
+        let replacement_tag_object = "e".repeat(40);
+        let release_path = format!("repos/{REPOSITORY}/releases/tags/{}", spec.tag);
+        let mut release_without_tag = FakeGithub {
+            responses: BTreeMap::from([(release_path.clone(), github_release_json(&spec))]),
+        };
+
+        assert!(
+            reconcile_release(
+                &mut release_without_tag,
+                &spec,
+                &expected_tag_object,
+                &"b".repeat(40)
+            )
+            .is_err()
+        );
+
+        let mut release_with_replaced_tag = FakeGithub {
+            responses: BTreeMap::from([
+                (release_path, github_release_json(&spec)),
+                (
+                    format!("repos/{REPOSITORY}/git/ref/tags/{}", spec.tag),
+                    tag_reference_json(&spec, &replacement_tag_object),
+                ),
+                (
+                    format!("repos/{REPOSITORY}/git/tags/{replacement_tag_object}"),
+                    annotated_tag_json(&spec, &replacement_tag_object),
+                ),
+            ]),
+        };
+        assert_eq!(
+            reconcile_release(
+                &mut release_with_replaced_tag,
+                &spec,
+                &expected_tag_object,
+                &"b".repeat(40)
+            )
+            .unwrap_err(),
+            "annotated tag ref changed to another object"
+        );
+    }
+
+    #[test]
+    fn release_creation_requires_exact_tag_object_before_post() {
+        let spec = release_spec();
+        let policy = "b".repeat(40);
+        let expected_tag_object = "d".repeat(40);
+        let replacement_tag_object = "e".repeat(40);
+        let mut github = FakeGithub {
+            responses: BTreeMap::from([
+                (
+                    format!(
+                        "repos/{REPOSITORY}/compare/{}...{policy}?per_page=1&page=1",
+                        spec.source
+                    ),
+                    json!({
+                        "status": "ahead",
+                        "base_commit": {"sha": spec.source},
+                        "merge_base_commit": {"sha": spec.source},
+                    }),
+                ),
+                (
+                    format!("repos/{REPOSITORY}/git/ref/heads/main"),
+                    json!({
+                        "ref": "refs/heads/main",
+                        "object": {"type": "commit", "sha": policy},
+                    }),
+                ),
+                (
+                    format!("repos/{REPOSITORY}/git/ref/tags/{}", spec.tag),
+                    tag_reference_json(&spec, &replacement_tag_object),
+                ),
+                (
+                    format!("repos/{REPOSITORY}/git/tags/{replacement_tag_object}"),
+                    annotated_tag_json(&spec, &replacement_tag_object),
+                ),
+            ]),
+        };
+
+        assert_eq!(
+            reconcile_release(&mut github, &spec, &expected_tag_object, &policy).unwrap_err(),
+            "annotated tag ref changed to another object"
+        );
+    }
+
+    #[test]
+    fn tag_ref_creation_rechecks_live_policy_after_object_creation() {
+        let spec = release_spec();
+        let policy = "b".repeat(40);
+        let mut github = TagMutationGapGithub {
+            main_reads: 0,
+            tag_posts: 0,
+            ref_posts: 0,
+            policy: policy.clone(),
+            moved: "c".repeat(40),
+            spec: spec.clone(),
+        };
+
+        assert!(reconcile_tag(&mut github, &spec, &policy).is_err());
+        assert_eq!(github.main_reads, 2);
+        assert_eq!(github.tag_posts, 1);
+        assert_eq!(github.ref_posts, 0);
+    }
+
+    #[test]
+    fn release_creation_reads_live_policy_last_and_rejects_drift() {
+        let spec = release_spec();
+        let policy = "b".repeat(40);
+        let mut github = ReleaseMutationGapGithub {
+            compare_reads: 0,
+            main_reads: 0,
+            release_posts: 0,
+            policy: policy.clone(),
+            moved: "c".repeat(40),
+            spec: spec.clone(),
+        };
+
+        assert!(reconcile_release(&mut github, &spec, &"d".repeat(40), &policy).is_err());
+        assert_eq!(github.compare_reads, 1);
+        assert_eq!(github.main_reads, 1);
+        assert_eq!(github.release_posts, 0);
+    }
+
+    fn release_tag_drift_error(drift: TagDriftAfterRelease) -> String {
+        let spec = release_spec();
+        let policy = "b".repeat(40);
+        let tag_object_sha = "d".repeat(40);
+        let mut github = ReleaseTagMutationGapGithub {
+            policy: policy.clone(),
+            release_posts: 0,
+            release_reads: 0,
+            tag_reads: 0,
+            tag_object_sha: tag_object_sha.clone(),
+            drift,
+            spec: spec.clone(),
+        };
+
+        let error = reconcile_release(&mut github, &spec, &tag_object_sha, &policy).unwrap_err();
+        assert_eq!(github.release_posts, 1);
+        assert_eq!(github.release_reads, 2);
+        assert_eq!(github.tag_reads, 2);
+        error
+    }
+
+    #[test]
+    fn release_creation_rejects_tag_deletion_and_semantic_drift_after_readback() {
+        for drift in [
+            TagDriftAfterRelease::Deleted,
+            TagDriftAfterRelease::LightweightReplacement,
+            TagDriftAfterRelease::ObjectReplacement,
+            TagDriftAfterRelease::SourceDrift,
+        ] {
+            let _ = release_tag_drift_error(drift);
+        }
+    }
+
+    #[test]
+    fn release_creation_rejects_semantically_identical_tag_object_replacement() {
+        assert_eq!(
+            release_tag_drift_error(TagDriftAfterRelease::SemanticallyIdenticalObjectReplacement),
+            "annotated tag ref changed to another object"
+        );
+    }
+
+    #[test]
+    fn recovery_run_rejects_every_binding_drift() {
+        let source = "a".repeat(40);
+        let workflow = workflow();
+        let run = workflow_run(&source);
+        let artifacts = no_artifacts();
+        validate_original_run_payload(&workflow, &run, &run, &artifacts, &source, 789, 2).unwrap();
+
+        macro_rules! reject_run_drift {
+            ($change:expr) => {{
+                let mut value = run.clone();
+                $change(&mut value);
+                assert!(
+                    validate_original_run_payload(
+                        &workflow, &value, &run, &artifacts, &source, 789, 2
+                    )
+                    .is_err()
+                );
+
+                let mut current = run.clone();
+                $change(&mut current);
+                assert!(
+                    validate_original_run_payload(
+                        &workflow, &run, &current, &artifacts, &source, 789, 2
+                    )
+                    .is_err()
+                );
+            }};
+        }
+
+        reject_run_drift!(|value: &mut WorkflowRun| value.id = 790);
+        reject_run_drift!(|value: &mut WorkflowRun| value.run_attempt = 3);
+        reject_run_drift!(|value: &mut WorkflowRun| value.workflow_id = RELEASE_WORKFLOW_ID + 1);
+        reject_run_drift!(|value: &mut WorkflowRun| value.path = "other.yml".to_string());
+        reject_run_drift!(|value: &mut WorkflowRun| value.event = "workflow_dispatch".to_string());
+        reject_run_drift!(|value: &mut WorkflowRun| value.status = "in_progress".to_string());
+        reject_run_drift!(|value: &mut WorkflowRun| value.conclusion = Some("skipped".to_string()));
+        reject_run_drift!(|value: &mut WorkflowRun| value.head_branch = Some("other".to_string()));
+        reject_run_drift!(|value: &mut WorkflowRun| value.head_sha = "b".repeat(40));
+        reject_run_drift!(
+            |value: &mut WorkflowRun| value.repository.full_name = "NVIDIA/other".to_string()
+        );
+
+        let mut wrong_workflow = workflow.clone();
+        wrong_workflow.id = 0;
+        assert!(
+            validate_original_run_payload(&wrong_workflow, &run, &run, &artifacts, &source, 789, 2)
+                .is_err()
+        );
+        wrong_workflow = workflow.clone();
+        wrong_workflow.path = ".github/workflows/other.yml".to_string();
+        assert!(
+            validate_original_run_payload(&wrong_workflow, &run, &run, &artifacts, &source, 789, 2)
+                .is_err()
+        );
+        wrong_workflow = workflow.clone();
+        wrong_workflow.state = "disabled_manually".to_string();
+        assert!(
+            validate_original_run_payload(&wrong_workflow, &run, &run, &artifacts, &source, 789, 2)
+                .is_err()
+        );
+
+        let retained = ArtifactInventory {
+            total_count: 1,
+            artifacts: vec![json!({"id": 1})],
+        };
+        assert!(
+            validate_original_run_payload(&workflow, &run, &run, &retained, &source, 789, 2)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn recovery_rejects_a_self_consistent_wrong_workflow_id() {
+        let source = "a".repeat(40);
+        let mut workflow = workflow();
+        workflow.id = RELEASE_WORKFLOW_ID + 1;
+        let mut run = workflow_run(&source);
+        run.workflow_id = workflow.id;
+
+        assert_eq!(
+            validate_original_run_payload(&workflow, &run, &run, &no_artifacts(), &source, 789, 2,)
+                .unwrap_err(),
+            "replacement publication workflow identity differs"
+        );
+    }
+
+    #[test]
+    fn recovery_rejects_a_newer_current_attempt() {
+        let source = "a".repeat(40);
+        let workflow = workflow();
+        let selected_attempt = workflow_run(&source);
+        let mut current_run = selected_attempt.clone();
+        current_run.run_attempt += 1;
+
+        assert_eq!(
+            validate_original_run_payload(
+                &workflow,
+                &selected_attempt,
+                &current_run,
+                &no_artifacts(),
+                &source,
+                789,
+                2,
+            )
+            .unwrap_err(),
+            "original publication run does not bind the recovery source"
+        );
+    }
+
+    #[test]
+    fn finalizer_app_scope_is_exact() {
+        let exact = InstallationRepositories {
+            total_count: 1,
+            repositories: vec![repository()],
+        };
+        validate_app_scope_payload(&exact).unwrap();
+
+        let extra = InstallationRepositories {
+            total_count: 2,
+            repositories: vec![
+                repository(),
+                Repository {
+                    full_name: "NVIDIA/other".to_string(),
+                },
+            ],
+        };
+        assert!(validate_app_scope_payload(&extra).is_err());
+    }
+
+    #[test]
+    fn exact_changelog_heading_does_not_accept_version_prefixes() {
+        assert!(is_changelog_heading(
+            "## [0.4.0-rc.3](https://example.invalid) - 2026-09-04",
+            "## [0.4.0-rc.3]"
+        ));
+        assert!(!is_changelog_heading(
+            "## [0.4.0-rc.30](https://example.invalid)",
+            "## [0.4.0-rc.3]"
+        ));
+        assert!(is_sha(&"a".repeat(40)));
+        assert!(!is_sha(&"A".repeat(40)));
     }
 }

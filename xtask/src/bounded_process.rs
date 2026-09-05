@@ -4,172 +4,13 @@
 //! Bounded subprocess-tree execution for release-reachable validation.
 
 use std::io::{self, Read};
-use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 const PIPE_CLOSE_GRACE: Duration = Duration::from_millis(250);
 const POST_CANCEL_TIMEOUT: Duration = Duration::from_secs(2);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_INPUT_BYTES: usize = 4 * 1024 * 1024;
-const CARGO_SEED_ENV: &str = "YAML_SIGIL_CARGO_SEED";
-const CARGO_STATE_ROOT_ENV: &str = "YAML_SIGIL_CARGO_STATE_ROOT";
-static CARGO_STATE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-#[derive(Debug)]
-struct FreshCargoState {
-    phase: PathBuf,
-}
-
-impl FreshCargoState {
-    fn from_environment(command: &mut Command) -> io::Result<Option<Self>> {
-        let seed = std::env::var_os(CARGO_SEED_ENV);
-        let state_root = std::env::var_os(CARGO_STATE_ROOT_ENV);
-        match (seed, state_root) {
-            (None, None) => Ok(None),
-            (Some(seed), Some(state_root)) => {
-                Self::prepare(command, Path::new(&seed), Path::new(&state_root)).map(Some)
-            }
-            _ => Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "incomplete protected Cargo state boundary",
-            )),
-        }
-    }
-
-    fn prepare(command: &mut Command, seed: &Path, state_root: &Path) -> io::Result<Self> {
-        let seed = seed.canonicalize()?;
-        let state_root = state_root.canonicalize()?;
-        if !seed.is_dir() || !state_root.is_dir() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "protected Cargo seed and state root must be directories",
-            ));
-        }
-
-        let sequence = CARGO_STATE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let phase = state_root.join(format!("rust-phase-{}-{sequence}", std::process::id()));
-        std::fs::create_dir(&phase)?;
-        let cargo_home = phase.join("cargo-home");
-        let target = phase.join("target");
-        std::fs::create_dir(&cargo_home)?;
-        std::fs::create_dir(&target)?;
-
-        link_seed_entries(&seed, &cargo_home)?;
-
-        let mut inherited = std::env::vars_os()
-            .map(|(name, _)| name)
-            .collect::<Vec<_>>();
-        inherited.extend(command.get_envs().map(|(name, _)| name.to_os_string()));
-        for name in inherited {
-            let text = name.to_string_lossy();
-            if text.starts_with("CARGO_ALIAS_") || text.starts_with("CARGO_TARGET_") {
-                command.env_remove(name);
-            }
-        }
-        for name in [
-            "CARGO_BUILD_RUSTC",
-            "CARGO_BUILD_RUSTC_WRAPPER",
-            "CARGO_BUILD_RUSTDOC",
-            "CARGO_BUILD_TARGET",
-            "CARGO_ENCODED_RUSTFLAGS",
-            "RUSTC",
-            "RUSTC_WRAPPER",
-            "RUSTC_WORKSPACE_WRAPPER",
-            "RUSTDOC",
-            "RUSTDOCFLAGS",
-        ] {
-            command.env_remove(name);
-        }
-        command
-            .env("CARGO_HOME", cargo_home)
-            .env("CARGO_TARGET_DIR", target)
-            .env("CARGO_NET_OFFLINE", "true");
-        Ok(Self { phase })
-    }
-
-    fn cleanup(self) -> io::Result<()> {
-        std::fs::remove_dir_all(&self.phase).map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!(
-                    "remove disposable Cargo state {}: {error}",
-                    self.phase.display()
-                ),
-            )
-        })
-    }
-}
-
-#[cfg(unix)]
-fn link_seed_entries(seed: &Path, cargo_home: &Path) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    for name in ["registry", "git", "advisory-db"] {
-        let entry = seed.join(name);
-        if entry.try_exists()? {
-            let metadata = std::fs::symlink_metadata(&entry)?;
-            if !metadata.is_dir() || metadata.file_type().is_symlink() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("protected Cargo seed {name} is not a direct directory"),
-                ));
-            }
-            std::os::unix::fs::symlink(&entry, cargo_home.join(name))?;
-        }
-    }
-    let config = seed.join("config.toml");
-    match std::fs::symlink_metadata(&config) {
-        Ok(metadata) => {
-            if !metadata.is_file()
-                || metadata.file_type().is_symlink()
-                || metadata.permissions().mode() & 0o222 != 0
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "protected Cargo seed config.toml is absent, linked, or writable",
-                ));
-            }
-            std::os::unix::fs::symlink(&config, cargo_home.join("config.toml"))?;
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "protected Cargo seed config.toml is absent",
-            ));
-        }
-        Err(error) => return Err(error),
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn link_seed_entries(_seed: &Path, _cargo_home: &Path) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "protected Cargo state isolation is Linux-only",
-    ))
-}
-
-fn finish_with_fresh_state<T>(
-    result: io::Result<T>,
-    state: Option<FreshCargoState>,
-) -> io::Result<T> {
-    let cleanup = match state {
-        Some(state) => state.cleanup(),
-        None => Ok(()),
-    };
-    match (result, cleanup) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
-        (Err(error), Err(cleanup_error)) => Err(io::Error::new(
-            error.kind(),
-            format!("{error}; Cargo state cleanup failed: {cleanup_error}"),
-        )),
-    }
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct OutputLimits {
@@ -273,8 +114,7 @@ pub(crate) fn require_within_limit(bytes: &[u8], limit: usize, label: &str) -> i
 /// more than each configured limit plus one sentinel byte.
 pub(crate) fn output(command: &mut Command, limits: OutputLimits) -> io::Result<Output> {
     validate_limits(limits, None)?;
-    let state = FreshCargoState::from_environment(command)?;
-    finish_with_fresh_state(platform::output(command, limits, None), state)
+    platform::output(command, limits, None)
 }
 
 /// Write bounded input and capture both bounded output streams under the same
@@ -285,8 +125,7 @@ pub(crate) fn output_with_input(
     limits: OutputLimits,
 ) -> io::Result<Output> {
     validate_limits(limits, Some(input))?;
-    let state = FreshCargoState::from_environment(command)?;
-    finish_with_fresh_state(platform::output(command, limits, Some(input)), state)
+    platform::output(command, limits, Some(input))
 }
 
 #[cfg(unix)]
@@ -1466,84 +1305,6 @@ mod tests {
         assert!(oversized_capture.exceeded);
         assert_eq!(oversized_capture.bytes.len(), 9);
         assert_eq!(oversized.position(), 9);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn fresh_state_discards_alias_wrapper_and_target_poison() {
-        let seed = tempfile::tempdir().unwrap();
-        for name in ["registry", "git", "advisory-db"] {
-            fs::create_dir(seed.path().join(name)).unwrap();
-        }
-        fs::write(seed.path().join("config.toml"), b"[net]\noffline = true\n").unwrap();
-        let mut permissions = fs::metadata(seed.path().join("config.toml"))
-            .unwrap()
-            .permissions();
-        permissions.set_readonly(true);
-        fs::set_permissions(seed.path().join("config.toml"), permissions).unwrap();
-        let root = tempfile::tempdir().unwrap();
-        let limits = OutputLimits {
-            stdout: 4096,
-            stderr: 4096,
-        };
-
-        let mut first = Command::new("/bin/sh");
-        first
-            .arg("-c")
-            .arg("mkdir -p \"$CARGO_HOME/bin\"; test -L \"$CARGO_HOME/config.toml\"; rm \"$CARGO_HOME/config.toml\"; printf poison > \"$CARGO_HOME/config.toml\"; printf poison > \"$CARGO_HOME/bin/cargo-audit\"; printf poison > \"$CARGO_TARGET_DIR/forged\"")
-            .env("RUSTC_WRAPPER", "/candidate/wrapper")
-            .env("CARGO_ALIAS_AUDIT", "version");
-        let first_state = FreshCargoState::prepare(&mut first, seed.path(), root.path()).unwrap();
-        assert!(
-            platform::output(&mut first, limits, None)
-                .unwrap()
-                .status
-                .success()
-        );
-        first_state.cleanup().unwrap();
-
-        let marker = root.path().join("clean");
-        let mut second = Command::new("/bin/sh");
-        second.arg("-c").arg(format!(
-            "test -L \"$CARGO_HOME/config.toml\" && grep -Fxq 'offline = true' \"$CARGO_HOME/config.toml\" && test ! -e \"$CARGO_HOME/bin/cargo-audit\" && test ! -e \"$CARGO_TARGET_DIR/forged\" && test -z \"${{RUSTC_WRAPPER-}}\" && test -z \"${{CARGO_ALIAS_AUDIT-}}\" && printf clean > {}",
-            marker.display()
-        ));
-        let second_state = FreshCargoState::prepare(&mut second, seed.path(), root.path()).unwrap();
-        assert!(
-            platform::output(&mut second, limits, None)
-                .unwrap()
-                .status
-                .success()
-        );
-        second_state.cleanup().unwrap();
-        assert_eq!(fs::read(marker).unwrap(), b"clean");
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn fresh_state_rejects_linked_seed_configuration() {
-        let seed = tempfile::tempdir().unwrap();
-        let outside = tempfile::NamedTempFile::new().unwrap();
-        std::os::unix::fs::symlink(outside.path(), seed.path().join("config.toml")).unwrap();
-        let root = tempfile::tempdir().unwrap();
-        let mut command = Command::new("/bin/true");
-
-        let error = FreshCargoState::prepare(&mut command, seed.path(), root.path()).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn fresh_state_rejects_missing_or_mutable_seed_configuration() {
-        let seed = tempfile::tempdir().unwrap();
-        let root = tempfile::tempdir().unwrap();
-        let mut command = Command::new("/bin/true");
-        let missing = FreshCargoState::prepare(&mut command, seed.path(), root.path()).unwrap_err();
-        assert_eq!(missing.kind(), io::ErrorKind::InvalidData);
-
-        fs::write(seed.path().join("config.toml"), b"[net]\noffline = true\n").unwrap();
-        let mutable = FreshCargoState::prepare(&mut command, seed.path(), root.path()).unwrap_err();
-        assert_eq!(mutable.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]

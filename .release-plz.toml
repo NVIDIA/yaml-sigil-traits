@@ -1,6 +1,7 @@
 [workspace]
 release = false
 release_always = false
+pr_branch_prefix = "release-plz-manual-"
 changelog_update = true
 # release-plz publishes source crates only. The protected App finalizer owns
 # annotated tags and immutable, zero-asset GitHub Releases.
@@ -10,7 +11,6 @@ git_release_type = "auto"
 publish_allow_dirty = false
 publish_no_verify = false
 publish_timeout = "5m"
-# The workflow runs the exact analyzer directly and fails on every error.
 semver_check = false
 
 [[package]]
