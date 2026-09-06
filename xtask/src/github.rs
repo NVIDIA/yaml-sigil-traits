@@ -946,13 +946,14 @@ fn inspect_release(github: &mut impl Transport, spec: &ReleaseSpec) -> Result<bo
 }
 
 fn validate_release(release: &GitHubRelease, spec: &ReleaseSpec) -> Result<(), String> {
+    let expected_prerelease = !spec.version.pre.is_empty();
     if release.id == 0
         || release.tag_name != spec.tag
         || release.target_commitish != spec.source
         || release.name != spec.tag
         || release.body != spec.body
         || release.draft
-        || release.prerelease != !spec.version.pre.is_empty()
+        || release.prerelease != expected_prerelease
         || !release.immutable
         || release.author.login != APP_LOGIN
         || release.author.id != APP_ID
