@@ -41,14 +41,15 @@ a proposed specification update for impact on this crate.
    git -C source-spec remote -v
    ```
 
-2. Record the current pin, fetch the spec, and check out the target
-   spec commit:
+2. Record the current pin, fetch the spec, resolve the requested target to a
+   full commit ID, and check out that commit. Use `origin/main` when the request
+   asks for the latest default branch and does not name a narrower target:
 
    ```shell
    old_spec="$(git rev-parse HEAD:source-spec)"
-   git -C source-spec fetch origin
-   git -C source-spec checkout <new-spec-commit>
-   new_spec="$(git -C source-spec rev-parse HEAD)"
+   git -C source-spec fetch --prune origin
+   new_spec="$(git -C source-spec rev-parse '<target-spec-ref>^{commit}')"
+   git -C source-spec checkout --detach "$new_spec"
    ```
 
 3. Review the spec delta that can affect trait vocabulary. Treat this as a
@@ -82,43 +83,67 @@ a proposed specification update for impact on this crate.
 
 4. Map spec changes to the crate surface:
 
+   - `src/lib.rs`: crate-level contract documentation, modules, and re-exports.
    - `src/algorithm.rs`: canonical YAML `alg` strings, protobuf enum slots,
      algorithm additions, and algorithm deprecations.
    - `src/signing.rs`: signing request, response, capability, and error
-     vocabulary.
+     vocabulary, including implementation-owned signing key types.
    - `src/transcription.rs`: compose/decompose forms, states, options, and
      error vocabulary.
    - `src/verification.rs`: verifier state model, pre-verify paths, options,
-     capability advertisement, and error vocabulary.
+     capability advertisement, error vocabulary, and implementation-owned
+     verification key types.
    - `src/conformance.rs`: advertised conformance profiles and policy enums.
+   - `tests/key_bindings.rs`: generic key DTO behavior, associated key types,
+     object safety, and async returned-future bounds.
+   - `README.md`: human-facing contract and implementation key-binding
+     guidance.
 
    If none of the reviewed spec changes affect these surfaces, record that
    conclusion in the commit or change description and leave the Rust contract
    unchanged.
 
-5. Stage the submodule pin and any contract updates together:
+   Every pin update must also replace the full commit ID in the README link to
+   `source-spec/THIRD_PARTY_NOTICES.md`, even when the Rust contract remains
+   unchanged. Keep the separately scoped notice and the package exclusion
+   language intact.
+
+5. Stage the submodule pin and required README update, then stage each exact
+   contract or test path you changed:
 
    ```shell
-   git add .gitmodules source-spec src Cargo.toml Cargo.lock README.md AGENTS.md
+   git add source-spec README.md
+   git status --short
    git diff --cached --submodule=log
    ```
+
+   Stage only intended paths. Do not stage the generated root `Cargo.lock`;
+   this repository deliberately ignores it.
 
 6. Run the crate quality loop:
 
    ```shell
    cargo xtask ci
-   cargo package
+   cargo package --allow-dirty
    ```
 
    `cargo xtask ci` is the complete non-release validation gate. Keep the
    package assembly and verification step separate because CI does not package
-   or publish artifacts.
+   or publish artifacts. The pre-commit package check needs `--allow-dirty`
+   because this workflow leaves the reviewed update uncommitted. When the task
+   includes creating a commit, rerun `cargo package` without `--allow-dirty`
+   after committing.
 
 7. Record release impact after review:
 
-   Publish this crate only as a crates.io `.crate` source package, and publish
-   it before downstream implementation repositories update to a changed public
-   contract. Do not distribute compiled native executables, executable
-   WebAssembly, installers, containers, retained CI or build outputs, GitHub
-   Release assets, or separately generated source archives. Local and
-   ephemeral compilation remains permitted for validation.
+   State whether the public contract changed and identify its compatibility
+   impact. Do not edit the package version, prepare a release, or publish from
+   an ordinary specification-update branch. A maintainer selects the version
+   and uses the separate repository-root `RELEASING.md` workflow. Record that a
+   changed public contract requires this crate's release to precede downstream
+   implementation adoption.
+
+   Publish only a crates.io `.crate` source package. Do not distribute compiled
+   native executables, executable WebAssembly, installers, containers, retained
+   CI or build outputs, GitHub Release assets, or separately generated source
+   archives. Local and ephemeral compilation remains permitted for validation.

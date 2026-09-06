@@ -360,7 +360,9 @@ hosted check, and xtask tests aligned whenever package metadata or contents
 change.
 
 The following package-validation guidance refers to full archive assembly and
-verification, not the static path-list comparison above.
+verification, not the static path-list comparison above. Use
+`cargo package --allow-dirty` to validate an intentional uncommitted change to
+packaged files. After committing, rerun the clean-worktree command below.
 
 Package validation is deliberately separate from the non-release CI sequence:
 
