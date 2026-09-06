@@ -7,8 +7,8 @@ executable WebAssembly, installers, containers, or build artifacts.
 
 ## Prepare the release pull request
 
-Install Rust `1.98.0`, cargo-binstall `1.20.1`, and release-plz `0.3.160`.
-Start from a clean checkout at exact current `origin/main` with current tags:
+Install the fixed toolchain and analyzer, then bind the release base to a clean
+current `origin/main`. `base_sha` is the later squash-parent expectation.
 
 ```shell
 rustup toolchain install 1.98.0 --component clippy,rustfmt
@@ -16,18 +16,19 @@ export RUSTUP_TOOLCHAIN=1.98.0
 git fetch origin main --tags
 test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"
 test -z "$(git status --porcelain)"
-# Install and read back the exact release preparation implementation.
+base_sha="$(git rev-parse origin/main)"
 cargo binstall --force --locked --no-confirm release-plz@0.3.160
 test "$(release-plz --version)" = "release-plz 0.3.160"
 ```
 
-Choose the exact stable or prerelease version, create its canonical branch,
-and let pinned release-plz prepare the version and changelog:
+Create a new canonical branch. `prepare` strips release credentials, runs
+`release-plz update`, and accepts changes only to the manifest and changelog.
 
 ```shell
 version="<SEMVER>"
 git switch --create "release-plz-manual-${version}" origin/main
 cargo xtask release prepare --version "${version}"
+git diff --check
 git diff -- CHANGELOG.md Cargo.toml
 cargo xtask ci
 ```
@@ -36,27 +37,41 @@ Stop if the diff contains anything except `CHANGELOG.md` and `Cargo.toml`, or
 if the selected version, changelog, or package inventory differs from the
 intended release.
 
-Configure the repository's approved SSH signing key and the DCO identity
-before creating the sole release commit:
+Create the sole release commit with the approved SSH key and DCO identity.
+`check` then proves the committed transaction without credentials or
+publication.
 
 ```shell
 git config user.name ddurst
 git config user.email 267424412+ddurst-nvidia@users.noreply.github.com
 git add CHANGELOG.md Cargo.toml
 git commit -S --signoff -m "chore(release): prepare yaml-sigil-traits ${version}"
+git verify-commit HEAD
+cargo xtask release check --version "${version}"
+```
+
+Push only the canonical branch and open its same-repository pull request.
+
+```shell
 git push origin "HEAD:refs/heads/release-plz-manual-${version}"
 gh pr create \
   --base main \
   --head "release-plz-manual-${version}" \
   --title "chore(release): prepare yaml-sigil-traits ${version}" \
   --body "Prepare the reviewed source-only yaml-sigil-traits ${version} release."
-cargo xtask release check --version "${version}"
 ```
 
-The post-commit `check` is credential-free. It verifies the branch, one
-SSH-signed and DCO-signed transaction, exact managed paths, version, changelog,
-release configuration, and source package. It does not contact GitHub or run
-release-plz's release command.
+Authorize exactly that head for copied-ref CI. The protected reporter pauses at
+`protected-automation`; approve that one deployment only after checking its PR,
+head, candidate run, and attempt.
+
+```shell
+pr_number="<PR_NUMBER>"
+release_head="$(git rev-parse HEAD)"
+gh pr comment "${pr_number}" \
+  --repo NVIDIA/yaml-sigil-traits \
+  --body "/ok to test ${release_head}"
+```
 
 Wait until GitHub shows one open same-repository pull request from the
 canonical branch to `main`, the commit is Verified, and exact-head
@@ -93,11 +108,36 @@ add the evidence file to the repository or upload it as a workflow artifact.
 If the pull-request head changes, treat the old evidence as superseded and
 repeat the exact-head checks and dry run.
 
-The pull request must remain one GitHub-Verified, DCO-signed commit current
-with `main`. Obtain exact-head CI authorization and explicit squash approval.
-After the reviewed squash reaches `main`, the enabled `publish.yml` workflow
-qualifies that exact merge, enters the `crates-io` environment only for a
-nonempty publication, and uses release-plz as the sole Cargo publisher.
+After `Required CI` succeeds, squash only the unchanged reviewed head. These
+checks prove tree equality, sole-parent history, DCO, GitHub verification, and
+PR association before treating the resulting `main` push as release authority.
+
+```shell
+git fetch --no-tags origin main
+test "$(git rev-parse refs/remotes/origin/main)" = "${base_sha}"
+test "$(git rev-parse HEAD^)" = "${base_sha}"
+gh pr merge "${pr_number}" \
+  --repo NVIDIA/yaml-sigil-traits \
+  --squash \
+  --match-head-commit "${release_head}" \
+  --subject "chore(release): prepare yaml-sigil-traits ${version} (#${pr_number})" \
+  --body "Signed-off-by: ddurst <267424412+ddurst-nvidia@users.noreply.github.com>"
+git fetch origin main
+main_sha="$(git rev-parse origin/main)"
+test "$(git rev-parse "${main_sha}^")" = "${base_sha}"
+test "$(git rev-parse "${main_sha}^{tree}")" = \
+  "$(git rev-parse "${release_head}^{tree}")"
+git show -s --format=%B "${main_sha}" | \
+  grep -Fx 'Signed-off-by: ddurst <267424412+ddurst-nvidia@users.noreply.github.com>'
+test "$(gh api "repos/NVIDIA/yaml-sigil-traits/commits/${main_sha}" \
+  --jq .commit.verification.verified)" = true
+test "$(gh api "repos/NVIDIA/yaml-sigil-traits/commits/${main_sha}/pulls" \
+  --jq "map(select(.number == ${pr_number})) | length")" = 1
+```
+
+The resulting `publish.yml` run enters `crates-io` only for this qualified
+release. Approve its one exact publication deployment after binding the run,
+source, version, and absent target objects. release-plz is the sole publisher.
 
 ## Validate or recover publication
 
@@ -226,7 +266,8 @@ jq -e '
   .can_admins_bypass == false and
   .deployment_branch_policy.protected_branches == false and
   .deployment_branch_policy.custom_branch_policies == true and
-  (.protection_rules | length) == 1 and
+  (.protection_rules | length) == 2 and
+  ([.protection_rules[] | select(.type == "branch_policy")] | length == 1) and
   ([.protection_rules[] | select(
     .type == "required_reviewers" and .prevent_self_review == false and
     (.reviewers | length) == 1 and .reviewers[0].type == "User" and
@@ -288,7 +329,6 @@ and attempt; never advance that transaction to newer source. The finalizer
 rechecks current protected policy after approval and immediately before each
 tag or Release mutation.
 
-After publication, verify the crates.io checksum and source commit, annotated
-tag target, immutable prerelease flag, empty Release asset list, and exact
-GitHub Release body. A conflicting existing crate, tag, or Release is a hard
-failure; do not replace it.
+After finalization, verify the crates.io checksum and VCS commit, annotated tag
+target, stable-versus-prerelease flag, immutable zero-asset Release, and exact
+changelog body. Never replace a conflicting crate, tag, or Release.
