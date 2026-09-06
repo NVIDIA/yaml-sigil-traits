@@ -683,7 +683,12 @@ jobs:
           set -euo pipefail
           state="${RUNNER_TEMP}/yaml-sigil-candidate-state"
           test ! -e "${state}"
-          install -d -m 0700 \
+          install_args=(-d -m 0700)
+          # Git for Windows cannot apply POSIX directory modes.
+          if [[ "${GITHUB_ACTIONS:-}" == "true" && "${RUNNER_OS:-}" == "Windows" ]]; then
+            install_args=(-d)
+          fi
+          install "${install_args[@]}" \
             "${state}" \
             "${state}/cargo-home" \
             "${state}/policy-bin" \
@@ -712,15 +717,24 @@ jobs:
           git -c credential.helper= fetch --no-tags --no-recurse-submodules \
             --depth=1 origin \
             "+refs/heads/main:refs/remotes/origin/main"
-          git show \
+          protected_git_show=(git show)
+          github_windows=false
+          # Keep Git Bash from rewriting Git's REV:path syntax on Windows.
+          if [[ "${GITHUB_ACTIONS:-}" == "true" && "${RUNNER_OS:-}" == "Windows" ]]; then
+            protected_git_show=(env MSYS_NO_PATHCONV=1 git show)
+            github_windows=true
+          fi
+          "${protected_git_show[@]}" \
             refs/remotes/origin/main:.github/scripts/materialize-candidate.sh \
             > "${POLICY_BIN}/materialize-candidate.sh"
-          git show \
+          "${protected_git_show[@]}" \
             refs/remotes/origin/main:.github/scripts/remove-preinstalled-aws-tap.sh \
             > "${POLICY_BIN}/remove-preinstalled-aws-tap.sh"
-          chmod 0500 \
-            "${POLICY_BIN}/materialize-candidate.sh" \
-            "${POLICY_BIN}/remove-preinstalled-aws-tap.sh"
+          if [[ "${github_windows}" == "false" ]]; then
+            chmod 0500 \
+              "${POLICY_BIN}/materialize-candidate.sh" \
+              "${POLICY_BIN}/remove-preinstalled-aws-tap.sh"
+          fi
 
       - name: Remove unused preinstalled Homebrew source
         if: ${{ runner.os == 'macOS' }}
