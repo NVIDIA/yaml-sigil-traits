@@ -133,7 +133,9 @@ cargo package
 dependency advisories. The GitHub Actions workflow runs the same validation as
 independent steps. `cargo package` performs separate local package assembly and
 verification without uploading anything; it is not part of the non-release CI
-sequence.
+sequence. Cargo rejects uncommitted changes to packaged files. Use
+`cargo package --allow-dirty` for pre-commit validation, then rerun
+`cargo package` after committing.
 
 ## Publishing
 
@@ -157,6 +159,6 @@ patent/IP, and non-endorsement notices are collected in
 [`THIRD_PARTY_NOTICES.md`](https://github.com/NVIDIA/yaml-sigil-traits/blob/main/THIRD_PARTY_NOTICES.md).
 
 The pinned specification has its own complete notice at
-[`source-spec/THIRD_PARTY_NOTICES.md`](https://github.com/NVIDIA/yaml-sigil-spec/blob/0fa13f2bf7aac43afb492d9c7dad8e3bf9cfa2bc/THIRD_PARTY_NOTICES.md).
+[`source-spec/THIRD_PARTY_NOTICES.md`](https://github.com/NVIDIA/yaml-sigil-spec/blob/bcfa1e05a61fc27c6fd814a3910e7a24a560f038/THIRD_PARTY_NOTICES.md).
 The crate package excludes `source-spec/`; repository distributions that
 initialize the submodule must preserve that notice.
