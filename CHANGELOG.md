@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.4.0-rc.4](https://github.com/NVIDIA/yaml-sigil-traits/compare/v0.4.0-rc.3...v0.4.0-rc.4) - 2026-09-06
+## [0.4.0](https://github.com/NVIDIA/yaml-sigil-traits/compare/v0.4.0-rc.3...v0.4.0) - 2026-09-06
 
 ### Fixed
 
