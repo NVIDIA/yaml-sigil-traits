@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0-rc.4](https://github.com/NVIDIA/yaml-sigil-traits/compare/v0.4.0-rc.3...v0.4.0-rc.4) - 2026-09-06
+
+### Fixed
+
+- *(xtask)* keep prerelease check compatible with Rust 1.95 ([#79](https://github.com/NVIDIA/yaml-sigil-traits/pull/79))
+- *(ci)* create candidate state portably on Windows ([#81](https://github.com/NVIDIA/yaml-sigil-traits/pull/81))
+
+### Other
+
+- *(spec)* refresh pin and update workflow guidance
+
 ## [0.4.0-rc.3](https://github.com/NVIDIA/yaml-sigil-traits/compare/v0.4.0-rc.2...v0.4.0-rc.3) - 2026-09-05
 
 ### Other
