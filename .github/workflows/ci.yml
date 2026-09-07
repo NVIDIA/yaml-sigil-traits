@@ -577,6 +577,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          "${GITHUB_WORKSPACE}/.github/scripts/candidate-state-canary.sh"
           cargo_config=(
             --config "build.rustc=\"${FIXED_RUSTC}\""
             --config 'build.rustc-wrapper=""'
