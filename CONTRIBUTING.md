@@ -33,6 +33,10 @@ ordinary feature or fix branch. A maintainer selects the exact release version
 and prepares the separate `release-plz-manual-<version>` pull request described
 in `RELEASING.md`.
 
+Do not edit `CHANGELOG.md` in an ordinary contribution. The canonical
+maintainer release procedure runs pinned `release-plz` to generate it from the
+integrated Conventional Commit history in the dedicated release pull request.
+
 ## Pull-request CI
 
 The repository writer reviews the latest pull-request head and comments
