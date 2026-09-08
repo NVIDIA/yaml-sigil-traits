@@ -61,9 +61,9 @@ gh pr create \
   --body "Prepare the reviewed source-only yaml-sigil-traits ${version} release."
 ```
 
-Authorize exactly that head for copied-ref CI. The protected reporter pauses at
-`protected-automation`; approve that one deployment only after checking its PR,
-head, candidate run, and attempt.
+Authorize exactly that head for copied-ref CI. The protected reporter checks
+the completed candidate and creates the App-owned `Required CI` verdict without
+a second contributor-side approval.
 
 ```shell
 pr_number="<PR_NUMBER>"
@@ -175,13 +175,15 @@ crate checksum and bounded `.cargo_vcs_info.json`, and never advances the
 release to a newer `main`.
 
 The separately reviewed `crates-io` environment remains the publication gate.
-After publication and the exact-source registry wait succeed, the finalizer
-waits for the `protected-automation` environment. Immediately before approving
-that deployment, a repository admin performs this read-only preflight. The
+After publication and the exact-source registry wait succeed, a secretless
+approval job waits for the `release-finalization` environment. Immediately
+before approving that deployment, a repository admin performs this read-only
+preflight. The
 `run_id` and `run_attempt` identify the current publication or recovery run,
 while `source_sha` is the exact qualified release source:
 
 ```shell
+set -euo pipefail
 repository="NVIDIA/yaml-sigil-traits"
 workflow_id="337393638"
 operation="push" # Use "recover" only for a bounded recovery run.
@@ -189,10 +191,17 @@ policy_sha="FULL_CURRENT_MAIN_SHA"
 source_sha="FULL_QUALIFIED_RELEASE_SOURCE_SHA"
 run_id="CURRENT_RUN_ID"
 run_attempt="CURRENT_RUN_ATTEMPT"
+approval_environment="release-finalization"
+approval_environment_id="21512734501"
+approval_branch_policy_id="59459213"
+automation_environment="protected-automation"
+automation_environment_id="20345456172"
+automation_branch_policy_id="57933875"
 [[ "${policy_sha}" =~ ^[0-9a-f]{40}$ ]]
 [[ "${source_sha}" =~ ^[0-9a-f]{40}$ ]]
 [[ "${run_id}" =~ ^[1-9][0-9]*$ ]]
 [[ "${run_attempt}" =~ ^[1-9][0-9]*$ ]]
+test "${run_attempt}" = 1
 
 operator="$(gh api user --jq .login)"
 test "$(gh api "repos/${repository}/collaborators/${operator}/permission" \
@@ -246,23 +255,36 @@ jq -e '
     .name == "Await exact crates.io source" and .status == "completed" and
     .conclusion == "success")] | length == 1) and
   ([.jobs[] | select(
-    .name == "Finalize immutable source-only Release" and
+    .name == "Approve immutable source-only Release" and
     .status == "waiting" and .conclusion == null)] | length == 1)
+' <<< "${jobs}"
+
+jq -e '
+  ([.jobs[] | select(
+    .name == "Finalize immutable source-only Release")] | length <= 1) and
+  ([.jobs[] | select(
+    .name == "Finalize immutable source-only Release" and
+    (.status == "in_progress" or .status == "completed" or
+     .conclusion != null))] | length == 0)
 ' <<< "${jobs}"
 
 pending="$(gh api \
   "repos/${repository}/actions/runs/${run_id}/pending_deployments")"
-jq -e '
+jq -e \
+  --arg approval_environment "${approval_environment}" \
+  --argjson approval_environment_id "${approval_environment_id}" '
   length == 1 and
-  .[0].environment.id == 20345456172 and
-  .[0].environment.name == "protected-automation" and
+  .[0].environment.id == $approval_environment_id and
+  .[0].environment.name == $approval_environment and
   .[0].current_user_can_approve == true
 ' <<< "${pending}"
 
-environment="$(gh api \
-  "repos/${repository}/environments/protected-automation")"
-jq -e '
-  .id == 20345456172 and .name == "protected-automation" and
+approval_environment_json="$(gh api \
+  "repos/${repository}/environments/${approval_environment}")"
+jq -e \
+  --arg approval_environment "${approval_environment}" \
+  --argjson approval_environment_id "${approval_environment_id}" '
+  .id == $approval_environment_id and .name == $approval_environment and
   .can_admins_bypass == false and
   .deployment_branch_policy.protected_branches == false and
   .deployment_branch_policy.custom_branch_policies == true and
@@ -273,16 +295,54 @@ jq -e '
     (.reviewers | length) == 1 and .reviewers[0].type == "User" and
     .reviewers[0].reviewer.login == "ddurst-nvidia" and
     .reviewers[0].reviewer.id == 267424412)] | length == 1)
-' <<< "${environment}"
+' <<< "${approval_environment_json}"
 
-branch_policies="$(gh api \
-  "repos/${repository}/environments/protected-automation/deployment-branch-policies?per_page=100")"
-jq -e '
+approval_branch_policies="$(gh api \
+  "repos/${repository}/environments/${approval_environment}/deployment-branch-policies?per_page=100")"
+jq -e --argjson approval_branch_policy_id "${approval_branch_policy_id}" '
   .total_count == 1 and (.branch_policies | length) == 1 and
-  .branch_policies[0].id == 57933875 and
+  .branch_policies[0].id == $approval_branch_policy_id and
   .branch_policies[0].name == "main" and
   .branch_policies[0].type == "branch"
-' <<< "${branch_policies}"
+' <<< "${approval_branch_policies}"
+
+test "$(gh api \
+  "repos/${repository}/environments/${approval_environment}/secrets" \
+  --jq .total_count)" = 0
+test "$(gh api \
+  "repos/${repository}/environments/${approval_environment}/variables" \
+  --jq .total_count)" = 0
+
+automation_environment_json="$(gh api \
+  "repos/${repository}/environments/${automation_environment}")"
+jq -e \
+  --arg automation_environment "${automation_environment}" \
+  --argjson automation_environment_id "${automation_environment_id}" '
+  .id == $automation_environment_id and .name == $automation_environment and
+  .can_admins_bypass == false and
+  .deployment_branch_policy.protected_branches == false and
+  .deployment_branch_policy.custom_branch_policies == true and
+  (.protection_rules | length) == 1 and
+  ([.protection_rules[] | select(.type == "branch_policy")] | length == 1) and
+  ([.protection_rules[] | select(.type == "required_reviewers")] | length == 0)
+' <<< "${automation_environment_json}"
+
+automation_branch_policies="$(gh api \
+  "repos/${repository}/environments/${automation_environment}/deployment-branch-policies?per_page=100")"
+jq -e --argjson automation_branch_policy_id "${automation_branch_policy_id}" '
+  .total_count == 1 and (.branch_policies | length) == 1 and
+  .branch_policies[0].id == $automation_branch_policy_id and
+  .branch_policies[0].name == "main" and
+  .branch_policies[0].type == "branch"
+' <<< "${automation_branch_policies}"
+
+test "$(gh api \
+  "repos/${repository}/environments/${automation_environment}/secrets" \
+  --jq '[.total_count, [.secrets[].name]]')" = \
+  '[1,["YAML_SIGIL_RELEASE_PR_APP_PRIVATE_KEY"]]'
+test "$(gh api \
+  "repos/${repository}/environments/${automation_environment}/variables" \
+  --jq .total_count)" = 0
 
 test "$(gh api "repos/${repository}/immutable-releases" \
   --jq .enabled)" = true
@@ -320,14 +380,17 @@ test "$(gh api "repos/${repository}/git/ref/heads/main" \
   --jq .object.sha)" = "${policy_sha}"
 ```
 
-This preflight uses no workflow credential and must not change repository
-settings, Apps, rulesets, environments, tags, or Releases. If any value drifts,
-do not approve. If publication has not occurred, prepare a fresh proposal and
-run from newly reviewed main. If any source crate is already public, correct
-the setting and use only bounded recovery with the original source SHA, run,
-and attempt; never advance that transaction to newer source. The finalizer
-rechecks current protected policy after approval and immediately before each
-tag or Release mutation.
+Approve only the exact `release-finalization` deployment proven by this
+preflight. That approval releases a secretless gate; its dependent finalizer
+then enters the main-only `protected-automation` App-key boundary without
+another reviewer prompt. The preflight uses no workflow credential and must
+not change repository settings, Apps, rulesets, environments, tags, or
+Releases. If any value drifts, do not approve. If publication has not occurred,
+prepare a fresh proposal and run from newly reviewed main. If a source crate is
+already public, correct the setting and use only bounded recovery with the
+original source SHA, run, and attempt; never advance that transaction to newer
+source. The finalizer rechecks current protected policy after approval and
+immediately before each tag or Release mutation.
 
 After finalization, verify the crates.io checksum and VCS commit, annotated tag
 target, stable-versus-prerelease flag, immutable zero-asset Release, and exact
