@@ -25,6 +25,8 @@ ATTEMPT = 2
 WORKFLOW_ID = 123456
 PULL = 65
 HEAD = "a" * 40
+POLICY_SHA = "b" * 40
+WORKFLOW_BLOB = "c" * 40
 SIGNER_ID = 42
 SIGNER_LOGIN = "example-contributor"
 SIGNER_NAME = "Example Contributor"
@@ -59,6 +61,7 @@ class FakeApi:
 def policy() -> Any:
     return reporter.Policy(
         repository=REPOSITORY,
+        policy_sha=POLICY_SHA,
         workflow_id=WORKFLOW_ID,
         workflow_path=".github/workflows/ci.yml",
         job_name="Candidate CI (Linux)",
@@ -92,12 +95,41 @@ def fixture() -> tuple[dict[str, Any], dict[tuple[str, str], Any]]:
         ): run,
         (
             "GET",
+            f"repos/{REPOSITORY}/git/ref/heads/main",
+        ): {
+            "ref": "refs/heads/main",
+            "object": {"type": "commit", "sha": POLICY_SHA},
+        },
+        (
+            "GET",
+            f"repos/{REPOSITORY}/contents/.github/workflows/ci.yml?ref={POLICY_SHA}",
+        ): {
+            "type": "file",
+            "path": ".github/workflows/ci.yml",
+            "sha": WORKFLOW_BLOB,
+            "size": 1000,
+        },
+        (
+            "GET",
+            f"repos/{REPOSITORY}/contents/.github/workflows/ci.yml?ref={HEAD}",
+        ): {
+            "type": "file",
+            "path": ".github/workflows/ci.yml",
+            "sha": WORKFLOW_BLOB,
+            "size": 1000,
+        },
+        (
+            "GET",
             f"repos/{REPOSITORY}/pulls/{PULL}",
         ): {
             "number": PULL,
             "state": "open",
             "commits": 1,
-            "base": {"ref": "main", "repo": {"full_name": REPOSITORY}},
+            "base": {
+                "ref": "main",
+                "sha": POLICY_SHA,
+                "repo": {"full_name": REPOSITORY},
+            },
             "head": {"sha": HEAD, "ref": "feature", "repo": {"full_name": "fork/repo"}},
         },
         (
@@ -226,9 +258,12 @@ class BindingTests(unittest.TestCase):
             "workflow path": lambda _, responses: responses[("GET", f"repos/{REPOSITORY}/actions/runs/{RUN_ID}")].__setitem__("path", ".github/workflows/other.yml"),
             "workflow event": lambda _, responses: responses[("GET", f"repos/{REPOSITORY}/actions/runs/{RUN_ID}")].__setitem__("event", "workflow_dispatch"),
             "run id": lambda _, responses: responses[("GET", f"repos/{REPOSITORY}/actions/runs/{RUN_ID}")].__setitem__("id", RUN_ID + 1),
+            "stale protected main": lambda _, responses: responses[("GET", f"repos/{REPOSITORY}/git/ref/heads/main")]["object"].__setitem__("sha", "d" * 40),
+            "candidate workflow blob": lambda _, responses: responses[("GET", f"repos/{REPOSITORY}/contents/.github/workflows/ci.yml?ref={HEAD}")].__setitem__("sha", "d" * 40),
             "copied ref syntax": lambda _, responses: responses[("GET", f"repos/{REPOSITORY}/actions/runs/{RUN_ID}")].__setitem__("head_branch", "pull-request/not-a-number"),
             "closed pull": lambda _, responses: responses[("GET", f"repos/{REPOSITORY}/pulls/{PULL}")].__setitem__("state", "closed"),
             "wrong base branch": lambda _, responses: responses[("GET", f"repos/{REPOSITORY}/pulls/{PULL}")]["base"].__setitem__("ref", "develop"),
+            "stale pull base": lambda _, responses: responses[("GET", f"repos/{REPOSITORY}/pulls/{PULL}")]["base"].__setitem__("sha", "d" * 40),
             "moved pull head": lambda _, responses: responses[("GET", f"repos/{REPOSITORY}/pulls/{PULL}")]["head"].__setitem__("sha", "b" * 40),
             "incomplete commits": lambda _, responses: responses[("GET", f"repos/{REPOSITORY}/pulls/{PULL}")].__setitem__("commits", 2),
             "unverified commit": lambda _, responses: responses[("GET", f"repos/{REPOSITORY}/pulls/{PULL}/commits?per_page=100&page=1")][0]["commit"]["verification"].__setitem__("verified", False),
@@ -344,12 +379,21 @@ class BindingTests(unittest.TestCase):
                 with self.assertRaises(reporter.ReporterError):
                     bind(event, responses)
 
-    def test_bounded_terminal_failure_maps_to_failure(self) -> None:
-        event, responses = fixture()
-        jobs = responses[("GET", f"repos/{REPOSITORY}/actions/runs/{RUN_ID}/attempts/{ATTEMPT}/jobs?per_page=100")]
-        jobs["jobs"][0]["conclusion"] = "timed_out"
-        result = bind(event, responses)
-        self.assertEqual(result.check_conclusion, "failure")
+    def test_bounded_terminal_conclusions_map_to_required_verdict(self) -> None:
+        for conclusion in sorted(reporter.TERMINAL_JOB_CONCLUSIONS):
+            with self.subTest(conclusion=conclusion):
+                event, responses = fixture()
+                jobs = responses[
+                    (
+                        "GET",
+                        f"repos/{REPOSITORY}/actions/runs/{RUN_ID}/attempts/"
+                        f"{ATTEMPT}/jobs?per_page=100",
+                    )
+                ]
+                jobs["jobs"][0]["conclusion"] = conclusion
+                result = bind(event, responses)
+                expected = "success" if conclusion == "success" else "failure"
+                self.assertEqual(result.check_conclusion, expected)
 
 
 class ReportingTests(unittest.TestCase):

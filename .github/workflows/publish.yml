@@ -359,23 +359,57 @@ jobs:
           "${RUNNER_TEMP}/release-xtask" github release finalize \
             --phase await --source "${SOURCE_SHA}" --version "${VERSION}"
 
+  finalization_approval:
+    name: Approve immutable source-only Release
+    if: >-
+      ${{ always() && needs.qualify.result == 'success' &&
+          needs.qualify.outputs.qualified == 'true' &&
+          needs.await_publication.result == 'success' &&
+          github.run_attempt == 1 }}
+    needs:
+      - await_publication
+      - qualify
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # This secretless deployment is the sole human gate between exact registry
+    # visibility and the protected finalizer. A rerun requires a new recovery
+    # dispatch rather than reusing an earlier approval.
+    environment: release-finalization
+    permissions: {}
+    steps:
+      - name: Require a fresh first-attempt approval
+        env:
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: test "${RUN_ATTEMPT}" = "1"
+
   finalize:
     name: Finalize immutable source-only Release
     if: >-
       ${{ always() && needs.qualify.result == 'success' &&
           needs.qualify.outputs.qualified == 'true' &&
-          needs.await_publication.result == 'success' }}
+          needs.await_publication.result == 'success' &&
+          needs.finalization_approval.result == 'success' &&
+          github.run_attempt == 1 }}
     needs:
       - await_publication
+      - finalization_approval
       - qualify
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    # The required reviewer attests the fresh repository-admin settings
-    # readback after exact registry visibility and before App authorization.
+    # This main-only environment exposes the App key only after the separate
+    # finalization approval succeeds. Required CI reporters use the same
+    # protected key boundary without inheriting the release-only human gate.
     environment: protected-automation
     permissions:
       contents: read
     steps:
+      # A rerun of only this job cannot reuse an approval from attempt one.
+      # Recovery starts a new bounded workflow_dispatch run instead.
+      - name: Reject a reused finalization approval
+        env:
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: test "${RUN_ATTEMPT}" = "1"
+
       - name: Check out protected finalizer policy
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

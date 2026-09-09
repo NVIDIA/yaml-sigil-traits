@@ -136,6 +136,7 @@ class Policy:
     """Protected constants supplied by the default-branch workflow."""
 
     repository: str
+    policy_sha: str
     workflow_id: int
     workflow_path: str
     job_name: str
@@ -145,6 +146,7 @@ class Policy:
     def validate(self) -> None:
         if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", self.repository):
             raise ReporterError("expected repository is malformed")
+        _sha(self.policy_sha, "protected policy SHA")
         if self.workflow_id <= 0:
             raise ReporterError("expected workflow ID is malformed")
         if not re.fullmatch(r"\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml", self.workflow_path):
@@ -223,6 +225,27 @@ def _sha(value: Any, label: str) -> str:
 
 def _repository_name(value: Any, label: str) -> str:
     return _text(_mapping(value, label).get("full_name"), f"{label} full name")
+
+
+def _workflow_blob(
+    api: Api,
+    repository_path: str,
+    workflow_path: str,
+    ref: str,
+    label: str,
+) -> tuple[str, int]:
+    encoded_path = urllib.parse.quote(workflow_path, safe="/")
+    query = urllib.parse.urlencode({"ref": ref})
+    entry = _mapping(
+        api.get(f"{repository_path}/contents/{encoded_path}?{query}"),
+        f"{label} workflow",
+    )
+    if entry.get("type") != "file" or entry.get("path") != workflow_path:
+        raise ReporterError(f"{label} workflow is not the expected file")
+    return (
+        _sha(entry.get("sha"), f"{label} workflow blob SHA"),
+        _integer(entry.get("size"), f"{label} workflow size"),
+    )
 
 
 def _account(value: Any, label: str) -> tuple[int, str, str]:
@@ -419,6 +442,36 @@ def bind_candidate(api: Api, event: dict[str, Any], policy: Policy) -> Binding:
     head_sha = _sha(run.get("head_sha"), "run head SHA")
     details_url = _text(run.get("html_url"), "run URL")
 
+    main_ref = _mapping(
+        api.get(f"{repository_path}/git/ref/heads/main"),
+        "protected main ref",
+    )
+    if main_ref.get("ref") != "refs/heads/main":
+        raise ReporterError("protected main ref name is unexpected")
+    main_object = _mapping(main_ref.get("object"), "protected main object")
+    if (
+        main_object.get("type") != "commit"
+        or _sha(main_object.get("sha"), "protected main SHA") != policy.policy_sha
+    ):
+        raise ReporterError("reporter policy is not current protected main")
+
+    protected_workflow = _workflow_blob(
+        api,
+        repository_path,
+        policy.workflow_path,
+        policy.policy_sha,
+        "protected",
+    )
+    candidate_workflow = _workflow_blob(
+        api,
+        repository_path,
+        policy.workflow_path,
+        head_sha,
+        "candidate",
+    )
+    if candidate_workflow != protected_workflow:
+        raise ReporterError("candidate workflow differs from protected policy")
+
     for field, expected, label in (
         ("id", run_id, "delivered run ID"),
         ("run_attempt", run_attempt, "delivered run attempt"),
@@ -441,6 +494,8 @@ def bind_candidate(api: Api, event: dict[str, Any], policy: Policy) -> Binding:
         raise ReporterError("pull request base branch is not main")
     if _repository_name(pull_base.get("repo"), "base repository") != policy.repository:
         raise ReporterError("pull request base repository is unexpected")
+    if _sha(pull_base.get("sha"), "pull request base SHA") != policy.policy_sha:
+        raise ReporterError("pull request base is not current protected main")
     pull_head = _mapping(pull.get("head"), "pull request head")
     if _sha(pull_head.get("sha"), "current pull request head SHA") != head_sha:
         raise ReporterError("pull request head moved after candidate execution")
@@ -652,6 +707,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("operation", choices=("inspect", "report"))
     result.add_argument("--event", required=True, type=Path)
     result.add_argument("--repository", required=True)
+    result.add_argument("--policy-sha", required=True)
     result.add_argument("--workflow-id", required=True, type=int)
     result.add_argument("--workflow-path", required=True)
     result.add_argument("--job-name", required=True)
@@ -663,6 +719,7 @@ def parser() -> argparse.ArgumentParser:
 def run(arguments: argparse.Namespace) -> None:
     policy = Policy(
         repository=arguments.repository,
+        policy_sha=arguments.policy_sha,
         workflow_id=arguments.workflow_id,
         workflow_path=arguments.workflow_path,
         job_name=arguments.job_name,

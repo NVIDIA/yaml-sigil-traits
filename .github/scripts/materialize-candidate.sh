@@ -3,6 +3,7 @@
 # Materialize one bot-copied candidate with anonymous Git transport. The
 # caller loads this script from protected main before any candidate path exists.
 set -euo pipefail
+umask 077
 
 # Keep machine and user Git configuration, credential helpers, and prompts out
 # of the candidate checkout boundary.
@@ -58,12 +59,24 @@ if [[ "${GITHUB_ACTIONS:-}" == "true" \
 fi
 origin_url="${YAML_SIGIL_MATERIALIZE_TEST_ORIGIN:-${canonical_url}}"
 
+# Require a genuinely empty candidate root. Reusing Git metadata or any other
+# entry would let residue from an earlier job influence fetch or checkout.
+workspace="$(pwd -P)"
+if [[ -e .git || -L .git ]]; then
+  echo "candidate workspace already contains Git metadata" >&2
+  exit 1
+fi
+preexisting_entry="$(find . -mindepth 1 -maxdepth 1 -print -quit)"
+if [[ -n "${preexisting_entry}" ]]; then
+  echo "candidate workspace is not empty" >&2
+  exit 1
+fi
+
 # Cargo searches every ancestor of the candidate workspace for
 # `.cargo/config{,.toml}`. Reject either file before checkout so runner state
 # outside the candidate cannot inject registries, credentials, wrappers, or
-# build configuration. The candidate root is deliberately excluded here: its
-# tracked configuration remains ordinary reviewed candidate input.
-workspace="$(pwd -P)"
+# build configuration. Candidate-root configuration is compared with protected
+# current main below before it can become a Cargo input.
 ancestor="$(dirname -- "${workspace}")"
 while :; do
   if [[ -e "${ancestor}/.cargo/config" \
@@ -79,17 +92,11 @@ while :; do
   ancestor="$(dirname -- "${ancestor}")"
 done
 
-# Initialize only Git metadata, then fetch current main, the exact copied ref,
+# Initialize fresh Git metadata, then fetch current main, the exact copied ref,
 # and GitHub's canonical current pull-request head without tags, credentials,
 # submodules, or a working tree.
-if [[ ! -d .git ]]; then
-  git init --quiet --initial-branch=main .
-fi
-if git remote get-url origin >/dev/null 2>&1; then
-  git remote set-url origin "${origin_url}"
-else
-  git remote add origin "${origin_url}"
-fi
+git init --quiet --initial-branch=main .
+git remote add origin "${origin_url}"
 git -c credential.helper= fetch --no-tags --no-recurse-submodules origin \
   "+refs/heads/main:refs/remotes/origin/main" \
   "+${candidate_ref}:refs/remotes/origin/candidate" \
@@ -110,11 +117,32 @@ if [[ "${copied_sha}" != "${head_sha}" \
   exit 1
 fi
 
+# Root Cargo configuration can select wrappers, aliases, registries, and
+# build commands before the terminal candidate-execution boundary. Permit only
+# the exact path, mode, and blob already reviewed on protected current main.
+for cargo_config in .cargo/config .cargo/config.toml; do
+  base_entry="$(git ls-tree "${base_sha}" -- "${cargo_config}")"
+  candidate_entry="$(git ls-tree "${head_sha}" -- "${cargo_config}")"
+  if [[ "${candidate_entry}" != "${base_entry}" ]]; then
+    echo "candidate root Cargo configuration differs from protected main: ${cargo_config}" >&2
+    exit 1
+  fi
+done
+
 # Populate the index without materializing paths, then reject every requested
 # content filter. With system/global configuration disabled, no candidate can
 # make a required filter or Git LFS helper execute during checkout.
 git read-tree "${head_sha}"
-attribute_result="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/yaml-sigil-filter-attributes-${BASHPID}"
+if [[ -z "${RUNNER_TEMP:-}" \
+  || "${RUNNER_TEMP}" == *$'\n'* \
+  || "${RUNNER_TEMP}" == *$'\r'* \
+  || ! -d "${RUNNER_TEMP}" ]]; then
+  echo "trusted runner temporary directory is missing or malformed" >&2
+  exit 1
+fi
+temp_root="$(cd -- "${RUNNER_TEMP}" && pwd -P)"
+attribute_result="$(mktemp "${temp_root}/yaml-sigil-filter-attributes.XXXXXX")"
+trap 'rm -f -- "${attribute_result}"' EXIT
 git ls-files -z \
   | git check-attr --cached --stdin -z filter \
   > "${attribute_result}"
@@ -129,6 +157,8 @@ while IFS= read -r -d '' path \
     exit 1
   fi
 done < "${attribute_result}"
+rm -f -- "${attribute_result}"
+trap - EXIT
 
 # Disable the well-known LFS process explicitly in addition to rejecting all
 # filter attributes, then perform one ordinary detached checkout.

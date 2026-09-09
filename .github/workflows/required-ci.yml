@@ -21,8 +21,9 @@ jobs:
           startsWith(github.event.workflow_run.head_branch, 'pull-request/') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # The shared App-key environment deliberately adds a second exact-run
-    # human gate after copied-head authorization and candidate execution.
+    # This main-only App-key environment is reviewer-free so the protected
+    # reporter follows candidate completion automatically. Release finalization
+    # uses its separate reviewer-gated environment.
     environment: protected-automation
     permissions:
       actions: read
@@ -53,6 +54,7 @@ jobs:
           python3 "${RUNNER_TEMP}/required-ci/reporter.py" inspect
           --event "${GITHUB_EVENT_PATH}"
           --repository "NVIDIA/yaml-sigil-traits"
+          --policy-sha "${GITHUB_SHA}"
           --workflow-id "333755870"
           --workflow-path ".github/workflows/ci.yml"
           --job-name "Candidate CI (Linux)"
@@ -80,6 +82,7 @@ jobs:
           python3 "${RUNNER_TEMP}/required-ci/reporter.py" report
           --event "${GITHUB_EVENT_PATH}"
           --repository "NVIDIA/yaml-sigil-traits"
+          --policy-sha "${GITHUB_SHA}"
           --workflow-id "333755870"
           --workflow-path ".github/workflows/ci.yml"
           --job-name "Candidate CI (Linux)"

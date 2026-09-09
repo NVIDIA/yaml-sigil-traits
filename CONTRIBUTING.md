@@ -4,6 +4,9 @@
 and DTO contract, compare it to the pinned specification, and draft changes,
 then review the result as the responsible author before submitting it.
 
+Repository writers use [`MAINTAINERS.md`](MAINTAINERS.md) for exact-head test
+authorization, protected-policy staging, merges, exceptions, and reverts.
+
 ## The Critical Rule
 
 **You must understand your code.** AI-assisted contributions are welcome, but
@@ -51,11 +54,15 @@ policy checks before candidate code, and make candidate executable work the
 terminal phase. GitHub-hosted macOS and Windows jobs are advisory. A separate
 checkout-free protected reporter binds the completed run, attempt, repository,
 open pull request, copied ref, current head, authoritative Linux result, and
-zero-artifact count. A required reviewer then approves that exact reporter's
-`protected-automation` deployment before the repository App creates
-`Required CI`. Contributor admission therefore has two human gates, both of
-which must be proven by a controlled canary before external contributor
-execution is enabled. A changed head or run requires fresh authorization.
+zero-artifact count. The reporter then uses protected `main` policy to create
+the repository App's `Required CI` verdict automatically. The exact-head
+command is the sole per-head human admission gate. Release finalization has a
+separate reviewer gate and cannot be authorized through contributor CI. A
+changed head requires fresh authorization.
+
+The copied `.github/workflows/ci.yml` must exactly match protected current
+`main`. Coordinate a proposed change to that workflow with a maintainer
+before requesting candidate testing.
 
 Every human-authored pull-request commit must form a linear history from
 current `main`, be GitHub Verified, and contain a `Signed-off-by` trailer that

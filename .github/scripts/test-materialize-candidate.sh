@@ -38,6 +38,7 @@ make_candidate() {
   local name="$1"
   local attributes="$2"
   local spec_repo="$3"
+  local root_cargo_config="${4:-false}"
   local work="${fixture_root}/${name}-work"
   local bare="${fixture_root}/${name}.git"
   git init --quiet --initial-branch=main "${work}"
@@ -46,12 +47,20 @@ make_candidate() {
     > "${work}/Cargo.toml"
   mkdir -p "${work}/src"
   printf 'pub fn value() -> u8 { 1 }\n' > "${work}/src/lib.rs"
+  if [[ "${root_cargo_config}" == "base" ]]; then
+    mkdir -p "${work}/.cargo"
+    printf '[alias]\nxtask = "check"\n' > "${work}/.cargo/config.toml"
+  fi
   commit_all "${work}" "base fixture"
   local base
   base="$(git -C "${work}" rev-parse HEAD)"
   git -C "${work}" switch --quiet -c pull-request/7
-  mkdir -p "${work}/.cargo"
-  printf '[net]\noffline = true\n' > "${work}/.cargo/config.toml"
+  # A dedicated negative fixture opts into candidate-root Cargo configuration.
+  if [[ "${root_cargo_config}" == "true" ]]; then
+    mkdir -p "${work}/.cargo"
+    printf '[build]\nrustc-wrapper = "/bin/false"\n' \
+      > "${work}/.cargo/config.toml"
+  fi
   printf '%s\n' "${attributes}" > "${work}/.gitattributes"
   printf 'candidate\n' > "${work}/candidate.txt"
   local spec_sha
@@ -70,13 +79,12 @@ make_candidate() {
   printf '%s\n' "${bare}"
 }
 
-run_materializer() {
+run_materializer_in() {
   local bare="$1"
   local spec_repo="$2"
   local destination="$3"
   local head
   head="$(git --git-dir="${bare}" rev-parse refs/heads/pull-request/7)"
-  mkdir "${destination}"
   (
     cd "${destination}"
     env -u GITHUB_ACTIONS \
@@ -85,6 +93,14 @@ run_materializer() {
       "${materializer}" NVIDIA/yaml-sigil-test "${head}" pull-request/7 \
       source-spec "${spec_repo}"
   )
+}
+
+run_materializer() {
+  local bare="$1"
+  local spec_repo="$2"
+  local destination="$3"
+  mkdir "${destination}"
+  run_materializer_in "${bare}" "${spec_repo}" "${destination}"
 }
 
 spec_repo="$(make_spec)"
@@ -110,6 +126,40 @@ fi
 run_materializer "${plain_repo}" "${spec_repo}" "${fixture_root}/plain-checkout"
 test "$(git -C "${fixture_root}/plain-checkout/source-spec" remote get-url origin)" \
   = "${spec_repo}"
+
+# A root Cargo configuration is safe only when its path, mode, and blob are
+# unchanged from protected current main.
+protected_config_repo="$(make_candidate protected-config '# no content filters' "${spec_repo}" base)"
+run_materializer "${protected_config_repo}" "${spec_repo}" \
+  "${fixture_root}/protected-config-checkout"
+
+# Candidate-root Cargo configuration could replace Rust tools or introduce a
+# wrapper before policy evaluation. Reject it before checkout.
+root_config_repo="$(make_candidate root-config '# no content filters' "${spec_repo}" true)"
+if run_materializer "${root_config_repo}" "${spec_repo}" \
+  "${fixture_root}/root-config-checkout"; then
+  echo "candidate-root Cargo configuration was accepted" >&2
+  exit 1
+fi
+
+# A destination with either ordinary residue or preinitialized Git metadata is
+# not a fresh materialization root.
+residue_destination="${fixture_root}/residue-checkout"
+mkdir "${residue_destination}"
+printf 'residue\n' > "${residue_destination}/left-behind.txt"
+if run_materializer_in "${plain_repo}" "${spec_repo}" \
+  "${residue_destination}"; then
+  echo "candidate destination residue was accepted" >&2
+  exit 1
+fi
+
+git_destination="${fixture_root}/git-checkout"
+git init --quiet --initial-branch=main "${git_destination}"
+if run_materializer_in "${plain_repo}" "${spec_repo}" \
+  "${git_destination}"; then
+  echo "preinitialized candidate Git metadata was accepted" >&2
+  exit 1
+fi
 
 # Named filters are rejected before checkout, including an otherwise optional
 # driver that a later machine configuration could mark required.

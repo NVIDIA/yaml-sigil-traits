@@ -317,14 +317,21 @@ jobs:
           test ! -e "${state}"
           install -d -m 0700 \
             "${state}" \
+            "${state}/bootstrap" \
             "${state}/cargo-home" \
             "${state}/policy-bin" \
-            "${state}/target"
+            "${state}/source" \
+            "${state}/target" \
+            "${state}/tmp"
           printf '%s\n' \
             "CANDIDATE_STATE=${state}" \
             "CARGO_HOME=${state}/cargo-home" \
             "CARGO_TARGET_DIR=${state}/target" \
-            "POLICY_BIN=${state}/policy-bin" >> "${GITHUB_ENV}"
+            "POLICY_BIN=${state}/policy-bin" \
+            "TEMP=${state}/tmp" \
+            "TMP=${state}/tmp" \
+            "TMPDIR=${state}/tmp" >> "${GITHUB_ENV}"
+        working-directory: ${{ github.workspace }}
 
       # Complete trusted host setup before any candidate-controlled path exists.
       - name: Set up Rust
@@ -381,6 +388,7 @@ jobs:
             "${POLICY_BIN}/check-pull-request-commits.sh"
           printf 'base_sha=%s\n' \
             "$(git rev-parse refs/remotes/origin/main)" >> "${GITHUB_OUTPUT}"
+        working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/bootstrap
 
       # Anonymous protected-main policy identifies a canonical repository-owned
       # release branch; ordinary contributor branches produce an empty value.
@@ -399,6 +407,7 @@ jobs:
           --head-sha "${CANDIDATE_SHA}"
           --base-sha "${BASE_SHA}"
           --output "${GITHUB_OUTPUT}"
+        working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/bootstrap
 
       - name: Install fixed actionlint
         if: ${{ matrix.full }}
@@ -411,6 +420,7 @@ jobs:
           chmod 0500 "${POLICY_BIN}/install-actionlint.sh"
           "${POLICY_BIN}/install-actionlint.sh" \
             "${CANDIDATE_STATE}/actionlint"
+        working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/bootstrap
 
       # Resolve every command while the workspace still contains protected
       # policy only. Candidate Cargo aliases and PATH entries cannot select
@@ -467,6 +477,7 @@ jobs:
               "python=${python_path}" \
               "rustfmt=${rustfmt_path}" >> "${GITHUB_OUTPUT}"
           fi
+        working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/bootstrap
 
       # The protected materializer now binds and checks out the exact anonymous
       # copied ref. No Action step follows this point in the candidate job.
@@ -480,6 +491,7 @@ jobs:
           "${POLICY_BIN}/materialize-candidate.sh" \
             "${GITHUB_REPOSITORY}" "${CANDIDATE_SHA}" "${CANDIDATE_REF}" \
             source-spec https://github.com/NVIDIA/yaml-sigil-spec.git
+        working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/source
 
       - name: Check pull request commit policy
         if: ${{ matrix.full }}
@@ -489,6 +501,7 @@ jobs:
           BASE_SHA="$(git rev-parse refs/remotes/origin/main)"
           export BASE_SHA
           "${POLICY_BIN}/check-pull-request-commits.sh"
+        working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/source
 
       - name: Validate canonical release transaction
         if: ${{ steps.candidate_pr.outputs.release_branch != '' }}
@@ -502,23 +515,27 @@ jobs:
           "${POLICY_BIN}/check-release-pr.sh" \
             "${BASE_SHA}" "${HEAD_SHA}" \
             "${YAML_SIGIL_RELEASE_PR_BRANCH}" "${release_version}"
+        working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/source
 
       - name: Lint Markdown
         if: ${{ matrix.full }}
         run: >-
           "${POLICY_BIN}/rumdl" check .
+        working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/source
 
       - name: Lint GitHub Actions workflows
         if: ${{ matrix.full }}
         run: >-
           "${POLICY_BIN}/actionlint"
           -shellcheck "${POLICY_BIN}/shellcheck" -pyflakes ""
+        working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/source
 
       - name: Lint shell scripts
         if: ${{ matrix.full }}
         run: >-
           find .github/scripts -type f -name '*.sh' -print0 |
           xargs -0 --no-run-if-empty "${POLICY_BIN}/shellcheck" --
+        working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/source
 
       - name: Check unused dependencies
         if: ${{ matrix.full }}
@@ -528,6 +545,7 @@ jobs:
           RUSTDOC: ${{ steps.fixed_tools.outputs.rustdoc }}
         run: >-
           "${POLICY_BIN}/cargo-machete" --with-metadata
+        working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/source
 
       - name: Check crate dependency policy
         if: ${{ matrix.full }}
@@ -537,6 +555,7 @@ jobs:
           RUSTDOC: ${{ steps.fixed_tools.outputs.rustdoc }}
         run: >-
           "${POLICY_BIN}/cargo-deny" check bans licenses sources -D warnings
+        working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/source
 
       - name: Check xtask dependency policy
         if: ${{ matrix.full }}
@@ -547,6 +566,7 @@ jobs:
         run: >-
           "${POLICY_BIN}/cargo-deny" --manifest-path xtask/Cargo.toml --locked
           check bans licenses sources -D warnings
+        working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/source
 
       - name: Audit crate dependencies
         if: ${{ matrix.full }}
@@ -558,6 +578,7 @@ jobs:
           "${FIXED_CARGO}" generate-lockfile --manifest-path Cargo.toml
           "${POLICY_BIN}/cargo-audit" audit --file Cargo.lock
           "${POLICY_BIN}/cargo-audit" audit --file xtask/Cargo.lock
+        working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/source
 
       # This is the only candidate-executable phase. It uses paths selected
       # before materialization, bypasses Cargo aliases and wrappers, and is the
@@ -625,6 +646,7 @@ jobs:
             "${FIXED_CARGO}" "${cargo_config[@]}" test --locked \
               --manifest-path xtask/Cargo.toml
           fi
+        working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/source
 
   candidate_linux:
     name: Candidate CI (Linux)
@@ -690,14 +712,21 @@ jobs:
           fi
           install "${install_args[@]}" \
             "${state}" \
+            "${state}/bootstrap" \
             "${state}/cargo-home" \
             "${state}/policy-bin" \
-            "${state}/target"
+            "${state}/source" \
+            "${state}/target" \
+            "${state}/tmp"
           printf '%s\n' \
             "CANDIDATE_STATE=${state}" \
             "CARGO_HOME=${state}/cargo-home" \
             "CARGO_TARGET_DIR=${state}/target" \
-            "POLICY_BIN=${state}/policy-bin" >> "${GITHUB_ENV}"
+            "POLICY_BIN=${state}/policy-bin" \
+            "TEMP=${state}/tmp" \
+            "TMP=${state}/tmp" \
+            "TMPDIR=${state}/tmp" >> "${GITHUB_ENV}"
+        working-directory: ${{ github.workspace }}
 
       # Set up the advisory host before any candidate-controlled path exists.
       - name: Set up Rust 1.98.0
@@ -735,12 +764,14 @@ jobs:
               "${POLICY_BIN}/materialize-candidate.sh" \
               "${POLICY_BIN}/remove-preinstalled-aws-tap.sh"
           fi
+        working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/bootstrap
 
       - name: Remove unused preinstalled Homebrew source
         if: ${{ runner.os == 'macOS' }}
         shell: bash
         run: |
           "${POLICY_BIN}/remove-preinstalled-aws-tap.sh"
+        working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/bootstrap
 
       # Resolve the fixed rustup launcher before candidate files exist. `run`
       # then selects Rust 1.98.0 tools directly without a candidate Cargo alias.
@@ -758,6 +789,7 @@ jobs:
           "${rustup_path}" run 1.98.0 cargo-fmt fmt --version
           "${rustup_path}" run 1.98.0 cargo-clippy clippy --version
           printf 'rustup=%s\n' "${rustup_path}" >> "${GITHUB_OUTPUT}"
+        working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/bootstrap
 
       # No Action or privileged host-setup step follows candidate materialization.
       - name: Materialize exact candidate without credentials
@@ -770,6 +802,7 @@ jobs:
           "${POLICY_BIN}/materialize-candidate.sh" \
             "${GITHUB_REPOSITORY}" "${CANDIDATE_SHA}" "${CANDIDATE_REF}" \
             source-spec https://github.com/NVIDIA/yaml-sigil-spec.git
+        working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/source
 
       # Advisory candidate execution is terminal: no policy, credential,
       # artifact, cache-save, or host-setup consumer follows this step.
@@ -793,3 +826,4 @@ jobs:
             test --all-features
           "${FIXED_RUSTUP}" run 1.98.0 cargo "${cargo_config[@]}" test --locked \
             --manifest-path xtask/Cargo.toml
+        working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/source

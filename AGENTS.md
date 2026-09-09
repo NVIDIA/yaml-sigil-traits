@@ -1,5 +1,16 @@
 # AGENTS.md - yaml-sigil-traits
 
+## Maintainer operations
+
+Ordinary repository work does not require the maintainer guide. Before
+performing or advising on hosted maintainer operations—authorizing pull-request
+tests, merging, exceptional integration, or reverting `main`—read
+[`MAINTAINERS.md`](MAINTAINERS.md) completely.
+
+Whenever a workflow or supporting policy changes, update the matching
+procedure in `MAINTAINERS.md` in the same change. Keep that runbook concise,
+coherent, and aligned with the executable behavior.
+
 ## Local Skill
 
 Use `.agents/skills/yaml-sigil-traits-spec-update/SKILL.md` when updating the
