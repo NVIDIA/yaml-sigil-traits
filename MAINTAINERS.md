@@ -117,17 +117,10 @@ does not authorize integration.
 
 #### Preserve exact commits
 
-Normal integration is squash-only. Preserve commit SHAs only with explicit
-authorization and when every commit in the exact linear range is signed and
-DCO-compliant. Use the exceptional transaction and make one non-force
-fast-forward:
-
-```shell
-git push origin <HEAD-SHA>:refs/heads/main
-```
-
-Verify the ancestry and pull-request association afterward. Never force-push
-`main` for this operation.
+Direct updates to `main` are not a general pull-request integration method.
+Use the default squash path. An exact-history operation requires its own
+separately landed, operation-specific policy and runbook; explicit
+authorization alone does not create that path.
 
 ### Merge with accepted failing checks
 
@@ -165,9 +158,8 @@ Verify the ancestry and pull-request association afterward. Never force-push
 
 Validate a protected-policy revert on `ci-testing/*` first. If the affected
 policy or an outage prevents `Required CI` from succeeding, use the
-exceptional transaction. Preserve the signed revert commit by direct
-fast-forward only when explicitly required. Never erase or rewrite reverted
-history.
+exceptional transaction and its SHA-guarded squash. Never directly update,
+erase, or rewrite `main` for a revert.
 
 ### Exceptional protected-main transaction
 
@@ -178,13 +170,16 @@ organization-owner settings change.
 
 1. Freeze the exact old `main`, target head, pull request, active runs, and
    every rule applicable to `main`. Prove every requirement except the named
-   App check is satisfied. Prepare and digest the complete
-   `Protect main and require CI` ruleset's original canonical payload and exact
-   restoration payload before mutation. Preserve every unrelated field and
-   existing bypass actor.
+   App check is satisfied. Canonicalize and digest the complete original
+   `Protect main and require CI` payload, including its name, target,
+   enforcement, conditions, rules, and bypass actors. Prepare its exact
+   restoration payload before mutation. Also capture and digest every tag
+   ruleset so the postflight can prove tag protection is unchanged.
 2. Serialize this window against every other admission, merge, release, and
-   settings mutation. Establish a guaranteed cleanup/finally boundary for
-   unconditional restoration before the first ruleset change.
+   settings mutation. Prepare the exact restoration command, readback, and
+   escalation path, then establish a guaranteed cleanup/finally boundary for
+   unconditional restoration before the first ruleset change. Restoration and
+   its readback remain authorized until the original digest is confirmed.
 3. Add only the authenticated maintainer as one temporary `User` bypass actor
    with `bypass_mode: pull_request`. Read back the complete ruleset and prove
    that this addition is the only change. Never alter tag rulesets.
@@ -199,18 +194,19 @@ organization-owner settings change.
 
    Do not delete the branch in this command. After protection is restored,
    perform branch cleanup only as the separate exact-ref operation above.
-   Exact-history preservation is a separate exceptional transaction. It
-   requires its own explicit authorization for a temporary `User` bypass with
-   `bypass_mode: always`, the exact non-force `main` update, and the same
-   unconditional restoration. Never reuse or broaden the pull-request-only
-   bypass payload.
+   This transaction does not authorize a direct ref update or exact-history
+   preservation.
 6. Whether integration succeeds, fails, or returns ambiguously, restore the
-   complete original ruleset before interpreting or retrying the result. Prove
-   restoration by authoritative readback and canonical digest. If restoration
-   cannot be proven, stop every repository mutation and escalate.
-7. After restoration, read the integration state. Do not retry an ambiguous
-   result blindly. Verify the tree, ancestry, signature, DCO, PR association,
-   current-main CI, and zero artifacts when integration succeeded.
+   complete original ruleset before interpreting or retrying the result. Never
+   retry an ambiguous integration update. After an ambiguous restoration,
+   perform authoritative readback before another restoration attempt. If the
+   original digest is absent, stop every unrelated repository mutation and
+   continue only exact restoration, readback, and escalation until the
+   original digest is confirmed.
+7. Only after restoration is confirmed, read and interpret the integration
+   state. Verify the tree, ancestry, signature, DCO, pull-request association,
+   current-main CI, zero artifacts, and unchanged tag-ruleset digests when
+   integration succeeded.
 
 The temporary bypass must never bypass another unsatisfied rule.
 
