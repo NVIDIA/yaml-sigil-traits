@@ -35,9 +35,11 @@ configuration or scripts that materialize a candidate, bind a pull request,
 report `Required CI`, or control a release.
 
 Review the complete base-to-head diff. Confirm that the head is rebased onto
-current `main`, its commits are linear, and each human-authored commit is
-GitHub Verified and DCO-compliant. Recheck after either `main` or the head
-moves.
+its exact current base, its commits are linear, and each human-authored commit
+is GitHub Verified and DCO-compliant. Route compatible work and every protected-
+policy change to `main`. Route breaking or dependent next-line work only to an
+advertised, protected `dev/MAJOR.MINOR.PATCH` coordination branch. Recheck after
+the base, protected `main` policy, or head moves.
 
 ### Test an ordinary pull request
 
@@ -57,6 +59,39 @@ moves.
    NVIDIA Linux is authoritative; macOS and Windows are advisory.
 4. If the PR head or `main` changes, rebase, review, and authorize the new
    exact head. Never reuse a stale command or verdict.
+
+### Test a coordination-line pull request
+
+Use this only after a `dev/MAJOR.MINOR.PATCH` base has been explicitly
+activated, advertised, and protected. Landing this runbook or its workflow
+support does not activate a line.
+
+1. Record the full current protected-policy, contribution-base, and candidate
+   objects:
+
+   ```shell
+   gh api repos/NVIDIA/yaml-sigil-traits/git/ref/heads/main --jq .object.sha
+   gh api repos/NVIDIA/yaml-sigil-traits/git/ref/heads/dev/MAJOR.MINOR.PATCH \
+     --jq .object.sha
+   gh pr view <PR-URL> --json baseRefName,baseRefOid,headRefOid
+   ```
+
+2. Require the pull request to target the recorded coordination ref and its
+   base SHA. Require its workflow and root Cargo configuration to match exact
+   protected `main`; the coordination line cannot admit its own policy.
+3. Review the exact head, then use the same `/ok to test <HEAD-SHA>` command.
+4. Require App-owned
+   `Required CI [refs/heads/dev/MAJOR.MINOR.PATCH]` on that exact head. The
+   ordinary `Required CI` context and a result for another line do not count.
+5. Immediately before integration, reread all three objects, the open pull
+   request, reviews, and the exact required context. Any movement requires a
+   fresh rebase, review, and test. Use default squash until the line's optional
+   writer-preserved intake procedure has separately passed its readiness test.
+
+After source integration, require the secretless coordination-branch Linux
+result, inspect advisory hosts, and require zero retained artifacts. No
+coordination ref may trigger publication, a protected environment, App-token
+minting, or a tag or Release mutation.
 
 ### Test a protected-policy change
 
@@ -98,8 +133,9 @@ does not authorize integration.
 
 #### Default squash
 
-1. Re-read the exact head and current base. Require App-owned `Required CI`
-   success, resolved review threads, verified signatures, DCO, and explicit
+1. Re-read the exact head and current base. Require the App-owned verdict for
+   that exact base—`Required CI` for `main`, or the base-specific coordination
+   context—plus resolved review threads, verified signatures, DCO, and explicit
    merge authorization.
 2. Guard the merge against head drift:
 
@@ -113,7 +149,9 @@ does not authorize integration.
 3. Verify the merge commit has one parent, its tree equals the reviewed head,
    GitHub marks it Verified, its DCO trailer is correct, and it is associated
    with the pull request.
-4. Require current-main CI success with zero retained artifacts.
+4. Require CI success on the updated destination with zero retained artifacts. A
+   `main` merge must also leave release qualification as a no-op unless it is
+   the separately prepared release pull request.
 
 #### Preserve exact commits
 
@@ -125,10 +163,10 @@ authorization alone does not create that path.
 ### Merge with accepted failing checks
 
 - Bind each failure to the exact head, run, and job.
-- If App-owned `Required CI` succeeded and only a documented advisory check
-  failed, obtain explicit acceptance of that failure and use the normal squash
-  path.
-- A candidate-caused `Required CI` failure remains merge-blocking. The
+- If the App-owned verdict required for the exact base succeeded and only a
+  documented advisory check failed, obtain explicit acceptance of that failure
+  and use the normal squash path.
+- A candidate-caused required-verdict failure remains merge-blocking. The
   exceptional transaction is eligible only when exact evidence proves that
   the reviewed protected-policy change itself prevents the current check
   mechanism from evaluating it, or a platform outage prevents check creation,

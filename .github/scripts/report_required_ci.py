@@ -21,6 +21,20 @@ API_VERSION = "2026-03-10"
 MAX_EVENT_BYTES = 256 * 1024
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_PULL_COMMITS = 100
+MAIN_REF = "refs/heads/main"
+MAIN_CHECK = "Required CI"
+SUPPORTED_REPOSITORIES = {
+    "NVIDIA/yaml-sigil-rs",
+    "NVIDIA/yaml-sigil-spec",
+    "NVIDIA/yaml-sigil-traits",
+}
+VERSION_COMPONENT = r"(?:0|[1-9][0-9]{0,8})"
+RUST_COORDINATION_BRANCH = re.compile(
+    rf"dev/{VERSION_COMPONENT}\.{VERSION_COMPONENT}\.{VERSION_COMPONENT}"
+)
+SPEC_COORDINATION_BRANCH = re.compile(
+    r"v[1-9][0-9]{0,8}(?:(?:alpha|beta)[1-9][0-9]{0,8})?"
+)
 SIGNATURE_QUERY = """
 query($owner:String!,$name:String!,$number:Int!,$first:Int!){
   repository(owner:$owner,name:$name){
@@ -140,7 +154,6 @@ class Policy:
     workflow_id: int
     workflow_path: str
     job_name: str
-    check_name: str
     app_slug: str
 
     def validate(self) -> None:
@@ -153,7 +166,6 @@ class Policy:
             raise ReporterError("expected workflow path is malformed")
         for label, value in (
             ("job name", self.job_name),
-            ("check name", self.check_name),
             ("App slug", self.app_slug),
         ):
             if not value or len(value) > 128 or any(c in value for c in "\r\n"):
@@ -169,6 +181,9 @@ class Binding:
     pull_number: int
     head_branch: str
     head_sha: str
+    base_ref: str
+    base_sha: str
+    check_name: str
     conclusion: str
     details_url: str
 
@@ -178,7 +193,10 @@ class Binding:
 
     @property
     def external_id(self) -> str:
-        return f"yaml-sigil-required-ci:{self.run_id}:{self.run_attempt}"
+        return (
+            f"yaml-sigil-required-ci:{self.run_id}:{self.run_attempt}:"
+            f"{self.base_sha}"
+        )
 
 
 @dataclass(frozen=True)
@@ -225,6 +243,48 @@ def _sha(value: Any, label: str) -> str:
 
 def _repository_name(value: Any, label: str) -> str:
     return _text(_mapping(value, label).get("full_name"), f"{label} full name")
+
+
+def base_policy(repository: str, branch: str) -> tuple[str, str]:
+    """Return the canonical full ref and App check for one allowed PR base."""
+
+    branch = _text(branch, "pull request base branch")
+    if repository not in SUPPORTED_REPOSITORIES:
+        raise ReporterError("repository has no protected candidate policy")
+    if branch == "main":
+        return MAIN_REF, MAIN_CHECK
+    if repository in {
+        "NVIDIA/yaml-sigil-rs",
+        "NVIDIA/yaml-sigil-traits",
+    }:
+        allowed = RUST_COORDINATION_BRANCH.fullmatch(branch) is not None
+    else:
+        allowed = SPEC_COORDINATION_BRANCH.fullmatch(branch) is not None
+    if not allowed:
+        raise ReporterError("pull request base is not an allowed coordination branch")
+    full_ref = f"refs/heads/{branch}"
+    check_name = f"Required CI [{full_ref}]"
+    if len(check_name) > 128:
+        raise ReporterError("coordination required-check name is oversized")
+    return full_ref, check_name
+
+
+def attested_job_name(
+    prefix: str,
+    policy_sha: str,
+    base_ref: str,
+    base_sha: str,
+) -> str:
+    """Encode the pre-execution policy and base binding in one job name."""
+
+    prefix = _text(prefix, "authoritative job name")
+    policy_sha = _sha(policy_sha, "attested policy SHA")
+    base_ref = _text(base_ref, "attested contribution base ref")
+    base_sha = _sha(base_sha, "attested contribution base SHA")
+    result = f"{prefix} [policy={policy_sha};base={base_ref}@{base_sha}]"
+    if len(result) > 200:
+        raise ReporterError("attested authoritative job name is oversized")
+    return result
 
 
 def _workflow_blob(
@@ -446,7 +506,7 @@ def bind_candidate(api: Api, event: dict[str, Any], policy: Policy) -> Binding:
         api.get(f"{repository_path}/git/ref/heads/main"),
         "protected main ref",
     )
-    if main_ref.get("ref") != "refs/heads/main":
+    if main_ref.get("ref") != MAIN_REF:
         raise ReporterError("protected main ref name is unexpected")
     main_object = _mapping(main_ref.get("object"), "protected main object")
     if (
@@ -490,12 +550,31 @@ def bind_candidate(api: Api, event: dict[str, Any], policy: Policy) -> Binding:
     if pull.get("state") != "open":
         raise ReporterError("pull request is not open")
     pull_base = _mapping(pull.get("base"), "pull request base")
-    if pull_base.get("ref") != "main":
-        raise ReporterError("pull request base branch is not main")
     if _repository_name(pull_base.get("repo"), "base repository") != policy.repository:
         raise ReporterError("pull request base repository is unexpected")
-    if _sha(pull_base.get("sha"), "pull request base SHA") != policy.policy_sha:
-        raise ReporterError("pull request base is not current protected main")
+    base_ref, check_name = base_policy(
+        policy.repository,
+        _text(pull_base.get("ref"), "pull request base branch"),
+    )
+    base_sha = _sha(pull_base.get("sha"), "pull request base SHA")
+    if base_ref == MAIN_REF:
+        base_readback = main_ref
+    else:
+        encoded_base_ref = urllib.parse.quote(
+            base_ref.removeprefix("refs/"), safe="/"
+        )
+        base_readback = _mapping(
+            api.get(f"{repository_path}/git/ref/{encoded_base_ref}"),
+            "contribution base ref",
+        )
+    base_object = _mapping(base_readback.get("object"), "contribution base object")
+    if (
+        base_readback.get("ref") != base_ref
+        or base_object.get("type") != "commit"
+        or _sha(base_object.get("sha"), "current contribution base SHA")
+        != base_sha
+    ):
+        raise ReporterError("pull request contribution base is not current")
     pull_head = _mapping(pull.get("head"), "pull request head")
     if _sha(pull_head.get("sha"), "current pull request head SHA") != head_sha:
         raise ReporterError("pull request head moved after candidate execution")
@@ -559,9 +638,19 @@ def bind_candidate(api: Api, event: dict[str, Any], policy: Policy) -> Binding:
     job_items = _sequence(jobs.get("jobs"), "job inventory jobs")
     if jobs.get("total_count") != len(job_items) or len(job_items) > 100:
         raise ReporterError("job inventory is incomplete or oversized")
-    authoritative = [job for job in job_items if isinstance(job, dict) and job.get("name") == policy.job_name]
+    authoritative_name = attested_job_name(
+        policy.job_name,
+        policy.policy_sha,
+        base_ref,
+        base_sha,
+    )
+    authoritative = [
+        job
+        for job in job_items
+        if isinstance(job, dict) and job.get("name") == authoritative_name
+    ]
     if len(authoritative) != 1:
-        raise ReporterError("authoritative Linux job is missing or duplicated")
+        raise ReporterError("attested authoritative Linux job is missing or duplicated")
     job = authoritative[0]
     if _integer(job.get("run_id"), "job run ID") != run_id:
         raise ReporterError("authoritative job belongs to another run")
@@ -589,6 +678,9 @@ def bind_candidate(api: Api, event: dict[str, Any], policy: Policy) -> Binding:
         pull_number=pull_number,
         head_branch=head_branch,
         head_sha=head_sha,
+        base_ref=base_ref,
+        base_sha=base_sha,
+        check_name=check_name,
         conclusion=conclusion,
         details_url=details_url,
     )
@@ -623,7 +715,7 @@ def _validate_check(
     if expected_id is not None and check_id != expected_id:
         raise ReporterError("required check ID changed during readback")
     if (
-        check.get("name") != policy.check_name
+        check.get("name") != binding.check_name
         or check.get("head_sha") != binding.head_sha
         or check.get("external_id") != binding.external_id
         or check.get("status") != "completed"
@@ -640,7 +732,7 @@ def report_check(api: Api, policy: Policy, binding: Binding) -> int:
 
     repository_path = f"repos/{policy.repository}"
     query = urllib.parse.urlencode(
-        {"check_name": policy.check_name, "filter": "all", "per_page": "100"}
+        {"check_name": binding.check_name, "filter": "all", "per_page": "100"}
     )
     inventory = _mapping(
         api.get(f"{repository_path}/commits/{binding.head_sha}/check-runs?{query}"),
@@ -666,7 +758,7 @@ def report_check(api: Api, policy: Policy, binding: Binding) -> int:
         )
 
     payload = {
-        "name": policy.check_name,
+        "name": binding.check_name,
         "head_sha": binding.head_sha,
         "status": "completed",
         "conclusion": binding.check_conclusion,
@@ -676,7 +768,8 @@ def report_check(api: Api, policy: Policy, binding: Binding) -> int:
             "title": "Authorized candidate CI result",
             "summary": (
                 "The exact copied pull-request head completed the authoritative "
-                f"Linux job with conclusion `{binding.conclusion}`."
+                f"Linux job for `{binding.base_ref}` at `{binding.base_sha}` "
+                f"with conclusion `{binding.conclusion}`."
             ),
         },
     }
@@ -700,6 +793,9 @@ def append_outputs(binding: Binding) -> None:
         output.write(f"conclusion={binding.conclusion}\n")
         output.write(f"run_id={binding.run_id}\n")
         output.write(f"run_attempt={binding.run_attempt}\n")
+        output.write(f"base_ref={binding.base_ref}\n")
+        output.write(f"base_sha={binding.base_sha}\n")
+        output.write(f"check_name={binding.check_name}\n")
 
 
 def parser() -> argparse.ArgumentParser:
@@ -711,7 +807,6 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--workflow-id", required=True, type=int)
     result.add_argument("--workflow-path", required=True)
     result.add_argument("--job-name", required=True)
-    result.add_argument("--check-name", required=True)
     result.add_argument("--app-slug", required=True)
     return result
 
@@ -723,7 +818,6 @@ def run(arguments: argparse.Namespace) -> None:
         workflow_id=arguments.workflow_id,
         workflow_path=arguments.workflow_path,
         job_name=arguments.job_name,
-        check_name=arguments.check_name,
         app_slug=arguments.app_slug,
     )
     event = read_event(arguments.event)
@@ -739,7 +833,7 @@ def run(arguments: argparse.Namespace) -> None:
     # before the only write. A moved head, rerun, ref, or artifact fails closed.
     binding = bind_candidate(read_api, event, policy)
     check_id = report_check(app_api, policy, binding)
-    print(f"reported {policy.check_name} check {check_id} for {binding.head_sha}")
+    print(f"reported {binding.check_name} check {check_id} for {binding.head_sha}")
 
 
 def main() -> int:
