@@ -140,10 +140,11 @@ fn set_activation_manifest_version(
 }
 
 fn prepare(root: &Path, version: &Version) -> Result<(), String> {
-    validate_version(version)?;
+    validate_selected_release_version(version)?;
     require_branch(root, version)?;
     require_exact_git_state(root, true)?;
     require_release_plz(root)?;
+    let original = manifest_version(root)?;
 
     // Pinned release-plz is the sole authority that edits the version and
     // changelog; this command never publishes, tags, or creates a Release.
@@ -161,6 +162,10 @@ fn prepare(root: &Path, version: &Version) -> Result<(), String> {
         return Err(format!("release-plz update failed with {status}"));
     }
 
+    let derived = manifest_version(root)?;
+    if &derived != version {
+        apply_exact_version(root, &original, &derived, version)?;
+    }
     require_release_changes(root, false)?;
     validate_release_content(root, version)?;
     eprintln!("release: prepared source changes for {version}");
@@ -168,7 +173,7 @@ fn prepare(root: &Path, version: &Version) -> Result<(), String> {
 }
 
 fn check(root: &Path, version: &Version) -> Result<(), String> {
-    validate_version(version)?;
+    validate_selected_release_version(version)?;
     require_branch(root, version)?;
     require_release_changes(root, true)?;
     validate_release_content(root, version)?;
@@ -218,6 +223,14 @@ fn validate_version(version: &Version) -> Result<(), String> {
     Ok(())
 }
 
+pub(crate) fn validate_selected_release_version(version: &Version) -> Result<(), String> {
+    validate_version(version)?;
+    if version.pre.as_str() == "rc.0" {
+        return Err("release version may not be the rc.0 coordination stub".to_string());
+    }
+    Ok(())
+}
+
 fn require_release_plz(root: &Path) -> Result<(), String> {
     let mut command = release_plz_command(root);
     command.arg("--version");
@@ -239,6 +252,90 @@ fn release_plz_command(root: &Path) -> Command {
         command.env_remove(name);
     }
     command
+}
+
+fn release_plz_set_version(root: &Path, selected: &Version) -> Command {
+    let mut command = release_plz_command(root);
+    command.arg("set-version").arg(selected.to_string()).args([
+        "--manifest-path",
+        "Cargo.toml",
+        "--config",
+        RELEASE_CONFIG,
+    ]);
+    command
+}
+
+fn apply_exact_version(
+    root: &Path,
+    original: &Version,
+    derived: &Version,
+    selected: &Version,
+) -> Result<(), String> {
+    let adjustment = require_exact_version_adjustment(original, derived, selected)?;
+    require_release_path_subset(root)?;
+
+    // Pinned release-plz performs the exact maintainer selection only after
+    // update has derived the changelog and preliminary version. This includes
+    // replacing the non-release rc.0 activation stub with the first real RC or
+    // stable version.
+    let status = release_plz_set_version(root, selected)
+        .status()
+        .map_err(|error| format!("run release-plz set-version: {error}"))?;
+    if !status.success() {
+        return Err(format!("release-plz set-version failed with {status}"));
+    }
+    eprintln!("release: {adjustment}; adjusted release-plz-derived {derived} to {selected}");
+    Ok(())
+}
+
+fn require_exact_version_adjustment(
+    original: &Version,
+    derived: &Version,
+    selected: &Version,
+) -> Result<&'static str, String> {
+    let same_core = derived.major == selected.major
+        && derived.minor == selected.minor
+        && derived.patch == selected.patch;
+    let selected_real_rc = selected
+        .pre
+        .as_str()
+        .strip_prefix("rc.")
+        .is_some_and(|ordinal| {
+            !ordinal.is_empty()
+                && ordinal != "0"
+                && ordinal.bytes().all(|byte| byte.is_ascii_digit())
+        });
+    let activation_stub_release = original.pre.as_str() == "rc.0"
+        && derived == original
+        && selected > original
+        && (selected.pre.is_empty() || selected_real_rc);
+    if same_core && activation_stub_release {
+        return Ok("replaced the rc.0 activation stub with the first release");
+    }
+    let stable_promotion = !original.pre.is_empty()
+        && selected.pre.is_empty()
+        && original.major == selected.major
+        && original.minor == selected.minor
+        && original.patch == selected.patch
+        && !derived.pre.is_empty()
+        && derived >= original
+        && derived < selected;
+    if same_core && stable_promotion {
+        return Ok("promoted the current prerelease to stable");
+    }
+    let new_prerelease = original.pre.is_empty()
+        && !selected.pre.is_empty()
+        && derived.pre.is_empty()
+        && original < selected
+        && selected < derived;
+    if same_core && new_prerelease {
+        return Ok("started the release-plz-derived version as a prerelease");
+    }
+    Err(format!(
+        "release-plz derived {derived}, not selected release {selected}; only a new \
+         prerelease, the first same-core release from rc.0, or promotion of the \
+         current same-core prerelease is supported"
+    ))
 }
 
 fn require_activation_branch(root: &Path, target: &Version) -> Result<(), String> {
@@ -295,14 +392,7 @@ fn require_release_changes(root: &Path, accept_committed: bool) -> Result<(), St
         return Err("release-plz did not produce source changes".to_string());
     }
 
-    let mut actual = git_paths(
-        root,
-        &["diff", "--name-only", "--no-renames", "-z", "origin/main"],
-    )?;
-    actual.extend(git_paths(
-        root,
-        &["ls-files", "--others", "--exclude-standard", "-z"],
-    )?);
+    let actual = release_changed_paths(root)?;
     let expected: BTreeSet<String> = RELEASE_PATHS
         .iter()
         .map(|path| (*path).to_string())
@@ -313,6 +403,32 @@ fn require_release_changes(root: &Path, accept_committed: bool) -> Result<(), St
             expected.into_iter().collect::<Vec<_>>().join(", "),
             actual.into_iter().collect::<Vec<_>>().join(", ")
         ));
+    }
+    Ok(())
+}
+
+fn release_changed_paths(root: &Path) -> Result<BTreeSet<String>, String> {
+    let mut actual = git_paths(
+        root,
+        &["diff", "--name-only", "--no-renames", "-z", "origin/main"],
+    )?;
+    actual.extend(git_paths(
+        root,
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+    )?);
+    Ok(actual)
+}
+
+fn require_release_path_subset(root: &Path) -> Result<(), String> {
+    let actual = release_changed_paths(root)?;
+    if actual.is_empty() {
+        return Err("release-plz produced no source changes".to_string());
+    }
+    let allowed = RELEASE_PATHS.iter().copied().collect::<BTreeSet<_>>();
+    for path in actual {
+        if !allowed.contains(path.as_str()) {
+            return Err(format!("release-plz changed unexpected path {path}"));
+        }
     }
     Ok(())
 }
@@ -701,7 +817,9 @@ mod tests {
     #[test]
     fn versions_and_release_paths_are_bounded() {
         assert!(validate_version(&Version::parse("1.2.3-rc.4").unwrap()).is_ok());
+        assert!(validate_version(&Version::parse("1.2.3-rc.0").unwrap()).is_ok());
         assert!(validate_version(&Version::parse("1.2.3+local").unwrap()).is_err());
+        assert!(validate_selected_release_version(&Version::parse("1.2.3-rc.0").unwrap()).is_err());
         assert_eq!(RELEASE_PATHS, ["CHANGELOG.md", "Cargo.toml"]);
         assert!(is_version_heading(
             "## [1.2.3](https://example.invalid) - 2026-09-04",
@@ -711,6 +829,74 @@ mod tests {
             "## [1.2.30](https://example.invalid)",
             "## [1.2.3]"
         ));
+    }
+
+    #[test]
+    fn exact_version_adjustment_is_limited_to_release_boundaries() {
+        for selected in ["0.5.0-rc.1", "0.5.0"] {
+            assert!(
+                require_exact_version_adjustment(
+                    &Version::parse("0.5.0-rc.0").unwrap(),
+                    &Version::parse("0.5.0-rc.0").unwrap(),
+                    &Version::parse(selected).unwrap(),
+                )
+                .is_ok()
+            );
+        }
+        assert!(
+            require_exact_version_adjustment(
+                &Version::parse("0.4.0-rc.2").unwrap(),
+                &Version::parse("0.4.0-rc.3").unwrap(),
+                &Version::parse("0.4.0").unwrap(),
+            )
+            .is_ok()
+        );
+        assert!(
+            require_exact_version_adjustment(
+                &Version::parse("0.4.0").unwrap(),
+                &Version::parse("0.5.0").unwrap(),
+                &Version::parse("0.5.0-rc.1").unwrap(),
+            )
+            .is_ok()
+        );
+        for (original, derived, selected) in [
+            ("0.5.0-rc.0", "0.5.0-rc.0", "0.6.0-rc.1"),
+            ("0.5.0-rc.0", "0.5.0-rc.0", "0.5.0-rc.0"),
+            ("0.5.0-rc.0", "0.5.0-rc.0", "0.5.0-rc.1.preview"),
+            ("0.5.0-rc.0", "0.5.0-rc.0", "0.5.0-zz.1"),
+            ("0.4.0-rc.2", "0.4.0-rc.3", "0.4.0-rc.4"),
+            ("0.4.0", "0.4.1", "0.5.0-rc.1"),
+        ] {
+            assert!(
+                require_exact_version_adjustment(
+                    &Version::parse(original).unwrap(),
+                    &Version::parse(derived).unwrap(),
+                    &Version::parse(selected).unwrap(),
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn exact_version_command_selects_only_the_traits_package() {
+        let command =
+            release_plz_set_version(Path::new("."), &Version::parse("0.5.0-rc.1").unwrap());
+        let args = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            [
+                "set-version",
+                "0.5.0-rc.1",
+                "--manifest-path",
+                "Cargo.toml",
+                "--config",
+                RELEASE_CONFIG,
+            ]
+        );
     }
 
     #[test]
@@ -771,6 +957,9 @@ mod tests {
 
     #[test]
     fn release_paths_include_tracked_deletions_and_untracked_files() {
+        let bounded = git_fixture();
+        require_release_path_subset(bounded.path()).unwrap();
+
         let deleted = git_fixture();
         std::fs::remove_file(deleted.path().join("README.md")).unwrap();
         assert!(require_release_changes(deleted.path(), false).is_err());
@@ -778,6 +967,7 @@ mod tests {
         let untracked = git_fixture();
         std::fs::write(untracked.path().join("untracked.txt"), "unexpected\n").unwrap();
         assert!(require_release_changes(untracked.path(), false).is_err());
+        assert!(require_release_path_subset(untracked.path()).is_err());
 
         let renamed = git_fixture();
         std::fs::remove_file(renamed.path().join("Cargo.toml")).unwrap();

@@ -348,6 +348,7 @@ fn qualify(
         .expect("prefix checked");
     let version = Version::parse(branch_version)
         .map_err(|error| format!("release branch version is invalid: {error}"))?;
+    release::validate_selected_release_version(&version)?;
     if !version.build.is_empty() || release::manifest_version(root)? != version {
         return Err("release branch and manifest versions differ".to_string());
     }
@@ -661,6 +662,7 @@ fn validate_commit(
 }
 
 fn validate_source_version(root: &Path, version: &Version) -> Result<(), String> {
+    release::validate_selected_release_version(version)?;
     if version.build.is_empty() && release::manifest_version(root)? == *version {
         Ok(())
     } else {
