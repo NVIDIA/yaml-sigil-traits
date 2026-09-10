@@ -11,6 +11,11 @@ Whenever a workflow or supporting policy changes, update the matching
 procedure in `MAINTAINERS.md` in the same change. Keep that runbook concise,
 coherent, and aligned with the executable behavior.
 
+Use [`CONTRIBUTING.md`](CONTRIBUTING.md) to choose `main` or an advertised
+breaking-change coordination base before starting work. Keep compatible and
+protected-policy changes on `main`; target the active coordination branch only
+for next-line work. A coordination branch never supplies its own CI policy.
+
 ## Local Skill
 
 Use `.agents/skills/yaml-sigil-traits-spec-update/SKILL.md` when updating the
@@ -281,7 +286,8 @@ add complexity without consolidating policy.
 
 The surviving provider helpers have deliberately narrow roles:
 
-- `report_required_ci.py` binds the complete candidate run before the App-owned
+- `report_required_ci.py` binds the complete candidate run, including the
+  aggregate job's pre-execution policy/base attestation, before the App-owned
   required check and remains byte-identical across the YamlSigil repositories.
 - `materialize-candidate.sh` performs anonymous exact-head checkout and rejects
   content filters, candidate-selected submodule URLs, and ancestor Cargo

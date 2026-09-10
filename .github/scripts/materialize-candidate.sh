@@ -11,27 +11,56 @@ export GIT_CONFIG_GLOBAL=/dev/null
 export GIT_CONFIG_NOSYSTEM=1
 export GIT_TERMINAL_PROMPT=0
 
-# Require the fixed repository, exact copied ref, exact reviewed head, and an
-# optional fixed source-spec repository as the complete input contract.
-if [[ "$#" -ne 3 && "$#" -ne 5 ]]; then
-  echo "usage: materialize-candidate.sh REPOSITORY HEAD_SHA COPIED_REF [GITLINK_PATH GITLINK_REPOSITORY]" >&2
+# Require the fixed repository, exact copied ref and head, independent policy
+# and contribution bases, and an optional fixed source-spec repository.
+if [[ "$#" -ne 6 && "$#" -ne 8 ]]; then
+  echo "usage: materialize-candidate.sh REPOSITORY HEAD_SHA COPIED_REF POLICY_SHA BASE_REF BASE_SHA [GITLINK_PATH GITLINK_REPOSITORY]" >&2
   exit 2
 fi
 
 repository="$1"
 head_sha="$2"
 copied_ref="$3"
-gitlink_path="${4:-}"
-gitlink_repository="${5:-}"
+policy_sha="$4"
+base_ref="$5"
+base_sha="$6"
+gitlink_path="${7:-}"
+gitlink_repository="${8:-}"
 
 # Reject values that could become options, alternate refs, or shell-visible
 # control characters before passing them to Git.
 if [[ ! "${repository}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ \
   || ! "${head_sha}" =~ ^[0-9a-f]{40}$ \
-  || ! "${copied_ref}" =~ ^pull-request/[1-9][0-9]*$ ]]; then
-  echo "candidate repository, head, or copied ref is malformed" >&2
+  || ! "${copied_ref}" =~ ^pull-request/[1-9][0-9]*$ \
+  || ! "${policy_sha}" =~ ^[0-9a-f]{40}$ \
+  || ! "${base_sha}" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "candidate repository, head, copied ref, or SHA is malformed" >&2
   exit 1
 fi
+
+# Admit only the repository-specific coordination namespace compiled into
+# protected main. Candidate input cannot turn another branch into a PR base.
+version_component='(0|[1-9][0-9]{0,8})'
+case "${repository}" in
+  NVIDIA/yaml-sigil-rs | NVIDIA/yaml-sigil-traits)
+    if [[ "${base_ref}" != "refs/heads/main" \
+      && ! "${base_ref}" =~ ^refs/heads/dev/${version_component}\.${version_component}\.${version_component}$ ]]; then
+      echo "candidate contribution base is not allowed for this repository" >&2
+      exit 1
+    fi
+    ;;
+  NVIDIA/yaml-sigil-spec)
+    if [[ "${base_ref}" != "refs/heads/main" \
+      && ! "${base_ref}" =~ ^refs/heads/v[1-9][0-9]{0,8}((alpha|beta)[1-9][0-9]{0,8})?$ ]]; then
+      echo "candidate contribution base is not allowed for this repository" >&2
+      exit 1
+    fi
+    ;;
+  *)
+    echo "repository has no protected candidate policy" >&2
+    exit 1
+    ;;
+esac
 
 # The optional gitlink pair is all-or-nothing and accepts one simple path plus
 # a caller-fixed public repository URL or local test fixture.
@@ -92,28 +121,31 @@ while :; do
   ancestor="$(dirname -- "${ancestor}")"
 done
 
-# Initialize fresh Git metadata, then fetch current main, the exact copied ref,
-# and GitHub's canonical current pull-request head without tags, credentials,
-# submodules, or a working tree.
+# Initialize fresh Git metadata, then fetch protected current main, the exact
+# contribution base, copied ref, and canonical pull-request head without tags,
+# credentials, submodules, or a working tree.
 git init --quiet --initial-branch=main .
 git remote add origin "${origin_url}"
 git -c credential.helper= fetch --no-tags --no-recurse-submodules origin \
-  "+refs/heads/main:refs/remotes/origin/main" \
+  "+refs/heads/main:refs/remotes/origin/policy" \
+  "+${base_ref}:refs/remotes/origin/base" \
   "+${candidate_ref}:refs/remotes/origin/candidate" \
   "+${pull_ref}:refs/remotes/origin/pull-head"
 
-base_sha="$(git rev-parse --verify 'refs/remotes/origin/main^{commit}')"
+policy_readback="$(git rev-parse --verify 'refs/remotes/origin/policy^{commit}')"
+base_readback="$(git rev-parse --verify 'refs/remotes/origin/base^{commit}')"
 copied_sha="$(git rev-parse --verify 'refs/remotes/origin/candidate^{commit}')"
 pull_sha="$(git rev-parse --verify 'refs/remotes/origin/pull-head^{commit}')"
 
-# A moved copied ref, moved canonical pull head, or candidate that is no longer
-# based on exact current main needs another human authorization and cannot
-# execute in this run.
-if [[ "${copied_sha}" != "${head_sha}" \
+# Movement of protected policy, contribution base, copied ref, or canonical
+# pull head invalidates this run. The candidate must include its exact base.
+if [[ "${policy_readback}" != "${policy_sha}" \
+  || "${base_readback}" != "${base_sha}" \
+  || "${copied_sha}" != "${head_sha}" \
   || "${pull_sha}" != "${head_sha}" \
-  || ! "${base_sha}" =~ ^[0-9a-f]{40}$ ]] \
+  || ! "${base_readback}" =~ ^[0-9a-f]{40}$ ]] \
   || ! git merge-base --is-ancestor "${base_sha}" "${head_sha}"; then
-  echo "candidate ref, pull head, reviewed head, or current main binding changed" >&2
+  echo "candidate policy, base, ref, pull head, or reviewed head changed" >&2
   exit 1
 fi
 
@@ -121,9 +153,9 @@ fi
 # build commands before the terminal candidate-execution boundary. Permit only
 # the exact path, mode, and blob already reviewed on protected current main.
 for cargo_config in .cargo/config .cargo/config.toml; do
-  base_entry="$(git ls-tree "${base_sha}" -- "${cargo_config}")"
+  policy_entry="$(git ls-tree "${policy_sha}" -- "${cargo_config}")"
   candidate_entry="$(git ls-tree "${head_sha}" -- "${cargo_config}")"
-  if [[ "${candidate_entry}" != "${base_entry}" ]]; then
+  if [[ "${candidate_entry}" != "${policy_entry}" ]]; then
     echo "candidate root Cargo configuration differs from protected main: ${cargo_config}" >&2
     exit 1
   fi

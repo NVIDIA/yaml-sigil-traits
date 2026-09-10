@@ -46,7 +46,7 @@ jobs:
           test -s "${RUNNER_TEMP}/required-ci/reporter.py"
           python3 -m py_compile "${RUNNER_TEMP}/required-ci/reporter.py"
 
-      - name: Bind exact candidate run without App authority
+      - name: Bind exact-base candidate run without App authority
         id: inspect
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -58,7 +58,6 @@ jobs:
           --workflow-id "333755870"
           --workflow-path ".github/workflows/ci.yml"
           --job-name "Candidate CI (Linux)"
-          --check-name "Required CI"
           --app-slug "nvidia-yamlsigil-release-pr"
 
       - name: Create checks-only repository token
@@ -73,7 +72,7 @@ jobs:
 
       # Rebind every mutable field after token creation and immediately before
       # the sole App-authorized mutation.
-      - name: Create exact App-owned verdict
+      - name: Create exact-base App-owned verdict
         env:
           APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
           APP_TOKEN: ${{ steps.app-token.outputs.token }}
@@ -86,5 +85,4 @@ jobs:
           --workflow-id "333755870"
           --workflow-path ".github/workflows/ci.yml"
           --job-name "Candidate CI (Linux)"
-          --check-name "Required CI"
           --app-slug "nvidia-yamlsigil-release-pr"

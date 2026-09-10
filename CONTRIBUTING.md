@@ -40,6 +40,23 @@ Do not edit `CHANGELOG.md` in an ordinary contribution. The canonical
 maintainer release procedure runs pinned `release-plz` to generate it from the
 integrated Conventional Commit history in the dedicated release pull request.
 
+## Choose the pull-request base
+
+Target `main` for changes compatible with the current public API. A maintainer
+may advertise one protected `dev/MAJOR.MINOR.PATCH` coordination branch for a
+breaking API or behavior change, work that depends on that unpromoted change,
+or its migration documentation and tests. Do not invent a coordination branch.
+When compatibility is uncertain, ask a maintainer before opening the pull
+request.
+
+Apply a fix needed by both lines to `main` first; the release coordinator moves
+it forward. Protected CI, admission, and release-policy changes always target
+`main`. Releases are prepared only from qualified `main`.
+
+Squash is the default integration method on either base. A trusted writer may
+preserve an intentional commit series only through the separately authorized
+procedure in [`MAINTAINERS.md`](MAINTAINERS.md).
+
 ## Pull-request CI
 
 The repository writer reviews the latest pull-request head and comments
@@ -55,27 +72,31 @@ terminal phase. GitHub-hosted macOS and Windows jobs are advisory. A separate
 checkout-free protected reporter binds the completed run, attempt, repository,
 open pull request, copied ref, current head, authoritative Linux result, and
 zero-artifact count. The reporter then uses protected `main` policy to create
-the repository App's `Required CI` verdict automatically. The exact-head
-command is the sole per-head human admission gate. Release finalization has a
-separate reviewer gate and cannot be authorized through contributor CI. A
-changed head requires fresh authorization.
+the repository App's `Required CI` verdict for `main`, or
+`Required CI [refs/heads/dev/MAJOR.MINOR.PATCH]` for the exact active
+coordination base. A result for one base never satisfies another. The
+exact-head command is the sole per-head human admission gate. Release
+finalization has a separate reviewer gate and cannot be authorized through
+contributor CI. A changed head requires fresh authorization.
+The authoritative aggregate job records its pre-execution protected-policy SHA
+and exact base ref/SHA; movement of either object invalidates the run.
 
 The copied `.github/workflows/ci.yml` must exactly match protected current
 `main`. Coordinate a proposed change to that workflow with a maintainer
 before requesting candidate testing.
 
-Every human-authored pull-request commit must form a linear history from
-current `main`, be GitHub Verified, and contain a `Signed-off-by` trailer that
-exactly matches its Git author. The contributor's fork branch remains the
-pull-request head; a writer's command authorizes testing only and does not
-authorize integration.
+Every human-authored pull-request commit must form a linear history from the
+exact current pull-request base, be GitHub Verified, and contain a
+`Signed-off-by` trailer that exactly matches its Git author. The contributor's
+fork branch remains the pull-request head; a writer's command authorizes
+testing only and does not authorize integration.
 
-Before final authorization, fetch current upstream `main`, rebase the original
-contributor branch with `git rebase --gpg-sign <upstream>/main`, and push the
-rewritten branch back to the same fork with `--force-with-lease`. Confirm every
-rewritten commit is GitHub Verified and DCO-compliant, then request testing for
-the new exact SHA. Do not copy the contribution onto a repository-owned branch
-merely to run CI.
+Before final authorization, fetch the current upstream pull-request base,
+rebase the original contributor branch onto that exact ref with
+`git rebase --gpg-sign`, and push the rewritten branch back to the same fork
+with an exact lease. Confirm every rewritten commit is GitHub Verified and
+DCO-compliant, then request testing for the new exact SHA. Do not copy the
+contribution onto a repository-owned branch merely to run CI.
 
 #### Signing Off Your Work
 

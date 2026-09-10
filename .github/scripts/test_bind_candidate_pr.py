@@ -6,6 +6,7 @@ from __future__ import annotations
 import copy
 import importlib.util
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
@@ -19,10 +20,13 @@ sys.modules[SPEC.name] = binder
 SPEC.loader.exec_module(binder)
 
 
-REPOSITORY = "NVIDIA/yaml-sigil-test"
+REPOSITORY = "NVIDIA/yaml-sigil-rs"
 PULL = 17
 HEAD = "a" * 40
-BASE = "b" * 40
+POLICY_SHA = "b" * 40
+COORDINATION_SHA = "c" * 40
+COORDINATION_BRANCH = "dev/0.6.0"
+COORDINATION_REF = f"refs/heads/{COORDINATION_BRANCH}"
 COPIED_REF = f"pull-request/{PULL}"
 
 
@@ -40,16 +44,20 @@ class FakeApi:
         return copy.deepcopy(self.responses[path])
 
 
-def fixture(branch: str = "release-plz-manual-1.2.3-rc.4") -> dict[str, Any]:
+def fixture(
+    branch: str = "release-plz-manual-1.2.3-rc.4",
+    base_branch: str = "main",
+) -> dict[str, Any]:
     prefix = f"repos/{REPOSITORY}"
-    return {
+    base_sha = POLICY_SHA if base_branch == "main" else COORDINATION_SHA
+    responses = {
         f"{prefix}/pulls/{PULL}": {
             "number": PULL,
             "state": "open",
             "commits": 1,
             "base": {
-                "ref": "main",
-                "sha": BASE,
+                "ref": base_branch,
+                "sha": base_sha,
                 "repo": {"full_name": REPOSITORY},
             },
             "head": {
@@ -72,14 +80,20 @@ def fixture(branch: str = "release-plz-manual-1.2.3-rc.4") -> dict[str, Any]:
         },
         f"{prefix}/git/ref/heads/main": {
             "ref": "refs/heads/main",
-            "object": {"type": "commit", "sha": BASE},
+            "object": {"type": "commit", "sha": POLICY_SHA},
         },
     }
+    if base_branch != "main":
+        responses[f"{prefix}/git/ref/heads/{base_branch}"] = {
+            "ref": f"refs/heads/{base_branch}",
+            "object": {"type": "commit", "sha": base_sha},
+        }
+    return responses
 
 
 def bind(responses: dict[str, Any]) -> Any:
     return binder.bind_candidate_pr(
-        FakeApi(responses), REPOSITORY, COPIED_REF, HEAD, BASE
+        FakeApi(responses), REPOSITORY, COPIED_REF, HEAD, POLICY_SHA
     )
 
 
@@ -87,10 +101,51 @@ class CandidatePrBindingTests(unittest.TestCase):
     def test_canonical_release_branch_is_emitted(self) -> None:
         result = bind(fixture())
         self.assertEqual(result.release_branch, "release-plz-manual-1.2.3-rc.4")
+        self.assertEqual(result.base_ref, "refs/heads/main")
+        self.assertEqual(result.base_sha, POLICY_SHA)
+        self.assertEqual(result.check_name, "Required CI")
 
     def test_ordinary_branch_emits_no_release_value(self) -> None:
         result = bind(fixture("docs/clarify-example"))
         self.assertIsNone(result.release_branch)
+
+    def test_coordination_base_has_a_distinct_required_check(self) -> None:
+        result = bind(fixture("feat/new-api", COORDINATION_BRANCH))
+        self.assertEqual(result.base_ref, COORDINATION_REF)
+        self.assertEqual(result.base_sha, COORDINATION_SHA)
+        self.assertEqual(result.check_name, f"Required CI [{COORDINATION_REF}]")
+        self.assertIsNone(result.release_branch)
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory, "output")
+            binder.append_output(output, result)
+            self.assertEqual(
+                output.read_text(encoding="utf-8"),
+                (
+                    f"base_ref={COORDINATION_REF}\n"
+                    f"base_sha={COORDINATION_SHA}\n"
+                    f"check_name=Required CI [{COORDINATION_REF}]\n"
+                    "release_branch=\n"
+                ),
+            )
+
+    def test_policy_and_contribution_objects_cannot_be_swapped(self) -> None:
+        responses = fixture("feat/new-api", COORDINATION_BRANCH)
+        with self.assertRaisesRegex(binder.BindingError, "protected policy"):
+            binder.bind_candidate_pr(
+                FakeApi(responses),
+                REPOSITORY,
+                COPIED_REF,
+                HEAD,
+                COORDINATION_SHA,
+            )
+
+        responses = fixture("feat/new-api", COORDINATION_BRANCH)
+        responses[f"repos/{REPOSITORY}/git/ref/heads/{COORDINATION_BRANCH}"][
+            "object"
+        ]["sha"] = POLICY_SHA
+        with self.assertRaisesRegex(binder.BindingError, "contribution base"):
+            bind(responses)
 
     def test_every_mutable_binding_rejects_drift(self) -> None:
         prefix = f"repos/{REPOSITORY}"
@@ -168,6 +223,28 @@ class CandidatePrBindingTests(unittest.TestCase):
         ] = "fork/repo"
         with self.assertRaisesRegex(binder.BindingError, "canonical"):
             bind(responses)
+
+        with self.assertRaisesRegex(binder.BindingError, "canonical"):
+            bind(fixture("release-plz-manual-1.2.3", COORDINATION_BRANCH))
+
+    def test_coordination_base_must_match_repository_policy(self) -> None:
+        with self.assertRaisesRegex(binder.BindingError, "allowed coordination"):
+            bind(fixture("feat/new-api", "dev/not-semver"))
+
+        with self.assertRaisesRegex(binder.BindingError, "no protected"):
+            binder.base_policy("NVIDIA/another-repository", "main")
+
+        for branch in ("v2", "v2alpha1", "v2beta3"):
+            self.assertEqual(
+                binder.base_policy("NVIDIA/yaml-sigil-spec", branch),
+                (
+                    f"refs/heads/{branch}",
+                    f"Required CI [refs/heads/{branch}]",
+                ),
+            )
+        for branch in ("v0", "v1alpha0", "dev/2.0.0"):
+            with self.assertRaisesRegex(binder.BindingError, "allowed coordination"):
+                binder.base_policy("NVIDIA/yaml-sigil-spec", branch)
 
 
 if __name__ == "__main__":

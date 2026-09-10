@@ -2,8 +2,11 @@ name: CI
 
 on:
   push:
+    # Coordination refs run the same non-publishing matrix; rollback refs do
+    # not match and never execute CI or release policy.
     branches:
       - main
+      - dev/*.*.*
       - ci-testing/*
       - pull-request/[0-9]+
 
@@ -18,6 +21,7 @@ jobs:
     name: Policy and documentation
     if: >-
       ${{ github.ref == 'refs/heads/main' ||
+          startsWith(github.ref, 'refs/heads/dev/') ||
           startsWith(github.ref, 'refs/heads/ci-testing/') }}
     runs-on: linux-amd64-cpu4
     timeout-minutes: 20
@@ -78,6 +82,7 @@ jobs:
     name: Rust 1.98.0 (Linux)
     if: >-
       ${{ github.ref == 'refs/heads/main' ||
+          startsWith(github.ref, 'refs/heads/dev/') ||
           startsWith(github.ref, 'refs/heads/ci-testing/') }}
     runs-on: linux-amd64-cpu8
     timeout-minutes: 60
@@ -161,6 +166,7 @@ jobs:
     name: Rust 1.95.0 (Linux)
     if: >-
       ${{ github.ref == 'refs/heads/main' ||
+          startsWith(github.ref, 'refs/heads/dev/') ||
           startsWith(github.ref, 'refs/heads/ci-testing/') }}
     runs-on: linux-amd64-cpu8
     timeout-minutes: 40
@@ -191,6 +197,7 @@ jobs:
     if: >-
       ${{ always() &&
           (github.ref == 'refs/heads/main' ||
+           startsWith(github.ref, 'refs/heads/dev/') ||
            startsWith(github.ref, 'refs/heads/ci-testing/')) }}
     needs:
       - trusted_policy
@@ -214,6 +221,7 @@ jobs:
     name: Portability (${{ matrix.name }})
     if: >-
       ${{ github.ref == 'refs/heads/main' ||
+          startsWith(github.ref, 'refs/heads/dev/') ||
           startsWith(github.ref, 'refs/heads/ci-testing/') }}
     runs-on: ${{ matrix.runner }}
     continue-on-error: true
@@ -270,9 +278,69 @@ jobs:
       - name: Test xtask
         run: cargo test --locked --manifest-path xtask/Cargo.toml
 
+  candidate_binding:
+    name: Bind candidate to protected policy and base
+    if: ${{ startsWith(github.ref, 'refs/heads/pull-request/') }}
+    runs-on: linux-amd64-cpu4
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      base_ref: ${{ steps.pull.outputs.base_ref }}
+      base_sha: ${{ steps.pull.outputs.base_sha }}
+      policy_sha: ${{ steps.policy.outputs.policy_sha }}
+    env:
+      GH_TOKEN: ""
+      GITHUB_TOKEN: ""
+      GIT_ASKPASS: /bin/false
+      GIT_CONFIG_GLOBAL: /dev/null
+      GIT_CONFIG_NOSYSTEM: "1"
+      GIT_CONFIG_SYSTEM: /dev/null
+      GIT_TERMINAL_PROMPT: "0"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      # Bind the run before any candidate-executable job starts. Downstream
+      # jobs rebind these exact objects before materializing contributor code.
+      - name: Initialize fresh binding state
+        run: install -d -m 0700 "${RUNNER_TEMP}/candidate-binding"
+
+      - name: Stage binder from protected current main
+        id: policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init --quiet --initial-branch=main .
+          git remote add origin \
+            "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git -c credential.helper= -c http.extraHeader= \
+            fetch --quiet --no-tags --no-recurse-submodules --depth=1 \
+            origin "+refs/heads/main:refs/remotes/origin/main"
+          policy_sha="$(git rev-parse refs/remotes/origin/main)"
+          git show \
+            "${policy_sha}:.github/scripts/bind-candidate-pr.py" \
+            > bind-candidate-pr.py
+          chmod 0500 bind-candidate-pr.py
+          python3 -m py_compile bind-candidate-pr.py
+          printf 'policy_sha=%s\n' "${policy_sha}" >> "${GITHUB_OUTPUT}"
+        working-directory: ${{ runner.temp }}/candidate-binding
+
+      - name: Bind copied ref to exact policy and contribution base
+        id: pull
+        env:
+          POLICY_SHA: ${{ steps.policy.outputs.policy_sha }}
+        run: >-
+          python3 ./bind-candidate-pr.py
+          --repository "${GITHUB_REPOSITORY}"
+          --copied-ref "${GITHUB_REF_NAME}"
+          --head-sha "${GITHUB_SHA}"
+          --policy-sha "${POLICY_SHA}"
+          --output "${GITHUB_OUTPUT}"
+        working-directory: ${{ runner.temp }}/candidate-binding
+
   candidate_linux_lanes:
     name: Candidate ${{ matrix.name }} (Linux)
     if: ${{ startsWith(github.ref, 'refs/heads/pull-request/') }}
+    needs:
+      - candidate_binding
     runs-on: linux-amd64-cpu8
     timeout-minutes: 75
     permissions: {}
@@ -386,7 +454,7 @@ jobs:
             "${POLICY_BIN}/check-release-pr.sh" \
             "${POLICY_BIN}/materialize-candidate.sh" \
             "${POLICY_BIN}/check-pull-request-commits.sh"
-          printf 'base_sha=%s\n' \
+          printf 'policy_sha=%s\n' \
             "$(git rev-parse refs/remotes/origin/main)" >> "${GITHUB_OUTPUT}"
         working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/bootstrap
 
@@ -394,19 +462,34 @@ jobs:
       # release branch; ordinary contributor branches produce an empty value.
       - name: Bind current pull request metadata
         id: candidate_pr
-        if: ${{ matrix.full }}
         env:
-          BASE_SHA: ${{ steps.protected_policy.outputs.base_sha }}
           CANDIDATE_REF: ${{ github.ref_name }}
           CANDIDATE_SHA: ${{ github.sha }}
+          POLICY_SHA: ${{ steps.protected_policy.outputs.policy_sha }}
         shell: bash
         run: >-
           python3 "${POLICY_BIN}/bind-candidate-pr.py"
           --repository "${GITHUB_REPOSITORY}"
           --copied-ref "${CANDIDATE_REF}"
           --head-sha "${CANDIDATE_SHA}"
-          --base-sha "${BASE_SHA}"
+          --policy-sha "${POLICY_SHA}"
           --output "${GITHUB_OUTPUT}"
+        working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/bootstrap
+
+      # The aggregate verdict records the binding established before any
+      # candidate job began. Fail if protected policy or the base moved.
+      - name: Match pre-execution policy and base binding
+        env:
+          BASE_REF: ${{ steps.candidate_pr.outputs.base_ref }}
+          BASE_SHA: ${{ steps.candidate_pr.outputs.base_sha }}
+          EXPECTED_BASE_REF: ${{ needs.candidate_binding.outputs.base_ref }}
+          EXPECTED_BASE_SHA: ${{ needs.candidate_binding.outputs.base_sha }}
+          EXPECTED_POLICY_SHA: ${{ needs.candidate_binding.outputs.policy_sha }}
+          POLICY_SHA: ${{ steps.protected_policy.outputs.policy_sha }}
+        run: |
+          test "${POLICY_SHA}" = "${EXPECTED_POLICY_SHA}"
+          test "${BASE_REF}" = "${EXPECTED_BASE_REF}"
+          test "${BASE_SHA}" = "${EXPECTED_BASE_SHA}"
         working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/bootstrap
 
       - name: Install fixed actionlint
@@ -483,30 +566,33 @@ jobs:
       # copied ref. No Action step follows this point in the candidate job.
       - name: Materialize exact candidate without credentials
         env:
+          BASE_REF: ${{ steps.candidate_pr.outputs.base_ref }}
+          BASE_SHA: ${{ steps.candidate_pr.outputs.base_sha }}
           CANDIDATE_REF: ${{ github.ref_name }}
           CANDIDATE_SHA: ${{ github.sha }}
+          POLICY_SHA: ${{ steps.protected_policy.outputs.policy_sha }}
         shell: bash
         run: |
           set -euo pipefail
           "${POLICY_BIN}/materialize-candidate.sh" \
             "${GITHUB_REPOSITORY}" "${CANDIDATE_SHA}" "${CANDIDATE_REF}" \
+            "${POLICY_SHA}" "${BASE_REF}" "${BASE_SHA}" \
             source-spec https://github.com/NVIDIA/yaml-sigil-spec.git
         working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/source
 
       - name: Check pull request commit policy
         if: ${{ matrix.full }}
         env:
+          BASE_SHA: ${{ steps.candidate_pr.outputs.base_sha }}
           HEAD_SHA: ${{ github.sha }}
         run: |
-          BASE_SHA="$(git rev-parse refs/remotes/origin/main)"
-          export BASE_SHA
           "${POLICY_BIN}/check-pull-request-commits.sh"
         working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/source
 
       - name: Validate canonical release transaction
         if: ${{ steps.candidate_pr.outputs.release_branch != '' }}
         env:
-          BASE_SHA: ${{ steps.protected_policy.outputs.base_sha }}
+          BASE_SHA: ${{ steps.candidate_pr.outputs.base_sha }}
           HEAD_SHA: ${{ github.sha }}
           YAML_SIGIL_RELEASE_PR_BRANCH: >-
             ${{ steps.candidate_pr.outputs.release_branch }}
@@ -649,9 +735,11 @@ jobs:
         working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/source
 
   candidate_linux:
-    name: Candidate CI (Linux)
+    name: >-
+      Candidate CI (Linux) [policy=${{ needs.candidate_binding.outputs.policy_sha }};base=${{ needs.candidate_binding.outputs.base_ref }}@${{ needs.candidate_binding.outputs.base_sha }}]
     if: ${{ always() && startsWith(github.ref, 'refs/heads/pull-request/') }}
     needs:
+      - candidate_binding
       - candidate_linux_lanes
     runs-on: linux-amd64-cpu4
     timeout-minutes: 5
@@ -659,12 +747,17 @@ jobs:
     steps:
       - name: Require Rust 1.98.0 and 1.95.0 candidate lanes
         env:
+          BINDING_RESULT: ${{ needs.candidate_binding.result }}
           CANDIDATE_LANES_RESULT: ${{ needs.candidate_linux_lanes.result }}
-        run: test "${CANDIDATE_LANES_RESULT}" = success
+        run: |
+          test "${BINDING_RESULT}" = success
+          test "${CANDIDATE_LANES_RESULT}" = success
 
   candidate_portability:
     name: Candidate portability (${{ matrix.name }})
     if: ${{ startsWith(github.ref, 'refs/heads/pull-request/') }}
+    needs:
+      - candidate_binding
     runs-on: ${{ matrix.runner }}
     continue-on-error: true
     timeout-minutes: 45
@@ -738,6 +831,7 @@ jobs:
 
       # Stage fixed protected helpers before candidate-controlled source exists.
       - name: Stage protected candidate policy
+        id: protected_policy
         shell: bash
         run: |
           set -euo pipefail
@@ -757,13 +851,19 @@ jobs:
             refs/remotes/origin/main:.github/scripts/materialize-candidate.sh \
             > "${POLICY_BIN}/materialize-candidate.sh"
           "${protected_git_show[@]}" \
+            refs/remotes/origin/main:.github/scripts/bind-candidate-pr.py \
+            > "${POLICY_BIN}/bind-candidate-pr.py"
+          "${protected_git_show[@]}" \
             refs/remotes/origin/main:.github/scripts/remove-preinstalled-aws-tap.sh \
             > "${POLICY_BIN}/remove-preinstalled-aws-tap.sh"
           if [[ "${github_windows}" == "false" ]]; then
             chmod 0500 \
+              "${POLICY_BIN}/bind-candidate-pr.py" \
               "${POLICY_BIN}/materialize-candidate.sh" \
               "${POLICY_BIN}/remove-preinstalled-aws-tap.sh"
           fi
+          printf 'policy_sha=%s\n' \
+            "$(git rev-parse refs/remotes/origin/main)" >> "${GITHUB_OUTPUT}"
         working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/bootstrap
 
       - name: Remove unused preinstalled Homebrew source
@@ -771,6 +871,40 @@ jobs:
         shell: bash
         run: |
           "${POLICY_BIN}/remove-preinstalled-aws-tap.sh"
+        working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/bootstrap
+
+      # Rebind the exact contribution base separately from protected policy on
+      # every advisory host before candidate materialization.
+      - name: Bind current pull request metadata
+        id: candidate_pr
+        env:
+          CANDIDATE_REF: ${{ github.ref_name }}
+          CANDIDATE_SHA: ${{ github.sha }}
+          POLICY_SHA: ${{ steps.protected_policy.outputs.policy_sha }}
+        shell: bash
+        run: >-
+          python3 "${POLICY_BIN}/bind-candidate-pr.py"
+          --repository "${GITHUB_REPOSITORY}"
+          --copied-ref "${CANDIDATE_REF}"
+          --head-sha "${CANDIDATE_SHA}"
+          --policy-sha "${POLICY_SHA}"
+          --output "${GITHUB_OUTPUT}"
+        working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/bootstrap
+
+      # Advisory jobs cannot affect Required CI, but they still fail closed if
+      # their protected policy or contribution base differs from preflight.
+      - name: Match pre-execution policy and base binding
+        env:
+          BASE_REF: ${{ steps.candidate_pr.outputs.base_ref }}
+          BASE_SHA: ${{ steps.candidate_pr.outputs.base_sha }}
+          EXPECTED_BASE_REF: ${{ needs.candidate_binding.outputs.base_ref }}
+          EXPECTED_BASE_SHA: ${{ needs.candidate_binding.outputs.base_sha }}
+          EXPECTED_POLICY_SHA: ${{ needs.candidate_binding.outputs.policy_sha }}
+          POLICY_SHA: ${{ steps.protected_policy.outputs.policy_sha }}
+        run: |
+          test "${POLICY_SHA}" = "${EXPECTED_POLICY_SHA}"
+          test "${BASE_REF}" = "${EXPECTED_BASE_REF}"
+          test "${BASE_SHA}" = "${EXPECTED_BASE_SHA}"
         working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/bootstrap
 
       # Resolve the fixed rustup launcher before candidate files exist. `run`
@@ -794,13 +928,17 @@ jobs:
       # No Action or privileged host-setup step follows candidate materialization.
       - name: Materialize exact candidate without credentials
         env:
+          BASE_REF: ${{ steps.candidate_pr.outputs.base_ref }}
+          BASE_SHA: ${{ steps.candidate_pr.outputs.base_sha }}
           CANDIDATE_REF: ${{ github.ref_name }}
           CANDIDATE_SHA: ${{ github.sha }}
+          POLICY_SHA: ${{ steps.protected_policy.outputs.policy_sha }}
         shell: bash
         run: |
           set -euo pipefail
           "${POLICY_BIN}/materialize-candidate.sh" \
             "${GITHUB_REPOSITORY}" "${CANDIDATE_SHA}" "${CANDIDATE_REF}" \
+            "${POLICY_SHA}" "${BASE_REF}" "${BASE_SHA}" \
             source-spec https://github.com/NVIDIA/yaml-sigil-spec.git
         working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/source
 

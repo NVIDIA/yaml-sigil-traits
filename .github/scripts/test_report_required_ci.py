@@ -19,13 +19,16 @@ sys.modules[SPEC.name] = reporter
 SPEC.loader.exec_module(reporter)
 
 
-REPOSITORY = "NVIDIA/yaml-sigil-test"
+REPOSITORY = "NVIDIA/yaml-sigil-rs"
 RUN_ID = 1234
 ATTEMPT = 2
 WORKFLOW_ID = 123456
 PULL = 65
 HEAD = "a" * 40
 POLICY_SHA = "b" * 40
+COORDINATION_SHA = "d" * 40
+COORDINATION_BRANCH = "dev/0.6.0"
+OTHER_COORDINATION_BRANCH = "dev/0.7.0"
 WORKFLOW_BLOB = "c" * 40
 SIGNER_ID = 42
 SIGNER_LOGIN = "example-contributor"
@@ -65,12 +68,16 @@ def policy() -> Any:
         workflow_id=WORKFLOW_ID,
         workflow_path=".github/workflows/ci.yml",
         job_name="Candidate CI (Linux)",
-        check_name="Required CI",
         app_slug="nvidia-yamlsigil-release-pr",
     )
 
 
-def fixture() -> tuple[dict[str, Any], dict[tuple[str, str], Any]]:
+def fixture(
+    base_branch: str = "main",
+    base_sha: str | None = None,
+) -> tuple[dict[str, Any], dict[tuple[str, str], Any]]:
+    if base_sha is None:
+        base_sha = POLICY_SHA if base_branch == "main" else COORDINATION_SHA
     run = {
         "id": RUN_ID,
         "run_attempt": ATTEMPT,
@@ -126,8 +133,8 @@ def fixture() -> tuple[dict[str, Any], dict[tuple[str, str], Any]]:
             "state": "open",
             "commits": 1,
             "base": {
-                "ref": "main",
-                "sha": POLICY_SHA,
+                "ref": base_branch,
+                "sha": base_sha,
                 "repo": {"full_name": REPOSITORY},
             },
             "head": {"sha": HEAD, "ref": "feature", "repo": {"full_name": "fork/repo"}},
@@ -204,7 +211,12 @@ def fixture() -> tuple[dict[str, Any], dict[tuple[str, str], Any]]:
             "total_count": 2,
             "jobs": [
                 {
-                    "name": "Candidate CI (Linux)",
+                    "name": reporter.attested_job_name(
+                        "Candidate CI (Linux)",
+                        POLICY_SHA,
+                        f"refs/heads/{base_branch}",
+                        base_sha,
+                    ),
                     "run_id": RUN_ID,
                     "run_attempt": ATTEMPT,
                     "head_sha": HEAD,
@@ -226,6 +238,11 @@ def fixture() -> tuple[dict[str, Any], dict[tuple[str, str], Any]]:
             f"repos/{REPOSITORY}/actions/runs/{RUN_ID}/artifacts?per_page=1",
         ): {"total_count": 0, "artifacts": []},
     }
+    if base_branch != "main":
+        paths[("GET", f"repos/{REPOSITORY}/git/ref/heads/{base_branch}")] = {
+            "ref": f"refs/heads/{base_branch}",
+            "object": {"type": "commit", "sha": base_sha},
+        }
     return event, paths
 
 
@@ -238,8 +255,81 @@ class BindingTests(unittest.TestCase):
         event, responses = fixture()
         result = bind(event, responses)
         self.assertEqual(result.head_sha, HEAD)
+        self.assertEqual(result.base_ref, "refs/heads/main")
+        self.assertEqual(result.base_sha, POLICY_SHA)
+        self.assertEqual(result.check_name, "Required CI")
         self.assertEqual(result.conclusion, "success")
         self.assertEqual(result.check_conclusion, "success")
+
+    def test_coordination_base_uses_a_nonreusable_check_context(self) -> None:
+        event, responses = fixture(COORDINATION_BRANCH)
+        coordination = bind(event, responses)
+        self.assertEqual(
+            coordination.check_name,
+            f"Required CI [refs/heads/{COORDINATION_BRANCH}]",
+        )
+        self.assertEqual(coordination.base_sha, COORDINATION_SHA)
+
+        event, responses = fixture()
+        main = bind(event, responses)
+        event, responses = fixture(OTHER_COORDINATION_BRANCH)
+        other = bind(event, responses)
+        self.assertEqual({main.head_sha, coordination.head_sha, other.head_sha}, {HEAD})
+        self.assertEqual(len({main.check_name, coordination.check_name, other.check_name}), 3)
+
+        with self.assertRaisesRegex(reporter.ReporterError, "no protected"):
+            reporter.base_policy("NVIDIA/another-repository", "main")
+
+    def test_policy_and_contribution_objects_cannot_be_swapped(self) -> None:
+        event, responses = fixture(COORDINATION_BRANCH)
+        responses[("GET", f"repos/{REPOSITORY}/git/ref/heads/main")]["object"][
+            "sha"
+        ] = COORDINATION_SHA
+        with self.assertRaisesRegex(reporter.ReporterError, "current protected main"):
+            bind(event, responses)
+
+        event, responses = fixture(COORDINATION_BRANCH)
+        responses[
+            ("GET", f"repos/{REPOSITORY}/git/ref/heads/{COORDINATION_BRANCH}")
+        ]["object"]["sha"] = POLICY_SHA
+        with self.assertRaisesRegex(reporter.ReporterError, "contribution base"):
+            bind(event, responses)
+
+    def test_run_attestation_rejects_temporal_policy_or_base_substitution(self) -> None:
+        jobs_path = (
+            "GET",
+            f"repos/{REPOSITORY}/actions/runs/{RUN_ID}/attempts/{ATTEMPT}/jobs?per_page=100",
+        )
+
+        event, responses = fixture()
+        responses[jobs_path]["jobs"][0]["name"] = reporter.attested_job_name(
+            "Candidate CI (Linux)",
+            "e" * 40,
+            "refs/heads/main",
+            POLICY_SHA,
+        )
+        with self.assertRaisesRegex(reporter.ReporterError, "attested authoritative"):
+            bind(event, responses)
+
+        event, responses = fixture(COORDINATION_BRANCH)
+        responses[jobs_path]["jobs"][0]["name"] = reporter.attested_job_name(
+            "Candidate CI (Linux)",
+            POLICY_SHA,
+            "refs/heads/main",
+            POLICY_SHA,
+        )
+        with self.assertRaisesRegex(reporter.ReporterError, "attested authoritative"):
+            bind(event, responses)
+
+        event, responses = fixture(COORDINATION_BRANCH)
+        responses[jobs_path]["jobs"][0]["name"] = reporter.attested_job_name(
+            "Candidate CI (Linux)",
+            POLICY_SHA,
+            f"refs/heads/{COORDINATION_BRANCH}",
+            "e" * 40,
+        )
+        with self.assertRaisesRegex(reporter.ReporterError, "attested authoritative"):
+            bind(event, responses)
 
     def test_every_security_binding_rejects_drift(self) -> None:
         def wrong_delivered_run_id(event: dict[str, Any], responses: dict[Any, Any]) -> None:
@@ -482,6 +572,35 @@ class ReportingTests(unittest.TestCase):
         )
         self.assertEqual(reporter.report_check(api, policy(), self.binding), 88)
         self.assertEqual(len(api.calls), 1)
+
+    def test_coordination_check_uses_only_its_base_context(self) -> None:
+        event, responses = fixture(COORDINATION_BRANCH)
+        binding = bind(event, responses)
+        query = (
+            "check_name=Required+CI+%5Brefs%2Fheads%2Fdev%2F0.6.0%5D"
+            "&filter=all&per_page=100"
+        )
+        check = {
+            "id": 89,
+            "name": binding.check_name,
+            "head_sha": HEAD,
+            "external_id": binding.external_id,
+            "status": "completed",
+            "conclusion": "success",
+            "app": {"slug": "nvidia-yamlsigil-release-pr"},
+        }
+        api = FakeApi(
+            {
+                ("GET", f"repos/{REPOSITORY}/commits/{HEAD}/check-runs?{query}"): {
+                    "total_count": 0,
+                    "check_runs": [],
+                },
+                ("POST", f"repos/{REPOSITORY}/check-runs"): check,
+                ("GET", f"repos/{REPOSITORY}/check-runs/89"): check,
+            }
+        )
+        self.assertEqual(reporter.report_check(api, policy(), binding), 89)
+        self.assertEqual(api.calls[1][2]["name"], binding.check_name)
 
 
 if __name__ == "__main__":
