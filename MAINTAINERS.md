@@ -231,10 +231,61 @@ does not authorize integration.
 
 #### Preserve exact commits
 
-Direct updates to `main` are not a general pull-request integration method.
-Use the default squash path. An exact-history operation requires its own
-separately landed, operation-specific policy and runbook; explicit
-authorization alone does not create that path.
+Default to squash. Preserve an exact commit series only when its author is a
+current trusted writer, explicit human authorization covers the exact series,
+and every retained commit is linear, GitHub Verified, DCO-compliant, and worth
+preserving as a distinct change. This path remains a pull-request integration
+operation; it does not authorize unrelated direct pushes or history rewrites.
+
+1. Record the exact pull request, its current base and head, and the current
+   `main` object as `OLD-SHA`. Require the base and `main` to equal `OLD-SHA`,
+   the pull-request head to equal `NEW-SHA`, all threads to be resolved, and
+   App-owned `Required CI` to have succeeded on `NEW-SHA`.
+2. Prove locally that the proposed update is a fast-forward:
+
+   ```shell
+   git merge-base --is-ancestor <OLD-SHA> <NEW-SHA>
+   ```
+
+3. Require a separate active ruleset that targets only `main`, has no bypass
+   actors, and independently enforces linear history plus deletion and
+   non-fast-forward protection. Capture, canonicalize, and digest it, the
+   complete `Protect main and require CI` ruleset, and every tag ruleset.
+   Include each ruleset's target, enforcement, conditions, rules, and bypass
+   actors. Prepare the exact admission-ruleset restoration payload, readback,
+   and cleanup path before mutation.
+4. Serialize repository mutations. Add only the authenticated maintainer as a
+   temporary `User` bypass actor with `bypass_mode: always` to
+   `Protect main and require CI`. Read back the complete ruleset and prove this
+   is the only change. The independent history ruleset and tag rulesets remain
+   unchanged.
+5. Re-read the pull request, `main`, and the source branch. Stop on any drift.
+   Bind the fast-forward to the recorded old object:
+
+   ```shell
+   git push \
+     --force-with-lease=refs/heads/main:<OLD-SHA> \
+     origin <NEW-SHA>:refs/heads/main
+   ```
+
+   This exact lease is only a stale-ref compare-and-swap guard. It never
+   permits a non-fast-forward update; the independent server rule must reject
+   one. Generic `--force-with-lease` and every retry of an ambiguous update are
+   prohibited.
+6. Restore the complete original admission ruleset unconditionally before
+   interpreting the update. If restoration is ambiguous, read it back before
+   another exact restoration attempt. Until the original digest is restored,
+   stop unrelated repository mutations, but continue the prepared restoration,
+   readback, and escalation path.
+7. Read back `main`. Require it to equal `NEW-SHA`, verify every preserved
+   commit and pull-request association, then require current-main CI success,
+   an ordinary non-release Publish no-op, and zero retained artifacts or
+   deployments. Prove the independent history-ruleset and tag-ruleset digests
+   are unchanged.
+
+Before first use and after changing this command, exercise the same lease
+against a disposable local Git remote. Advance the destination after recording
+the old object, then prove the push fails and leaves the destination unchanged.
 
 ### Merge with accepted failing checks
 
