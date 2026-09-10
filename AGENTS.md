@@ -312,10 +312,12 @@ environment, cache-save path, or retained artifact. Candidate jobs stage fixed
 tools in fresh runner-temporary state, complete static policy checks before
 candidate executable work, and leave that executable phase terminal. The local
 command does not launch other operating systems. The checkout-free reporter
-uses the shared `protected-automation` environment, so contributor admission
-has two exact-run human gates: copied-head authorization and reporter deployment
-approval. Prove both gates with the controlled canary before enabling external
-contributor execution.
+uses the shared `protected-automation` environment and runs automatically from
+protected current `main` after candidate CI. Exact-head `/ok to test`
+authorization is the sole per-head human gate; a changed head requires fresh
+authorization. Before enabling external contributor execution, prove that
+one-human-step flow, the App-owned verdict, and zero retained output with a
+controlled canary.
 
 Validate shell scripts under `.github/scripts` with Shuck before landing
 changes. Install it from the `shuck-cli` crate and run it from the repository
