@@ -21,8 +21,13 @@ cargo binstall --force --locked --no-confirm release-plz@0.3.160
 test "$(release-plz --version)" = "release-plz 0.3.160"
 ```
 
-Create a new canonical branch. `prepare` strips release credentials, runs
-`release-plz update`, and accepts changes only to the manifest and changelog.
+Create a new canonical branch. If current `main` carries an unpublished
+`MAJOR.MINOR.PATCH-rc.0` coordination stub, select either its first real RC or
+the stable `MAJOR.MINOR.PATCH`; never release `rc.0` itself. `prepare` strips
+release credentials, runs `release-plz update` first, and uses pinned
+`release-plz set-version` only for a bounded maintainer-selected version
+adjustment. It accepts changes only to the manifest and changelog.
+Both `prepare` and `check` reject `rc.0` as a release version.
 
 ```shell
 version="<SEMVER>"
