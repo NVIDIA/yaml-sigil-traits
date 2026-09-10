@@ -4,6 +4,8 @@
 //! Provider-neutral preparation and validation for a manual release PR.
 
 use std::collections::BTreeSet;
+use std::fs;
+use std::io::Write as _;
 use std::path::Path;
 use std::process::{Command, Output};
 
@@ -17,6 +19,7 @@ use crate::release_policy::{RELEASE_PLZ_VERSION, TRAITS_PACKAGE};
 use crate::{cargo_metadata_output, package_content, safe_file};
 
 const BRANCH_PREFIX: &str = "release-plz-manual-";
+const ACTIVATION_BRANCH_PREFIX: &str = "activate-";
 const RELEASE_CONFIG: &str = ".release-plz.toml";
 const RELEASE_CREDENTIAL_ENV: &[&str] = &[
     "ACTIONS_CACHE_URL",
@@ -33,6 +36,7 @@ const RELEASE_CREDENTIAL_ENV: &[&str] = &[
 const DCO_TRAILER: &str =
     "Signed-off-by: ddurst <267424412+ddurst-nvidia@users.noreply.github.com>";
 const RELEASE_PATHS: &[&str] = &["CHANGELOG.md", "Cargo.toml"];
+const ACTIVATION_PATHS: &[&str] = &["Cargo.toml"];
 
 #[derive(Args)]
 pub(crate) struct ReleaseArgs {
@@ -42,6 +46,12 @@ pub(crate) struct ReleaseArgs {
 
 #[derive(Subcommand)]
 enum ReleaseCommand {
+    /// Prepare an unpublished rc.0 coordination-line activation from exact main.
+    Activate {
+        /// Stable target version whose coordination state starts at rc.0.
+        #[arg(long)]
+        version: Version,
+    },
     /// Run pinned release-plz update on an exact clean manual branch.
     Prepare {
         /// Exact version selected by the maintainer.
@@ -58,9 +68,75 @@ enum ReleaseCommand {
 
 pub(crate) fn run(root: &Path, args: ReleaseArgs) -> Result<(), String> {
     match args.command {
+        ReleaseCommand::Activate { version } => activate(root, &version),
         ReleaseCommand::Prepare { version } => prepare(root, &version),
         ReleaseCommand::Check { version } => check(root, &version),
     }
+}
+
+fn activate(root: &Path, target: &Version) -> Result<(), String> {
+    let current = manifest_version(root)?;
+    let selected = activation_version(&current, target)?;
+    require_activation_branch(root, target)?;
+    require_exact_git_state(root, true)?;
+
+    // rc.0 is a non-release safety stub for the coordination line. Keep
+    // release-plz and the changelog out of this transition; release-plz first
+    // participates after promotion when a maintainer prepares a real release.
+    set_activation_manifest_version(root, &current, &selected)?;
+
+    require_exact_changed_paths(root, ACTIVATION_PATHS, "activation")?;
+    if manifest_version(root)? != selected {
+        return Err(format!(
+            "activation did not retain exact version {selected}"
+        ));
+    }
+    eprintln!(
+        "release: prepared unpublished coordination state {selected}; only Cargo.toml changed"
+    );
+    Ok(())
+}
+
+fn activation_version(current: &Version, target: &Version) -> Result<Version, String> {
+    if !current.pre.is_empty() || !current.build.is_empty() {
+        return Err("coordination activation requires a stable current main version".to_string());
+    }
+    if !target.pre.is_empty() || !target.build.is_empty() {
+        return Err("coordination target must be a stable MAJOR.MINOR.PATCH version".to_string());
+    }
+    let selected = Version::parse(&format!("{target}-rc.0"))
+        .map_err(|error| format!("derive coordination version: {error}"))?;
+    if selected <= *current {
+        return Err(format!(
+            "coordination version {selected} must advance current main {current}"
+        ));
+    }
+    Ok(selected)
+}
+
+fn set_activation_manifest_version(
+    root: &Path,
+    current: &Version,
+    selected: &Version,
+) -> Result<(), String> {
+    let relative = Path::new("Cargo.toml");
+    let body = safe_file::read_manifest(root, relative)
+        .map_err(|error| format!("read Cargo.toml for coordination activation: {error}"))?;
+    let mut document = body
+        .parse::<DocumentMut>()
+        .map_err(|error| format!("parse Cargo.toml for coordination activation: {error}"))?;
+    let version = document
+        .get_mut("package")
+        .and_then(toml_edit::Item::as_table_like_mut)
+        .and_then(|package| package.get_mut("version"))
+        .ok_or_else(|| "Cargo.toml lacks package.version".to_string())?;
+    if version.as_str() != Some(current.to_string().as_str()) {
+        return Err(format!(
+            "Cargo.toml package.version changed from expected {current}"
+        ));
+    }
+    *version = toml_edit::value(selected.to_string());
+    write_exact_file(root, relative, &document.to_string())
 }
 
 fn prepare(root: &Path, version: &Version) -> Result<(), String> {
@@ -165,6 +241,18 @@ fn release_plz_command(root: &Path) -> Command {
     command
 }
 
+fn require_activation_branch(root: &Path, target: &Version) -> Result<(), String> {
+    let expected = format!("{ACTIVATION_BRANCH_PREFIX}{target}");
+    let observed = git_optional_line(root, &["symbolic-ref", "--short", "HEAD"])?
+        .ok_or_else(|| "coordination activation requires a named local branch".to_string())?;
+    if observed != expected {
+        return Err(format!(
+            "coordination activation branch differs: expected {expected}, found {observed}"
+        ));
+    }
+    Ok(())
+}
+
 fn require_branch(root: &Path, version: &Version) -> Result<(), String> {
     let expected = format!("{BRANCH_PREFIX}{version}");
     let current = git_optional_line(root, &["symbolic-ref", "--short", "HEAD"])?;
@@ -226,6 +314,59 @@ fn require_release_changes(root: &Path, accept_committed: bool) -> Result<(), St
             actual.into_iter().collect::<Vec<_>>().join(", ")
         ));
     }
+    Ok(())
+}
+
+fn require_exact_changed_paths(root: &Path, expected: &[&str], label: &str) -> Result<(), String> {
+    let mut actual = git_paths(root, &["diff", "--name-only", "--no-renames", "-z", "HEAD"])?;
+    actual.extend(git_paths(
+        root,
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+    )?);
+    let expected = expected
+        .iter()
+        .map(|path| (*path).to_string())
+        .collect::<BTreeSet<_>>();
+    if actual != expected {
+        return Err(format!(
+            "{label} paths differ: expected [{}], found [{}]",
+            expected.into_iter().collect::<Vec<_>>().join(", "),
+            actual.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    Ok(())
+}
+
+fn write_exact_file(root: &Path, relative: &Path, body: &str) -> Result<(), String> {
+    let path = root.join(relative);
+    let metadata = fs::symlink_metadata(&path)
+        .map_err(|error| format!("inspect {}: {error}", relative.display()))?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(format!("{} is not a regular file", relative.display()));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{} has no parent", relative.display()))?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(|error| {
+        format!(
+            "create restoration file for {}: {error}",
+            relative.display()
+        )
+    })?;
+    temporary
+        .write_all(body.as_bytes())
+        .map_err(|error| format!("write restoration file for {}: {error}", relative.display()))?;
+    temporary
+        .as_file()
+        .set_permissions(metadata.permissions())
+        .map_err(|error| format!("preserve permissions for {}: {error}", relative.display()))?;
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|error| format!("sync restoration file for {}: {error}", relative.display()))?;
+    temporary
+        .persist(&path)
+        .map_err(|error| format!("restore {}: {}", relative.display(), error.error))?;
     Ok(())
 }
 
@@ -570,6 +711,57 @@ mod tests {
             "## [1.2.30](https://example.invalid)",
             "## [1.2.3]"
         ));
+    }
+
+    #[test]
+    fn coordination_activation_derives_only_a_forward_rc_zero() {
+        let current = Version::parse("0.4.0").unwrap();
+        assert_eq!(
+            activation_version(&current, &Version::parse("0.5.0").unwrap()).unwrap(),
+            Version::parse("0.5.0-rc.0").unwrap()
+        );
+        for target in ["0.4.0", "0.5.0-rc.1", "0.5.0+local"] {
+            assert!(activation_version(&current, &Version::parse(target).unwrap()).is_err());
+        }
+        assert!(
+            activation_version(
+                &Version::parse("0.4.1-rc.1").unwrap(),
+                &Version::parse("0.5.0").unwrap(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn coordination_activation_changes_only_the_package_version() {
+        let temporary = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temporary.path().join("Cargo.toml"),
+            "[package]\nname = \"example\"\nversion = \"0.4.0\"\npublish = [\"crates-io\"]\n",
+        )
+        .unwrap();
+        set_activation_manifest_version(
+            temporary.path(),
+            &Version::parse("0.4.0").unwrap(),
+            &Version::parse("0.5.0-rc.0").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(temporary.path().join("Cargo.toml")).unwrap(),
+            "[package]\nname = \"example\"\nversion = \"0.5.0-rc.0\"\npublish = [\"crates-io\"]\n"
+        );
+    }
+
+    #[test]
+    fn coordination_activation_leaves_only_the_manifest() {
+        let temporary = git_fixture();
+        write_exact_file(temporary.path(), Path::new("CHANGELOG.md"), "# Changelog\n").unwrap();
+        require_exact_changed_paths(temporary.path(), ACTIVATION_PATHS, "activation").unwrap();
+
+        std::fs::write(temporary.path().join("unexpected.txt"), "unexpected\n").unwrap();
+        assert!(
+            require_exact_changed_paths(temporary.path(), ACTIVATION_PATHS, "activation").is_err()
+        );
     }
 
     #[test]

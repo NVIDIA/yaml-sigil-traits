@@ -4,7 +4,8 @@
 
 Ordinary repository work does not require the maintainer guide. Before
 performing or advising on hosted maintainer operations—authorizing pull-request
-tests, merging, exceptional integration, or reverting `main`—read
+tests, merging, activating or synchronizing a coordination line, exceptional
+integration, or reverting `main`—read
 [`MAINTAINERS.md`](MAINTAINERS.md) completely.
 
 Whenever a workflow or supporting policy changes, update the matching
@@ -205,17 +206,21 @@ Prepare and validate a locally owned release transaction with the exact
 maintainer-selected version:
 
 ```shell
+cargo xtask release activate --version MAJOR.MINOR.PATCH
 cargo xtask release prepare --version VERSION
 cargo xtask release check --version VERSION
 ```
 
-`prepare` requires pinned release-plz `0.3.160`, exact clean `origin/main`, and
+`release activate` prepares only an unpublished `MAJOR.MINOR.PATCH-rc.0`
+coordination state from exact clean `origin/main`; follow `MAINTAINERS.md` for
+its separate protected-ref transaction. `prepare` requires pinned release-plz
+`0.3.160`, exact clean `origin/main`, and
 the canonical `release-plz-manual-VERSION` branch. `check` requires its sole
 SSH-signed, DCO-signed commit current with `origin/main` and verifies the
 branch, exact paths, source package, version, changelog, and release-plz
 policy. It is credential-free and does not run `release-plz release`. Follow
-`RELEASING.md` for the separate maintainer-operated exact-head dry run;
-neither xtask command publishes or uses credentials.
+`RELEASING.md` for the separate maintainer-operated exact-head dry run. These
+xtask commands do not publish or use credentials.
 
 The command runs these checks in order:
 
