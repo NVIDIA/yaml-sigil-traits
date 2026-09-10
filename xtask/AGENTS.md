@@ -7,6 +7,11 @@ small, and covered by `CommandFactory::debug_assert()`.
 credential-free. They may run ordinary development commands, but they must not
 inspect a CI provider, parse workflow YAML, call a forge API, or publish.
 
+`cargo xtask release activate --version <MAJOR.MINOR.PATCH>` selects the
+unpublished `<MAJOR.MINOR.PATCH>-rc.0` coordination safety stub from exact
+clean `origin/main`. It does not invoke release-plz or edit a changelog, leaves
+only `Cargo.toml` changed, and never creates or updates a remote ref.
+
 The only provider-specific namespace is `cargo xtask github release`. Keep it
 limited to `qualify` and `finalize`:
 

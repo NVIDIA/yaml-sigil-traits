@@ -60,6 +60,82 @@ the base, protected `main` policy, or head moves.
 4. If the PR head or `main` changes, rebase, review, and authorize the new
    exact head. Never reuse a stale command or verdict.
 
+### Create and activate a coordination line
+
+Landing coordination support does not activate a line. Use this procedure only
+for a concrete approved next version, with one separately reviewed repository-
+administrator activation packet and explicit authorization for its exact
+objects and settings. The activation version is an unpublished `rc.0`
+placeholder; release preparation remains main-only.
+
+1. Select exactly one unused `dev/MAJOR.MINOR.PATCH` line. Record exact
+   current `main`, the full coordination and
+   `refs/heads/rollback/dev/MAJOR.MINOR.PATCH` refs, active runs, and complete
+   branch and tag rulesets. Require both new refs to be absent.
+2. Prepare one signed, DCO-compliant activation commit from exact `main`.
+   The bounded xtask selects the non-release `${target}-rc.0` safety stub and
+   accepts only the manifest change. Release-plz first participates after
+   promotion when a maintainer prepares an actual release:
+
+   ```shell
+   target=MAJOR.MINOR.PATCH
+   git fetch origin main --tags
+   main_sha="$(git rev-parse origin/main)"
+   git switch --detach "${main_sha}"
+   git switch --create "activate-${target}"
+   cargo xtask release activate --version "${target}"
+   cargo xtask ci
+   test -f Cargo.lock
+   test ! -L Cargo.lock
+   rm -- Cargo.lock
+   git diff --check
+   git diff -- Cargo.toml
+   git add Cargo.toml
+   git commit -S --signoff -m "chore: activate dev/${target}"
+   git verify-commit HEAD
+   activation_sha="$(git rev-parse HEAD)"
+   test "$(git rev-parse "${activation_sha}^")" = "${main_sha}"
+   ```
+
+   Stop if any path except `Cargo.toml` changes or validation fails. This
+   commit must not be tagged, released, published, or reused for another
+   target.
+3. Before ref creation, prepare, authorize, apply, and read back the exact
+   coordination and rollback protection payloads, required context
+   `Required CI [refs/heads/dev/MAJOR.MINOR.PATCH]`, any minimum creation-only
+   exception, and unconditional restoration/readback. The rules must retain
+   non-fast-forward and deletion protection, exclude rollback from CI, and
+   grant no release, environment, App-token, or publication path.
+4. Bind creation to the exact activation commit and an absent destination:
+
+   ```shell
+   repository=NVIDIA/yaml-sigil-traits
+   line="dev/${target}"
+   destination="refs/heads/${line}"
+   rollback="refs/heads/rollback/${line}"
+   test "$(gh api "repos/${repository}/git/ref/heads/main" \
+     --jq .object.sha)" = "${main_sha}"
+   test -z "$(git ls-remote origin "${destination}" "${rollback}")"
+   git merge-base --is-ancestor "${main_sha}" "${activation_sha}"
+   git push --force-with-lease="${destination}:" \
+     origin "${activation_sha}:${destination}"
+   test "$(gh api "repos/${repository}/git/ref/heads/${line}" \
+     --jq .object.sha)" = "${activation_sha}"
+   ```
+
+   The empty expected value in the exact lease is an absent-ref compare-and-
+   swap guard. It does not authorize a rewrite or a generic force push. Never
+   retry an ambiguous push; read the ref and stop on any value other than the
+   exact proposed SHA.
+5. In the same serialized window, reread the new ref and unconditionally
+   remove any creation-only exception. Digest-compare the complete protected
+   state with the reviewed target and prove tag protection unchanged.
+6. Require the automatic coordination-ref CI at the exact activation SHA to
+   succeed, including advisory hosts, with zero artifacts, deployments, tags,
+   Releases, or publication effects. Advertise the full ref as a pull-request
+   base only after every check and settings readback is exact. Keep the rollback
+   ref absent until the first authorized synchronization.
+
 ### Test a coordination-line pull request
 
 Use this only after a `dev/MAJOR.MINOR.PATCH` base has been explicitly
