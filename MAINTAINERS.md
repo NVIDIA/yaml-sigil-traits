@@ -169,6 +169,243 @@ result, inspect advisory hosts, and require zero retained artifacts. No
 coordination ref may trigger publication, a protected environment, App-token
 minting, or a tag or Release mutation.
 
+### Integrate a coordination-line pull request
+
+Use the default squash procedure below unless the repository has separately
+proved and enabled writer-preserved intake for the active line. For either
+method, re-read protected `main`, the coordination ref, the pull request, and
+the exact base-specific required check immediately before integration.
+
+Writer-preserved intake is available only when the pull-request author is a
+current trusted writer and explicit authorization covers the exact pull
+request, destination, old object, new object, and retained commit series.
+Every retained commit must be linear, GitHub Verified, DCO-compliant, and
+intentionally distinct.
+
+1. Record `OLD-SHA` from the live coordination ref and `NEW-SHA` from the
+   current pull-request head. Require the pull-request base SHA to equal
+   `OLD-SHA`, then prove a fast-forward:
+
+   ```shell
+   git merge-base --is-ancestor <OLD-SHA> <NEW-SHA>
+   ```
+
+2. Capture and digest all applicable branch and tag protection. Keep an
+   independent no-bypass non-fast-forward rule effective. Prepare exact
+   restoration before any temporary PR-admission exception.
+3. Re-read every bound object, then update only the full coordination ref:
+
+   ```shell
+   destination=refs/heads/<LINE>
+   git push --force-with-lease="${destination}:<OLD-SHA>" \
+     origin "<NEW-SHA>:${destination}"
+   ```
+
+   The exact lease is a stale-ref compare-and-swap guard, not permission to
+   rewrite history. Never use a generic force option or retry an ambiguous
+   update.
+4. Restore protection before interpreting the update. Read back the ref,
+   terminal pull-request association, retained commits, signatures, DCO,
+   branch CI, artifacts, deployments, and unchanged tag protection.
+
+### Synchronize a coordination line
+
+Synchronization rebases the complete next-line series onto current `main`.
+It is a separately authorized coordinator operation, not contributor intake.
+
+1. Pause intake. Record exact `main`, coordination, previous-main-base, and
+   rollback objects plus complete applicable rules and active runs.
+2. On the first synchronization, create the rollback ref only if it is absent:
+
+   ```shell
+   rollback=refs/heads/rollback/<LINE>
+   git push --force-with-lease="${rollback}:" \
+     origin "<OLD-LINE-SHA>:${rollback}"
+   ```
+
+   On every later synchronization, bind its movement to the old rollback SHA:
+
+   ```shell
+   rollback=refs/heads/rollback/<LINE>
+   git push --force-with-lease="${rollback}:<OLD-ROLLBACK-SHA>" \
+     origin "<OLD-LINE-SHA>:${rollback}"
+   ```
+
+   Run exactly one form and read the rollback ref back. Never use a generic
+   force option. If live protection requires a one-operation maintenance
+   exception, restore and digest-compare it before starting the local rebase.
+3. In a clean isolated worktree, rebase only the recorded series. Preserve
+   each original author and DCO trailer; make the authorized coordinator the
+   committer and verified signer. First require the recorded previous-main
+   object to be an ancestor of both current `main` and the old line, and reject
+   merge commits in the line range. Account for every old and new commit and
+   logical patch, including empty or equivalent commits, then run the complete
+   local gate:
+
+   ```shell
+   previous_main_sha=<PREVIOUS-MAIN-SHA>
+   main_sha=<MAIN-SHA>
+   old_line_sha=<OLD-LINE-SHA>
+   git merge-base --is-ancestor "${previous_main_sha}" "${main_sha}"
+   git merge-base --is-ancestor "${previous_main_sha}" "${old_line_sha}"
+   test -z "$(git rev-list --min-parents=2 \
+     "${previous_main_sha}..${old_line_sha}")"
+   git switch --detach "${old_line_sha}"
+   git -c core.hooksPath=/dev/null rebase -S \
+     --reapply-cherry-picks --empty=ask \
+     --onto "${main_sha}" "${previous_main_sha}"
+   new_line_sha="$(git rev-parse HEAD)"
+   cargo xtask ci
+   ```
+
+   An empty-commit stop requires explicit reconciliation; never silently skip
+   it or continue with an unaccounted series.
+4. Under the separately reviewed synchronization exception, replace only the
+   coordination ref with the exact old-head lease:
+
+   ```shell
+   destination=refs/heads/<LINE>
+   git push --force-with-lease="${destination}:<OLD-LINE-SHA>" \
+     origin "${new_line_sha}:${destination}"
+   ```
+
+   Immediately beforehand, require live `main`, coordination, and rollback to
+   equal the recorded objects. Never update `main` in this step. Restore and
+   read back protection before interpreting an ambiguous result.
+5. Require fresh coordination-ref CI with zero artifacts or privileged effects,
+   refresh affected pull requests, and only then resume intake.
+
+### Close and promote a coordination line
+
+1. Freeze the line, remove unready work through review, finish migration
+   guidance, replace temporary dependencies, and complete one final
+   synchronization.
+2. Open exactly one cumulative pull request from the coordination ref to
+   `main`. Record its exact base and head and the exhaustive ordered provenance
+   for every retained source-derived and coordinator-created commit. Compare
+   the frozen line with the rolling rollback ref and explicitly record every
+   intentionally removed or superseded old-line commit. The protected verifier
+   proves the final series and each named source pull request; it does not infer
+   source pull requests that human review omitted.
+3. Run authorized candidate testing, then invoke only the protected-current-
+   `main` promotion verifier. Require its App-owned `Required CI` result on the
+   exact promotion head. An ordinary source-PR verdict does not count.
+4. After explicit promotion authorization, pause both refs and re-read every
+   bound object and protection payload. Prove `main` is an ancestor of the
+   promotion head, then use the proved protected-main exact-history transaction
+   with the exact old-`main` lease. Do not use the Web UI merge button or
+   squash the promotion.
+5. Restore protection before interpreting the update. Require exact retained
+   history and terminal promotion-PR association, current-main CI, unchanged
+   tag protection, zero artifacts and deployments, and no tag, Release, or
+   publication effect. Promotion is not release authorization.
+
+#### Prepare and dispatch promotion evidence
+
+Keep the manifest outside the repository; it is per-run evidence, not project
+configuration. Record every value from a fresh GitHub readback. `policy_sha`
+and `base_sha` are the same exact live `main` object, `head_sha` is both the
+live coordination ref and cumulative pull-request head, and the run ID and
+attempt identify its successful authorized candidate run.
+
+For every final-series commit, fetch the exact GitHub diff and compute the
+whitespace-sensitive ID used by protected policy:
+
+```shell
+repository="NVIDIA/yaml-sigil-traits"
+commit_sha="FULL_40_CHARACTER_COMMIT_SHA"
+diff_file="$(mktemp)"
+gh api -H "Accept: application/vnd.github.diff" \
+  "repos/${repository}/commits/${commit_sha}" > "${diff_file}"
+git patch-id --verbatim < "${diff_file}"
+```
+
+Require exactly one output line. For a `source` entry, run this for both the
+final-series `sha` and retained `original_sha` and require equal patch IDs.
+Use the source PR's exact retained commit order. A squash intake names its
+generated merge object; exact-history intake names every original PR commit.
+For coordinator-created entries, list every changed path once in sorted order;
+a rename or copy lists both its source and destination. Rust activation must be
+one ordinary `Cargo.toml` modification, never a rename or copy into that path.
+
+Write one JSON object with no additional fields, in final-series order:
+
+```json
+{
+  "version": 1,
+  "repository": "NVIDIA/<REPOSITORY>",
+  "policy_sha": "<MAIN-SHA>",
+  "promotion_pull": 123,
+  "base_ref": "refs/heads/main",
+  "base_sha": "<MAIN-SHA>",
+  "head_sha": "<PROMOTION-HEAD-SHA>",
+  "coordination_ref": "refs/heads/<LINE>",
+  "candidate_run_id": 123456789,
+  "candidate_run_attempt": 1,
+  "coordinator": {"id": 12345, "login": "<LOGIN>"},
+  "entries": [
+    {
+      "kind": "source",
+      "sha": "<FINAL-SERIES-SHA>",
+      "patch_id": "<VERBATIM-PATCH-ID>",
+      "source_pull": 122,
+      "original_sha": "<RETAINED-SOURCE-SHA>"
+    },
+    {
+      "kind": "integration",
+      "sha": "<COORDINATOR-COMMIT-SHA>",
+      "patch_id": "<VERBATIM-PATCH-ID>",
+      "paths": ["<FIRST-SORTED-PATH>", "<SECOND-SORTED-PATH>"]
+    }
+  ]
+}
+```
+
+Specification promotions cannot contain `activation`. Rust promotions must
+begin with exactly one `activation` entry whose sole path is `Cargo.toml`; its
+shape otherwise matches `integration`. Confirm the file is valid and bounded,
+then dispatch the protected workflow from `main`:
+
+```shell
+manifest_file="/absolute/path/to/promotion-manifest.json"
+jq -e . "${manifest_file}"
+wc -c < "${manifest_file}"
+gh workflow run required-ci.yml --ref main \
+  --field "manifest=@${manifest_file}"
+```
+
+Require fewer than 49,152 bytes and capture the returned run URL directly.
+Never retry an ambiguous dispatch; locate and read back the single attempted
+run instead. The `protected-automation` deployment proceeds automatically
+under its main-only branch policy; bind it to the exact recorded policy SHA,
+manifest, and run and require it to succeed. Require the resulting App-owned
+check on the exact head and zero artifacts before the separately authorized
+promotion.
+
+### Retire, abandon, or restart a line
+
+After the first accepted main-origin version for a promoted line, delete its
+coordination and rollback refs through a separately authorized cleanup. To
+abandon an unpromoted line, first stop intake and close or retarget its pull
+requests. In either case, record both exact heads and use one exact lease per
+existing ref. Treat an already absent rollback ref as clean:
+
+```shell
+git push --force-with-lease=refs/heads/<LINE>:<LINE-SHA> \
+  origin :refs/heads/<LINE>
+git push --force-with-lease=refs/heads/rollback/<LINE>:<ROLLBACK-SHA> \
+  origin :refs/heads/rollback/<LINE>
+```
+
+Read back each ambiguous response instead of retrying. Remove line-specific
+settings only after both refs are absent; restore and digest-compare every
+temporary exception and prove tag protection unchanged. A never-promoted line
+may restart only as a new activation from then-current `main`, after both old
+refs are absent and all eligibility and review evidence is fresh. After
+promotion, corrections use the ordinary reviewed `main` path. Do not create an
+archive ref; the closed pull requests and existing commit history are the
+durable record.
+
 ### Test a protected-policy change
 
 The reporter deliberately rejects a candidate `ci.yml` that differs from

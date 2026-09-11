@@ -283,8 +283,20 @@ with compiled repository and package policy. Do not use the mutable `CI`
 variable as a trust switch. The GitHub release commands are workflow-only.
 
 `cargo xtask ci` and every non-`github` command must remain provider-neutral
-and credential-free. The checkout-free protected reporter remains Python so
-protected-main policy runs without compiling candidate Rust. Keep
+and credential-free.
+
+Python is permitted here only for the pre-checkout candidate binder, the
+checkout-free protected reporter, and their deterministic fixtures. Those
+policies must run before candidate materialization or App-token creation, as
+applicable, and must not compile candidate-controlled Rust. Every Python file
+added or materially changed must begin with comments explaining why Python is
+justified at that boundary, then document its inputs, trust assumptions,
+outputs, mutations, and fail-closed behavior. Keep it standard-library-only
+unless a separately reviewed dependency is demonstrably needed. Use a
+provider-neutral Cargo xtask for repository validation or maintenance logic
+that does not require this pre-checkout boundary.
+
+Keep
 `.github/scripts/check-pull-request-commits.sh` identical across the YamlSigil
 repositories. Small host-setup helpers may remain shell when moving them would
 add complexity without consolidating policy.
@@ -294,6 +306,10 @@ The surviving provider helpers have deliberately narrow roles:
 - `report_required_ci.py` binds the complete candidate run, including the
   aggregate job's pre-execution policy/base attestation, before the App-owned
   required check and remains byte-identical across the YamlSigil repositories.
+- `bind-candidate-pr.py` anonymously binds the open pull request, exact
+  contribution base, protected current `main`, copied ref, verification
+  inventory, and optional main-only canonical release branch before source
+  materialization.
 - `materialize-candidate.sh` performs anonymous exact-head checkout and rejects
   content filters, candidate-selected submodule URLs, and ancestor Cargo
   configuration before materializing source.

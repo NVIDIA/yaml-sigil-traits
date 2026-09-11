@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
-"""Tests for anonymous copied-ref pull-request binding."""
+# Python is justified here because these deterministic fixtures exercise the
+# pre-checkout Python binder without network access, credentials, or candidate
+# subprocesses. Keeping tests in the binder's language avoids a second policy
+# implementation and makes malformed GitHub JSON exact and reproducible.
+"""Deterministic trust-boundary tests for copied-ref pull-request binding.
+
+The fixtures model only the binder's bounded anonymous GitHub reads and its
+validated runner-output append. They prove accepted main and coordination-base
+bindings as well as fail-closed behavior for stale refs, malformed objects,
+unverified commits, unsupported bases, and noncanonical release branches.
+They initiate no network requests, GitHub mutations, checkouts, or
+subprocesses. A test-managed temporary file exercises the binder's sole
+production filesystem mutation: appending validated runner-output scalars.
+"""
 
 from __future__ import annotations
 
@@ -34,10 +47,14 @@ class FakeApi:
     """Path-keyed read-only API fixture."""
 
     def __init__(self, responses: dict[str, Any]) -> None:
+        """Deep-copy one case's responses so mutations stay isolated."""
+
         self.responses = copy.deepcopy(responses)
         self.calls: list[str] = []
 
     def get(self, path: str) -> Any:
+        """Return one expected response and reject unmodeled API reads."""
+
         self.calls.append(path)
         if path not in self.responses:
             raise AssertionError(f"unexpected API call: {path}")
@@ -48,6 +65,8 @@ def fixture(
     branch: str = "release-plz-manual-1.2.3-rc.4",
     base_branch: str = "main",
 ) -> dict[str, Any]:
+    """Build one internally consistent anonymous GitHub response inventory."""
+
     prefix = f"repos/{REPOSITORY}"
     base_sha = POLICY_SHA if base_branch == "main" else COORDINATION_SHA
     responses = {
@@ -92,12 +111,16 @@ def fixture(
 
 
 def bind(responses: dict[str, Any]) -> Any:
+    """Run the production binder against one isolated fixture inventory."""
+
     return binder.bind_candidate_pr(
         FakeApi(responses), REPOSITORY, COPIED_REF, HEAD, POLICY_SHA
     )
 
 
 class CandidatePrBindingTests(unittest.TestCase):
+    """Exercise accepted bindings and every mutable fail-closed boundary."""
+
     def test_canonical_release_branch_is_emitted(self) -> None:
         result = bind(fixture())
         self.assertEqual(result.release_branch, "release-plz-manual-1.2.3-rc.4")
