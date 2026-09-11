@@ -1,5 +1,24 @@
 #!/usr/bin/env python3
-"""Bind anonymous copied-ref PR metadata before candidate materialization."""
+# Python is justified here because the credential-free candidate job must bind
+# structured GitHub metadata before materializing or executing candidate source.
+# A Cargo xtask would require compiling repository-controlled Rust at the wrong
+# trust boundary; shell would make the bounded JSON checks harder to type and
+# fixture-test. Keep this pre-checkout binder standard-library-only.
+"""Bind anonymous copied-ref PR metadata before candidate materialization.
+
+This provider-specific trust-boundary helper accepts the repository, copied
+ref, reviewed candidate SHA, protected-policy SHA, and runner-output path. It
+performs bounded, anonymous GitHub reads to prove that the pull request remains
+open; its candidate, contribution base, copied ref, commit verification
+inventory, and protected ``main`` are current; and any release branch has the
+canonical same-repository shape.
+
+On success it appends only validated single-line base and release scalars to
+the caller-supplied runner-output file. That append is its sole mutation. It
+does not accept a token, check out source, execute candidate code, create a
+check, or change repository state. Missing, malformed, oversized, ambiguous,
+stale, or unverified evidence fails closed before candidate materialization.
+"""
 
 from __future__ import annotations
 
@@ -57,6 +76,8 @@ class AnonymousGitHubApi:
     """Bounded GitHub API client that never accepts or sends a credential."""
 
     def get(self, path: str) -> Any:
+        """Fetch one bounded anonymous JSON response from a relative API path."""
+
         if path.startswith("/") or ".." in path or any(c in path for c in "\r\n"):
             raise BindingError("GitHub API path is malformed")
         request = urllib.request.Request(
@@ -94,30 +115,40 @@ class CandidatePrBinding:
 
 
 def _mapping(value: Any, label: str) -> dict[str, Any]:
+    """Return one JSON object or reject the named field."""
+
     if not isinstance(value, dict):
         raise BindingError(f"{label} is not an object")
     return value
 
 
 def _sequence(value: Any, label: str) -> list[Any]:
+    """Return one JSON array or reject the named field."""
+
     if not isinstance(value, list):
         raise BindingError(f"{label} is not an array")
     return value
 
 
 def _integer(value: Any, label: str) -> int:
+    """Return one positive JSON integer, excluding booleans."""
+
     if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
         raise BindingError(f"{label} is not a positive integer")
     return value
 
 
 def _text(value: Any, label: str) -> str:
+    """Return one nonempty line of text suitable for runner output."""
+
     if not isinstance(value, str) or not value or any(c in value for c in "\r\n"):
         raise BindingError(f"{label} is not one nonempty line")
     return value
 
 
 def _sha(value: Any, label: str) -> str:
+    """Return one canonical lowercase full Git object ID."""
+
     value = _text(value, label)
     if re.fullmatch(r"[0-9a-f]{40}", value) is None:
         raise BindingError(f"{label} is not a lowercase full SHA")
@@ -125,6 +156,8 @@ def _sha(value: Any, label: str) -> str:
 
 
 def _repository(value: Any, label: str) -> str:
+    """Extract one repository's nonempty ``full_name`` field."""
+
     return _text(_mapping(value, label).get("full_name"), f"{label} full name")
 
 
@@ -290,6 +323,8 @@ def append_output(path: Path, binding: CandidatePrBinding) -> None:
 
 
 def parser() -> argparse.ArgumentParser:
+    """Build the fixed command-line interface used by candidate CI."""
+
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument("--repository", required=True)
     result.add_argument("--copied-ref", required=True)
@@ -300,6 +335,8 @@ def parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    """Bind current GitHub state and append outputs, returning failure closed."""
+
     arguments = parser().parse_args()
     try:
         binding = bind_candidate_pr(
