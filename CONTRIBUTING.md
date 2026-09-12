@@ -86,17 +86,18 @@ The copied `.github/workflows/ci.yml` must exactly match protected current
 before requesting candidate testing.
 
 Every human-authored pull-request commit must form a linear history from the
-exact current pull-request base, be GitHub Verified, and contain a
-`Signed-off-by` trailer that exactly matches its Git author. The contributor's
-fork branch remains the pull-request head; a writer's command authorizes
-testing only and does not authorize integration.
+exact current pull-request base and contain a `Signed-off-by` trailer that
+exactly matches its Git author. Cryptographic signatures are optional for
+ordinary contributor commits. The contributor's fork branch remains the pull-
+request head; a writer's command authorizes testing only and does not authorize
+integration.
 
 Before final authorization, fetch the current upstream pull-request base,
-rebase the original contributor branch onto that exact ref with
-`git rebase --gpg-sign`, and push the rewritten branch back to the same fork
-with an exact lease. Confirm every rewritten commit is GitHub Verified and
-DCO-compliant, then request testing for the new exact SHA. Do not copy the
-contribution onto a repository-owned branch merely to run CI.
+require the contributor branch to be linearly rebased onto that exact ref, and
+push any rewritten branch back to the same fork with an exact lease. Confirm
+every rewritten commit is DCO-compliant, then request testing for the new exact
+SHA. Do not copy the contribution onto a repository-owned branch merely to run
+CI.
 
 #### Signing Off Your Work
 

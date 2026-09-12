@@ -303,11 +303,12 @@ add complexity without consolidating policy.
 
 The surviving provider helpers have deliberately narrow roles:
 
-- `report_required_ci.py` binds the complete candidate run, including the
-  aggregate job's pre-execution policy/base attestation, before the App-owned
-  required check and remains byte-identical across the YamlSigil repositories.
+- `report_required_ci.py` binds the complete candidate run, including raw-
+  author DCO and the aggregate job's pre-execution policy/base attestation,
+  before the App-owned required check and remains byte-identical across the
+  YamlSigil repositories.
 - `bind-candidate-pr.py` anonymously binds the open pull request, exact
-  contribution base, protected current `main`, copied ref, verification
+  contribution base, protected current `main`, copied ref, ordered commit
   inventory, and optional main-only canonical release branch before source
   materialization.
 - `materialize-candidate.sh` performs anonymous exact-head checkout and rejects
