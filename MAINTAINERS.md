@@ -289,12 +289,15 @@ It is a separately authorized coordinator operation, not contributor intake.
    `main`. Record its exact base and head, then review the complete aggregate
    diff, resulting tree, and ordered linear series. Account for retained source
    work, coordinator changes, and every removed or superseded old-line commit.
-3. If the cumulative head retains the exact protected-main candidate workflow
-   and reporter policy, review and authorize that head through the ordinary
+3. Compare the cumulative head's `.github/workflows/ci.yml` with exact
+   protected current `main`. If it is byte-identical, review and authorize
+   that head through the ordinary
    `/ok to test <FULL-40-CHARACTER-HEAD-SHA>` path. Require the automatic
    App-owned `Required CI` result for that exact head and current `main` base.
-   If the head changes protected policy, do not authorize its copied-ref run;
-   follow [Test a protected-policy change](#test-a-protected-policy-change) on
+   That verdict validates candidate execution under the existing protected
+   reporter; it does not empirically validate a reporter change proposed by
+   the head. If `ci.yml` differs, do not authorize its copied-ref run; follow
+   [Test a protected-policy change](#test-a-protected-policy-change) on
    `ci-testing/*` and do not manufacture a promotion App check.
 4. Treat either form of exact-head validation only as test evidence. It does
    not authenticate provenance or authorize promotion. If changed policy
@@ -343,6 +346,16 @@ durable record.
 
 The reporter deliberately rejects a candidate `ci.yml` that differs from
 protected current `main`. Do not weaken that binding to make a proposal pass.
+Choose the test path from the exact candidate workflow:
+
+- If `ci.yml` is byte-identical to protected current `main`, use the
+  ordinary exact-head `/ok to test` path. Its App verdict validates candidate
+  execution under the existing protected reporter; it does not empirically
+  validate a reporter change proposed by the head. Give every reporter change
+  focused code review and tests, then run one inert current-main canary after
+  integration before declaring the new reporter operational.
+- If `ci.yml` differs, do not issue `/ok to test` for that head. Use the
+  following trusted staging procedure.
 
 1. Complete the same exact-head review. Confirm the staging workflow has no
    publication, OIDC, protected environment, secret, cache-save, or retained
