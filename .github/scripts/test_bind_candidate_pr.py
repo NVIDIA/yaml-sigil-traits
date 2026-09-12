@@ -6,9 +6,9 @@
 """Deterministic trust-boundary tests for copied-ref pull-request binding.
 
 The fixtures model only the binder's bounded anonymous GitHub reads and its
-validated runner-output append. They prove accepted main and coordination-base
-bindings as well as fail-closed behavior for stale refs, malformed objects,
-unverified commits, unsupported bases, and noncanonical release branches.
+validated runner-output append. They prove accepted unsigned main and
+coordination-base bindings as well as fail-closed behavior for stale refs,
+malformed objects, unsupported bases, and noncanonical release branches.
 They initiate no network requests, GitHub mutations, checkouts, or
 subprocesses. A test-managed temporary file exercises the binder's sole
 production filesystem mutation: appending validated runner-output scalars.
@@ -89,7 +89,7 @@ def fixture(
             {
                 "sha": HEAD,
                 "commit": {
-                    "verification": {"verified": True, "reason": "valid"}
+                    "verification": {"verified": False, "reason": "unsigned"}
                 },
             }
         ],
@@ -128,7 +128,7 @@ class CandidatePrBindingTests(unittest.TestCase):
         self.assertEqual(result.base_sha, POLICY_SHA)
         self.assertEqual(result.check_name, "Required CI")
 
-    def test_ordinary_branch_emits_no_release_value(self) -> None:
+    def test_ordinary_unsigned_branch_emits_no_release_value(self) -> None:
         result = bind(fixture("docs/clarify-example"))
         self.assertIsNone(result.release_branch)
 
@@ -196,12 +196,6 @@ class CandidatePrBindingTests(unittest.TestCase):
             "incomplete commits": lambda value: value[pull_path].__setitem__(
                 "commits", 2
             ),
-            "unverified commit": lambda value: value[commits_path][0]["commit"][
-                "verification"
-            ].__setitem__("verified", False),
-            "verification reason": lambda value: value[commits_path][0]["commit"][
-                "verification"
-            ].__setitem__("reason", "unsigned"),
             "last commit": lambda value: value[commits_path][0].__setitem__(
                 "sha", "c" * 40
             ),

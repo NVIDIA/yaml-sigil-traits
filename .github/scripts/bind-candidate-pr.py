@@ -9,15 +9,17 @@
 This provider-specific trust-boundary helper accepts the repository, copied
 ref, reviewed candidate SHA, protected-policy SHA, and runner-output path. It
 performs bounded, anonymous GitHub reads to prove that the pull request remains
-open; its candidate, contribution base, copied ref, commit verification
-inventory, and protected ``main`` are current; and any release branch has the
-canonical same-repository shape.
+open; its candidate, contribution base, copied ref, ordered commit inventory,
+and protected ``main`` are current; and any release branch has the canonical
+same-repository shape.
 
 On success it appends only validated single-line base and release scalars to
 the caller-supplied runner-output file. That append is its sole mutation. It
 does not accept a token, check out source, execute candidate code, create a
 check, or change repository state. Missing, malformed, oversized, ambiguous,
-stale, or unverified evidence fails closed before candidate materialization.
+or stale evidence fails closed before candidate materialization. Commit DCO is
+validated later by protected policy; ordinary contributors need not sign
+commits cryptographically.
 """
 
 from __future__ import annotations
@@ -231,17 +233,6 @@ def bind_candidate_pr(
     for item in commits:
         commit = _mapping(item, "pull request commit")
         commit_shas.append(_sha(commit.get("sha"), "pull request commit SHA"))
-        verification = _mapping(
-            _mapping(commit.get("commit"), "pull request commit body").get(
-                "verification"
-            ),
-            "pull request commit verification",
-        )
-        if (
-            verification.get("verified") is not True
-            or verification.get("reason") != "valid"
-        ):
-            raise BindingError("pull request commit is not GitHub Verified")
     if commit_shas[-1] != head_sha:
         raise BindingError("pull request commit inventory does not end at the head")
 

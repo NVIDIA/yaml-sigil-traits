@@ -36,10 +36,11 @@ report `Required CI`, or control a release.
 
 Review the complete base-to-head diff. Confirm that the head is rebased onto
 its exact current base, its commits are linear, and each human-authored commit
-is GitHub Verified and DCO-compliant. Route compatible work and every protected-
-policy change to `main`. Route breaking or dependent next-line work only to an
-advertised, protected `dev/MAJOR.MINOR.PATCH` coordination branch. Recheck after
-the base, protected `main` policy, or head moves.
+is DCO-compliant. Ordinary contributor commits need not be cryptographically
+signed. Route compatible work and every protected-policy change to `main`.
+Route breaking or dependent next-line work only to an advertised, protected
+`dev/MAJOR.MINOR.PATCH` coordination branch. Recheck after the base, protected
+`main` policy, or head moves.
 
 ### Test an ordinary pull request
 
@@ -448,8 +449,7 @@ does not authorize integration.
 
 1. Re-read the exact head and current base. Require the App-owned verdict for
    that exact base—`Required CI` for `main`, or the base-specific coordination
-   context—plus resolved review threads, verified signatures, DCO, and explicit
-   merge authorization.
+   context—plus resolved review threads, DCO, and explicit merge authorization.
 2. Guard the merge against head drift:
 
    ```shell

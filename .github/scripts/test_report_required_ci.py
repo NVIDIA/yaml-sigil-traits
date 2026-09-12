@@ -221,7 +221,7 @@ def fixture(
                         "fix: bind one identity\n\n"
                         f"Signed-off-by: {SIGNER_NAME} <{SIGNER_EMAIL}>"
                     ),
-                    "verification": {"verified": True, "reason": "valid"},
+                    "verification": {"verified": False, "reason": "unsigned"},
                 },
             }
         ],
@@ -675,7 +675,6 @@ class BindingTests(unittest.TestCase):
             "stale pull base": lambda _, responses: responses[("GET", f"repos/{REPOSITORY}/pulls/{PULL}")]["base"].__setitem__("sha", "d" * 40),
             "moved pull head": lambda _, responses: responses[("GET", f"repos/{REPOSITORY}/pulls/{PULL}")]["head"].__setitem__("sha", "b" * 40),
             "incomplete commits": lambda _, responses: responses[("GET", f"repos/{REPOSITORY}/pulls/{PULL}")].__setitem__("commits", 2),
-            "unverified commit": lambda _, responses: responses[("GET", f"repos/{REPOSITORY}/pulls/{PULL}/commits?per_page=100&page=1")][0]["commit"]["verification"].__setitem__("verified", False),
             "moved copied ref": lambda _, responses: responses[("GET", f"repos/{REPOSITORY}/git/ref/heads/pull-request/{PULL}")]["object"].__setitem__("sha", "b" * 40),
             "wrong job run": lambda _, responses: responses[("GET", f"repos/{REPOSITORY}/actions/runs/{RUN_ID}/attempts/{ATTEMPT}/jobs?per_page=100")]["jobs"][0].__setitem__("run_id", RUN_ID + 1),
             "wrong job attempt": lambda _, responses: responses[("GET", f"repos/{REPOSITORY}/actions/runs/{RUN_ID}/attempts/{ATTEMPT}/jobs?per_page=100")]["jobs"][0].__setitem__("run_attempt", ATTEMPT + 1),
@@ -698,95 +697,41 @@ class BindingTests(unittest.TestCase):
         with self.assertRaisesRegex(reporter.ReporterError, "missing or duplicated"):
             bind(event, responses)
 
-    def test_verified_signer_and_rest_identities_must_match(self) -> None:
+    def test_unsigned_candidate_is_accepted_without_signature_query(self) -> None:
+        event, responses = fixture()
+        api = FakeApi(responses)
+        result = reporter.bind_candidate(api, event, policy())
+        self.assertEqual(result.head_sha, HEAD)
+        self.assertFalse(any(method == "GRAPHQL" for method, _, _ in api.calls))
+
+    def test_missing_or_mismatched_raw_author_dco_fails_closed(self) -> None:
         commits_path = (
             "GET",
             f"repos/{REPOSITORY}/pulls/{PULL}/commits?per_page=100&page=1",
         )
-        signature_path = ("GRAPHQL", reporter.SIGNATURE_QUERY)
-
-        def signature(responses: dict[Any, Any]) -> dict[str, Any]:
-            return responses[signature_path]["data"]["repository"]["pullRequest"][
-                "commits"
-            ]["nodes"][0]["commit"]["signature"]
-
-        mutations = {
-            "author ID": lambda responses: responses[commits_path][0][
-                "author"
-            ].__setitem__("id", SIGNER_ID + 1),
-            "committer login": lambda responses: responses[commits_path][0][
-                "committer"
-            ].__setitem__("login", "lookalike"),
-            "signer ID": lambda responses: signature(responses)["signer"].__setitem__(
-                "databaseId", SIGNER_ID + 1
+        for name, message in {
+            "missing": "fix: missing trailer",
+            "mismatched": (
+                "fix: mismatched trailer\n\n"
+                f"Signed-off-by: Lookalike <{SIGNER_EMAIL}>"
             ),
-            "raw author email": lambda responses: responses[commits_path][0][
-                "commit"
-            ]["author"].__setitem__("email", "lookalike@example.invalid"),
-            "raw committer email": lambda responses: responses[commits_path][0][
-                "commit"
-            ]["committer"].__setitem__("email", "lookalike@example.invalid"),
-            "signature email": lambda responses: signature(responses).__setitem__(
-                "email", "lookalike@example.invalid"
-            ),
-            "GitHub signature": lambda responses: signature(responses).__setitem__(
-                "wasSignedByGitHub", True
-            ),
-        }
-        for name, mutate in mutations.items():
+        }.items():
             with self.subTest(name=name):
                 event, responses = fixture()
-                mutate(responses)
-                with self.assertRaises(reporter.ReporterError):
+                responses[commits_path][0]["commit"]["message"] = message
+                with self.assertRaisesRegex(reporter.ReporterError, "raw-author DCO"):
                     bind(event, responses)
 
-    def test_null_signer_and_forged_dco_fail_closed(self) -> None:
-        event, responses = fixture()
-        signature = responses[("GRAPHQL", reporter.SIGNATURE_QUERY)]["data"][
-            "repository"
-        ]["pullRequest"]["commits"]["nodes"][0]["commit"]["signature"]
-        signature["signer"] = None
-        with self.assertRaisesRegex(reporter.ReporterError, "signer is not an object"):
-            bind(event, responses)
-
+    def test_ordinary_candidate_does_not_require_rest_account_identity(self) -> None:
         event, responses = fixture()
         commits_path = (
             "GET",
             f"repos/{REPOSITORY}/pulls/{PULL}/commits?per_page=100&page=1",
         )
-        responses[commits_path][0]["commit"]["message"] = (
-            "fix: forged trailer\n\n"
-            f"Signed-off-by: Lookalike <{SIGNER_EMAIL}>"
-        )
-        with self.assertRaisesRegex(reporter.ReporterError, "raw-author DCO"):
-            bind(event, responses)
-
-    def test_signature_inventory_must_be_complete_and_ordered(self) -> None:
-        signature_path = ("GRAPHQL", reporter.SIGNATURE_QUERY)
-
-        def commits(responses: dict[Any, Any]) -> dict[str, Any]:
-            return responses[signature_path]["data"]["repository"]["pullRequest"][
-                "commits"
-            ]
-
-        mutations = {
-            "count": lambda responses: commits(responses).__setitem__("totalCount", 2),
-            "next page": lambda responses: commits(responses)[
-                "pageInfo"
-            ].__setitem__("hasNextPage", True),
-            "OID": lambda responses: commits(responses)["nodes"][0]["commit"].__setitem__(
-                "oid", "b" * 40
-            ),
-            "ambiguous node": lambda responses: commits(responses)["nodes"][0].__setitem__(
-                "unexpected", True
-            ),
-        }
-        for name, mutate in mutations.items():
-            with self.subTest(name=name):
-                event, responses = fixture()
-                mutate(responses)
-                with self.assertRaises(reporter.ReporterError):
-                    bind(event, responses)
+        responses[commits_path][0]["author"] = None
+        responses[commits_path][0]["committer"] = None
+        result = bind(event, responses)
+        self.assertEqual(result.head_sha, HEAD)
 
     def test_bounded_terminal_conclusions_map_to_required_verdict(self) -> None:
         for conclusion in sorted(reporter.TERMINAL_JOB_CONCLUSIONS):
@@ -845,6 +790,47 @@ class PromotionBindingTests(unittest.TestCase):
             result.external_id,
             rf"^yaml-sigil-promotion-ci:[0-9a-f]{{64}}:{RUN_ID}:{ATTEMPT}:{POLICY_SHA}$",
         )
+
+    def test_promotion_signature_inventory_remains_required_and_exact(self) -> None:
+        signature_path = ("GRAPHQL", reporter.SIGNATURE_QUERY)
+
+        def graph_commits(responses: dict[Any, Any]) -> dict[str, Any]:
+            return responses[signature_path]["data"]["repository"]["pullRequest"][
+                "commits"
+            ]
+
+        mutations = {
+            "count": lambda responses: graph_commits(responses).__setitem__(
+                "totalCount", 3
+            ),
+            "next page": lambda responses: graph_commits(responses)[
+                "pageInfo"
+            ].__setitem__("hasNextPage", True),
+            "OID": lambda responses: graph_commits(responses)["nodes"][0][
+                "commit"
+            ].__setitem__("oid", "b" * 40),
+            "ambiguous node": lambda responses: graph_commits(responses)["nodes"][
+                0
+            ].__setitem__("unexpected", True),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                manifest_raw, event, context, responses = promotion_fixture()
+                mutate(responses)
+                with self.assertRaises(reporter.ReporterError):
+                    self.promote(manifest_raw, event, context, responses)
+
+        manifest_raw, event, context, responses = promotion_fixture()
+        commits_path = (
+            "GET",
+            f"repos/{REPOSITORY}/pulls/{PULL}/commits?per_page=100&page=1",
+        )
+        responses[commits_path][0]["commit"]["verification"] = {
+            "verified": False,
+            "reason": "unsigned",
+        }
+        with self.assertRaisesRegex(reporter.ReporterError, "not GitHub Verified"):
+            self.promote(manifest_raw, event, context, responses)
 
     def test_automatic_path_ignores_a_promotion_shaped_input(self) -> None:
         event, responses = fixture()

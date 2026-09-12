@@ -14,11 +14,11 @@ compiling or executing candidate-controlled Rust, shell, or repository files.
 The standard-library-only implementation also keeps its network and subprocess
 surface explicit and fixture-testable on the GitHub-hosted reporter runner.
 
-The automatic path accepts only a completed copied-ref run and retains its
-direct author/committer/signer rule. The separately selected manual path
-accepts a bounded manifest from a current trusted writer, rebinds every commit
-retained in the final series and its logical patch, and never executes candidate
-code. Both paths repeat all
+The automatic path accepts only a completed copied-ref run and requires each
+commit's raw author DCO without requiring an external contributor signature.
+The separately selected manual path accepts a bounded manifest from a current
+trusted writer, rebinds every signed commit retained in the final series and
+its logical patch, and never executes candidate code. Both paths repeat all
 mutable checks after App-token creation immediately before the sole mutation.
 """
 
@@ -1009,25 +1009,6 @@ class PatchInventory:
         return result
 
 
-def _require_direct_identity(
-    commit: dict[str, Any], signature: SignatureIdentity, label: str
-) -> None:
-    """Require one ordinary candidate commit to have one exact identity."""
-
-    signer = (signature.signer_id, signature.signer_login, "User")
-    if _account(commit.get("author"), f"{label} author") != signer:
-        raise ReporterError(f"{label} author does not match the verified signer")
-    if _account(commit.get("committer"), f"{label} committer") != signer:
-        raise ReporterError(f"{label} committer does not match the verified signer")
-    _, author_email, author_dco = _raw_identity(commit, "author", label)
-    _, committer_email, _ = _raw_identity(commit, "committer", label)
-    if author_email != signature.email or committer_email != signature.email:
-        raise ReporterError(f"{label} signature email does not match raw identity")
-    body = _mapping(commit.get("commit"), f"{label} body")
-    if author_dco not in _signoffs(body.get("message"), f"{label} message"):
-        raise ReporterError(f"{label} lacks the exact raw-author DCO sign-off")
-
-
 def _require_coordinator_signature(
     commit: dict[str, Any],
     signature: SignatureIdentity,
@@ -1045,14 +1026,20 @@ def _require_coordinator_signature(
         raise ReporterError(f"{label} signature email does not match its committer")
 
 
-def _require_author_dco(commit: dict[str, Any], label: str) -> tuple[int, str, str]:
-    """Require a commit's raw author to supply its exact DCO trailer."""
+def _require_raw_author_dco(commit: dict[str, Any], label: str) -> None:
+    """Require the literal Git author to supply its exact DCO trailer."""
 
-    author = _account(commit.get("author"), f"{label} author")
     _, _, author_dco = _raw_identity(commit, "author", label)
     body = _mapping(commit.get("commit"), f"{label} body")
     if author_dco not in _signoffs(body.get("message"), f"{label} message"):
         raise ReporterError(f"{label} lacks the exact raw-author DCO sign-off")
+
+
+def _require_author_dco(commit: dict[str, Any], label: str) -> tuple[int, str, str]:
+    """Require an attributed author's exact DCO for a preserved replay."""
+
+    author = _account(commit.get("author"), f"{label} author")
+    _require_raw_author_dco(commit, label)
     return author
 
 
@@ -1106,7 +1093,7 @@ def _bind_candidate_evidence(
     event: dict[str, Any],
     policy: Policy,
     *,
-    require_direct_identity: bool,
+    require_signatures: bool,
 ) -> CandidateEvidence:
     """Bind one copied-ref run and retain its exact commit evidence."""
 
@@ -1235,33 +1222,28 @@ def _bind_candidate_evidence(
         raise ReporterError("pull request commit inventory is incomplete")
     commit_shas: list[str] = []
     for index, value in enumerate(commits, 1):
-        commit = _mapping(value, f"pull request commit {index}")
-        commit_shas.append(_sha(commit.get("sha"), f"pull request commit {index} SHA"))
-        verification = _mapping(
-            _mapping(commit.get("commit"), f"pull request commit {index} body").get(
-                "verification"
-            ),
-            f"pull request commit {index} verification",
-        )
-        if (
-            verification.get("verified") is not True
-            or verification.get("reason") != "valid"
-        ):
-            raise ReporterError(f"pull request commit {index} is not GitHub Verified")
+        label = f"pull request commit {index}"
+        commit = _mapping(value, label)
+        commit_shas.append(_sha(commit.get("sha"), f"{label} SHA"))
+        if require_signatures:
+            verification = _mapping(
+                _mapping(commit.get("commit"), f"{label} body").get("verification"),
+                f"{label} verification",
+            )
+            if (
+                verification.get("verified") is not True
+                or verification.get("reason") != "valid"
+            ):
+                raise ReporterError(f"{label} is not GitHub Verified")
+        else:
+            _require_raw_author_dco(commit, label)
     if commit_shas[-1] != head_sha:
         raise ReporterError("pull request commit inventory does not end at the head")
-    signatures = _signature_inventory(
-        api, policy.repository, pull_number, commit_shas
+    signatures = (
+        _signature_inventory(api, policy.repository, pull_number, commit_shas)
+        if require_signatures
+        else []
     )
-    if require_direct_identity:
-        for index, (commit, signature) in enumerate(
-            zip(commits, signatures, strict=True), 1
-        ):
-            _require_direct_identity(
-                _mapping(commit, f"pull request commit {index}"),
-                signature,
-                f"pull request commit {index}",
-            )
 
     encoded_ref = urllib.parse.quote(f"heads/{head_branch}", safe="/")
     copied_ref = _mapping(
@@ -1341,7 +1323,7 @@ def bind_candidate(api: Api, event: dict[str, Any], policy: Policy) -> Binding:
     """Bind the triggering delivery to one fresh copied-ref CI attempt."""
 
     return _bind_candidate_evidence(
-        api, event, policy, require_direct_identity=True
+        api, event, policy, require_signatures=False
     ).binding
 
 
@@ -1536,7 +1518,7 @@ def bind_promotion(
         api,
         _promotion_delivery(policy, manifest),
         policy,
-        require_direct_identity=False,
+        require_signatures=True,
     )
     binding = evidence.binding
     if (
