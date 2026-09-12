@@ -34,10 +34,14 @@ An **ordinary change** leaves protected CI and release policy unchanged. A
 configuration or scripts that materialize a candidate, bind a pull request,
 report `Required CI`, or control a release.
 
-Review the complete base-to-head diff. Confirm that the head is rebased onto
-its exact current base, its commits are linear, and each human-authored commit
-is DCO-compliant. Ordinary contributor commits need not be cryptographically
-signed. Route compatible work and every protected-policy change to `main`.
+Review the complete base-to-head diff. Before authorizing an externally
+authored head, review every executable input, including workflow files and
+helpers, `build.rs`, procedural-macro and build dependencies, xtask code,
+Cargo configuration, aliases and wrappers, and test setup. Confirm that the
+head is rebased onto its exact current base, its commits are linear, and each
+human-authored commit is DCO-compliant. Ordinary contributor commits need not
+be cryptographically signed. Route compatible work and every protected-policy
+change to `main`.
 Route breaking or dependent next-line work only to an advertised, protected
 `dev/MAJOR.MINOR.PATCH` coordination branch. Recheck after the base, protected
 `main` policy, or head moves.
