@@ -286,106 +286,37 @@ It is a separately authorized coordinator operation, not contributor intake.
    guidance, replace temporary dependencies, and complete one final
    synchronization.
 2. Open exactly one cumulative pull request from the coordination ref to
-   `main`. Record its exact base and head and the exhaustive ordered provenance
-   for every retained source-derived and coordinator-created commit. Compare
-   the frozen line with the rolling rollback ref and explicitly record every
-   intentionally removed or superseded old-line commit. The protected verifier
-   proves the final series and each named source pull request; it does not infer
-   source pull requests that human review omitted.
-3. Run authorized candidate testing, then invoke only the protected-current-
-   `main` promotion verifier. Require its App-owned `Required CI` result on the
-   exact promotion head. An ordinary source-PR verdict does not count.
-4. After explicit promotion authorization, pause both refs and re-read every
-   bound object and protection payload. Prove `main` is an ancestor of the
-   promotion head, then use the proved protected-main exact-history transaction
-   with the exact old-`main` lease. Do not use the Web UI merge button or
-   squash the promotion.
-5. Restore protection before interpreting the update. Require exact retained
-   history and terminal promotion-PR association, current-main CI, unchanged
-   tag protection, zero artifacts and deployments, and no tag, Release, or
-   publication effect. Promotion is not release authorization.
-
-#### Prepare and dispatch promotion evidence
-
-Keep the manifest outside the repository; it is per-run evidence, not project
-configuration. Record every value from a fresh GitHub readback. `policy_sha`
-and `base_sha` are the same exact live `main` object, `head_sha` is both the
-live coordination ref and cumulative pull-request head, and the run ID and
-attempt identify its successful authorized candidate run.
-
-For every final-series commit, fetch the exact GitHub diff and compute the
-whitespace-sensitive ID used by protected policy:
-
-```shell
-repository="NVIDIA/yaml-sigil-traits"
-commit_sha="FULL_40_CHARACTER_COMMIT_SHA"
-diff_file="$(mktemp)"
-gh api -H "Accept: application/vnd.github.diff" \
-  "repos/${repository}/commits/${commit_sha}" > "${diff_file}"
-git patch-id --verbatim < "${diff_file}"
-```
-
-Require exactly one output line. For a `source` entry, run this for both the
-final-series `sha` and retained `original_sha` and require equal patch IDs.
-Use the source PR's exact retained commit order. A squash intake names its
-generated merge object; exact-history intake names every original PR commit.
-For coordinator-created entries, list every changed path once in sorted order;
-a rename or copy lists both its source and destination. Rust activation must be
-one ordinary `Cargo.toml` modification, never a rename or copy into that path.
-
-Write one JSON object with no additional fields, in final-series order:
-
-```json
-{
-  "version": 1,
-  "repository": "NVIDIA/<REPOSITORY>",
-  "policy_sha": "<MAIN-SHA>",
-  "promotion_pull": 123,
-  "base_ref": "refs/heads/main",
-  "base_sha": "<MAIN-SHA>",
-  "head_sha": "<PROMOTION-HEAD-SHA>",
-  "coordination_ref": "refs/heads/<LINE>",
-  "candidate_run_id": 123456789,
-  "candidate_run_attempt": 1,
-  "coordinator": {"id": 12345, "login": "<LOGIN>"},
-  "entries": [
-    {
-      "kind": "source",
-      "sha": "<FINAL-SERIES-SHA>",
-      "patch_id": "<VERBATIM-PATCH-ID>",
-      "source_pull": 122,
-      "original_sha": "<RETAINED-SOURCE-SHA>"
-    },
-    {
-      "kind": "integration",
-      "sha": "<COORDINATOR-COMMIT-SHA>",
-      "patch_id": "<VERBATIM-PATCH-ID>",
-      "paths": ["<FIRST-SORTED-PATH>", "<SECOND-SORTED-PATH>"]
-    }
-  ]
-}
-```
-
-Specification promotions cannot contain `activation`. Rust promotions must
-begin with exactly one `activation` entry whose sole path is `Cargo.toml`; its
-shape otherwise matches `integration`. Confirm the file is valid and bounded,
-then dispatch the protected workflow from `main`:
-
-```shell
-manifest_file="/absolute/path/to/promotion-manifest.json"
-jq -e . "${manifest_file}"
-wc -c < "${manifest_file}"
-gh workflow run required-ci.yml --ref main \
-  --field "manifest=@${manifest_file}"
-```
-
-Require fewer than 49,152 bytes and capture the returned run URL directly.
-Never retry an ambiguous dispatch; locate and read back the single attempted
-run instead. The `protected-automation` deployment proceeds automatically
-under its main-only branch policy; bind it to the exact recorded policy SHA,
-manifest, and run and require it to succeed. Require the resulting App-owned
-check on the exact head and zero artifacts before the separately authorized
-promotion.
+   `main`. Record its exact base and head, then review the complete aggregate
+   diff, resulting tree, and ordered linear series. Account for retained source
+   work, coordinator changes, and every removed or superseded old-line commit.
+3. Compare the cumulative head's `.github/workflows/ci.yml` with exact
+   protected current `main`. If it is byte-identical, review and authorize
+   that head through the ordinary
+   `/ok to test <FULL-40-CHARACTER-HEAD-SHA>` path. Require the automatic
+   App-owned `Required CI` result for that exact head and current `main` base.
+   That verdict validates candidate execution under the existing protected
+   reporter; it does not empirically validate a reporter change proposed by
+   the head. If `ci.yml` differs, do not authorize its copied-ref run; follow
+   [Test a protected-policy change](#test-a-protected-policy-change) on
+   `ci-testing/*` and do not manufacture a promotion App check.
+4. Treat either form of exact-head validation only as test evidence. It does
+   not authenticate provenance or authorize promotion. If changed policy
+   prevents the normal App check, proceed only through the separately
+   authorized exceptional exact-history and protection transaction.
+5. Independently verify the exact `main`, line, and pull-request objects; the
+   complete linear signed and DCO-compliant series; source and synchronization
+   provenance; the aggregate diff and tree; current branch and tag protection;
+   zero artifacts and deployments; and no publication effect. After explicit
+   promotion authorization, pause both refs and prove that `main` is an
+   ancestor of the promotion head.
+6. Use the proved protected-main exact-history transaction with the exact old-
+   `main` lease. Do not use the Web UI merge button or squash the promotion.
+   Restore and digest-compare protection before interpreting an ambiguous
+   update, and never retry that update.
+7. Read back the exact retained history and terminal pull-request association,
+   current-main CI, unchanged tag protection, zero artifacts and deployments,
+   and no tag, Release, or publication effect. Promotion is not release
+   authorization.
 
 ### Retire, abandon, or restart a line
 
@@ -415,6 +346,16 @@ durable record.
 
 The reporter deliberately rejects a candidate `ci.yml` that differs from
 protected current `main`. Do not weaken that binding to make a proposal pass.
+Choose the test path from the exact candidate workflow:
+
+- If `ci.yml` is byte-identical to protected current `main`, use the
+  ordinary exact-head `/ok to test` path. Its App verdict validates candidate
+  execution under the existing protected reporter; it does not empirically
+  validate a reporter change proposed by the head. Give every reporter change
+  focused code review and tests, then run one inert current-main canary after
+  integration before declaring the new reporter operational.
+- If `ci.yml` differs, do not issue `/ok to test` for that head. Use the
+  following trusted staging procedure.
 
 1. Complete the same exact-head review. Confirm the staging workflow has no
    publication, OIDC, protected environment, secret, cache-save, or retained

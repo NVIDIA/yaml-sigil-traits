@@ -1,24 +1,20 @@
 #!/usr/bin/env python3
-# Python is justified here because these tests exercise the checkout-free
-# protected Python reporter without network access, a candidate checkout, or an
-# App token. Keeping the fixtures in the reporter's language makes malformed
-# API objects and subprocess results deterministic while avoiding a second
-# implementation of the policy in Rust or shell.
+# Python is justified here because these tests directly import the checkout-free
+# protected Python reporter and exercise its bounded API contract without
+# network access, a candidate checkout, or an App token. Keeping fixtures in
+# the reporter's language avoids reimplementing its policy in Rust or shell.
 """Deterministic trust-boundary tests for the checkout-free Python reporter.
 
-Python is used here because the protected reporter itself is intentionally a
-standard-library-only Python program that runs before any candidate checkout
-or App token. These fixtures exercise its API, identity, provenance, bounded-
-input, and subprocess boundaries without network access or repository state.
-They are not a second workflow-policy implementation.
+The fixtures model bounded GitHub REST responses and verify the automatic
+candidate binding, DCO policy, base-specific check identity, App scope,
+idempotency, and fail-closed behavior. They perform no network access or
+repository mutation and are not a second workflow-policy implementation.
 """
 
 from __future__ import annotations
 
 import copy
 import importlib.util
-import json
-import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -49,33 +45,6 @@ SIGNER_ID = 42
 SIGNER_LOGIN = "example-contributor"
 SIGNER_NAME = "Example Contributor"
 SIGNER_EMAIL = "contributor@example.invalid"
-COORDINATOR_ID = 77
-COORDINATOR_LOGIN = "release-coordinator"
-COORDINATOR_NAME = "Release Coordinator"
-COORDINATOR_EMAIL = "coordinator@example.invalid"
-SOURCE_PULL = 66
-ACTIVATION_SHA = "1" * 40
-SOURCE_CURRENT = HEAD
-SOURCE_ORIGINAL = "2" * 40
-SOURCE_HEAD = "4" * 40
-SOURCE_DIFF = b"""diff --git a/src/lib.rs b/src/lib.rs
-index 1111111..2222222 100644
---- a/src/lib.rs
-+++ b/src/lib.rs
-@@ -1 +1 @@
--old_value
-+new_value
-"""
-ACTIVATION_DIFF = b"""diff --git a/Cargo.toml b/Cargo.toml
-index 3333333..4444444 100644
---- a/Cargo.toml
-+++ b/Cargo.toml
-@@ -1 +1 @@
--version = "0.5.0"
-+version = "0.6.0-rc.0"
-"""
-
-
 class FakeApi:
     """Deterministic path-keyed API fixture."""
 
@@ -94,16 +63,6 @@ class FakeApi:
         """Return the fixture for one recorded REST mutation."""
 
         return self._take("POST", path, payload)
-
-    def graphql(self, query: str, variables: dict[str, Any]) -> Any:
-        """Return the fixture for the reporter's fixed GraphQL query."""
-
-        return self._take("GRAPHQL", query, variables)
-
-    def diff(self, path: str) -> bytes:
-        """Return exact diff bytes without text normalization."""
-
-        return self._take("DIFF", path, None)
 
     def _take(self, method: str, path: str, payload: Any) -> Any:
         """Record one call and fail if the test did not authorize its path."""
@@ -225,37 +184,6 @@ def fixture(
                 },
             }
         ],
-        ("GRAPHQL", reporter.SIGNATURE_QUERY): {
-            "data": {
-                "repository": {
-                    "pullRequest": {
-                        "commits": {
-                            "totalCount": 1,
-                            "nodes": [
-                                {
-                                    "commit": {
-                                        "oid": HEAD,
-                                        "signature": {
-                                            "__typename": "SshSignature",
-                                            "email": SIGNER_EMAIL,
-                                            "isValid": True,
-                                            "state": "VALID",
-                                            "wasSignedByGitHub": False,
-                                            "signer": {
-                                                "databaseId": SIGNER_ID,
-                                                "login": SIGNER_LOGIN,
-                                                "__typename": "User",
-                                            },
-                                        },
-                                    }
-                                }
-                            ],
-                            "pageInfo": {"hasNextPage": False},
-                        }
-                    }
-                }
-            }
-        },
         (
             "GET",
             f"repos/{REPOSITORY}/git/ref/heads/pull-request/{PULL}",
@@ -309,264 +237,6 @@ def bind(event: dict[str, Any], responses: dict[tuple[str, str], Any]) -> Any:
     """Run ordinary candidate binding against an isolated fake API."""
 
     return reporter.bind_candidate(FakeApi(responses), event, policy())
-
-
-def verbatim_patch_id(diff: bytes) -> str:
-    """Derive a fixture value with the same reviewed Git primitive as policy."""
-
-    completed = subprocess.run(
-        ["git", "patch-id", "--verbatim"],
-        input=diff,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=True,
-    )
-    return completed.stdout.decode("ascii").split()[0]
-
-
-def promotion_commit(
-    sha: str,
-    parent: str,
-    *,
-    author_id: int,
-    author_login: str,
-    author_name: str,
-    author_email: str,
-    committer_id: int,
-    committer_login: str,
-    committer_name: str,
-    committer_email: str,
-    path: str,
-    patch: str = "@@ -1 +1 @@\n-old\n+new",
-) -> dict[str, Any]:
-    """Build one complete linear commit response for promotion fixtures."""
-
-    return {
-        "sha": sha,
-        "author": {"id": author_id, "login": author_login, "type": "User"},
-        "committer": {
-            "id": committer_id,
-            "login": committer_login,
-            "type": "User",
-        },
-        "parents": [{"sha": parent}],
-        "files": [{"filename": path, "status": "modified", "patch": patch}],
-        "commit": {
-            "author": {"name": author_name, "email": author_email},
-            "committer": {"name": committer_name, "email": committer_email},
-            "message": (
-                "change: retained work\n\n"
-                f"Signed-off-by: {author_name} <{author_email}>"
-            ),
-            "verification": {"verified": True, "reason": "valid"},
-        },
-    }
-
-
-def promotion_signature(sha: str) -> dict[str, Any]:
-    """Build one exact coordinator-owned GraphQL signature node."""
-
-    return {
-        "commit": {
-            "oid": sha,
-            "signature": {
-                "__typename": "SshSignature",
-                "email": COORDINATOR_EMAIL,
-                "isValid": True,
-                "state": "VALID",
-                "wasSignedByGitHub": False,
-                "signer": {
-                    "databaseId": COORDINATOR_ID,
-                    "login": COORDINATOR_LOGIN,
-                    "__typename": "User",
-                },
-            },
-        }
-    }
-
-
-def promotion_fixture() -> tuple[
-    str,
-    dict[str, Any],
-    reporter.PromotionContext,
-    dict[tuple[str, str], Any],
-]:
-    """Build a complete valid Rust promotion and all authoritative evidence."""
-
-    event, responses = fixture()
-    source_patch_id = verbatim_patch_id(SOURCE_DIFF)
-    activation_patch_id = verbatim_patch_id(ACTIVATION_DIFF)
-    manifest_value = {
-        "version": 1,
-        "repository": REPOSITORY,
-        "policy_sha": POLICY_SHA,
-        "promotion_pull": PULL,
-        "base_ref": "refs/heads/main",
-        "base_sha": POLICY_SHA,
-        "head_sha": HEAD,
-        "coordination_ref": f"refs/heads/{COORDINATION_BRANCH}",
-        "candidate_run_id": RUN_ID,
-        "candidate_run_attempt": ATTEMPT,
-        "coordinator": {"id": COORDINATOR_ID, "login": COORDINATOR_LOGIN},
-        "entries": [
-            {
-                "kind": "activation",
-                "sha": ACTIVATION_SHA,
-                "patch_id": activation_patch_id,
-                "paths": ["Cargo.toml"],
-            },
-            {
-                "kind": "source",
-                "sha": SOURCE_CURRENT,
-                "patch_id": source_patch_id,
-                "source_pull": SOURCE_PULL,
-                "original_sha": SOURCE_ORIGINAL,
-            },
-        ],
-    }
-    manifest_raw = json.dumps(manifest_value, separators=(",", ":"), sort_keys=True)
-    event = {
-        "ref": "main",
-        "repository": {"full_name": REPOSITORY},
-        "sender": {
-            "id": COORDINATOR_ID,
-            "login": COORDINATOR_LOGIN,
-            "type": "User",
-        },
-        "inputs": {"manifest": manifest_raw},
-    }
-    context = reporter.PromotionContext(
-        event_name="workflow_dispatch",
-        ref="refs/heads/main",
-        sha=POLICY_SHA,
-        workflow_ref=(
-            f"{REPOSITORY}/.github/workflows/required-ci.yml@refs/heads/main"
-        ),
-        actor=COORDINATOR_LOGIN,
-        actor_id=COORDINATOR_ID,
-        triggering_actor=COORDINATOR_LOGIN,
-        run_attempt=1,
-    )
-
-    source_current = promotion_commit(
-        SOURCE_CURRENT,
-        ACTIVATION_SHA,
-        author_id=SIGNER_ID,
-        author_login=SIGNER_LOGIN,
-        author_name=SIGNER_NAME,
-        author_email=SIGNER_EMAIL,
-        committer_id=COORDINATOR_ID,
-        committer_login=COORDINATOR_LOGIN,
-        committer_name=COORDINATOR_NAME,
-        committer_email=COORDINATOR_EMAIL,
-        path="src/lib.rs",
-    )
-    source_original = promotion_commit(
-        SOURCE_ORIGINAL,
-        "5" * 40,
-        author_id=SIGNER_ID,
-        author_login=SIGNER_LOGIN,
-        author_name=SIGNER_NAME,
-        author_email=SIGNER_EMAIL,
-        committer_id=COORDINATOR_ID,
-        committer_login=COORDINATOR_LOGIN,
-        committer_name=COORDINATOR_NAME,
-        committer_email=COORDINATOR_EMAIL,
-        path="src/lib.rs",
-    )
-    activation = promotion_commit(
-        ACTIVATION_SHA,
-        POLICY_SHA,
-        author_id=COORDINATOR_ID,
-        author_login=COORDINATOR_LOGIN,
-        author_name=COORDINATOR_NAME,
-        author_email=COORDINATOR_EMAIL,
-        committer_id=COORDINATOR_ID,
-        committer_login=COORDINATOR_LOGIN,
-        committer_name=COORDINATOR_NAME,
-        committer_email=COORDINATOR_EMAIL,
-        path="Cargo.toml",
-    )
-
-    pull_path = ("GET", f"repos/{REPOSITORY}/pulls/{PULL}")
-    responses[pull_path]["commits"] = 2
-    responses[pull_path]["head"] = {
-        "sha": HEAD,
-        "ref": COORDINATION_BRANCH,
-        "repo": {"full_name": REPOSITORY},
-    }
-    responses[
-        ("GET", f"repos/{REPOSITORY}/pulls/{PULL}/commits?per_page=100&page=1")
-    ] = [activation, source_current]
-    responses[("GRAPHQL", reporter.SIGNATURE_QUERY)]["data"]["repository"][
-        "pullRequest"
-    ]["commits"] = {
-        "totalCount": 2,
-        "nodes": [promotion_signature(ACTIVATION_SHA), promotion_signature(SOURCE_CURRENT)],
-        "pageInfo": {"hasNextPage": False},
-    }
-    responses[
-        ("GET", f"repos/{REPOSITORY}/git/ref/heads/{COORDINATION_BRANCH}")
-    ] = {
-        "ref": f"refs/heads/{COORDINATION_BRANCH}",
-        "object": {"type": "commit", "sha": HEAD},
-    }
-    responses[
-        (
-            "GET",
-            f"repos/{REPOSITORY}/collaborators/{COORDINATOR_LOGIN}/permission",
-        )
-    ] = {
-        "permission": "write",
-        "user": {
-            "id": COORDINATOR_ID,
-            "login": COORDINATOR_LOGIN,
-            "type": "User",
-        },
-    }
-    responses[("GET", f"repos/{REPOSITORY}/pulls/{SOURCE_PULL}")] = {
-        "number": SOURCE_PULL,
-        "state": "closed",
-        "merged": True,
-        "merged_at": "2026-09-01T00:00:00Z",
-        "commits": 1,
-        "merge_commit_sha": SOURCE_ORIGINAL,
-        "base": {
-            "ref": COORDINATION_BRANCH,
-            "repo": {"full_name": REPOSITORY},
-        },
-    }
-    responses[
-        (
-            "GET",
-            f"repos/{REPOSITORY}/pulls/{SOURCE_PULL}/commits?per_page=100&page=1",
-        )
-    ] = [{"sha": SOURCE_HEAD}]
-    responses[
-        (
-            "GET",
-            f"repos/{REPOSITORY}/commits/{SOURCE_ORIGINAL}/pulls?per_page=100&page=1",
-        )
-    ] = [
-        {
-            "number": SOURCE_PULL,
-            "base": {"repo": {"full_name": REPOSITORY}},
-        }
-    ]
-    for sha, commit in (
-        (SOURCE_CURRENT, source_current),
-        (SOURCE_ORIGINAL, source_original),
-        (ACTIVATION_SHA, activation),
-    ):
-        responses[
-            ("GET", f"repos/{REPOSITORY}/commits/{sha}?per_page=100&page=1")
-        ] = commit
-    for sha in (SOURCE_CURRENT, SOURCE_ORIGINAL):
-        responses[("DIFF", f"repos/{REPOSITORY}/commits/{sha}")] = SOURCE_DIFF
-    responses[("DIFF", f"repos/{REPOSITORY}/commits/{ACTIVATION_SHA}")] = (
-        ACTIVATION_DIFF
-    )
-    return manifest_raw, event, context, responses
 
 
 class BindingTests(unittest.TestCase):
@@ -704,6 +374,69 @@ class BindingTests(unittest.TestCase):
         self.assertEqual(result.head_sha, HEAD)
         self.assertFalse(any(method == "GRAPHQL" for method, _, _ in api.calls))
 
+    def test_multi_commit_main_candidate_uses_ordinary_required_check(self) -> None:
+        """Bind and report one ordinary multi-commit main candidate."""
+
+        event, responses = fixture()
+        pull_path = ("GET", f"repos/{REPOSITORY}/pulls/{PULL}")
+        commits_path = (
+            "GET",
+            f"repos/{REPOSITORY}/pulls/{PULL}/commits?per_page=100&page=1",
+        )
+        first = copy.deepcopy(responses[commits_path][0])
+        first["sha"] = "e" * 40
+        first["commit"]["message"] = (
+            "fix: first signed-off change\n\n"
+            f"Signed-off-by: {SIGNER_NAME} <{SIGNER_EMAIL}>"
+        )
+        responses[pull_path]["commits"] = 2
+        responses[commits_path].insert(0, first)
+
+        read_api = FakeApi(responses)
+        binding = reporter.bind_candidate(read_api, event, policy())
+        self.assertEqual(binding.head_sha, HEAD)
+        self.assertEqual(binding.base_ref, "refs/heads/main")
+        self.assertEqual(binding.check_name, "Required CI")
+        self.assertEqual(
+            binding.external_id,
+            f"yaml-sigil-required-ci:{RUN_ID}:{ATTEMPT}:{POLICY_SHA}",
+        )
+
+        query = "check_name=Required+CI&filter=all&per_page=100"
+        check = {
+            "id": 88,
+            "name": "Required CI",
+            "head_sha": HEAD,
+            "external_id": binding.external_id,
+            "status": "completed",
+            "conclusion": "success",
+            "app": {"slug": "nvidia-yamlsigil-release-pr"},
+        }
+        app_api = FakeApi(
+            {
+                ("GET", f"repos/{REPOSITORY}/commits/{HEAD}/check-runs?{query}"): {
+                    "total_count": 0,
+                    "check_runs": [],
+                },
+                ("POST", f"repos/{REPOSITORY}/check-runs"): check,
+                ("GET", f"repos/{REPOSITORY}/check-runs/88"): check,
+            }
+        )
+        self.assertEqual(reporter.report_check(app_api, policy(), binding), 88)
+        self.assertEqual(
+            app_api.calls[1][2]["output"]["title"],
+            "Authorized candidate CI result",
+        )
+
+    def test_removed_promotion_operations_are_rejected(self) -> None:
+        """Keep the deleted manual command surface unreachable."""
+
+        for operation in ("inspect-promotion", "report-promotion"):
+            with self.subTest(operation=operation):
+                with mock.patch("sys.stderr"):
+                    with self.assertRaises(SystemExit):
+                        reporter.parser().parse_args([operation])
+
     def test_missing_or_mismatched_raw_author_dco_fails_closed(self) -> None:
         commits_path = (
             "GET",
@@ -748,553 +481,6 @@ class BindingTests(unittest.TestCase):
                 result = bind(event, responses)
                 expected = "success" if conclusion == "success" else "failure"
                 self.assertEqual(result.check_conclusion, expected)
-
-
-class PromotionBindingTests(unittest.TestCase):
-    def promote(
-        self,
-        manifest_raw: str,
-        event: dict[str, Any],
-        context: reporter.PromotionContext,
-        responses: dict[tuple[str, str], Any],
-    ) -> Any:
-        """Run promotion binding against one isolated fake API."""
-
-        return reporter.bind_promotion(
-            FakeApi(responses), event, policy(), manifest_raw, context
-        )
-
-    def replace_manifest(
-        self,
-        manifest_raw: str,
-        event: dict[str, Any],
-        mutate: Any,
-    ) -> str:
-        """Mutate, recanonicalize, and reattach one manifest fixture."""
-
-        value = json.loads(manifest_raw)
-        mutate(value)
-        updated = json.dumps(value, separators=(",", ":"), sort_keys=True)
-        event["inputs"]["manifest"] = updated
-        return updated
-
-    def test_happy_path_binds_distinct_promotion_check(self) -> None:
-        manifest_raw, event, context, responses = promotion_fixture()
-        result = self.promote(manifest_raw, event, context, responses)
-        self.assertEqual(result.mode, "promotion")
-        self.assertEqual(result.head_sha, HEAD)
-        self.assertEqual(result.base_sha, POLICY_SHA)
-        self.assertEqual(result.check_name, "Required CI")
-        self.assertEqual(result.conclusion, "success")
-        self.assertRegex(
-            result.external_id,
-            rf"^yaml-sigil-promotion-ci:[0-9a-f]{{64}}:{RUN_ID}:{ATTEMPT}:{POLICY_SHA}$",
-        )
-
-    def test_promotion_signature_inventory_remains_required_and_exact(self) -> None:
-        signature_path = ("GRAPHQL", reporter.SIGNATURE_QUERY)
-
-        def graph_commits(responses: dict[Any, Any]) -> dict[str, Any]:
-            return responses[signature_path]["data"]["repository"]["pullRequest"][
-                "commits"
-            ]
-
-        mutations = {
-            "count": lambda responses: graph_commits(responses).__setitem__(
-                "totalCount", 3
-            ),
-            "next page": lambda responses: graph_commits(responses)[
-                "pageInfo"
-            ].__setitem__("hasNextPage", True),
-            "OID": lambda responses: graph_commits(responses)["nodes"][0][
-                "commit"
-            ].__setitem__("oid", "b" * 40),
-            "ambiguous node": lambda responses: graph_commits(responses)["nodes"][
-                0
-            ].__setitem__("unexpected", True),
-        }
-        for name, mutate in mutations.items():
-            with self.subTest(name=name):
-                manifest_raw, event, context, responses = promotion_fixture()
-                mutate(responses)
-                with self.assertRaises(reporter.ReporterError):
-                    self.promote(manifest_raw, event, context, responses)
-
-        manifest_raw, event, context, responses = promotion_fixture()
-        commits_path = (
-            "GET",
-            f"repos/{REPOSITORY}/pulls/{PULL}/commits?per_page=100&page=1",
-        )
-        responses[commits_path][0]["commit"]["verification"] = {
-            "verified": False,
-            "reason": "unsigned",
-        }
-        with self.assertRaisesRegex(reporter.ReporterError, "not GitHub Verified"):
-            self.promote(manifest_raw, event, context, responses)
-
-    def test_automatic_path_ignores_a_promotion_shaped_input(self) -> None:
-        event, responses = fixture()
-        event["inputs"] = {"manifest": '{"version":1}'}
-        api = FakeApi(responses)
-        result = reporter.bind_candidate(api, event, policy())
-        self.assertEqual(result.mode, "candidate")
-        self.assertTrue(result.external_id.startswith("yaml-sigil-required-ci:"))
-        self.assertFalse(any(method == "DIFF" for method, _, _ in api.calls))
-        self.assertFalse(any("collaborators" in path for _, path, _ in api.calls))
-
-    def test_server_owned_dispatch_context_is_exact(self) -> None:
-        mutations = {
-            "event": {"event_name": "workflow_run"},
-            "ref": {"ref": "refs/heads/dev/0.6.0"},
-            "policy": {"sha": "e" * 40},
-            "workflow": {
-                "workflow_ref": (
-                    f"{REPOSITORY}/.github/workflows/required-ci.yml@refs/heads/dev/0.6.0"
-                )
-            },
-            "actor": {"actor": "another-writer"},
-            "actor ID": {"actor_id": COORDINATOR_ID + 1},
-            "rerun actor": {"triggering_actor": "another-writer"},
-            "rerun": {"run_attempt": 2},
-        }
-        for name, changes in mutations.items():
-            with self.subTest(name=name):
-                manifest_raw, event, context, responses = promotion_fixture()
-                changed = reporter.PromotionContext(
-                    **{**context.__dict__, **changes}
-                )
-                with self.assertRaises(reporter.ReporterError):
-                    self.promote(manifest_raw, event, changed, responses)
-
-    def test_current_writer_and_event_sender_are_rebound(self) -> None:
-        manifest_raw, event, context, responses = promotion_fixture()
-        permission_path = (
-            "GET",
-            f"repos/{REPOSITORY}/collaborators/{COORDINATOR_LOGIN}/permission",
-        )
-        responses[permission_path]["permission"] = "read"
-        with self.assertRaisesRegex(reporter.ReporterError, "trusted writer"):
-            self.promote(manifest_raw, event, context, responses)
-
-        manifest_raw, event, context, responses = promotion_fixture()
-        event["sender"]["id"] += 1
-        with self.assertRaisesRegex(reporter.ReporterError, "sender"):
-            self.promote(manifest_raw, event, context, responses)
-
-    def test_candidate_run_and_live_coordination_ref_are_exact(self) -> None:
-        manifest_raw, event, context, responses = promotion_fixture()
-        manifest_raw = self.replace_manifest(
-            manifest_raw,
-            event,
-            lambda value: value.__setitem__("candidate_run_attempt", ATTEMPT + 1),
-        )
-        with self.assertRaisesRegex(reporter.ReporterError, "attempt"):
-            self.promote(manifest_raw, event, context, responses)
-
-        manifest_raw, event, context, responses = promotion_fixture()
-        responses[
-            ("GET", f"repos/{REPOSITORY}/git/ref/heads/{COORDINATION_BRANCH}")
-        ]["object"]["sha"] = "e" * 40
-        with self.assertRaisesRegex(reporter.ReporterError, "coordination ref moved"):
-            self.promote(manifest_raw, event, context, responses)
-
-    def test_manifest_inventory_rejects_missing_extra_duplicate_and_reorder(self) -> None:
-        mutations = {
-            "missing": lambda value: value["entries"].pop(),
-            "extra": lambda value: value["entries"].append(
-                {
-                    **value["entries"][1],
-                    "sha": "7" * 40,
-                }
-            ),
-            "duplicate": lambda value: value["entries"].append(
-                copy.deepcopy(value["entries"][1])
-            ),
-            "reordered": lambda value: value["entries"].reverse(),
-        }
-        for name, mutate in mutations.items():
-            with self.subTest(name=name):
-                manifest_raw, event, context, responses = promotion_fixture()
-                manifest_raw = self.replace_manifest(
-                    manifest_raw, event, mutate
-                )
-                with self.assertRaises(reporter.ReporterError):
-                    self.promote(manifest_raw, event, context, responses)
-
-    def test_signer_source_patch_and_coordinator_paths_are_exact(self) -> None:
-        manifest_raw, event, context, responses = promotion_fixture()
-        signature = responses[("GRAPHQL", reporter.SIGNATURE_QUERY)]["data"][
-            "repository"
-        ]["pullRequest"]["commits"]["nodes"][0]["commit"]["signature"]
-        signature["signer"]["databaseId"] += 1
-        with self.assertRaisesRegex(reporter.ReporterError, "coordinator"):
-            self.promote(manifest_raw, event, context, responses)
-
-        manifest_raw, event, context, responses = promotion_fixture()
-        responses[("DIFF", f"repos/{REPOSITORY}/commits/{SOURCE_CURRENT}")] = (
-            SOURCE_DIFF.replace(b"new_value", b"different_value")
-        )
-        with self.assertRaisesRegex(reporter.ReporterError, "logical patch"):
-            self.promote(manifest_raw, event, context, responses)
-
-        manifest_raw, event, context, responses = promotion_fixture()
-        manifest_raw = self.replace_manifest(
-            manifest_raw,
-            event,
-            lambda value: value["entries"][0].__setitem__(
-                "paths", ["Cargo.toml", "src/lib.rs"]
-            ),
-        )
-        with self.assertRaisesRegex(reporter.ReporterError, "workspace manifest"):
-            self.promote(manifest_raw, event, context, responses)
-
-        manifest_raw, event, context, responses = promotion_fixture()
-        activation_path = (
-            "GET",
-            f"repos/{REPOSITORY}/commits/{ACTIVATION_SHA}?per_page=100&page=1",
-        )
-        responses[activation_path]["files"][0]["filename"] = "src/lib.rs"
-        with self.assertRaisesRegex(reporter.ReporterError, "ordinary Cargo.toml"):
-            self.promote(manifest_raw, event, context, responses)
-
-    def test_rust_activation_cannot_rename_into_cargo_manifest(self) -> None:
-        """Treat both rename endpoints as paths and reject activation renames."""
-
-        manifest_raw, event, context, responses = promotion_fixture()
-        activation_path = (
-            "GET",
-            f"repos/{REPOSITORY}/commits/{ACTIVATION_SHA}?per_page=100&page=1",
-        )
-        activation = responses[activation_path]
-        activation["files"][0].update(
-            {
-                "status": "renamed",
-                "previous_filename": "src/old-version-manifest.toml",
-            }
-        )
-        self.assertEqual(
-            reporter._changed_paths(activation, "activation fixture"),
-            ("Cargo.toml", "src/old-version-manifest.toml"),
-        )
-        with self.assertRaisesRegex(reporter.ReporterError, "ordinary Cargo.toml"):
-            self.promote(manifest_raw, event, context, responses)
-
-    def test_source_message_and_textual_patch_are_exact(self) -> None:
-        for name, sha in {
-            "current": SOURCE_CURRENT,
-            "original": SOURCE_ORIGINAL,
-        }.items():
-            with self.subTest(message=name):
-                manifest_raw, event, context, responses = promotion_fixture()
-                commit_path = (
-                    "GET",
-                    f"repos/{REPOSITORY}/commits/{sha}?per_page=100&page=1",
-                )
-                responses[commit_path]["commit"]["message"] += "\nChanged-trailer: yes"
-                with self.assertRaisesRegex(
-                    reporter.ReporterError, "complete commit message"
-                ):
-                    self.promote(manifest_raw, event, context, responses)
-
-        for name, sha in {
-            "activation": ACTIVATION_SHA,
-            "current": SOURCE_CURRENT,
-            "original": SOURCE_ORIGINAL,
-        }.items():
-            with self.subTest(missing_patch=name):
-                manifest_raw, event, context, responses = promotion_fixture()
-                commit_path = (
-                    "GET",
-                    f"repos/{REPOSITORY}/commits/{sha}?per_page=100&page=1",
-                )
-                responses[commit_path]["files"][0].pop("patch")
-                with self.assertRaisesRegex(
-                    reporter.ReporterError, "complete textual patch"
-                ):
-                    self.promote(manifest_raw, event, context, responses)
-
-    def test_source_pull_inventory_is_exhaustive(self) -> None:
-        manifest_raw, event, context, responses = promotion_fixture()
-        another_original = "9" * 40
-        source_pull_path = ("GET", f"repos/{REPOSITORY}/pulls/{SOURCE_PULL}")
-        responses[source_pull_path]["commits"] = 2
-        source_commits_path = (
-            "GET",
-            f"repos/{REPOSITORY}/pulls/{SOURCE_PULL}/commits?per_page=100&page=1",
-        )
-        responses[source_commits_path] = [
-            {"sha": another_original},
-            {"sha": SOURCE_ORIGINAL},
-        ]
-        with self.assertRaisesRegex(reporter.ReporterError, "exceed the promotion series"):
-            self.promote(manifest_raw, event, context, responses)
-
-    def test_same_source_pull_commits_cannot_be_replayed_in_reverse(self) -> None:
-        """Reject a valid two-commit source PR retained in the wrong order.
-
-        This exercises the complete promotion binding rather than comparing
-        two lists in isolation. Every commit, association, signature, message,
-        patch, and parent is otherwise valid; only the relationship between
-        the source PR's order and the final promotion series is reversed.
-        """
-
-        manifest_raw, event, context, responses = promotion_fixture()
-        original_first = "6" * 40
-        current_last = "7" * 40
-        source_patch_id = verbatim_patch_id(SOURCE_DIFF)
-
-        manifest = json.loads(manifest_raw)
-        manifest["head_sha"] = current_last
-        manifest["entries"].append(
-            {
-                "kind": "source",
-                "sha": current_last,
-                "patch_id": source_patch_id,
-                "source_pull": SOURCE_PULL,
-                "original_sha": original_first,
-            }
-        )
-        manifest_raw = json.dumps(manifest, separators=(",", ":"), sort_keys=True)
-        event["inputs"]["manifest"] = manifest_raw
-
-        current_last_commit = promotion_commit(
-            current_last,
-            SOURCE_CURRENT,
-            author_id=SIGNER_ID,
-            author_login=SIGNER_LOGIN,
-            author_name=SIGNER_NAME,
-            author_email=SIGNER_EMAIL,
-            committer_id=COORDINATOR_ID,
-            committer_login=COORDINATOR_LOGIN,
-            committer_name=COORDINATOR_NAME,
-            committer_email=COORDINATOR_EMAIL,
-            path="src/lib.rs",
-        )
-        original_first_commit = promotion_commit(
-            original_first,
-            "5" * 40,
-            author_id=SIGNER_ID,
-            author_login=SIGNER_LOGIN,
-            author_name=SIGNER_NAME,
-            author_email=SIGNER_EMAIL,
-            committer_id=COORDINATOR_ID,
-            committer_login=COORDINATOR_LOGIN,
-            committer_name=COORDINATOR_NAME,
-            committer_email=COORDINATOR_EMAIL,
-            path="src/lib.rs",
-        )
-
-        run_path = ("GET", f"repos/{REPOSITORY}/actions/runs/{RUN_ID}")
-        responses[run_path]["head_sha"] = current_last
-        pull_path = ("GET", f"repos/{REPOSITORY}/pulls/{PULL}")
-        responses[pull_path]["commits"] = 3
-        responses[pull_path]["head"]["sha"] = current_last
-        promotion_commits_path = (
-            "GET",
-            f"repos/{REPOSITORY}/pulls/{PULL}/commits?per_page=100&page=1",
-        )
-        responses[promotion_commits_path].append(current_last_commit)
-        graph_commits = responses[("GRAPHQL", reporter.SIGNATURE_QUERY)]["data"][
-            "repository"
-        ]["pullRequest"]["commits"]
-        graph_commits["totalCount"] = 3
-        graph_commits["nodes"].append(promotion_signature(current_last))
-
-        responses[
-            ("GET", f"repos/{REPOSITORY}/git/ref/heads/pull-request/{PULL}")
-        ]["object"]["sha"] = current_last
-        jobs_path = (
-            "GET",
-            f"repos/{REPOSITORY}/actions/runs/{RUN_ID}/attempts/{ATTEMPT}/jobs?per_page=100",
-        )
-        for job in responses[jobs_path]["jobs"]:
-            job["head_sha"] = current_last
-        responses[
-            ("GET", f"repos/{REPOSITORY}/git/ref/heads/{COORDINATION_BRANCH}")
-        ]["object"]["sha"] = current_last
-
-        candidate_workflow = responses.pop(
-            (
-                "GET",
-                f"repos/{REPOSITORY}/contents/.github/workflows/ci.yml?ref={HEAD}",
-            )
-        )
-        responses[
-            (
-                "GET",
-                f"repos/{REPOSITORY}/contents/.github/workflows/ci.yml?ref={current_last}",
-            )
-        ] = candidate_workflow
-        responses[
-            (
-                "GET",
-                f"repos/{REPOSITORY}/commits/{current_last}?per_page=100&page=1",
-            )
-        ] = current_last_commit
-        responses[
-            (
-                "GET",
-                f"repos/{REPOSITORY}/commits/{original_first}?per_page=100&page=1",
-            )
-        ] = original_first_commit
-        responses[("DIFF", f"repos/{REPOSITORY}/commits/{current_last}")] = SOURCE_DIFF
-        responses[("DIFF", f"repos/{REPOSITORY}/commits/{original_first}")] = SOURCE_DIFF
-
-        source_pull_path = ("GET", f"repos/{REPOSITORY}/pulls/{SOURCE_PULL}")
-        responses[source_pull_path]["commits"] = 2
-        source_commits_path = (
-            "GET",
-            f"repos/{REPOSITORY}/pulls/{SOURCE_PULL}/commits?per_page=100&page=1",
-        )
-        responses[source_commits_path] = [
-            {"sha": original_first},
-            {"sha": SOURCE_ORIGINAL},
-        ]
-        responses[
-            (
-                "GET",
-                f"repos/{REPOSITORY}/commits/{original_first}/pulls?per_page=100&page=1",
-            )
-        ] = [
-            {
-                "number": SOURCE_PULL,
-                "base": {"repo": {"full_name": REPOSITORY}},
-            }
-        ]
-
-        with self.assertRaisesRegex(reporter.ReporterError, "reordered"):
-            self.promote(manifest_raw, event, context, responses)
-
-    def test_source_pr_and_api_shapes_fail_closed(self) -> None:
-        manifest_raw, event, context, responses = promotion_fixture()
-        responses[("GET", f"repos/{REPOSITORY}/pulls/{SOURCE_PULL}")][
-            "merged"
-        ] = False
-        with self.assertRaisesRegex(reporter.ReporterError, "terminally merged"):
-            self.promote(manifest_raw, event, context, responses)
-
-        manifest_raw, event, context, responses = promotion_fixture()
-        responses[
-            (
-                "GET",
-                f"repos/{REPOSITORY}/commits/{SOURCE_ORIGINAL}/pulls?per_page=100&page=1",
-            )
-        ] = {"unexpected": True}
-        with self.assertRaisesRegex(reporter.ReporterError, "not an array"):
-            self.promote(manifest_raw, event, context, responses)
-
-    def test_manifest_parser_rejects_malformed_duplicate_and_oversized_input(self) -> None:
-        with self.assertRaisesRegex(reporter.ReporterError, "valid JSON"):
-            reporter.read_promotion_manifest("{")
-        with self.assertRaisesRegex(reporter.ReporterError, "duplicate field"):
-            reporter.read_promotion_manifest('{"version":1,"version":1}')
-        with self.assertRaisesRegex(reporter.ReporterError, "oversized"):
-            reporter.read_promotion_manifest(
-                "x" * (reporter.MAX_PROMOTION_MANIFEST_BYTES + 1)
-            )
-
-    def test_manifest_parser_enforces_repository_activation_policy(self) -> None:
-        manifest_raw, _, _, _ = promotion_fixture()
-        value = json.loads(manifest_raw)
-        value["entries"].pop(0)
-        with self.assertRaisesRegex(reporter.ReporterError, "must begin"):
-            reporter.read_promotion_manifest(json.dumps(value))
-
-        value = json.loads(manifest_raw)
-        value["entries"][1]["prior_sha"] = "5" * 40
-        with self.assertRaisesRegex(reporter.ReporterError, "incomplete or ambiguous"):
-            reporter.read_promotion_manifest(json.dumps(value))
-
-        value = json.loads(manifest_raw)
-        value["repository"] = "NVIDIA/yaml-sigil-spec"
-        value["coordination_ref"] = "refs/heads/v1alpha2"
-        with self.assertRaisesRegex(reporter.ReporterError, "cannot contain activation"):
-            reporter.read_promotion_manifest(json.dumps(value))
-        value["entries"].pop(0)
-        parsed = reporter.read_promotion_manifest(json.dumps(value))
-        self.assertEqual(parsed.repository, "NVIDIA/yaml-sigil-spec")
-
-
-class PatchInventoryTests(unittest.TestCase):
-    def patch_id(self, raw: bytes, sha: str = "8" * 40) -> str:
-        """Compute one policy patch ID from exact fixture bytes."""
-
-        path = f"repos/{REPOSITORY}/commits/{sha}"
-        return reporter.PatchInventory(
-            FakeApi({("DIFF", path): raw}), REPOSITORY
-        ).patch_id(sha, "fixture commit")
-
-    def test_verbatim_ids_distinguish_yaml_and_python_indentation(self) -> None:
-        yaml_two = b"""diff --git a/a.yml b/a.yml
---- a/a.yml
-+++ b/a.yml
-@@ -1 +1 @@
--  run: true
-+    run: true
-"""
-        yaml_three = yaml_two.replace(b"+    run", b"+      run")
-        python_four = b"""diff --git a/a.py b/a.py
---- a/a.py
-+++ b/a.py
-@@ -1 +1 @@
--    return True
-+        return True
-"""
-        python_eight = python_four.replace(b"+        return", b"+            return")
-        self.assertNotEqual(self.patch_id(yaml_two), self.patch_id(yaml_three, "9" * 40))
-        self.assertNotEqual(
-            self.patch_id(python_four, "a" * 40),
-            self.patch_id(python_eight, "b" * 40),
-        )
-
-    def test_patch_id_process_output_and_failure_are_bounded(self) -> None:
-        cases = {
-            "empty": subprocess.CompletedProcess([], 0, b"", b""),
-            "multiple": subprocess.CompletedProcess(
-                [], 0, (b"a" * 40 + b" 0\n" + b"b" * 40 + b" 0\n"), b""
-            ),
-            "malformed": subprocess.CompletedProcess([], 0, b"not-a-hash 0\n", b""),
-            "malformed source": subprocess.CompletedProcess(
-                [], 0, b"a" * 40 + b" not-a-sha\n", b""
-            ),
-            "stderr": subprocess.CompletedProcess([], 0, b"a" * 40 + b" 0\n", b"warning"),
-            "failure": subprocess.CompletedProcess([], 1, b"", b"failed"),
-        }
-        for name, completed in cases.items():
-            with self.subTest(name=name), mock.patch.object(
-                reporter.subprocess, "run", return_value=completed
-            ):
-                with self.assertRaises(reporter.ReporterError):
-                    self.patch_id(SOURCE_DIFF)
-
-        with mock.patch.object(
-            reporter.subprocess,
-            "run",
-            side_effect=subprocess.TimeoutExpired(["git", "patch-id"], 10),
-        ):
-            with self.assertRaises(reporter.ReporterError):
-                self.patch_id(SOURCE_DIFF)
-
-    def test_patch_input_has_per_commit_and_aggregate_bounds(self) -> None:
-        oversized = b"x" * (reporter.MAX_PROMOTION_PATCH_BYTES + 1)
-        with self.assertRaisesRegex(reporter.ReporterError, "oversized"):
-            self.patch_id(oversized)
-
-        first = "8" * 40
-        second = "9" * 40
-        inventory = reporter.PatchInventory(
-            FakeApi(
-                {
-                    ("DIFF", f"repos/{REPOSITORY}/commits/{first}"): SOURCE_DIFF,
-                    ("DIFF", f"repos/{REPOSITORY}/commits/{second}"): SOURCE_DIFF,
-                }
-            ),
-            REPOSITORY,
-        )
-        inventory.total_bytes = reporter.MAX_PROMOTION_PATCH_TOTAL_BYTES - len(SOURCE_DIFF)
-        inventory.patch_id(first, "first")
-        with self.assertRaisesRegex(reporter.ReporterError, "inventory is oversized"):
-            inventory.patch_id(second, "second")
 
 
 class ReportingTests(unittest.TestCase):
@@ -1385,46 +571,6 @@ class ReportingTests(unittest.TestCase):
         )
         self.assertEqual(reporter.report_check(api, policy(), self.binding), 88)
         self.assertEqual(len(api.calls), 1)
-
-    def test_ordinary_check_cannot_substitute_for_promotion_evidence(self) -> None:
-        """Create a promotion check even when ordinary CI already succeeded."""
-
-        manifest_raw, event, context, responses = promotion_fixture()
-        promotion = reporter.bind_promotion(
-            FakeApi(responses), event, policy(), manifest_raw, context
-        )
-        self.assertNotEqual(promotion.external_id, self.binding.external_id)
-        query = "check_name=Required+CI&filter=all&per_page=100"
-        ordinary_check = {
-            "id": 88,
-            "name": "Required CI",
-            "head_sha": HEAD,
-            "external_id": self.binding.external_id,
-            "status": "completed",
-            "conclusion": "success",
-            "app": {"slug": "nvidia-yamlsigil-release-pr"},
-        }
-        promotion_check = {
-            **ordinary_check,
-            "id": 89,
-            "external_id": promotion.external_id,
-        }
-        api = FakeApi(
-            {
-                ("GET", f"repos/{REPOSITORY}/commits/{HEAD}/check-runs?{query}"): {
-                    "total_count": 1,
-                    "check_runs": [ordinary_check],
-                },
-                ("POST", f"repos/{REPOSITORY}/check-runs"): promotion_check,
-                ("GET", f"repos/{REPOSITORY}/check-runs/89"): promotion_check,
-            }
-        )
-        self.assertEqual(reporter.report_check(api, policy(), promotion), 89)
-        self.assertEqual(api.calls[1][2]["external_id"], promotion.external_id)
-        self.assertEqual(
-            api.calls[1][2]["output"]["title"],
-            "Authorized cumulative promotion result",
-        )
 
     def test_coordination_check_uses_only_its_base_context(self) -> None:
         event, responses = fixture(COORDINATION_BRANCH)
