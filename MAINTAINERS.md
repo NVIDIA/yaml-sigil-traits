@@ -1,5 +1,7 @@
 # Maintainer guide
 
+<!-- Temporary copied-ref binding smoke test; close without merging. -->
+
 This is the concise human maintainer operations runbook for
 `yaml-sigil-traits`. Contributor and release procedures live in
 [`CONTRIBUTING.md`](CONTRIBUTING.md) and [`RELEASING.md`](RELEASING.md).
