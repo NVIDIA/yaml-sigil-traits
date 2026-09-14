@@ -65,6 +65,24 @@ Route breaking or dependent next-line work only to an advertised, protected
 4. If the PR head or `main` changes, rebase, review, and authorize the new
    exact head. Never reuse a stale command or verdict.
 
+### Diagnose copied-ref binding failures
+
+The anonymous binder reports the failed endpoint, HTTP status, request ID,
+validated rate-limit headers, and retry attempt before candidate checkout.
+Recognized rate limits and transient server errors receive at most three
+complete binding attempts within two minutes, including requests and waits.
+Each request is capped at 30 seconds or the remaining budget. Retries honor
+server delays; otherwise secondary limits wait 60 seconds with exponential
+backoff, and transient server errors wait one then two seconds. Every retry
+rereads all binding metadata against the originally supplied head and policy.
+Ordinary forbidden responses, invalid metadata, and stale bindings fail closed.
+
+If a quota reset exceeds the budget, wait until the reported reset time, then
+recheck the current head and `main` before authorizing another run. A primary
+limit without a valid reset time fails without guessing. Error bodies and
+arbitrary headers are not logged. These diagnostics distinguish rate limiting
+from other forbidden responses; HTTP 403 alone does not establish the cause.
+
 ### Create and activate a coordination line
 
 Landing coordination support does not activate a line. Use this procedure only

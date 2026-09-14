@@ -9,6 +9,8 @@ The fixtures model only the binder's bounded anonymous GitHub reads and its
 validated runner-output append. They prove accepted unsigned main and
 coordination-base bindings as well as fail-closed behavior for stale refs,
 malformed objects, unsupported bases, and noncanonical release branches.
+HTTP fixtures exercise bounded diagnostics, shared deadlines, and fresh binding
+after retry waits without depending on live GitHub failures.
 They initiate no network requests, GitHub mutations, checkouts, or
 subprocesses. A test-managed temporary file exercises the binder's sole
 production filesystem mutation: appending validated runner-output scalars.
@@ -18,11 +20,18 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import io
+import json
 import sys
 import tempfile
+import threading
 import unittest
+import urllib.error
+from contextlib import ExitStack
+from email.message import Message
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 
 MODULE_PATH = Path(__file__).with_name("bind-candidate-pr.py")
@@ -262,6 +271,248 @@ class CandidatePrBindingTests(unittest.TestCase):
         for branch in ("v0", "v1alpha0", "dev/2.0.0"):
             with self.assertRaisesRegex(binder.BindingError, "allowed coordination"):
                 binder.base_policy("NVIDIA/yaml-sigil-spec", branch)
+
+
+class RecordingBody(io.BytesIO):
+    """Record read bounds while retaining ordinary response close behavior."""
+
+    def read(self, size: int = -1) -> bytes:
+        self.requested_size = size
+        return super().read(size)
+
+
+class HttpBindingTests(unittest.TestCase):
+    """Exercise the real HTTP client without network or actual retry sleeps."""
+
+    def setUp(self) -> None:
+        self.now = 1000.0
+        self.latency = 0.0
+        self.sleeps: list[float] = []
+        self.calls: list[str] = []
+        self.timeouts: list[float] = []
+        self.errors: dict[str, list[tuple[int, dict[str, str], bytes]]] = {}
+        self.bodies: list[RecordingBody] = []
+        self.responses = fixture("fix/example")
+        self.pull_path = f"repos/{REPOSITORY}/pulls/{PULL}"
+        self.after_wait = lambda: None
+        self.log = io.StringIO()
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(patch.object(binder.urllib.request, "urlopen", self.urlopen))
+        stack.enter_context(patch.object(binder.time, "monotonic", lambda: self.now))
+        stack.enter_context(patch.object(binder.time, "time", lambda: self.now))
+        stack.enter_context(patch.object(binder.time, "sleep", self.sleep))
+        stack.enter_context(patch.object(binder.sys, "stderr", self.log))
+
+    def sleep(self, delay: float) -> None:
+        self.sleeps.append(delay)
+        self.now += delay
+        self.after_wait()
+
+    def fail(
+        self, status: int, headers: dict[str, str] | None = None,
+        body: bytes = b'{}', *, path: str | None = None, times: int = 1,
+    ) -> None:
+        self.errors[path or self.pull_path] = [(status, headers or {}, body)] * times
+
+    def urlopen(self, request: Any, timeout: float) -> RecordingBody:
+        path = request.full_url.removeprefix(binder.API_ROOT + "/")
+        self.assertEqual(request.get_method(), "GET")
+        self.assertFalse(request.has_header("Authorization"))
+        self.calls.append(path)
+        self.timeouts.append(timeout)
+        self.now += self.latency
+        if self.errors.get(path):
+            status, values, raw = self.errors[path].pop(0)
+            headers = Message()
+            for name, value in values.items():
+                headers[name] = value
+            body = RecordingBody(raw)
+            self.bodies.append(body)
+            raise urllib.error.HTTPError(request.full_url, status, "fixture", headers, body)
+        response = self.responses[path]
+        body = RecordingBody(response if isinstance(response, bytes) else json.dumps(response).encode())
+        self.bodies.append(body)
+        return body
+
+    def bind(self) -> Any:
+        return binder.bind_with_retries(REPOSITORY, COPIED_REF, HEAD, POLICY_SHA)
+
+    def test_recoverable_http_errors_honor_delays(self) -> None:
+        cases = [
+            (403, {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1002"}, b'{}', 3),
+            (403, {"x-ratelimit-remaining": "0", "x-ratelimit-reset": "1002",
+                   "retry-after": "5"}, b'{}', 5),
+            (403, {"retry-after": "2"}, b'{}', 2),
+            (403, {}, b'{"message":"You have exceeded a secondary rate limit."}', 60),
+            (429, {}, b'{}', 60),
+            (429, {"retry-after": "0"}, b'{}', 1),
+            (503, {"retry-after": "4"}, b'{}', 4),
+            *((status, {}, b'{}', 1) for status in (500, 502, 503, 504)),
+        ]
+        for status, headers, body, delay in cases:
+            with self.subTest(status=status, headers=headers):
+                self.now = 1000
+                self.sleeps.clear()
+                self.calls.clear()
+                self.fail(status, headers, body)
+                self.assertEqual(self.bind().base_sha, POLICY_SHA)
+                self.assertEqual(self.sleeps, [delay])
+                self.assertEqual(self.calls[:2], [self.pull_path] * 2)
+                self.assertTrue(all(body.closed for body in self.bodies))
+
+    def test_fatal_errors_do_not_retry(self) -> None:
+        cases = [
+            (403, {}, b'{"message":"Resource not accessible"}'),
+            (401, {"retry-after": "1"}, b'{}'),
+            (404, {}, b'{}'),
+            (501, {}, b'{}'),
+            (403, {"x-ratelimit-remaining": "0"}, b'{}'),
+            *((403, {"x-ratelimit-remaining": "0", "x-ratelimit-reset": value}, b'{}')
+              for value in ("-1", "nan", "1" * 13, "1002\nignored")),
+        ]
+        for status, headers, body in cases:
+            with self.subTest(status=status, headers=headers):
+                self.calls.clear()
+                self.fail(status, headers, body)
+                with self.assertRaisesRegex(binder.BindingError, f"HTTP {status}"):
+                    self.bind()
+                self.assertEqual(self.calls, [self.pull_path])
+                self.assertEqual(self.sleeps, [])
+
+    def test_diagnostics_are_bounded_and_allowlisted(self) -> None:
+        self.fail(403, {
+            "x-github-request-id": "A1:B2-C3",
+            "x-ratelimit-limit": "60", "x-ratelimit-remaining": "0",
+            "x-ratelimit-used": "60", "x-ratelimit-reset": "9999",
+            "x-ratelimit-resource": "core", "retry-after": "20",
+            "authorization": "private-header",
+        }, b'{"message":"private-body"}')
+        with self.assertRaises(binder.BindingError) as raised:
+            self.bind()
+        diagnostic = str(raised.exception)
+        for expected in (self.pull_path, "HTTP 403", "primary rate limit",
+                         "A1:B2-C3", "x-ratelimit-reset=9999", "retry-after=20",
+                         "attempt 1/3", "exceeds remaining"):
+            self.assertIn(expected, diagnostic)
+        self.assertNotIn("private", diagnostic)
+        self.assertEqual(self.bodies[0].requested_size, binder.MAX_ERROR_BYTES + 1)
+        self.assertTrue(self.bodies[0].closed)
+        self.assertEqual(self.sleeps, [])
+
+        for raw in (b'not JSON', b'{"message":17}', b'\xff', b'[' * 2000,
+                    b'x' * (binder.MAX_ERROR_BYTES + 100)):
+            with self.subTest(raw_length=len(raw)):
+                self.fail(403, {"x-github-request-id": "unsafe\n::error::",
+                                "retry-after": "-1", "x-ratelimit-resource": "\x1b[31m"}, raw)
+                with self.assertRaises(binder.BindingError) as raised:
+                    self.bind()
+                self.assertNotIn("unsafe", str(raised.exception))
+                self.assertNotIn("\x1b", str(raised.exception))
+                self.assertEqual(self.sleeps, [])
+
+    def test_attempts_and_secondary_backoff_are_bounded(self) -> None:
+        self.fail(503, times=3)
+        with self.assertRaisesRegex(binder.BindingError, "attempts exhausted"):
+            self.bind()
+        self.assertEqual(len(self.calls), 3)
+        self.assertEqual(self.sleeps, [1, 2])
+
+        self.calls.clear()
+        self.sleeps.clear()
+        self.fail(429, times=3)
+        with self.assertRaisesRegex(binder.BindingError, "required wait 120.0s"):
+            self.bind()
+        self.assertEqual(len(self.calls), 2)
+        self.assertEqual(self.sleeps, [60])
+
+    def test_request_time_counts_against_the_shared_budget(self) -> None:
+        self.latency = 20
+        self.fail(429, {"retry-after": "60"}, path=f"repos/{REPOSITORY}/git/ref/heads/main")
+        with self.assertRaisesRegex(binder.BindingError, "remaining 40.0s"):
+            self.bind()
+        self.assertEqual(self.sleeps, [])
+
+        self.calls.clear()
+        self.timeouts.clear()
+        self.responses = fixture("fix/example", COORDINATION_BRANCH)
+        self.latency = 25
+        with self.assertRaisesRegex(binder.BindingError, "budget"):
+            self.bind()
+        self.assertEqual(self.timeouts, [30, 30, 30, 30, 20])
+
+    def test_stalled_io_and_transport_errors_fail_without_retry(self) -> None:
+        finished = threading.Event()
+        started = threading.Event()
+
+        def stalled(*args: Any, **kwargs: Any) -> io.BytesIO:
+            started.set()
+            finished.wait()
+            return io.BytesIO(b'{}')
+
+        try:
+            with patch.object(binder, "MAX_REQUEST_SECONDS", 0.02), \
+                 patch.object(binder.urllib.request, "urlopen", stalled):
+                with self.assertRaisesRegex(binder.BindingError, "timed out"):
+                    self.bind()
+                self.assertTrue(started.is_set())
+        finally:
+            finished.set()
+        for error in (urllib.error.URLError("fixture"), TimeoutError("fixture")):
+            with patch.object(binder.urllib.request, "urlopen", side_effect=error) as request:
+                with self.assertRaisesRegex(binder.BindingError, "read failed"):
+                    self.bind()
+                self.assertEqual(request.call_count, 1)
+        self.assertEqual(self.sleeps, [])
+
+    def test_malformed_success_responses_remain_fatal(self) -> None:
+        for raw in (b'not JSON', b'x' * (binder.MAX_RESPONSE_BYTES + 1)):
+            with self.subTest(raw_length=len(raw)):
+                self.calls.clear()
+                self.responses[self.pull_path] = raw
+                with self.assertRaises(binder.BindingError):
+                    self.bind()
+                self.assertEqual(self.calls, [self.pull_path])
+                self.assertEqual(self.sleeps, [])
+
+    def test_retry_rebinds_every_mutable_object(self) -> None:
+        prefix = f"repos/{REPOSITORY}/git/ref/heads/"
+        changes = [
+            lambda: self.responses[self.pull_path].__setitem__("state", "closed"),
+            lambda: self.responses[self.pull_path]["head"].__setitem__("sha", "d" * 40),
+            *(lambda name=name: self.responses[prefix + name]["object"].__setitem__("sha", "d" * 40)
+              for name in ("main", COPIED_REF, COORDINATION_BRANCH)),
+        ]
+        for change in changes:
+            with self.subTest(change=changes.index(change)):
+                self.responses = fixture("fix/example", COORDINATION_BRANCH)
+                self.calls.clear()
+                self.sleeps.clear()
+                self.after_wait = change
+                self.fail(503, path=prefix + "main")
+                with self.assertRaises(binder.BindingError):
+                    self.bind()
+                self.assertEqual(self.calls[4], self.pull_path)
+                self.assertEqual(self.sleeps, [1])
+
+    def test_cli_writes_only_one_complete_successful_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory, "output")
+            arguments = [str(MODULE_PATH), "--repository", REPOSITORY,
+                         "--copied-ref", COPIED_REF, "--head-sha", HEAD,
+                         "--policy-sha", POLICY_SHA, "--output", str(output)]
+            with patch.object(binder.sys, "argv", arguments):
+                self.fail(503, path=f"repos/{REPOSITORY}/git/ref/heads/main")
+                self.assertEqual(binder.main(), 0)
+                expected = (f"base_ref=refs/heads/main\nbase_sha={POLICY_SHA}\n"
+                            "check_name=Required CI\nrelease_branch=\n")
+                self.assertEqual(output.read_text(), expected)
+                self.fail(503, path=f"repos/{REPOSITORY}/git/ref/heads/main")
+                self.after_wait = lambda: self.responses[self.pull_path].__setitem__(
+                    "state", "closed"
+                )
+                self.assertEqual(binder.main(), 1)
+                self.assertEqual(output.read_text(), expected)
 
 
 if __name__ == "__main__":
