@@ -13,6 +13,9 @@ open; its candidate, contribution base, copied ref, ordered commit inventory,
 and protected ``main`` are current; and any release branch has the canonical
 same-repository shape.
 
+Recoverable HTTP failures restart the complete binding, with at most three
+attempts sharing a two-minute budget for requests and retry waits.
+
 On success it appends only validated single-line base and release scalars to
 the caller-supplied runner-output file. That append is its sole mutation. It
 does not accept a token, check out source, execute candidate code, create a
@@ -26,8 +29,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import queue
 import re
 import sys
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -39,6 +45,10 @@ from typing import Any, Protocol
 API_ROOT = "https://api.github.com"
 API_VERSION = "2026-03-10"
 MAX_RESPONSE_BYTES = 1024 * 1024
+MAX_ERROR_BYTES = 8 * 1024
+MAX_BINDING_SECONDS = 120
+MAX_REQUEST_SECONDS = 30
+MAX_ATTEMPTS = 3
 RELEASE_BRANCH_PREFIX = "release-plz-manual-"
 MAIN_REF = "refs/heads/main"
 MAIN_CHECK = "Required CI"
@@ -67,6 +77,70 @@ class BindingError(RuntimeError):
     """A copied-ref or release-branch binding failed closed."""
 
 
+class GitHubHttpError(BindingError):
+    """One HTTP failure with bounded diagnostics and an optional retry delay."""
+
+    def __init__(self, path: str, error: urllib.error.HTTPError) -> None:
+        """Retain only validated headers; use the bounded body for classification."""
+
+        patterns = {
+            "x-github-request-id": r"[A-Za-z0-9:_-]{1,128}",
+            "x-ratelimit-resource": r"[A-Za-z0-9_-]{1,64}",
+            **dict.fromkeys(
+                (
+                    "x-ratelimit-limit", "x-ratelimit-remaining",
+                    "x-ratelimit-used", "x-ratelimit-reset", "retry-after",
+                ),
+                r"[0-9]{1,12}",
+            ),
+        }
+        self.headers = {
+            name: value
+            for name, pattern in patterns.items()
+            if re.fullmatch(pattern, value := (error.headers or {}).get(name, ""))
+        }
+        message = ""
+        try:
+            raw = error.read(MAX_ERROR_BYTES + 1)
+            body = json.loads(raw) if len(raw) <= MAX_ERROR_BYTES else None
+            if isinstance(body, dict) and isinstance(body.get("message"), str):
+                message = body["message"].casefold()
+        except (OSError, ValueError, RecursionError):
+            pass  # Headers still diagnose an unreadable or malformed error body.
+        self.kind = "not retryable"
+        if error.code in (403, 429):
+            if int(self.headers.get("x-ratelimit-remaining", "-1")) == 0:
+                self.kind = "primary rate limit"
+            elif (
+                error.code == 429 or "retry-after" in self.headers
+                or "secondary rate limit" in message
+            ):
+                self.kind = "secondary rate limit"
+        elif error.code in (500, 502, 503, 504):
+            self.kind = "transient server error"
+        details = "; ".join(f"{name}={value}" for name, value in self.headers.items())
+        super().__init__(
+            f"GitHub API {path} returned HTTP {error.code} ({self.kind})"
+            + (f"; {details}" if details else "")
+        )
+
+    def retry_delay(self, attempt: int) -> float | None:
+        """Honor GitHub's delays, with bounded attempts supplied by the caller."""
+
+        if self.kind == "not retryable":
+            return None
+        advertised = self.headers.get("retry-after")
+        if self.kind == "primary rate limit":
+            reset = self.headers.get("x-ratelimit-reset")
+            if reset is None:
+                return None  # Do not guess when an exhausted quota resets.
+            return max(1, int(reset) - time.time() + 1, int(advertised or 0))
+        if advertised is not None:
+            return max(1, int(advertised))
+        initial = 60 if self.kind == "secondary rate limit" else 1
+        return initial * 2 ** (attempt - 1)
+
+
 class Api(Protocol):
     """Minimal anonymous GitHub read boundary used by fixtures and production."""
 
@@ -77,11 +151,43 @@ class Api(Protocol):
 class AnonymousGitHubApi:
     """Bounded GitHub API client that never accepts or sends a credential."""
 
+    def __init__(self, deadline: float) -> None:
+        """Share one monotonic deadline across all reads and binding attempts."""
+
+        self.deadline = deadline
+
     def get(self, path: str) -> Any:
         """Fetch one bounded anonymous JSON response from a relative API path."""
 
         if path.startswith("/") or ".." in path or any(c in path for c in "\r\n"):
             raise BindingError("GitHub API path is malformed")
+        timeout = min(MAX_REQUEST_SECONDS, self.deadline - time.monotonic())
+        if timeout <= 0:
+            raise BindingError("GitHub API binding exceeded its 120-second budget")
+        result: queue.Queue[Any] = queue.Queue(maxsize=1)
+
+        def read() -> None:
+            try:
+                result.put(self._read(path, timeout))
+            except Exception as error:
+                result.put(error)
+
+        # urllib's socket timeout does not bound DNS or a trickling response.
+        # This worker only reads; a timeout ends binding without further reads
+        # or outputs, and a stalled daemon cannot hold the CLI process open.
+        threading.Thread(target=read, daemon=True).start()
+        try:
+            value = result.get(timeout=timeout)
+        except queue.Empty as error:
+            raise BindingError(f"GitHub API {path} timed out") from error
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    @staticmethod
+    def _read(path: str, timeout: float) -> Any:
+        """Perform one read; only the outer binding loop may retry or write."""
+
         request = urllib.request.Request(
             f"{API_ROOT}/{path}",
             method="GET",
@@ -92,12 +198,13 @@ class AnonymousGitHubApi:
             },
         )
         try:
-            with urllib.request.urlopen(request, timeout=30) as response:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
                 raw = response.read(MAX_RESPONSE_BYTES + 1)
         except urllib.error.HTTPError as error:
-            raise BindingError(f"GitHub API read returned HTTP {error.code}") from error
-        except urllib.error.URLError as error:
-            raise BindingError("GitHub API read failed") from error
+            with error:
+                raise GitHubHttpError(path, error) from error
+        except (urllib.error.URLError, OSError) as error:
+            raise BindingError(f"GitHub API {path} read failed") from error
         if len(raw) > MAX_RESPONSE_BYTES:
             raise BindingError("GitHub API response is oversized")
         try:
@@ -294,6 +401,43 @@ def bind_candidate_pr(
     )
 
 
+def bind_with_retries(
+    repository: str, copied_ref: str, head_sha: str, policy_sha: str
+) -> CandidatePrBinding:
+    """Retry complete bindings, never mixing evidence from before and after a wait."""
+
+    deadline = time.monotonic() + MAX_BINDING_SECONDS
+    api = AnonymousGitHubApi(deadline)
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            binding = bind_candidate_pr(api, repository, copied_ref, head_sha, policy_sha)
+        except GitHubHttpError as error:
+            context = f"{error}; attempt {attempt}/{MAX_ATTEMPTS}"
+            delay = error.retry_delay(attempt)
+            if delay is None:
+                reason = ("missing valid x-ratelimit-reset"
+                          if error.kind == "primary rate limit" else "retry refused")
+                raise BindingError(f"{context}; {reason}") from error
+            if attempt == MAX_ATTEMPTS:
+                raise BindingError(f"{context}; retry attempts exhausted") from error
+            remaining = deadline - time.monotonic()
+            if delay >= remaining:
+                raise BindingError(
+                    f"{context}; required wait {delay:.1f}s exceeds remaining "
+                    f"{max(0, remaining):.1f}s binding budget"
+                ) from error
+            print(
+                f"candidate PR binding: {context}; retrying in {delay:.1f}s",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
+            continue
+        if time.monotonic() >= deadline:
+            raise BindingError("GitHub API binding exceeded its 120-second budget")
+        return binding
+    raise AssertionError("binding attempt limit must be positive")
+
+
 def append_output(path: Path, binding: CandidatePrBinding) -> None:
     """Append only validated one-line binding scalars to runner output."""
 
@@ -330,8 +474,7 @@ def main() -> int:
 
     arguments = parser().parse_args()
     try:
-        binding = bind_candidate_pr(
-            AnonymousGitHubApi(),
+        binding = bind_with_retries(
             arguments.repository,
             arguments.copied_ref,
             arguments.head_sha,
