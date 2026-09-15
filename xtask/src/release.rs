@@ -312,6 +312,19 @@ fn require_exact_version_adjustment(
     if same_core && activation_stub_release {
         return Ok("replaced the rc.0 activation stub with the first release");
     }
+    let next_rc = original
+        .pre
+        .as_str()
+        .strip_prefix("rc.")
+        .and_then(|ordinal| ordinal.parse::<u64>().ok())
+        .filter(|ordinal| *ordinal > 0)
+        .and_then(|ordinal| ordinal.checked_add(1));
+    if same_core
+        && derived == original
+        && next_rc.is_some_and(|next| selected.pre.as_str() == format!("rc.{next}"))
+    {
+        return Ok("advanced the unchanged release candidate");
+    }
     let stable_promotion = !original.pre.is_empty()
         && selected.pre.is_empty()
         && original.major == selected.major
@@ -333,8 +346,8 @@ fn require_exact_version_adjustment(
     }
     Err(format!(
         "release-plz derived {derived}, not selected release {selected}; only a new \
-         prerelease, the first same-core release from rc.0, or promotion of the \
-         current same-core prerelease is supported"
+         prerelease, the first same-core release from rc.0, the next unchanged \
+         RC, or promotion of the current same-core prerelease is supported"
     ))
 }
 
@@ -833,6 +846,17 @@ mod tests {
 
     #[test]
     fn exact_version_adjustment_is_limited_to_release_boundaries() {
+        for (original, selected) in [("0.5.1-rc.1", "0.5.1-rc.2"), ("0.5.1-rc.9", "0.5.1-rc.10")] {
+            let original = Version::parse(original).unwrap();
+            assert!(
+                require_exact_version_adjustment(
+                    &original,
+                    &original,
+                    &Version::parse(selected).unwrap(),
+                )
+                .is_ok()
+            );
+        }
         for selected in ["0.5.0-rc.1", "0.5.0"] {
             assert!(
                 require_exact_version_adjustment(
@@ -860,6 +884,17 @@ mod tests {
             .is_ok()
         );
         for (original, derived, selected) in [
+            ("0.5.1-rc.1", "0.5.1-rc.1", "0.5.1-rc.1"),
+            ("0.5.1-rc.2", "0.5.1-rc.2", "0.5.1-rc.1"),
+            ("0.5.1-rc.1", "0.5.1-rc.1", "0.5.1-rc.3"),
+            ("0.5.1-rc.1", "0.5.1-rc.1", "0.5.2-rc.2"),
+            ("0.5.1-rc.1", "0.5.1-rc.1", "0.5.1-beta.2"),
+            ("0.5.1-rc.1.preview", "0.5.1-rc.1.preview", "0.5.1-rc.2"),
+            (
+                "0.5.1-rc.18446744073709551615",
+                "0.5.1-rc.18446744073709551615",
+                "0.5.1-rc.18446744073709551616",
+            ),
             ("0.5.0-rc.0", "0.5.0-rc.0", "0.6.0-rc.1"),
             ("0.5.0-rc.0", "0.5.0-rc.0", "0.5.0-rc.0"),
             ("0.5.0-rc.0", "0.5.0-rc.0", "0.5.0-rc.1.preview"),
