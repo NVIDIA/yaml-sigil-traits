@@ -27,6 +27,8 @@ the stable `MAJOR.MINOR.PATCH`; never release `rc.0` itself. `prepare` strips
 release credentials, runs `release-plz update` first, and uses pinned
 `release-plz set-version` only for a bounded maintainer-selected version
 adjustment. It accepts changes only to the manifest and changelog.
+When update leaves the current `rc.N` unchanged, preparation also permits the
+next ordinal on the same version core.
 Both `prepare` and `check` reject `rc.0` as a release version.
 
 ```shell
@@ -41,6 +43,10 @@ cargo xtask ci
 Stop if the diff contains anything except `CHANGELOG.md` and `Cargo.toml`, or
 if the selected version, changelog, or package inventory differs from the
 intended release.
+
+Review every generated changelog entry and version change. For an unchanged
+RC, pinned `set-version` relabels the latest changelog entry. Retain the generated
+new entry and restore the previous published entry from `HEAD` alongside it.
 
 Create the sole release commit with the approved SSH key and DCO identity.
 `check` then proves the committed transaction without credentials or

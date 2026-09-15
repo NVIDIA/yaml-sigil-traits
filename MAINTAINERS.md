@@ -65,6 +65,10 @@ Route breaking or dependent next-line work only to an advertised, protected
 4. If the PR head or `main` changes, rebase, review, and authorize the new
    exact head. Never reuse a stale command or verdict.
 
+Release preparation can advance an unchanged `rc.N` to its immediate successor
+on the same version core. Pinned release-plz applies that explicit selection
+after `update`; follow `RELEASING.md` for the normal source checks and approvals.
+
 ### Diagnose copied-ref binding failures
 
 The anonymous binder reports the failed endpoint, HTTP status, request ID,
