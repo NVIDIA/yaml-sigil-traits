@@ -106,7 +106,8 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-          ref: ${{ github.sha }}
+          path: policy
+          ref: refs/heads/main
 
       - name: Set up Rust 1.98.0
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
@@ -115,6 +116,7 @@ jobs:
           toolchain: 1.98.0
 
       - name: Compile protected typed qualifier
+        working-directory: policy
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
@@ -128,9 +130,11 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+          path: release-source
           ref: ${{ steps.invocation.outputs.source }}
 
       - name: Qualify release or ordinary no-op
+        working-directory: release-source
         id: qualify
         env:
           GH_TOKEN: ${{ github.token }}
@@ -144,7 +148,7 @@ jobs:
           sha256sum --check "${RUNNER_TEMP}/release-xtask.sha256"
           test "$(cat "${RUNNER_TEMP}/release-policy.sha")" = "${GITHUB_SHA}"
           test "$(git rev-parse HEAD)" = "${SOURCE_SHA}"
-          args=(github release qualify --mode "${MODE}" --source "${SOURCE_SHA}")
+          args=(github release qualify --source-root . --mode "${MODE}" --source "${SOURCE_SHA}")
           # Recovery alone binds the original run and attempt.
           case "${MODE}" in
             recover)
@@ -173,14 +177,15 @@ jobs:
       id-token: write
       pull-requests: read
     steps:
-      # This checkout is protected current-main policy, never historical
-      # recovery source. The compiled qualifier survives the source checkout.
+      # Keep protected current-main policy separate from exact source data.
+      # Only the policy checkout compiles the release commands.
       - name: Check out protected publication policy
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
-          ref: ${{ github.sha }}
+          path: policy
+          ref: refs/heads/main
 
       - name: Set up Rust 1.98.0
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
@@ -189,6 +194,7 @@ jobs:
           toolchain: 1.98.0
 
       - name: Compile protected typed requalifier
+        working-directory: policy
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
@@ -202,6 +208,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+          path: release-source
           ref: ${{ needs.qualify.outputs.source }}
 
       - name: Install exact cargo-binstall
@@ -215,6 +222,7 @@ jobs:
           cargo binstall --force --locked --no-confirm release-plz@0.3.160
 
       - name: Requalify exact source after approval
+        working-directory: release-source
         id: requalify
         env:
           GH_TOKEN: ${{ github.token }}
@@ -243,12 +251,12 @@ jobs:
           case "${MODE}" in
             push)
               test "${POLICY_SHA}" = "${SOURCE_SHA}"
-              "${RUNNER_TEMP}/release-xtask" github release qualify \
+              "${RUNNER_TEMP}/release-xtask" github release qualify --source-root . \
                 --mode publish --source "${SOURCE_SHA}"
               ;;
             recover)
               git merge-base --is-ancestor "${SOURCE_SHA}" "${POLICY_SHA}"
-              "${RUNNER_TEMP}/release-xtask" github release qualify \
+              "${RUNNER_TEMP}/release-xtask" github release qualify --source-root . \
                 --mode recover --source "${SOURCE_SHA}" \
                 --original-run-id "${ORIGINAL_RUN_ID}" \
                 --original-run-attempt "${ORIGINAL_ATTEMPT}"
@@ -259,6 +267,7 @@ jobs:
           esac
 
       - name: Publish exact source with Trusted Publishing
+        working-directory: release-source
         if: ${{ steps.requalify.outputs.registry_state == 'absent' }}
         env:
           # release-plz resolves the explicit Cargo publish registry by name.
@@ -310,7 +319,8 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-          ref: ${{ github.sha }}
+          path: policy
+          ref: refs/heads/main
 
       - name: Set up Rust 1.98.0
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
@@ -319,6 +329,7 @@ jobs:
           toolchain: 1.98.0
 
       - name: Compile protected registry validator
+        working-directory: policy
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
@@ -332,9 +343,11 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+          path: release-source
           ref: ${{ needs.qualify.outputs.source }}
 
       - name: Rebind protected policy and source lineage
+        working-directory: release-source
         env:
           POLICY_SHA: ${{ github.sha }}
           SOURCE_SHA: ${{ needs.qualify.outputs.source }}
@@ -349,6 +362,7 @@ jobs:
       # This credential-free phase owns the bounded registry wait. The App
       # token is minted only in the dependent finalizer after this succeeds.
       - name: Await exact published archive
+        working-directory: release-source
         env:
           SOURCE_SHA: ${{ needs.qualify.outputs.source }}
           VERSION: ${{ needs.qualify.outputs.version }}
@@ -356,7 +370,7 @@ jobs:
           set -euo pipefail
           sha256sum --check "${RUNNER_TEMP}/release-xtask.sha256"
           test "$(git rev-parse HEAD)" = "${SOURCE_SHA}"
-          "${RUNNER_TEMP}/release-xtask" github release finalize \
+          "${RUNNER_TEMP}/release-xtask" github release finalize --source-root . \
             --phase await --source "${SOURCE_SHA}" --version "${VERSION}"
 
   finalization_approval:
@@ -415,7 +429,8 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-          ref: ${{ github.sha }}
+          path: policy
+          ref: refs/heads/main
 
       - name: Set up Rust 1.98.0
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
@@ -424,6 +439,7 @@ jobs:
           toolchain: 1.98.0
 
       - name: Compile protected typed finalizer
+        working-directory: policy
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
@@ -437,11 +453,13 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+          path: release-source
           ref: ${{ needs.qualify.outputs.source }}
 
       # Avoid minting the App token if current protected policy or the retained
       # historical source lineage changed while registry visibility settled.
       - name: Rebind protected finalizer policy
+        working-directory: release-source
         env:
           POLICY_SHA: ${{ github.sha }}
           SOURCE_SHA: ${{ needs.qualify.outputs.source }}
@@ -464,6 +482,7 @@ jobs:
           permission-contents: write
 
       - name: Reconcile exact tag and Release
+        working-directory: release-source
         env:
           APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
@@ -473,6 +492,6 @@ jobs:
           set -euo pipefail
           sha256sum --check "${RUNNER_TEMP}/release-xtask.sha256"
           test "$(git rev-parse HEAD)" = "${SOURCE_SHA}"
-          "${RUNNER_TEMP}/release-xtask" github release finalize \
+          "${RUNNER_TEMP}/release-xtask" github release finalize --source-root . \
             --phase reconcile --source "${SOURCE_SHA}" \
             --version "${VERSION}"

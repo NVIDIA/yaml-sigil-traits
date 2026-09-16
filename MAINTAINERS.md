@@ -404,7 +404,11 @@ Choose the test path from the exact candidate workflow:
    is absent. Stop if the ref moved or the result is ambiguous.
 
 For a release-policy change, also use the validation-only procedure in
-`RELEASING.md`. Never exercise publication from `ci-testing/*`.
+`RELEASING.md`. Never exercise publication from `ci-testing/*`. Review release-provenance
+comparisons as exact Git path/blob identity checks. They may inspect only the
+reviewed inventory and Git object identities; workflow syntax and semantics
+remain in hosted policy tooling. A support-line activation still requires its
+own eligible stable release and separately authorized protection transaction.
 
 An external contributor cannot stage an upstream `ci-testing/*` ref. The
 permitted maintainer may stage the contributor's exact reviewed commit; that

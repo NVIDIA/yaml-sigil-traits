@@ -15,6 +15,9 @@ only `Cargo.toml` changed, and never creates or updates a remote ref.
 The only provider-specific namespace is `cargo xtask github release`. Keep it
 limited to `qualify` and `finalize`:
 
+- Both commands require an explicit `--source-root` pointing to a distinct,
+  exact clean checkout. Keep compiled protected-main policy in place; never
+  overwrite it with historical release source.
 - `qualify` reads exact GitHub and crates.io state and makes ordinary main
   pushes a successful no-op. Its publication mode requalifies live main after
   protected-environment approval and rejects registry drift.
@@ -41,3 +44,9 @@ cargo fmt --manifest-path xtask/Cargo.toml --all --check
 cargo clippy --locked --manifest-path xtask/Cargo.toml --all-targets --all-features -- -D warnings
 cargo test --locked --manifest-path xtask/Cargo.toml
 ```
+
+The existing release commands may compare reviewed path names and opaque Git
+blob identities across exact commits solely to prove release-policy provenance.
+This narrow exception permits no workflow-content parsing, semantic validation,
+provider-policy snapshots, or general workflow checks. Keep the required path
+set and activation anchor under protected `main`; source trees remain data.
