@@ -269,6 +269,23 @@ class BindingTests(unittest.TestCase):
         with self.assertRaisesRegex(reporter.ReporterError, "no protected"):
             reporter.base_policy("NVIDIA/another-repository", "main")
 
+    def test_support_checks_are_exact_and_spec_rejects_support(self) -> None:
+        event, responses = fixture("support/0.5")
+        support = bind(event, responses)
+        self.assertEqual(support.check_name, "Required CI [refs/heads/support/0.5]")
+        self.assertEqual(support.base_sha, COORDINATION_SHA)
+        other_event, other_responses = fixture("support/0.6")
+        other = bind(other_event, other_responses)
+        self.assertNotEqual(support.check_name, other.check_name)
+        for repo in ("NVIDIA/yaml-sigil-rs", "NVIDIA/yaml-sigil-traits"):
+            for branch in ("support/0.5", "support/999999999.999999999"):
+                self.assertLessEqual(len(reporter.base_policy(repo, branch)[1]), 128)
+            for branch in ("support/0", "support/0.5.1", "support/00.5", "support/0.05", "support/1000000000.5"):
+                with self.assertRaises(reporter.ReporterError):
+                    reporter.base_policy(repo, branch)
+        with self.assertRaises(reporter.ReporterError):
+            reporter.base_policy("NVIDIA/yaml-sigil-spec", "support/0.5")
+
     def test_policy_and_contribution_objects_cannot_be_swapped(self) -> None:
         event, responses = fixture(COORDINATION_BRANCH)
         responses[("GET", f"repos/{REPOSITORY}/git/ref/heads/main")]["object"][

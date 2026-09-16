@@ -70,6 +70,7 @@ impl ReleaseLine {
             .ok_or_else(|| "support base requires exactly two version components".to_string())?;
         fn component(value: &str) -> Result<u64, String> {
             if value.is_empty()
+                || value.len() > 9
                 || (value.len() > 1 && value.starts_with('0'))
                 || !value.bytes().all(|byte| byte.is_ascii_digit())
             {
@@ -212,6 +213,7 @@ mod release_line_tests {
             "refs/heads/dev/0.6.0",
             "refs/heads/support/+1.2",
             "refs/heads/support/18446744073709551616.2",
+            "refs/heads/support/1000000000.5",
         ] {
             assert!(ReleaseLine::from_base_ref(bad).is_err(), "{bad}");
         }

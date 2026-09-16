@@ -253,8 +253,26 @@ class CandidatePrBindingTests(unittest.TestCase):
         with self.assertRaisesRegex(binder.BindingError, "canonical"):
             bind(fixture("release-plz-manual-1.2.3", COORDINATION_BRANCH))
 
+    def test_support_base_and_release_branch_bind_the_same_line(self) -> None:
+        for branch in ("fix/backport", "release-plz-manual-0.5.2-rc.1"):
+            result = bind(fixture(branch, "support/0.5"))
+            self.assertEqual(result.base_ref, "refs/heads/support/0.5")
+            self.assertEqual(result.check_name, "Required CI [refs/heads/support/0.5]")
+            self.assertEqual(result.base_sha, COORDINATION_SHA)
+        for version in ("0.6.0", "1.5.2", "00.5.2", "0.5.2+local"):
+            with self.assertRaisesRegex(binder.BindingError, "canonical"):
+                bind(fixture(f"release-plz-manual-{version}", "support/0.5"))
+        for repo in ("NVIDIA/yaml-sigil-rs", "NVIDIA/yaml-sigil-traits"):
+            self.assertEqual(binder.base_policy(repo, "support/999999999.999999999")[0],
+                             "refs/heads/support/999999999.999999999")
+            for branch in ("support/0", "support/0.5.1", "support/00.5", "support/0.05", "support/1000000000.5"):
+                with self.assertRaises(binder.BindingError):
+                    binder.base_policy(repo, branch)
+        with self.assertRaises(binder.BindingError):
+            binder.base_policy("NVIDIA/yaml-sigil-spec", "support/0.5")
+
     def test_coordination_base_must_match_repository_policy(self) -> None:
-        with self.assertRaisesRegex(binder.BindingError, "allowed coordination"):
+        with self.assertRaisesRegex(binder.BindingError, "allowed contribution"):
             bind(fixture("feat/new-api", "dev/not-semver"))
 
         with self.assertRaisesRegex(binder.BindingError, "no protected"):
@@ -269,7 +287,7 @@ class CandidatePrBindingTests(unittest.TestCase):
                 ),
             )
         for branch in ("v0", "v1alpha0", "dev/2.0.0"):
-            with self.assertRaisesRegex(binder.BindingError, "allowed coordination"):
+            with self.assertRaisesRegex(binder.BindingError, "allowed contribution"):
                 binder.base_policy("NVIDIA/yaml-sigil-spec", branch)
 
 

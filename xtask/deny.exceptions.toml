@@ -1,4 +1,5 @@
-# Unicode-3.0 is restricted to this exact proc-macro dependency.
+# Unicode-3.0 is restricted to unicode-ident 1.0.x patches.
 exceptions = [
-    { allow = ["Unicode-3.0"], crate = "unicode-ident@1.0.24" },
+    # Permit proc-macro patch updates within 1.0.x under the same license approval.
+    { allow = ["Unicode-3.0"], crate = "unicode-ident:1.0.*" },
 ]

@@ -36,13 +36,14 @@ make_fixture() {
 
 run_checker() {
   local root="$1"
+  local base_ref="${2:-refs/heads/main}"
   local base
   local head
-  base="$(git -C "${root}" rev-parse refs/remotes/origin/main)"
+  base="$(git -C "${root}" rev-parse "refs/remotes/origin/${base_ref#refs/heads/}")"
   head="$(git -C "${root}" rev-parse HEAD)"
   (
     cd "${root}"
-    "${checker}" "${base}" "${head}" release-plz-manual-1.2.3 1.2.3
+    "${checker}" "${base}" "${head}" release-plz-manual-1.2.3 1.2.3 "${base_ref}"
   )
 }
 
@@ -50,6 +51,22 @@ valid="$(make_fixture valid)"
 git -C "${valid}" add Cargo.toml CHANGELOG.md
 git -C "${valid}" commit --quiet -m "release"
 run_checker "${valid}"
+
+# A support release keeps its own parent and diff after main advances.
+git -C "${valid}" update-ref refs/remotes/origin/support/1.2 HEAD^
+git -C "${valid}" update-ref refs/remotes/origin/main HEAD
+run_checker "${valid}" refs/heads/support/1.2
+# An unrelated main tip cannot be substituted for the selected support base.
+if run_checker "${valid}"; then
+  echo "support release accepted the advanced main base" >&2
+  exit 1
+fi
+git -C "${valid}" update-ref refs/remotes/origin/support/1.3 HEAD^
+# Version identity remains bound to the canonical support base.
+if run_checker "${valid}" refs/heads/support/1.3; then
+  echo "support release accepted a different version line" >&2
+  exit 1
+fi
 
 deleted="$(make_fixture deleted)"
 git -C "${deleted}" add Cargo.toml CHANGELOG.md
