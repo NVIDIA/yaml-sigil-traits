@@ -706,7 +706,7 @@ jobs:
               release_version="${YAML_SIGIL_RELEASE_PR_BRANCH#release-plz-manual-}"
               "${FIXED_CARGO}" "${cargo_config[@]}" run --locked \
                 --manifest-path xtask/Cargo.toml -- \
-                release check --version "${release_version}"
+                release check --base-ref refs/heads/main --version "${release_version}"
             fi
             "${FIXED_CARGO}" "${cargo_config[@]}" run --locked \
               --manifest-path xtask/Cargo.toml -- package-content

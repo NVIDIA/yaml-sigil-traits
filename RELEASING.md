@@ -34,7 +34,7 @@ Both `prepare` and `check` reject `rc.0` as a release version.
 ```shell
 version="<SEMVER>"
 git switch --create "release-plz-manual-${version}" origin/main
-cargo xtask release prepare --version "${version}"
+cargo xtask release prepare --base-ref refs/heads/main --version "${version}"
 git diff --check
 git diff -- CHANGELOG.md Cargo.toml
 cargo xtask ci
@@ -59,7 +59,7 @@ git config user.email 267424412+ddurst-nvidia@users.noreply.github.com
 git add CHANGELOG.md Cargo.toml
 git commit -S --signoff -m "chore(release): prepare yaml-sigil-traits ${version}"
 git verify-commit HEAD
-cargo xtask release check --version "${version}"
+cargo xtask release check --base-ref refs/heads/main --version "${version}"
 ```
 
 Push only the canonical branch and open its same-repository pull request.
@@ -416,3 +416,19 @@ immediately before each tag or Release mutation.
 After finalization, verify the crates.io checksum and VCS commit, annotated tag
 target, stable-versus-prerelease flag, immutable zero-asset Release, and exact
 changelog body. Never replace a conflicting crate, tag, or Release.
+
+## Explicit release base
+
+The procedures above name `refs/heads/main` explicitly. Keep `--base-ref` on
+all detached invocations. For a future protected support line, use the same
+manual release branch convention with `--base-ref refs/heads/support/M.N` in
+both preparation and checking. Fetch that base and its tags first; preparation
+starts at its exact remote-tracking tip. The selected version stays on `M.N`,
+uses the patch after the last stable release, and advances an existing RC by
+one ordinal or promotes that patch to stable. Duplicate versions, skipped
+patches, `rc.0`, and build metadata are rejected during preparation.
+
+Preparation continues to use release-plz 0.3.160 for version and changelog
+changes. These command options alone do not enable support publication. Read
+[the maintainer procedure](MAINTAINERS.md#support-readiness-commands) for the
+read-only activation proposal and remaining activation boundary.

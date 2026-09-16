@@ -3,6 +3,7 @@
 
 //! Typed GitHub qualification and source-only release finalization.
 
+mod support;
 mod transport;
 
 use std::collections::BTreeSet;
@@ -87,8 +88,17 @@ struct GithubReleaseArgs {
 
 #[derive(Subcommand)]
 enum GithubReleaseCommand {
+    /// Validate and print a proposed support activation without mutation.
+    StartSupport {
+        #[arg(long)]
+        version: Version,
+        #[arg(long)]
+        repository: Option<String>,
+    },
     /// Qualify a main push, validation dispatch, or same-source recovery.
     Qualify {
+        #[arg(long)]
+        base_ref: String,
         /// Separate checkout containing exact release source as data.
         #[arg(long)]
         source_root: PathBuf,
@@ -103,6 +113,8 @@ enum GithubReleaseCommand {
     },
     /// Reconcile the deterministic tag and immutable zero-asset Release.
     Finalize {
+        #[arg(long)]
+        base_ref: String,
         /// Separate checkout containing exact published source as data.
         #[arg(long)]
         source_root: PathBuf,
@@ -132,15 +144,22 @@ enum FinalizationPhase {
 pub(crate) fn run(root: &Path, args: GithubArgs) -> Result<(), String> {
     let GithubCommand::Release(args) = args.command;
     match args.command {
+        GithubReleaseCommand::StartSupport {
+            version,
+            repository,
+        } => support::start(root, &version, repository.as_deref()),
         GithubReleaseCommand::Qualify {
+            base_ref,
             source_root,
             mode,
             source,
             original_run_id,
             original_run_attempt,
         } => {
+            support::require_main_base(&base_ref)?;
             let context = Context::from_env(&source_root, &source)?;
             require_separate_checkouts(root, &source_root, &context.sha, &source)?;
+            release::check_manifest(root)?;
             require_api_token()?;
             let mut github = GhCli::new()?;
             let mut registry = CratesIo::new();
@@ -156,13 +175,16 @@ pub(crate) fn run(root: &Path, args: GithubArgs) -> Result<(), String> {
             result.write_outputs()
         }
         GithubReleaseCommand::Finalize {
+            base_ref,
             source_root,
             source,
             version,
             phase,
         } => {
+            support::require_main_base(&base_ref)?;
             let context = Context::from_env(&source_root, &source)?;
             require_separate_checkouts(root, &source_root, &context.sha, &source)?;
+            release::check_manifest(root)?;
             let mut registry = CratesIo::new();
             match phase {
                 FinalizationPhase::Await => {
@@ -200,7 +222,6 @@ fn require_separate_checkouts(
     if policy == source || policy.starts_with(&source) || source.starts_with(&policy) {
         return Err("release policy and source require separate, non-nested checkouts".into());
     }
-    release::check_manifest(policy_root)?;
     Ok(())
 }
 
@@ -1616,6 +1637,56 @@ mod tests {
                 .contains("separate")
         );
         assert!(exact_checkout(policy.path(), &"0".repeat(40)).is_err());
+        let source = repository();
+        let source_sha = crate::release_base::git(source.path(), &["rev-parse", "HEAD"]).unwrap();
+        require_separate_checkouts(policy.path(), source.path(), sha, &source_sha).unwrap();
+        // Ignore the nested repository in its enclosing policy checkout, so
+        // the rejection exercises independent Git roots rather than dirtiness.
+        std::fs::write(policy.path().join(".git/info/exclude"), "/nested/\n").unwrap();
+        let nested = policy.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        crate::release_base::git(&nested, &["init", "--quiet"]).unwrap();
+        crate::release_base::git(
+            &nested,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+                "nested",
+            ],
+        )
+        .unwrap();
+        let nested_sha = crate::release_base::git(&nested, &["rev-parse", "HEAD"]).unwrap();
+        exact_checkout(&nested, &nested_sha).unwrap();
+        assert!(
+            require_separate_checkouts(policy.path(), &nested, sha, &nested_sha)
+                .unwrap_err()
+                .contains("non-nested")
+        );
+        assert!(
+            require_separate_checkouts(&nested, policy.path(), &nested_sha, sha)
+                .unwrap_err()
+                .contains("non-nested")
+        );
+        #[cfg(unix)]
+        {
+            let aliases = tempfile::tempdir().unwrap();
+            let alias = aliases.path().join("policy-alias");
+            std::os::unix::fs::symlink(policy.path(), &alias).unwrap();
+            assert!(
+                require_separate_checkouts(policy.path(), &alias, sha, sha)
+                    .unwrap_err()
+                    .contains("separate")
+            );
+        }
+
         let child = policy.path().join("child");
         std::fs::create_dir(&child).unwrap();
         assert!(exact_checkout(&child, sha).unwrap_err().contains("root"));

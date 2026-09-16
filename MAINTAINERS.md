@@ -596,3 +596,32 @@ Repository scope, commands, documentation and style, third-party material
 and attribution, coordinated Buf upgrades, and other working guidance remain
 in [`AGENTS.md`](AGENTS.md). Agents performing maintainer operations must
 read both files completely.
+
+## Support readiness commands
+
+Release procedures pass a canonical `--base-ref` explicitly, including every
+detached CI checkout. Use `refs/heads/main` for the current release path.
+`release prepare` and `release check` also understand `refs/heads/support/M.N`;
+the support version must stay on that line. The selected base controls the
+preparation starting point and release transaction checks.
+
+From exact clean current `main`, with a read-only GitHub token supplied through
+`GH_TOKEN`, inspect a future activation proposal with:
+
+```shell
+cargo xtask github release start-support \
+  --repository NVIDIA/yaml-sigil-traits --version MAJOR.MINOR.PATCH
+```
+
+The command requires the line's latest stable release, verifies its annotated
+App tags and exact non-yanked source archives, and proves that a later stable
+version was published from main outside the line. A release candidate does not
+establish eligibility. It refuses an existing support ref or inventory and
+prints the absent-ref push plus `.github/support-lines/M.N.json` for review.
+The enumerated seed is `.github/support-policy-paths.txt`; maintain it when
+load-bearing release policy gains a file. Inventories exclude themselves.
+
+This readiness command applies no settings, creates no refs, and publishes
+nothing. Opening a line still requires the separately reviewed protection and
+activation transaction. Support qualification and publication remain disabled
+until the provenance checks and main-dispatched release procedure are deployed.
