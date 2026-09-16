@@ -9,7 +9,8 @@ use std::collections::BTreeSet;
 use std::env;
 use std::fs::OpenOptions;
 use std::io::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
@@ -88,6 +89,9 @@ struct GithubReleaseArgs {
 enum GithubReleaseCommand {
     /// Qualify a main push, validation dispatch, or same-source recovery.
     Qualify {
+        /// Separate checkout containing exact release source as data.
+        #[arg(long)]
+        source_root: PathBuf,
         #[arg(long, value_enum)]
         mode: QualificationMode,
         #[arg(long, value_name = "SHA")]
@@ -99,6 +103,9 @@ enum GithubReleaseCommand {
     },
     /// Reconcile the deterministic tag and immutable zero-asset Release.
     Finalize {
+        /// Separate checkout containing exact published source as data.
+        #[arg(long)]
+        source_root: PathBuf,
         #[arg(long, value_name = "SHA")]
         source: String,
         #[arg(long)]
@@ -126,17 +133,19 @@ pub(crate) fn run(root: &Path, args: GithubArgs) -> Result<(), String> {
     let GithubCommand::Release(args) = args.command;
     match args.command {
         GithubReleaseCommand::Qualify {
+            source_root,
             mode,
             source,
             original_run_id,
             original_run_attempt,
         } => {
-            let context = Context::from_env(root, &source)?;
+            let context = Context::from_env(&source_root, &source)?;
+            require_separate_checkouts(root, &source_root, &context.sha, &source)?;
             require_api_token()?;
             let mut github = GhCli::new()?;
             let mut registry = CratesIo::new();
             let result = qualify(
-                root,
+                &source_root,
                 &mut github,
                 &mut registry,
                 &context,
@@ -147,15 +156,17 @@ pub(crate) fn run(root: &Path, args: GithubArgs) -> Result<(), String> {
             result.write_outputs()
         }
         GithubReleaseCommand::Finalize {
+            source_root,
             source,
             version,
             phase,
         } => {
-            let context = Context::from_env(root, &source)?;
+            let context = Context::from_env(&source_root, &source)?;
+            require_separate_checkouts(root, &source_root, &context.sha, &source)?;
             let mut registry = CratesIo::new();
             match phase {
                 FinalizationPhase::Await => {
-                    await_publication(root, &mut registry, &context, &version)
+                    await_publication(&source_root, &mut registry, &context, &version)
                 }
                 FinalizationPhase::Reconcile => {
                     require_api_token()?;
@@ -163,7 +174,7 @@ pub(crate) fn run(root: &Path, args: GithubArgs) -> Result<(), String> {
                         .map_err(|_| "APP_SLUG is required for finalization".to_string())?;
                     let mut github = GhCli::new()?;
                     finalize(
-                        root,
+                        &source_root,
                         &mut github,
                         &mut registry,
                         &context,
@@ -174,6 +185,48 @@ pub(crate) fn run(root: &Path, args: GithubArgs) -> Result<(), String> {
             }
         }
     }
+}
+
+// Policy remains in the checkout that compiled this command. Never infer the
+// source root from the working directory or overwrite policy with source data.
+fn require_separate_checkouts(
+    policy_root: &Path,
+    source_root: &Path,
+    policy_sha: &str,
+    source_sha: &str,
+) -> Result<(), String> {
+    let policy = exact_checkout(policy_root, policy_sha)?;
+    let source = exact_checkout(source_root, source_sha)?;
+    if policy == source || policy.starts_with(&source) || source.starts_with(&policy) {
+        return Err("release policy and source require separate, non-nested checkouts".into());
+    }
+    release::check_manifest(policy_root)?;
+    Ok(())
+}
+
+fn exact_checkout(root: &Path, sha: &str) -> Result<PathBuf, String> {
+    require_sha(sha, "checkout commit")?;
+    crate::crate_archive::require_clean_source(root, sha)?;
+    let physical =
+        std::fs::canonicalize(root).map_err(|error| format!("canonicalize checkout: {error}"))?;
+    let output = crate::bounded_process::output(
+        Command::new("git")
+            .current_dir(root)
+            .args(["rev-parse", "--show-toplevel"]),
+        crate::bounded_process::VALIDATION_OUTPUT_LIMITS,
+    )
+    .map_err(|error| format!("read checkout root: {error}"))?;
+    if !output.status.success() {
+        return Err("checkout is not a Git worktree".into());
+    }
+    let top = std::str::from_utf8(&output.stdout)
+        .map_err(|error| format!("decode checkout root: {error}"))?;
+    let top = std::fs::canonicalize(top.trim())
+        .map_err(|error| format!("canonicalize Git root: {error}"))?;
+    if physical != top {
+        return Err("release checkout path is not its Git worktree root".into());
+    }
+    Ok(physical)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1516,6 +1569,62 @@ mod tests {
                 Err(format!("unexpected GitHub mutation: {path}"))
             }
         }
+    }
+
+    #[test]
+    fn policy_and_source_roots_are_exact_distinct_and_clean() {
+        fn repository() -> tempfile::TempDir {
+            let dir = tempfile::tempdir().unwrap();
+            for args in [
+                vec!["init", "--quiet"],
+                vec!["config", "user.name", "Fixture"],
+                vec!["config", "user.email", "fixture@example.invalid"],
+                vec![
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "fixture",
+                ],
+            ] {
+                assert!(
+                    Command::new("git")
+                        .current_dir(dir.path())
+                        .args(args)
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+            }
+            dir
+        }
+        let policy = repository();
+        let output = Command::new("git")
+            .current_dir(policy.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let sha = std::str::from_utf8(&output.stdout).unwrap().trim();
+        assert_eq!(
+            exact_checkout(policy.path(), sha).unwrap(),
+            policy.path().canonicalize().unwrap()
+        );
+        assert!(
+            require_separate_checkouts(policy.path(), policy.path(), sha, sha)
+                .unwrap_err()
+                .contains("separate")
+        );
+        assert!(exact_checkout(policy.path(), &"0".repeat(40)).is_err());
+        let child = policy.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        assert!(exact_checkout(&child, sha).unwrap_err().contains("root"));
+        std::fs::write(policy.path().join("untracked"), "drift").unwrap();
+        assert!(
+            exact_checkout(policy.path(), sha)
+                .unwrap_err()
+                .contains("clean")
+        );
     }
 
     #[derive(Clone, Copy)]

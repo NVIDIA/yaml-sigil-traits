@@ -153,6 +153,15 @@ source, version, and absent target objects. release-plz is the sole publisher.
 
 ## Validate or recover publication
 
+Every release job retains two distinct checkouts: `policy` from protected
+current `main`, and `release-source` at the qualified source SHA. Only `policy`
+compiles the typed release command. `qualify` and both `finalize` phases receive
+`--source-root` explicitly and reject identical, nested, dirty, or incorrectly
+bound checkouts. Source remains data even during historical recovery. The
+policy checkout must still match the workflow's main SHA; a changed main
+requires a fresh dispatch. Existing original-run and registry checks remain
+required.
+
 The `validate` workflow dispatch checks the protected current-main release
 policy and makes every mutation job skip. It has no OIDC, App token, or
 release-plz invocation. Dispatch it against the exact current `main`:

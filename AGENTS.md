@@ -277,6 +277,12 @@ permissions, secrets, expressions, Action pins, or historical workflow files.
 Accept tokens only through environment variables; never log them, serialize
 them into fixtures, or pass them as command-line arguments.
 
+The existing release commands may compare reviewed path names and opaque Git
+blob identities across exact commits solely to prove release-policy provenance.
+This narrow exception permits no workflow-content parsing, semantic validation,
+provider-policy snapshots, or general workflow checks. Keep the required path
+set and activation anchor under protected `main`; source trees remain data.
+
 Within GitHub Actions, bind repository selection to GitHub's default
 `GITHUB_ACTIONS` and `GITHUB_REPOSITORY` variables and require an exact match
 with compiled repository and package policy. Do not use the mutable `CI`
