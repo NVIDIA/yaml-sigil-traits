@@ -44,9 +44,10 @@ Stop if the diff contains anything except `CHANGELOG.md` and `Cargo.toml`, or
 if the selected version, changelog, or package inventory differs from the
 intended release.
 
-Review every generated changelog entry and version change. For an unchanged
-RC, pinned `set-version` relabels the latest changelog entry. Retain the generated
-new entry and restore the previous published entry from `HEAD` alongside it.
+Review every generated changelog entry and version change. When advancing an
+unchanged RC or promoting it to stable, pinned `set-version` can relabel the
+latest published RC entry. Retain the generated new entry and restore the
+previous published entry from `HEAD` alongside it.
 
 Create the sole release commit with the approved SSH key and DCO identity.
 `check` then proves the committed transaction without credentials or
