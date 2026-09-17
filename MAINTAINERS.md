@@ -664,3 +664,5 @@ major and minor match the base. Detached validation receives that exact base
 explicitly; release paths and package validators retain their repository's
 existing boundaries. Support admission creates no publication authority and
 activates no support ref or ruleset.
+
+<!-- Inert support-admission validation canary. Close without merging. -->
