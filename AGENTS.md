@@ -438,3 +438,13 @@ across the two Rust repositories, and changes only the selected local refs.
 The per-line JSON inventory excludes itself; compare opaque Git blob IDs,
 never workflow contents. Recovery validates historical inventory and retained
 protected-base lineage without demanding current-main content.
+
+## Support release dispatch boundary
+
+Support push CI runs the existing nonpublishing matrix. The publication workflow
+runs only on main; its protected-main input helper binds canonical base, exact
+source, optional initial version, and operation before source checkout. Every
+later authority boundary passes the qualified version explicitly. Keep
+`bind-release-invocation.sh` and its focused shell tests identical in the two
+Rust repositories. Validate them with Shuck or ShellCheck and actionlint;
+provider workflow parsing remains outside the xtask.

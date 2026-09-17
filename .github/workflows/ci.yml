@@ -2,11 +2,12 @@ name: CI
 
 on:
   push:
-    # Coordination refs run the same non-publishing matrix; rollback refs do
+    # Coordination and support refs run the non-publishing matrix; rollback refs do
     # not match and never execute CI or release policy.
     branches:
       - main
       - dev/*.*.*
+      - support/*.*
       - ci-testing/*
       - pull-request/[0-9]+
 
@@ -22,6 +23,7 @@ jobs:
     if: >-
       ${{ github.ref == 'refs/heads/main' ||
           startsWith(github.ref, 'refs/heads/dev/') ||
+          startsWith(github.ref, 'refs/heads/support/') ||
           startsWith(github.ref, 'refs/heads/ci-testing/') }}
     runs-on: linux-amd64-cpu4
     timeout-minutes: 20
@@ -76,6 +78,7 @@ jobs:
           .github/scripts/test-materialize-candidate.sh
           .github/scripts/test-check-release-pr.sh
           .github/scripts/test-attach-release-source.sh
+          .github/scripts/test-bind-release-invocation.sh
           .github/scripts/check-trusted-tool-pins.sh
           .github/scripts/test-trusted-tool-pins.sh
 
@@ -84,6 +87,7 @@ jobs:
     if: >-
       ${{ github.ref == 'refs/heads/main' ||
           startsWith(github.ref, 'refs/heads/dev/') ||
+          startsWith(github.ref, 'refs/heads/support/') ||
           startsWith(github.ref, 'refs/heads/ci-testing/') }}
     runs-on: linux-amd64-cpu8
     timeout-minutes: 60
@@ -168,6 +172,7 @@ jobs:
     if: >-
       ${{ github.ref == 'refs/heads/main' ||
           startsWith(github.ref, 'refs/heads/dev/') ||
+          startsWith(github.ref, 'refs/heads/support/') ||
           startsWith(github.ref, 'refs/heads/ci-testing/') }}
     runs-on: linux-amd64-cpu8
     timeout-minutes: 40
@@ -199,6 +204,7 @@ jobs:
       ${{ always() &&
           (github.ref == 'refs/heads/main' ||
            startsWith(github.ref, 'refs/heads/dev/') ||
+           startsWith(github.ref, 'refs/heads/support/') ||
            startsWith(github.ref, 'refs/heads/ci-testing/')) }}
     needs:
       - trusted_policy
@@ -223,6 +229,7 @@ jobs:
     if: >-
       ${{ github.ref == 'refs/heads/main' ||
           startsWith(github.ref, 'refs/heads/dev/') ||
+          startsWith(github.ref, 'refs/heads/support/') ||
           startsWith(github.ref, 'refs/heads/ci-testing/') }}
     runs-on: ${{ matrix.runner }}
     continue-on-error: true
@@ -730,7 +737,8 @@ jobs:
               -s .github/scripts -p 'test_*.py'
             .github/scripts/test-materialize-candidate.sh
             .github/scripts/test-check-release-pr.sh
-          .github/scripts/test-attach-release-source.sh
+            .github/scripts/test-attach-release-source.sh
+            .github/scripts/test-bind-release-invocation.sh
           else
             "${FIXED_CARGO}" "${cargo_config[@]}" test --all-features
             "${FIXED_CARGO}" "${cargo_config[@]}" test --locked \

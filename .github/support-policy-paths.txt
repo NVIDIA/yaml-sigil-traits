@@ -2,6 +2,8 @@
 # This file contains path names only, never workflow contents or semantics.
 .cargo/config.toml
 .github/scripts/bind-candidate-pr.py
+.github/scripts/bind-release-invocation.sh
+.github/scripts/test-bind-release-invocation.sh
 .github/scripts/test-attach-release-source.sh
 .github/scripts/attach-release-source.sh
 .github/scripts/check-pull-request-commits.sh

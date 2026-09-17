@@ -1,7 +1,7 @@
 name: Publish
 
-# A main push may qualify one reviewed release. Manual dispatch is either
-# validation-only or recovery bound to the original source and run attempt.
+# A main push may qualify one reviewed release. Main dispatch may validate a
+# protected base, release support source, or recover an interrupted release.
 on:
   push:
     branches:
@@ -9,19 +9,29 @@ on:
   workflow_dispatch:
     inputs:
       operation:
-        description: Validate protected policy or recover one original main run.
+        description: Validate a base, release support, or recover an exact source.
         required: true
         default: validate
         type: choice
         options:
           - validate
+          - release
           - recover
+      base_ref:
+        description: Exact main or canonical support/M.N base; execution stays on main.
+        required: true
+        default: refs/heads/main
+        type: string
+      version:
+        description: Exact version; required for support release and recovery.
+        required: false
+        type: string
       source_sha:
-        description: Full source SHA; required for validation and recovery.
+        description: Full selected source SHA; validation uses the selected base tip.
         required: true
         type: string
       original_run_id:
-        description: Original push run ID; required only for recovery.
+        description: Original run ID; support recovery treats it as audit context.
         required: false
         type: string
       original_run_attempt:
@@ -38,6 +48,7 @@ concurrency:
 jobs:
   qualify:
     name: Qualify exact release source
+    if: ${{ github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -54,54 +65,6 @@ jobs:
       validation_only: ${{ steps.qualify.outputs.validation_only }}
       version: ${{ steps.qualify.outputs.version }}
     steps:
-      - name: Bind event inputs before checkout
-        id: invocation
-        env:
-          DISPATCH_OPERATION: ${{ inputs.operation }}
-          INPUT_ATTEMPT: ${{ inputs.original_run_attempt }}
-          INPUT_RUN_ID: ${{ inputs.original_run_id }}
-          INPUT_SOURCE: ${{ inputs.source_sha }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          test "${GITHUB_REF}" = "refs/heads/main"
-          # Select only a current-main push, validation, or fully bounded recovery.
-          case "${GITHUB_EVENT_NAME}" in
-            push)
-              test -z "${INPUT_SOURCE}${INPUT_RUN_ID}${INPUT_ATTEMPT}"
-              mode=push
-              source="${GITHUB_SHA}"
-              ;;
-            workflow_dispatch)
-              # Dispatch validation has no recovery coordinates; recovery has all three.
-              case "${DISPATCH_OPERATION}" in
-                validate)
-                  [[ "${INPUT_SOURCE}" =~ ^[0-9a-f]{40}$ ]]
-                  test "${INPUT_SOURCE}" = "${GITHUB_SHA}"
-                  test -z "${INPUT_RUN_ID}${INPUT_ATTEMPT}"
-                  mode=validate
-                  source="${INPUT_SOURCE}"
-                  ;;
-                recover)
-                  [[ "${INPUT_SOURCE}" =~ ^[0-9a-f]{40}$ ]]
-                  [[ "${INPUT_RUN_ID}" =~ ^[1-9][0-9]*$ ]]
-                  [[ "${INPUT_ATTEMPT}" =~ ^[1-9][0-9]*$ ]]
-                  mode=recover
-                  source="${INPUT_SOURCE}"
-                  ;;
-                *)
-                  echo "Unsupported publication operation." >&2
-                  exit 1
-                  ;;
-              esac
-              ;;
-            *)
-              echo "Unsupported publication event." >&2
-              exit 1
-              ;;
-          esac
-          printf 'mode=%s\nsource=%s\n' "${mode}" "${source}" >> "${GITHUB_OUTPUT}"
-
       # The dispatch workflow itself always comes from protected current main.
       - name: Check out protected release policy
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -110,6 +73,18 @@ jobs:
           persist-credentials: false
           path: policy
           ref: refs/heads/main
+
+      # Only protected main binds inputs before the separate source checkout.
+      - name: Bind selected release invocation
+        id: invocation
+        env:
+          DISPATCH_OPERATION: ${{ inputs.operation }}
+          INPUT_BASE: ${{ inputs.base_ref }}
+          INPUT_SOURCE: ${{ inputs.source_sha }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_RUN_ID: ${{ inputs.original_run_id }}
+          INPUT_ATTEMPT: ${{ inputs.original_run_attempt }}
+        run: policy/.github/scripts/bind-release-invocation.sh
 
       - name: Set up Rust 1.98.0
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
@@ -133,37 +108,35 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
           path: release-source
-          ref: ${{ steps.invocation.outputs.source }}
+          ref: ${{ steps.invocation.outputs.source_sha }}
 
-      - name: Qualify release or ordinary no-op
-        working-directory: release-source
+      - name: Qualify the selected exact source
         id: qualify
         env:
           GH_TOKEN: ${{ github.token }}
-          MODE: ${{ steps.invocation.outputs.mode }}
-          ORIGINAL_ATTEMPT: ${{ inputs.original_run_attempt }}
+          BASE_REF: ${{ steps.invocation.outputs.base_ref }}
+          SOURCE_SHA: ${{ steps.invocation.outputs.source_sha }}
+          SELECTED_VERSION: ${{ steps.invocation.outputs.version }}
+          QUALIFY_MODE: ${{ steps.invocation.outputs.mode }}
           ORIGINAL_RUN_ID: ${{ inputs.original_run_id }}
-          SOURCE_SHA: ${{ steps.invocation.outputs.source }}
+          ORIGINAL_RUN_ATTEMPT: ${{ inputs.original_run_attempt }}
         shell: bash
         run: |
-          set -euo pipefail
+          args=(github release qualify --base-ref "${BASE_REF}"
+            --source-root . --source-sha "${SOURCE_SHA}"
+            --operation "${QUALIFY_MODE}")
+          # Bind an explicit operator version without guessing from the dispatch ref.
+          if [[ -n "${SELECTED_VERSION}" ]]; then
+            args+=(--version "${SELECTED_VERSION}")
+          fi
+          # Main recovery validates this run; support retains it as audit context.
+          if [[ "${QUALIFY_MODE}" == recover ]]; then
+            args+=(--original-run-id "${ORIGINAL_RUN_ID}"
+              --original-run-attempt "${ORIGINAL_RUN_ATTEMPT}")
+          fi
           sha256sum --check "${RUNNER_TEMP}/release-xtask.sha256"
-          test "$(cat "${RUNNER_TEMP}/release-policy.sha")" = "${GITHUB_SHA}"
-          test "$(git rev-parse HEAD)" = "${SOURCE_SHA}"
-          args=(github release qualify --base-ref refs/heads/main --source-root . --mode "${MODE}" --source "${SOURCE_SHA}")
-          # Recovery alone binds the original run and attempt.
-          case "${MODE}" in
-            recover)
-              args+=(--original-run-id "${ORIGINAL_RUN_ID}")
-              args+=(--original-run-attempt "${ORIGINAL_ATTEMPT}")
-              ;;
-            push|validate)
-              ;;
-            *)
-              exit 1
-              ;;
-          esac
           "${RUNNER_TEMP}/release-xtask" "${args[@]}"
+        working-directory: release-source
 
   publish:
     name: Publish source crate
@@ -223,62 +196,54 @@ jobs:
           # Install the sole Cargo publisher at the reviewed version.
           cargo binstall --force --locked --no-confirm release-plz@0.3.160
 
-      - name: Requalify exact source after approval
-        working-directory: release-source
+      - name: Requalify the selected source after approval
         id: requalify
         env:
           GH_TOKEN: ${{ github.token }}
-          MODE: ${{ needs.qualify.outputs.mode }}
-          ORIGINAL_ATTEMPT: ${{ inputs.original_run_attempt }}
-          ORIGINAL_RUN_ID: ${{ inputs.original_run_id }}
-          POLICY_SHA: ${{ github.sha }}
+          BASE_REF: ${{ needs.qualify.outputs.base_ref }}
           SOURCE_SHA: ${{ needs.qualify.outputs.source }}
+          RELEASE_VERSION: ${{ needs.qualify.outputs.version }}
+          QUALIFY_MODE: ${{ needs.qualify.outputs.mode }}
+          ORIGINAL_RUN_ID: ${{ inputs.original_run_id }}
+          ORIGINAL_RUN_ATTEMPT: ${{ inputs.original_run_attempt }}
+        shell: bash
         run: |
-          set -euo pipefail
           sha256sum --check "${RUNNER_TEMP}/release-xtask.sha256"
-          test "$(cat "${RUNNER_TEMP}/release-policy.sha")" = "${POLICY_SHA}"
-          test "$(git rev-parse HEAD)" = "${SOURCE_SHA}"
-          # Refuse any release-plz executable other than the requested pin.
+          # Refuse an analyzer version other than the reviewed publisher pin.
           test "$(release-plz --version)" = "release-plz 0.3.160"
-          # Fresh pushes freeze live main; recovery rebinds only its historical
-          # source and original run coordinates under current protected policy.
-          case "${MODE}" in
-            push)
-              test "${POLICY_SHA}" = "${SOURCE_SHA}"
-              "${RUNNER_TEMP}/release-xtask" github release qualify --base-ref refs/heads/main --source-root . \
-                --mode publish --source "${SOURCE_SHA}"
-              ;;
-            recover)
-              git merge-base --is-ancestor "${SOURCE_SHA}" "${POLICY_SHA}"
-              "${RUNNER_TEMP}/release-xtask" github release qualify --base-ref refs/heads/main --source-root . \
-                --mode recover --source "${SOURCE_SHA}" \
-                --original-run-id "${ORIGINAL_RUN_ID}" \
-                --original-run-attempt "${ORIGINAL_ATTEMPT}"
-              ;;
-            *)
-              exit 1
-              ;;
-          esac
+          # Fresh publication rechecks that the selected version is still absent.
+          if [[ "${QUALIFY_MODE}" != recover ]]; then
+            QUALIFY_MODE=publish
+          fi
+          args=(github release qualify --base-ref "${BASE_REF}"
+            --source-root . --source-sha "${SOURCE_SHA}"
+            --version "${RELEASE_VERSION}" --operation "${QUALIFY_MODE}")
+          # Recovery retains its original source and run context after approval.
+          if [[ "${QUALIFY_MODE}" == recover ]]; then
+            args+=(--original-run-id "${ORIGINAL_RUN_ID}"
+              --original-run-attempt "${ORIGINAL_RUN_ATTEMPT}")
+          fi
+          "${RUNNER_TEMP}/release-xtask" "${args[@]}"
+        working-directory: release-source
 
       - name: Publish exact source with Trusted Publishing
         working-directory: release-source
         if: ${{ steps.requalify.outputs.registry_state == 'absent' }}
         env:
+          BASE_REF: ${{ needs.qualify.outputs.base_ref }}
           # release-plz resolves the explicit Cargo publish registry by name.
           CARGO_REGISTRIES_CRATES_IO_INDEX: sparse+https://index.crates.io/
           CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
-          MODE: ${{ needs.qualify.outputs.mode }}
-          POLICY_SHA: ${{ github.sha }}
           SOURCE_SHA: ${{ needs.qualify.outputs.source }}
           RELEASE_OPERATION: ${{ needs.qualify.outputs.operation }}
           QUALIFIED_VERSION: ${{ needs.qualify.outputs.version }}
         run: |
           set -euo pipefail
-          ../policy/.github/scripts/attach-release-source.sh "${SOURCE_SHA}" refs/heads/main
+          ../policy/.github/scripts/attach-release-source.sh "${SOURCE_SHA}" "${BASE_REF}"
           # Bind the executing policy and selected source immediately before
           # the publisher receives its read token and registry authority.
           "${RUNNER_TEMP}/release-xtask" github release rebind-policy \
-            --base-ref refs/heads/main --operation "${RELEASE_OPERATION}" \
+            --base-ref "${BASE_REF}" --operation "${RELEASE_OPERATION}" \
             --version "${QUALIFIED_VERSION}" \
             --source-root . --source-sha "${SOURCE_SHA}"
           # Qualified release-plz is the sole Cargo publisher and receives the
@@ -336,7 +301,7 @@ jobs:
       - name: Rebind protected policy and source lineage
         working-directory: release-source
         env:
-          POLICY_SHA: ${{ github.sha }}
+          BASE_REF: ${{ needs.qualify.outputs.base_ref }}
           SOURCE_SHA: ${{ needs.qualify.outputs.source }}
           RELEASE_OPERATION: ${{ needs.qualify.outputs.operation }}
           QUALIFIED_VERSION: ${{ needs.qualify.outputs.version }}
@@ -344,7 +309,7 @@ jobs:
           set -euo pipefail
           sha256sum --check "${RUNNER_TEMP}/release-xtask.sha256"
           "${RUNNER_TEMP}/release-xtask" github release rebind-policy \
-            --base-ref refs/heads/main --operation "${RELEASE_OPERATION}" \
+            --base-ref "${BASE_REF}" --operation "${RELEASE_OPERATION}" \
             --version "${QUALIFIED_VERSION}" \
             --source-root . --source-sha "${SOURCE_SHA}"
 
@@ -353,6 +318,7 @@ jobs:
       - name: Await exact published archive
         working-directory: release-source
         env:
+          BASE_REF: ${{ needs.qualify.outputs.base_ref }}
           SOURCE_SHA: ${{ needs.qualify.outputs.source }}
           RELEASE_OPERATION: ${{ needs.qualify.outputs.operation }}
           VERSION: ${{ needs.qualify.outputs.version }}
@@ -360,7 +326,7 @@ jobs:
           set -euo pipefail
           sha256sum --check "${RUNNER_TEMP}/release-xtask.sha256"
           test "$(git rev-parse HEAD)" = "${SOURCE_SHA}"
-          "${RUNNER_TEMP}/release-xtask" github release finalize --base-ref refs/heads/main --source-root . \
+          "${RUNNER_TEMP}/release-xtask" github release finalize --base-ref "${BASE_REF}" --source-root . \
             --operation "${RELEASE_OPERATION}" \
             --phase await --source "${SOURCE_SHA}" --version "${VERSION}"
 
@@ -452,7 +418,7 @@ jobs:
       - name: Rebind protected finalizer policy
         working-directory: release-source
         env:
-          POLICY_SHA: ${{ github.sha }}
+          BASE_REF: ${{ needs.qualify.outputs.base_ref }}
           SOURCE_SHA: ${{ needs.qualify.outputs.source }}
           RELEASE_OPERATION: ${{ needs.qualify.outputs.operation }}
           QUALIFIED_VERSION: ${{ needs.qualify.outputs.version }}
@@ -460,7 +426,7 @@ jobs:
           set -euo pipefail
           sha256sum --check "${RUNNER_TEMP}/release-xtask.sha256"
           "${RUNNER_TEMP}/release-xtask" github release rebind-policy \
-            --base-ref refs/heads/main --operation "${RELEASE_OPERATION}" \
+            --base-ref "${BASE_REF}" --operation "${RELEASE_OPERATION}" \
             --version "${QUALIFIED_VERSION}" \
             --source-root . --source-sha "${SOURCE_SHA}"
 
@@ -477,6 +443,7 @@ jobs:
       - name: Reconcile exact tag and Release
         working-directory: release-source
         env:
+          BASE_REF: ${{ needs.qualify.outputs.base_ref }}
           APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           SOURCE_SHA: ${{ needs.qualify.outputs.source }}
@@ -486,7 +453,7 @@ jobs:
           set -euo pipefail
           sha256sum --check "${RUNNER_TEMP}/release-xtask.sha256"
           test "$(git rev-parse HEAD)" = "${SOURCE_SHA}"
-          "${RUNNER_TEMP}/release-xtask" github release finalize --base-ref refs/heads/main --source-root . \
+          "${RUNNER_TEMP}/release-xtask" github release finalize --base-ref "${BASE_REF}" --source-root . \
             --operation "${RELEASE_OPERATION}" \
             --phase reconcile --source "${SOURCE_SHA}" \
             --version "${VERSION}"

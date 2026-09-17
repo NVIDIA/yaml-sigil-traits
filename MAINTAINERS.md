@@ -631,8 +631,8 @@ load-bearing release policy gains a file. Inventories exclude themselves.
 
 This readiness command applies no settings, creates no refs, and publishes
 nothing. Opening a line still requires the separately reviewed protection and
-activation transaction. Support qualification and publication remain disabled
-until the provenance checks and main-dispatched release procedure are deployed.
+activation transaction. The workflow admits an activated support line only
+through a dispatch on protected main; a support push runs CI without publication.
 
 ## Latest selection during finalization
 
@@ -704,3 +704,33 @@ minting the finalizer token. It fetches anonymously, reads no workflow bytes,
 and checks exact separate clean roots. The finalizer repeats the live lineage
 and policy check at each mutation boundary. These controls do not authorize
 support activation or publication by themselves.
+
+## Dispatch an activated support release
+
+Support push CI is nonpublishing. After the exact release PR has passed its
+base-specific required check and received human integration approval, verify
+the resulting support squash has the reviewed tree, sole expected parent,
+Verified signature, DCO, and exact PR association. Run the same preparation,
+source check, and read-only release-plz acceptance procedure in
+[`RELEASING.md`](RELEASING.md), selecting the support base explicitly.
+
+Dispatch `publish.yml` on `main` with `operation=validate`, `base_ref`, and the
+exact selected tip before publication. This operation skips every mutation job.
+For an authorized fresh release, dispatch `operation=release` with that same
+base and source and its exact `version`. Main releases retain automatic
+qualification after their release PR squash; `release` dispatch is support-only.
+
+Recovery always uses a fresh main dispatch with `operation=recover`, the
+original base, source, version, run ID, and attempt. It never substitutes the
+current support tip. A support recovery must already have published source
+packages; original-run coordinates provide audit context. Main recovery still
+validates its original main-push run.
+
+The protected-main input binder rejects noncanonical bases, source IDs,
+versions, and invalid operation combinations before source checkout. Typed
+qualification proves the selected source and inventory. Requalification after
+approval, anonymous policy rebind, registry confirmation, and finalization
+retain the same base/source/version/operation. A changed main policy requires
+a new dispatch. All privileged jobs and existing environments remain main-only,
+and publication is serialized across the whole repository. Each recovery
+receives fresh applicable environment approvals; an older approval is not reused.
