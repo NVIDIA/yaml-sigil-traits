@@ -664,3 +664,43 @@ major and minor match the base. Detached validation receives that exact base
 explicitly; release paths and package validators retain their repository's
 existing boundaries. Support admission creates no publication authority and
 activates no support ref or ruleset.
+
+### Maintain support provenance and recover an interrupted release
+
+Review `.github/support-lines/M.N.json` on protected main and on the support
+line. It records schema version `1`, the full `base_ref`, immutable `anchor`,
+historical main `policy_commit`, explicit `enforce` state, and a `blobs` object
+mapping reviewed paths to full Git blob IDs. Exclude the inventory itself.
+Current main selects the active line, anchor, and required path set. Initial
+activation uses the reviewed `.github/support-policy-paths.txt` seed; later
+path-set or enforcement changes require an explicit main policy review.
+
+After a protected-policy change, backport the required files and update the
+support inventory to name the exact main commit and its actual blob IDs.
+Fresh qualification checks the complete historical chain as well as current
+main equality, so current files cannot conceal stale inventory metadata. A
+line explicitly retired from current-content enforcement still needs a valid
+historical source inventory and protected lineage. Never change its anchor.
+
+Recovery uses the original source even when the support tip has advanced. It
+requires published source-package evidence, exact release-PR binding, valid
+historical inventory, and any existing deterministic annotated tags and
+immutable Releases. It does not require the old source to match newer main
+content. The support run ID and attempt are audit context only; main recovery
+retains its original push-run validation. Every recovery requires a fresh
+dispatch and the existing applicable environment approvals.
+
+Zero-package recovery is rejected. Start a fresh release from the current tip
+when nothing was published. Partial crate publication must be a dependency-
+ordered prefix with no forge objects; all crates must be public before any
+tag or Release can exist. A Release without its exact retained tag, a
+conflicting tag, or a mismatched source archive requires investigation rather
+than replacement. The one-crate traits repository has no nonempty partial
+crate prefix.
+
+The workflow calls `github release rebind-policy` with explicit base, source,
+version, and fresh/recovery operation before publication authority and before
+minting the finalizer token. It fetches anonymously, reads no workflow bytes,
+and checks exact separate clean roots. The finalizer repeats the live lineage
+and policy check at each mutation boundary. These controls do not authorize
+support activation or publication by themselves.

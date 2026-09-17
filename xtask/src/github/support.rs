@@ -25,6 +25,7 @@ pub(super) struct Inventory {
     pub(super) anchor: String,
     pub(super) policy_commit: String,
     pub(super) enforce: bool,
+    #[serde(deserialize_with = "super::provenance::unique_blobs")]
     pub(super) blobs: BTreeMap<String, String>,
 }
 
@@ -56,15 +57,6 @@ struct Tagger {
     email: String,
 }
 
-pub(super) fn require_main_base(base: &str) -> Result<(), String> {
-    if ReleaseLine::from_base_ref(base)? != ReleaseLine::Main {
-        return Err(
-            "support publication requires the support provenance and dispatch rollout".into(),
-        );
-    }
-    Ok(())
-}
-
 pub(super) fn start(
     root: &Path,
     version: &Version,
@@ -79,6 +71,7 @@ pub(super) fn start(
         major: version.major,
         minor: version.minor,
     };
+    ReleaseLine::from_base_ref(&line.base_ref())?;
     let mut github = GhCli::new()?;
     let main: Reference = github.get(&format!("repos/{REPOSITORY}/git/ref/heads/main"))?;
     if main.name != "refs/heads/main" || main.object.kind != "commit" || !is_sha(&main.object.sha) {
@@ -162,8 +155,11 @@ pub(super) fn start(
     Ok(())
 }
 
-fn require_repository(explicit: Option<&str>) -> Result<(), String> {
+pub(super) fn require_repository(explicit: Option<&str>) -> Result<(), String> {
     let observed = if std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true") {
+        if std::env::var("GITHUB_REF").as_deref() != Ok("refs/heads/main") {
+            return Err("release policy executes only from protected main".into());
+        }
         let actual =
             std::env::var("GITHUB_REPOSITORY").map_err(|_| "GITHUB_REPOSITORY is required")?;
         if explicit.is_some_and(|value| value != actual) {
@@ -179,6 +175,39 @@ fn require_repository(explicit: Option<&str>) -> Result<(), String> {
         return Err("repository differs from compiled release policy".into());
     }
     Ok(())
+}
+
+pub(super) fn require_fresh_progression(
+    github: &mut impl Transport,
+    line: ReleaseLine,
+    selected: &Version,
+) -> Result<(), String> {
+    if line == ReleaseLine::Main {
+        return Ok(());
+    }
+    let prefix = tag_prefixes()[0];
+    let references: Vec<Reference> = github.get(&format!(
+        "repos/{REPOSITORY}/git/matching-refs/tags/{prefix}"
+    ))?;
+    if references.len() > MAX_TAGS {
+        return Err("release tag inventory exceeds its bound".into());
+    }
+    let mut published = Vec::new();
+    for reference in references {
+        let raw = reference
+            .name
+            .strip_prefix(&format!("refs/tags/{prefix}"))
+            .ok_or("unexpected release tag prefix")?;
+        if let Ok(version) = Version::parse(raw)
+            && version.to_string() == raw
+        {
+            if reference.object.kind != "tag" || !is_sha(&reference.object.sha) {
+                return Err("release progression requires annotated release tags".into());
+            }
+            published.push(version);
+        }
+    }
+    line.require_advancement(selected, &published)
 }
 
 fn select_successor(
@@ -267,7 +296,7 @@ fn published_source(
     Ok(source)
 }
 
-fn seed_inventory(
+pub(super) fn seed_inventory(
     root: &Path,
     line: ReleaseLine,
     anchor: &str,
@@ -300,7 +329,7 @@ fn seed_inventory(
     })
 }
 
-fn require_path(path: &str) -> Result<(), String> {
+pub(super) fn require_path(path: &str) -> Result<(), String> {
     if path.is_empty()
         || path.starts_with('/')
         || path.starts_with(".github/support-lines/")
@@ -314,7 +343,7 @@ fn require_path(path: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn blob(root: &Path, commit: &str, path: &str) -> Result<String, String> {
+pub(super) fn blob(root: &Path, commit: &str, path: &str) -> Result<String, String> {
     require_path(path)?;
     if !is_sha(commit) {
         return Err("policy commit must be a full lowercase SHA".into());
@@ -333,7 +362,7 @@ fn blob(root: &Path, commit: &str, path: &str) -> Result<String, String> {
     Ok(fields[2].to_string())
 }
 
-fn is_sha(value: &str) -> bool {
+pub(super) fn is_sha(value: &str) -> bool {
     value.len() == 40
         && value
             .bytes()
@@ -344,7 +373,11 @@ fn tag_prefixes() -> Vec<&'static str> {
     vec![crate::release_policy::TRAITS_PACKAGE.tag_prefix]
 }
 
-fn validate_package_family(root: &Path) -> Result<(), String> {
+pub(super) fn source_version(root: &Path) -> Result<Version, String> {
+    crate::release::manifest_version(root)
+}
+
+pub(super) fn validate_package_family(root: &Path) -> Result<(), String> {
     crate::release::check_manifest(root)
 }
 
