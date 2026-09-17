@@ -1,0 +1,698 @@
+name: Candidate CI
+
+# Only ci.yml selects this route. Local calls use the exact caller commit;
+# ordinary copied-ref reporting binds this file to protected main as well.
+on:
+  workflow_call:
+
+permissions: {}
+
+jobs:
+  candidate_binding:
+    name: Bind candidate to protected policy and base
+    runs-on: linux-amd64-cpu4
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      base_ref: ${{ steps.pull.outputs.base_ref }}
+      base_sha: ${{ steps.pull.outputs.base_sha }}
+      policy_sha: ${{ steps.policy.outputs.policy_sha }}
+    env:
+      GH_TOKEN: ""
+      GITHUB_TOKEN: ""
+      GIT_ASKPASS: /bin/false
+      GIT_CONFIG_GLOBAL: /dev/null
+      GIT_CONFIG_NOSYSTEM: "1"
+      GIT_CONFIG_SYSTEM: /dev/null
+      GIT_TERMINAL_PROMPT: "0"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      # Bind the run before any candidate-executable job starts. Downstream
+      # jobs rebind these exact objects before materializing contributor code.
+      - name: Initialize fresh binding state
+        run: install -d -m 0700 "${RUNNER_TEMP}/candidate-binding"
+
+      - name: Stage binder from protected current main
+        id: policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init --quiet --initial-branch=main .
+          git remote add origin \
+            "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git -c credential.helper= -c http.extraHeader= \
+            fetch --quiet --no-tags --no-recurse-submodules --depth=1 \
+            origin "+refs/heads/main:refs/remotes/origin/main"
+          policy_sha="$(git rev-parse refs/remotes/origin/main)"
+          git show \
+            "${policy_sha}:.github/scripts/bind-candidate-pr.py" \
+            > bind-candidate-pr.py
+          chmod 0500 bind-candidate-pr.py
+          python3 -m py_compile bind-candidate-pr.py
+          printf 'policy_sha=%s\n' "${policy_sha}" >> "${GITHUB_OUTPUT}"
+        working-directory: ${{ runner.temp }}/candidate-binding
+
+      - name: Bind copied ref to exact policy and contribution base
+        id: pull
+        env:
+          POLICY_SHA: ${{ steps.policy.outputs.policy_sha }}
+        run: >-
+          python3 ./bind-candidate-pr.py
+          --repository "${GITHUB_REPOSITORY}"
+          --copied-ref "${GITHUB_REF_NAME}"
+          --head-sha "${GITHUB_SHA}"
+          --policy-sha "${POLICY_SHA}"
+          --output "${GITHUB_OUTPUT}"
+        working-directory: ${{ runner.temp }}/candidate-binding
+
+  candidate_linux_lanes:
+    name: Candidate ${{ matrix.name }} (Linux)
+    needs:
+      - candidate_binding
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 75
+    permissions: {}
+    env:
+      ACTIONS_CACHE_URL: ""
+      ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+      ACTIONS_ID_TOKEN_REQUEST_URL: ""
+      ACTIONS_RESULTS_URL: ""
+      ACTIONS_RUNTIME_TOKEN: ""
+      CARGO_REGISTRY_TOKEN: ""
+      CARGO_REGISTRIES_CRATES_IO_TOKEN: ""
+      GH_TOKEN: ""
+      GIT_ASKPASS: /bin/false
+      GIT_CONFIG_GLOBAL: /dev/null
+      GIT_CONFIG_NOSYSTEM: "1"
+      GIT_CONFIG_SYSTEM: /dev/null
+      GIT_LFS_SKIP_SMUDGE: "1"
+      GIT_TERMINAL_PROMPT: "0"
+      GIT_TOKEN: ""
+      GITHUB_TOKEN: ""
+      PYTHONNOUSERSITE: "1"
+      PYTHONSAFEPATH: "1"
+      RUSTFLAGS: -D warnings
+      RUSTC_WORKSPACE_WRAPPER: ""
+      RUSTC_WRAPPER: ""
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Rust 1.98.0
+            toolchain: 1.98.0
+            full: true
+          - name: Rust 1.95.0
+            toolchain: 1.95.0
+            full: false
+    steps:
+      - name: Create fresh candidate state
+        shell: bash
+        run: |
+          set -euo pipefail
+          state="${RUNNER_TEMP}/yaml-sigil-candidate-state"
+          test ! -e "${state}"
+          install -d -m 0700 \
+            "${state}" \
+            "${state}/bootstrap" \
+            "${state}/cargo-home" \
+            "${state}/policy-bin" \
+            "${state}/source" \
+            "${state}/target" \
+            "${state}/tmp"
+          printf '%s\n' \
+            "CANDIDATE_STATE=${state}" \
+            "CARGO_HOME=${state}/cargo-home" \
+            "CARGO_TARGET_DIR=${state}/target" \
+            "POLICY_BIN=${state}/policy-bin" \
+            "TEMP=${state}/tmp" \
+            "TMP=${state}/tmp" \
+            "TMPDIR=${state}/tmp" >> "${GITHUB_ENV}"
+        working-directory: ${{ github.workspace }}
+
+      # Complete trusted host setup before any candidate-controlled path exists.
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache: false
+          components: clippy, rustfmt
+          toolchain: ${{ matrix.toolchain }}
+
+      # This section would benefit by a change to the action allowlist
+      - name: Install Rust validation tools
+        if: ${{ matrix.full }}
+        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2.83.2
+        with:
+          checksum: true
+          fallback: none
+          tool: cargo-audit@0.22.2,cargo-deny@0.20.2,cargo-machete@0.9.2,shellcheck@0.11.0
+
+      - name: Install Markdown linter
+        if: ${{ matrix.full }}
+        uses: rvben/rumdl@95a982d941d00cf41a0dcef4d0788bd15a29be1b # v0.2.54
+        with:
+          install-only: true
+          version: "0.2.54"
+
+      # Fetch protected main before candidate source exists and stage every
+      # policy executable that must survive materialization.
+      - name: Stage protected candidate policy
+        id: protected_policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -c core.autocrlf=false init --quiet --initial-branch=main .
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git -c credential.helper= fetch --no-tags --no-recurse-submodules \
+            --depth=1 origin \
+            "+refs/heads/main:refs/remotes/origin/main"
+          git show \
+            refs/remotes/origin/main:.github/scripts/materialize-candidate.sh \
+            > "${POLICY_BIN}/materialize-candidate.sh"
+          git show \
+            refs/remotes/origin/main:.github/scripts/bind-candidate-pr.py \
+            > "${POLICY_BIN}/bind-candidate-pr.py"
+          git show \
+            refs/remotes/origin/main:.github/scripts/check-pull-request-commits.sh \
+            > "${POLICY_BIN}/check-pull-request-commits.sh"
+          git show \
+            refs/remotes/origin/main:.github/scripts/check-release-pr.sh \
+            > "${POLICY_BIN}/check-release-pr.sh"
+          chmod 0500 \
+            "${POLICY_BIN}/bind-candidate-pr.py" \
+            "${POLICY_BIN}/check-release-pr.sh" \
+            "${POLICY_BIN}/materialize-candidate.sh" \
+            "${POLICY_BIN}/check-pull-request-commits.sh"
+          printf 'policy_sha=%s\n' \
+            "$(git rev-parse refs/remotes/origin/main)" >> "${GITHUB_OUTPUT}"
+        working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/bootstrap
+
+      # Anonymous protected-main policy identifies a canonical repository-owned
+      # release branch; ordinary contributor branches produce an empty value.
+      - name: Bind current pull request metadata
+        id: candidate_pr
+        env:
+          CANDIDATE_REF: ${{ github.ref_name }}
+          CANDIDATE_SHA: ${{ github.sha }}
+          POLICY_SHA: ${{ steps.protected_policy.outputs.policy_sha }}
+        shell: bash
+        run: >-
+          python3 "${POLICY_BIN}/bind-candidate-pr.py"
+          --repository "${GITHUB_REPOSITORY}"
+          --copied-ref "${CANDIDATE_REF}"
+          --head-sha "${CANDIDATE_SHA}"
+          --policy-sha "${POLICY_SHA}"
+          --output "${GITHUB_OUTPUT}"
+        working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/bootstrap
+
+      # The aggregate verdict records the binding established before any
+      # candidate job began. Fail if protected policy or the base moved.
+      - name: Match pre-execution policy and base binding
+        env:
+          BASE_REF: ${{ steps.candidate_pr.outputs.base_ref }}
+          BASE_SHA: ${{ steps.candidate_pr.outputs.base_sha }}
+          EXPECTED_BASE_REF: ${{ needs.candidate_binding.outputs.base_ref }}
+          EXPECTED_BASE_SHA: ${{ needs.candidate_binding.outputs.base_sha }}
+          EXPECTED_POLICY_SHA: ${{ needs.candidate_binding.outputs.policy_sha }}
+          POLICY_SHA: ${{ steps.protected_policy.outputs.policy_sha }}
+        run: |
+          test "${POLICY_SHA}" = "${EXPECTED_POLICY_SHA}"
+          test "${BASE_REF}" = "${EXPECTED_BASE_REF}"
+          test "${BASE_SHA}" = "${EXPECTED_BASE_SHA}"
+        working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/bootstrap
+
+      - name: Install fixed actionlint
+        if: ${{ matrix.full }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git show \
+            refs/remotes/origin/main:.github/scripts/install-actionlint.sh \
+            > "${POLICY_BIN}/install-actionlint.sh"
+          chmod 0500 "${POLICY_BIN}/install-actionlint.sh"
+          "${POLICY_BIN}/install-actionlint.sh" \
+            "${CANDIDATE_STATE}/actionlint"
+        working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/bootstrap
+
+      # Resolve every command while the workspace still contains protected
+      # policy only. Candidate Cargo aliases and PATH entries cannot select
+      # these absolute executables after materialization.
+      - name: Pin fixed validation commands
+        id: fixed_tools
+        env:
+          FULL: ${{ matrix.full }}
+          TOOLCHAIN: ${{ matrix.toolchain }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_path="$(rustup which --toolchain "${TOOLCHAIN}" cargo)"
+          rustc_path="$(rustup which --toolchain "${TOOLCHAIN}" rustc)"
+          rustdoc_path="$(rustup which --toolchain "${TOOLCHAIN}" rustdoc)"
+          for path in "${cargo_path}" "${rustc_path}" "${rustdoc_path}"; do
+            [[ "${path}" == /* && "${path}" != *$'\n'* && "${path}" != *$'\r'* ]]
+            test -x "${path}"
+          done
+          printf '%s\n' \
+            "cargo=${cargo_path}" \
+            "rustc=${rustc_path}" \
+            "rustdoc=${rustdoc_path}" >> "${GITHUB_OUTPUT}"
+          # Only the full Rust 1.98.0 lane needs formatting, linting, and policy tools.
+          if [[ "${FULL}" == "true" ]]; then
+            cargo_fmt_path="$(rustup which --toolchain "${TOOLCHAIN}" cargo-fmt)"
+            cargo_clippy_path="$(rustup which --toolchain "${TOOLCHAIN}" cargo-clippy)"
+            rustfmt_path="$(rustup which --toolchain "${TOOLCHAIN}" rustfmt)"
+            python_path="$(command -v python3)"
+            for path in \
+              "${cargo_fmt_path}" \
+              "${cargo_clippy_path}" \
+              "${rustfmt_path}" \
+              "${python_path}"; do
+              [[ "${path}" == /* && "${path}" != *$'\n'* && "${path}" != *$'\r'* ]]
+              test -x "${path}"
+            done
+            for tool in cargo-audit cargo-deny cargo-machete rumdl shellcheck; do
+              source_path="$(command -v "${tool}")"
+              [[ "${source_path}" == /* \
+                && "${source_path}" != *$'\n'* \
+                && "${source_path}" != *$'\r'* ]]
+              test -x "${source_path}"
+              install -m 0500 "${source_path}" "${POLICY_BIN}/${tool}"
+            done
+            test "$("${POLICY_BIN}/cargo-audit" --version)" = \
+              "cargo-audit 0.22.2"
+            install -m 0500 \
+              "${CANDIDATE_STATE}/actionlint/actionlint" \
+              "${POLICY_BIN}/actionlint"
+            printf '%s\n' \
+              "cargo_clippy=${cargo_clippy_path}" \
+              "cargo_fmt=${cargo_fmt_path}" \
+              "python=${python_path}" \
+              "rustfmt=${rustfmt_path}" >> "${GITHUB_OUTPUT}"
+          fi
+        working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/bootstrap
+
+      # The protected materializer now binds and checks out the exact anonymous
+      # copied ref. No Action step follows this point in the candidate job.
+      - name: Materialize exact candidate without credentials
+        env:
+          BASE_REF: ${{ steps.candidate_pr.outputs.base_ref }}
+          BASE_SHA: ${{ steps.candidate_pr.outputs.base_sha }}
+          CANDIDATE_REF: ${{ github.ref_name }}
+          CANDIDATE_SHA: ${{ github.sha }}
+          POLICY_SHA: ${{ steps.protected_policy.outputs.policy_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          "${POLICY_BIN}/materialize-candidate.sh" \
+            "${GITHUB_REPOSITORY}" "${CANDIDATE_SHA}" "${CANDIDATE_REF}" \
+            "${POLICY_SHA}" "${BASE_REF}" "${BASE_SHA}" \
+            source-spec https://github.com/NVIDIA/yaml-sigil-spec.git
+        working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/source
+
+      - name: Check pull request commit policy
+        if: ${{ matrix.full }}
+        env:
+          BASE_SHA: ${{ steps.candidate_pr.outputs.base_sha }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          "${POLICY_BIN}/check-pull-request-commits.sh"
+        working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/source
+
+      - name: Validate canonical release transaction
+        if: ${{ steps.candidate_pr.outputs.release_branch != '' }}
+        env:
+          BASE_SHA: ${{ steps.candidate_pr.outputs.base_sha }}
+          HEAD_SHA: ${{ github.sha }}
+          RELEASE_BASE_REF: ${{ steps.candidate_pr.outputs.base_ref }}
+          YAML_SIGIL_RELEASE_PR_BRANCH: >-
+            ${{ steps.candidate_pr.outputs.release_branch }}
+        run: |
+          release_version="${YAML_SIGIL_RELEASE_PR_BRANCH#release-plz-manual-}"
+          "${POLICY_BIN}/check-release-pr.sh" \
+            "${BASE_SHA}" "${HEAD_SHA}" \
+            "${YAML_SIGIL_RELEASE_PR_BRANCH}" "${release_version}" "${RELEASE_BASE_REF}"
+        working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/source
+
+      - name: Lint Markdown
+        if: ${{ matrix.full }}
+        run: >-
+          "${POLICY_BIN}/rumdl" check .
+        working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/source
+
+      - name: Lint GitHub Actions workflows
+        if: ${{ matrix.full }}
+        run: >-
+          "${POLICY_BIN}/actionlint"
+          -shellcheck "${POLICY_BIN}/shellcheck" -pyflakes ""
+        working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/source
+
+      - name: Lint shell scripts
+        if: ${{ matrix.full }}
+        run: >-
+          find .github/scripts -type f -name '*.sh' -print0 |
+          xargs -0 --no-run-if-empty "${POLICY_BIN}/shellcheck" --
+        working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/source
+
+      - name: Check unused dependencies
+        if: ${{ matrix.full }}
+        env:
+          CARGO: ${{ steps.fixed_tools.outputs.cargo }}
+          RUSTC: ${{ steps.fixed_tools.outputs.rustc }}
+          RUSTDOC: ${{ steps.fixed_tools.outputs.rustdoc }}
+        run: >-
+          "${POLICY_BIN}/cargo-machete" --with-metadata
+        working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/source
+
+      - name: Check crate dependency policy
+        if: ${{ matrix.full }}
+        env:
+          CARGO: ${{ steps.fixed_tools.outputs.cargo }}
+          RUSTC: ${{ steps.fixed_tools.outputs.rustc }}
+          RUSTDOC: ${{ steps.fixed_tools.outputs.rustdoc }}
+        run: >-
+          "${POLICY_BIN}/cargo-deny" check bans licenses sources -D warnings
+        working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/source
+
+      - name: Check xtask dependency policy
+        if: ${{ matrix.full }}
+        env:
+          CARGO: ${{ steps.fixed_tools.outputs.cargo }}
+          RUSTC: ${{ steps.fixed_tools.outputs.rustc }}
+          RUSTDOC: ${{ steps.fixed_tools.outputs.rustdoc }}
+        run: >-
+          "${POLICY_BIN}/cargo-deny" --manifest-path xtask/Cargo.toml --locked
+          check bans licenses sources -D warnings
+        working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/source
+
+      - name: Audit crate dependencies
+        if: ${{ matrix.full }}
+        env:
+          FIXED_CARGO: ${{ steps.fixed_tools.outputs.cargo }}
+          RUSTC: ${{ steps.fixed_tools.outputs.rustc }}
+          RUSTDOC: ${{ steps.fixed_tools.outputs.rustdoc }}
+        run: |
+          "${FIXED_CARGO}" generate-lockfile --manifest-path Cargo.toml
+          "${POLICY_BIN}/cargo-audit" audit --file Cargo.lock
+          "${POLICY_BIN}/cargo-audit" audit --file xtask/Cargo.lock
+        working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/source
+
+      # This is the only candidate-executable phase. It uses paths selected
+      # before materialization, bypasses Cargo aliases and wrappers, and is the
+      # final step so GITHUB_ENV/GITHUB_PATH writes have no later consumer.
+      - name: Execute candidate validation (terminal)
+        env:
+          FIXED_CARGO: ${{ steps.fixed_tools.outputs.cargo }}
+          FIXED_CARGO_CLIPPY: ${{ steps.fixed_tools.outputs.cargo_clippy }}
+          FIXED_CARGO_FMT: ${{ steps.fixed_tools.outputs.cargo_fmt }}
+          FIXED_PYTHON: ${{ steps.fixed_tools.outputs.python }}
+          FIXED_RUSTC: ${{ steps.fixed_tools.outputs.rustc }}
+          FIXED_RUSTDOC: ${{ steps.fixed_tools.outputs.rustdoc }}
+          FIXED_RUSTFMT: ${{ steps.fixed_tools.outputs.rustfmt }}
+          FULL: ${{ matrix.full }}
+          RELEASE_BASE_REF: ${{ steps.candidate_pr.outputs.base_ref }}
+          YAML_SIGIL_RELEASE_PR_BRANCH: >-
+            ${{ steps.candidate_pr.outputs.release_branch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_config=(
+            --config "build.rustc=\"${FIXED_RUSTC}\""
+            --config 'build.rustc-wrapper=""'
+            --config 'build.rustc-workspace-wrapper=""'
+            --config "build.target-dir=\"${CARGO_TARGET_DIR}\""
+          )
+          export RUSTC="${FIXED_RUSTC}"
+          export RUSTDOC="${FIXED_RUSTDOC}"
+          # The full Rust 1.98.0 lane executes the complete candidate-owned suite;
+          # the separate Rust 1.95.0 lane executes only its compatibility tests.
+          if [[ "${FULL}" == "true" ]]; then
+            export CARGO="${FIXED_CARGO}"
+            export RUSTFMT="${FIXED_RUSTFMT}"
+            "${FIXED_CARGO_FMT}" fmt --all --check
+            "${FIXED_CARGO_FMT}" fmt \
+              --manifest-path xtask/Cargo.toml --all --check
+            # A protected helper has already admitted this exact release diff;
+            # the credential-free xtask now validates its candidate content.
+            if [[ -n "${YAML_SIGIL_RELEASE_PR_BRANCH}" ]]; then
+              release_version="${YAML_SIGIL_RELEASE_PR_BRANCH#release-plz-manual-}"
+              "${FIXED_CARGO}" "${cargo_config[@]}" run --locked \
+                --manifest-path xtask/Cargo.toml -- \
+                release check --base-ref "${RELEASE_BASE_REF}" --version "${release_version}"
+            fi
+            "${FIXED_CARGO}" "${cargo_config[@]}" run --locked \
+              --manifest-path xtask/Cargo.toml -- package-content
+            "${FIXED_CARGO_CLIPPY}" clippy "${cargo_config[@]}" \
+              --all-targets --all-features -- -D warnings
+            "${FIXED_CARGO_CLIPPY}" clippy "${cargo_config[@]}" --locked \
+              --manifest-path xtask/Cargo.toml \
+              --all-targets --all-features -- -D warnings
+            "${FIXED_CARGO}" "${cargo_config[@]}" test --all-features
+            "${FIXED_CARGO}" "${cargo_config[@]}" test --locked \
+              --manifest-path xtask/Cargo.toml
+            "${FIXED_PYTHON}" -m py_compile \
+              .github/scripts/bind-candidate-pr.py \
+              .github/scripts/report_required_ci.py \
+              .github/scripts/test_bind_candidate_pr.py \
+              .github/scripts/test_report_required_ci.py
+            "${FIXED_PYTHON}" -m unittest discover \
+              -s .github/scripts -p 'test_*.py'
+            .github/scripts/test-materialize-candidate.sh
+            .github/scripts/test-check-release-pr.sh
+            .github/scripts/test-attach-release-source.sh
+            .github/scripts/test-bind-release-invocation.sh
+          else
+            "${FIXED_CARGO}" "${cargo_config[@]}" test --all-features
+            "${FIXED_CARGO}" "${cargo_config[@]}" test --locked \
+              --manifest-path xtask/Cargo.toml
+          fi
+        working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/source
+
+  candidate_linux:
+    name: >-
+      Candidate CI (Linux) [policy=${{ needs.candidate_binding.outputs.policy_sha }};base=${{ needs.candidate_binding.outputs.base_ref }}@${{ needs.candidate_binding.outputs.base_sha }}]
+    if: ${{ always() }}
+    needs:
+      - candidate_binding
+      - candidate_linux_lanes
+    runs-on: linux-amd64-cpu4
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Require Rust 1.98.0 and 1.95.0 candidate lanes
+        env:
+          BINDING_RESULT: ${{ needs.candidate_binding.result }}
+          CANDIDATE_LANES_RESULT: ${{ needs.candidate_linux_lanes.result }}
+        run: |
+          test "${BINDING_RESULT}" = success
+          test "${CANDIDATE_LANES_RESULT}" = success
+
+  candidate_portability:
+    name: Candidate portability (${{ matrix.name }})
+    needs:
+      - candidate_binding
+    runs-on: ${{ matrix.runner }}
+    continue-on-error: true
+    timeout-minutes: 45
+    permissions: {}
+    env:
+      ACTIONS_CACHE_URL: ""
+      ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+      ACTIONS_ID_TOKEN_REQUEST_URL: ""
+      ACTIONS_RESULTS_URL: ""
+      ACTIONS_RUNTIME_TOKEN: ""
+      CARGO_REGISTRY_TOKEN: ""
+      CARGO_REGISTRIES_CRATES_IO_TOKEN: ""
+      GH_TOKEN: ""
+      GIT_ASKPASS: /bin/false
+      GIT_CONFIG_GLOBAL: /dev/null
+      GIT_CONFIG_NOSYSTEM: "1"
+      GIT_CONFIG_SYSTEM: /dev/null
+      GIT_LFS_SKIP_SMUDGE: "1"
+      GIT_TERMINAL_PROMPT: "0"
+      GIT_TOKEN: ""
+      GITHUB_TOKEN: ""
+      RUSTFLAGS: -D warnings
+      RUSTC_WORKSPACE_WRAPPER: ""
+      RUSTC_WRAPPER: ""
+      RUSTUP_TOOLCHAIN: 1.98.0
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS
+            runner: macos-latest
+          - name: Windows
+            runner: windows-latest
+    steps:
+      - name: Create fresh candidate state
+        shell: bash
+        run: |
+          set -euo pipefail
+          state="${RUNNER_TEMP}/yaml-sigil-candidate-state"
+          test ! -e "${state}"
+          install_args=(-d -m 0700)
+          # Git for Windows cannot apply POSIX directory modes.
+          if [[ "${GITHUB_ACTIONS:-}" == "true" && "${RUNNER_OS:-}" == "Windows" ]]; then
+            install_args=(-d)
+          fi
+          install "${install_args[@]}" \
+            "${state}" \
+            "${state}/bootstrap" \
+            "${state}/cargo-home" \
+            "${state}/policy-bin" \
+            "${state}/source" \
+            "${state}/target" \
+            "${state}/tmp"
+          printf '%s\n' \
+            "CANDIDATE_STATE=${state}" \
+            "CARGO_HOME=${state}/cargo-home" \
+            "CARGO_TARGET_DIR=${state}/target" \
+            "POLICY_BIN=${state}/policy-bin" \
+            "TEMP=${state}/tmp" \
+            "TMP=${state}/tmp" \
+            "TMPDIR=${state}/tmp" >> "${GITHUB_ENV}"
+        working-directory: ${{ github.workspace }}
+
+      # Set up the advisory host before any candidate-controlled path exists.
+      - name: Set up Rust 1.98.0
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache: false
+          components: clippy, rustfmt
+          toolchain: 1.98.0
+
+      # Stage fixed protected helpers before candidate-controlled source exists.
+      - name: Stage protected candidate policy
+        id: protected_policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -c core.autocrlf=false init --quiet --initial-branch=main .
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git -c credential.helper= fetch --no-tags --no-recurse-submodules \
+            --depth=1 origin \
+            "+refs/heads/main:refs/remotes/origin/main"
+          protected_git_show=(git show)
+          github_windows=false
+          # Keep Git Bash from rewriting Git's REV:path syntax on Windows.
+          if [[ "${GITHUB_ACTIONS:-}" == "true" && "${RUNNER_OS:-}" == "Windows" ]]; then
+            protected_git_show=(env MSYS_NO_PATHCONV=1 git show)
+            github_windows=true
+          fi
+          "${protected_git_show[@]}" \
+            refs/remotes/origin/main:.github/scripts/materialize-candidate.sh \
+            > "${POLICY_BIN}/materialize-candidate.sh"
+          "${protected_git_show[@]}" \
+            refs/remotes/origin/main:.github/scripts/bind-candidate-pr.py \
+            > "${POLICY_BIN}/bind-candidate-pr.py"
+          "${protected_git_show[@]}" \
+            refs/remotes/origin/main:.github/scripts/remove-preinstalled-aws-tap.sh \
+            > "${POLICY_BIN}/remove-preinstalled-aws-tap.sh"
+          if [[ "${github_windows}" == "false" ]]; then
+            chmod 0500 \
+              "${POLICY_BIN}/bind-candidate-pr.py" \
+              "${POLICY_BIN}/materialize-candidate.sh" \
+              "${POLICY_BIN}/remove-preinstalled-aws-tap.sh"
+          fi
+          printf 'policy_sha=%s\n' \
+            "$(git rev-parse refs/remotes/origin/main)" >> "${GITHUB_OUTPUT}"
+        working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/bootstrap
+
+      - name: Remove unused preinstalled Homebrew source
+        if: ${{ runner.os == 'macOS' }}
+        shell: bash
+        run: |
+          "${POLICY_BIN}/remove-preinstalled-aws-tap.sh"
+        working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/bootstrap
+
+      # Rebind the exact contribution base separately from protected policy on
+      # every advisory host before candidate materialization.
+      - name: Bind current pull request metadata
+        id: candidate_pr
+        env:
+          CANDIDATE_REF: ${{ github.ref_name }}
+          CANDIDATE_SHA: ${{ github.sha }}
+          POLICY_SHA: ${{ steps.protected_policy.outputs.policy_sha }}
+        shell: bash
+        run: >-
+          python3 "${POLICY_BIN}/bind-candidate-pr.py"
+          --repository "${GITHUB_REPOSITORY}"
+          --copied-ref "${CANDIDATE_REF}"
+          --head-sha "${CANDIDATE_SHA}"
+          --policy-sha "${POLICY_SHA}"
+          --output "${GITHUB_OUTPUT}"
+        working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/bootstrap
+
+      # Advisory jobs cannot affect Required CI, but they still fail closed if
+      # their protected policy or contribution base differs from preflight.
+      - name: Match pre-execution policy and base binding
+        env:
+          BASE_REF: ${{ steps.candidate_pr.outputs.base_ref }}
+          BASE_SHA: ${{ steps.candidate_pr.outputs.base_sha }}
+          EXPECTED_BASE_REF: ${{ needs.candidate_binding.outputs.base_ref }}
+          EXPECTED_BASE_SHA: ${{ needs.candidate_binding.outputs.base_sha }}
+          EXPECTED_POLICY_SHA: ${{ needs.candidate_binding.outputs.policy_sha }}
+          POLICY_SHA: ${{ steps.protected_policy.outputs.policy_sha }}
+        run: |
+          test "${POLICY_SHA}" = "${EXPECTED_POLICY_SHA}"
+          test "${BASE_REF}" = "${EXPECTED_BASE_REF}"
+          test "${BASE_SHA}" = "${EXPECTED_BASE_SHA}"
+        working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/bootstrap
+
+      # Resolve the fixed rustup launcher before candidate files exist. `run`
+      # then selects Rust 1.98.0 tools directly without a candidate Cargo alias.
+      - name: Pin fixed Rust launcher
+        id: fixed_tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup_path="$(command -v rustup)"
+          [[ "${rustup_path}" == /* \
+            && "${rustup_path}" != *$'\n'* \
+            && "${rustup_path}" != *$'\r'* ]]
+          test -x "${rustup_path}"
+          "${rustup_path}" run 1.98.0 cargo --version
+          "${rustup_path}" run 1.98.0 cargo-fmt fmt --version
+          "${rustup_path}" run 1.98.0 cargo-clippy clippy --version
+          printf 'rustup=%s\n' "${rustup_path}" >> "${GITHUB_OUTPUT}"
+        working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/bootstrap
+
+      # No Action or privileged host-setup step follows candidate materialization.
+      - name: Materialize exact candidate without credentials
+        env:
+          BASE_REF: ${{ steps.candidate_pr.outputs.base_ref }}
+          BASE_SHA: ${{ steps.candidate_pr.outputs.base_sha }}
+          CANDIDATE_REF: ${{ github.ref_name }}
+          CANDIDATE_SHA: ${{ github.sha }}
+          POLICY_SHA: ${{ steps.protected_policy.outputs.policy_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          "${POLICY_BIN}/materialize-candidate.sh" \
+            "${GITHUB_REPOSITORY}" "${CANDIDATE_SHA}" "${CANDIDATE_REF}" \
+            "${POLICY_SHA}" "${BASE_REF}" "${BASE_SHA}" \
+            source-spec https://github.com/NVIDIA/yaml-sigil-spec.git
+        working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/source
+
+      # Advisory candidate execution is terminal: no policy, credential,
+      # artifact, cache-save, or host-setup consumer follows this step.
+      - name: Execute advisory candidate validation (terminal)
+        env:
+          FIXED_RUSTUP: ${{ steps.fixed_tools.outputs.rustup }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_config=(
+            --config 'build.rustc="rustc"'
+            --config 'build.rustc-wrapper=""'
+            --config 'build.rustc-workspace-wrapper=""'
+          )
+          "${FIXED_RUSTUP}" run 1.98.0 cargo-fmt fmt --all --check
+          "${FIXED_RUSTUP}" run 1.98.0 cargo "${cargo_config[@]}" run --locked \
+            --manifest-path xtask/Cargo.toml -- package-content
+          "${FIXED_RUSTUP}" run 1.98.0 cargo-clippy clippy \
+            "${cargo_config[@]}" --all-targets --all-features -- -D warnings
+          "${FIXED_RUSTUP}" run 1.98.0 cargo "${cargo_config[@]}" \
+            test --all-features
+          "${FIXED_RUSTUP}" run 1.98.0 cargo "${cargo_config[@]}" test --locked \
+            --manifest-path xtask/Cargo.toml
+        working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/source

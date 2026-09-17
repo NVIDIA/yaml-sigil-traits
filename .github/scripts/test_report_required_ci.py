@@ -416,6 +416,27 @@ class StagingTests(unittest.TestCase):
 
 
 class WorkflowBlobTests(unittest.TestCase):
+    def test_reusable_caller_preserves_binding_and_all_callee_blobs(self) -> None:
+        event, responses = fixture()
+        name = "Candidate CI / Candidate CI (Linux)"
+        paths = (".github/workflows/ci-trusted.yml", ".github/workflows/ci-candidate.yml")
+        protected = replace(policy(), job_name=name, workflow_policy_paths=paths)
+        responses[JOBS_PATH]["jobs"][0]["name"] = reporter.attested_job_name(
+            name, POLICY_SHA, "refs/heads/main", POLICY_SHA
+        )
+        for path in paths:
+            for sha in (POLICY_SHA, HEAD):
+                responses[("GET", f"{PREFIX}/contents/{path}?ref={sha}")] = {
+                    "type": "file", "path": path, "sha": WORKFLOW_BLOB, "size": 1000
+                }
+        self.assertEqual(reporter.bind_candidate(FakeApi(responses), event, protected).head_sha, HEAD)
+        for path in paths:
+            with self.subTest(path=path):
+                changed = copy.deepcopy(responses)
+                changed[("GET", f"{PREFIX}/contents/{path}?ref={HEAD}")]["sha"] = "d" * 40
+                with self.assertRaisesRegex(reporter.ReporterError, "differs from protected"):
+                    reporter.bind_candidate(FakeApi(changed), event, protected)
+
     def test_local_callee_must_match_protected_main(self) -> None:
         event, responses = fixture()
         path = ".github/workflows/ci-candidate.yml"

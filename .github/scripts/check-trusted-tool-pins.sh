@@ -4,7 +4,15 @@
 # This is a narrow supply-chain lint, not a workflow graph or permissions parser.
 set -euo pipefail
 
-workflow="${1:-.github/workflows/ci.yml}"
+# With no fixture arguments, validate both fixed local callees independently.
+# The router contains no tool setup; neither execution route may hide drift.
+if (($# == 0)); then
+  "$0" .github/workflows/ci-trusted.yml
+  "$0" .github/workflows/ci-candidate.yml
+  exit 0
+fi
+
+workflow="$1"
 release_workflow="${2:-.github/workflows/publish.yml}"
 expected_audit="cargo-audit@0.22.2"
 expected_toolchain="1.98.0"
