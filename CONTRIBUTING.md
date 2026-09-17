@@ -81,9 +81,11 @@ contributor CI. A changed head requires fresh authorization.
 The authoritative aggregate job records its pre-execution protected-policy SHA
 and exact base ref/SHA; movement of either object invalidates the run.
 
-The copied `.github/workflows/ci.yml` must exactly match protected current
-`main`. Coordinate a proposed change to that workflow with a maintainer
-before requesting candidate testing.
+The copied `.github/workflows/ci.yml`, `ci-trusted.yml`, and
+`ci-candidate.yml` must exactly match protected current `main`. Coordinate a
+proposed workflow change with a maintainer before requesting candidate testing.
+Maintainers can explicitly stage a reviewed policy change through the separate
+procedure in `MAINTAINERS.md`; ordinary copied-ref admission stays unchanged.
 
 Every human-authored pull-request commit must form a linear history from the
 exact current pull-request base and contain a `Signed-off-by` trailer that

@@ -1,0 +1,252 @@
+name: Trusted CI
+
+# Only ci.yml selects this route. Local calls use the exact caller commit;
+# ordinary copied-ref reporting binds this file to protected main as well.
+on:
+  workflow_call:
+
+permissions: {}
+
+jobs:
+  trusted_policy:
+    name: Policy and documentation
+    runs-on: linux-amd64-cpu4
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Resolve the recorded gitlink without consulting submodule configuration,
+      # then fetch it only from the canonical public specification repository.
+      - name: Resolve exact specification checkout
+        id: source_spec
+        run: .github/scripts/resolve-source-spec-gitlink.sh . "${GITHUB_OUTPUT}"
+
+      - name: Check out exact specification
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          path: source-spec
+          persist-credentials: false
+          ref: ${{ steps.source_spec.outputs.sha }}
+          repository: NVIDIA/yaml-sigil-spec
+
+      - name: Lint Markdown
+        uses: rvben/rumdl@95a982d941d00cf41a0dcef4d0788bd15a29be1b # v0.2.54
+        with:
+          version: "0.2.54"
+
+      - name: Lint GitHub Actions workflows
+        uses: devops-actions/actionlint@9fb9c192862f19e684586ca84b500461bcd8a541 # v0.1.12 (actionlint v1.7.12)
+
+      # This section would benefit by a change to the action allowlist
+      - name: Lint shell scripts
+        uses: ludeeus/action-shellcheck@00cae500b08a931fb5698e11e79bfbd38e612a38 # 2.0.0
+        with:
+          check_together: true
+          scandir: .github/scripts
+          version: v0.11.0
+
+      - name: Test protected reporter and candidate materialization
+        run: |
+          python3 -m py_compile \
+            .github/scripts/bind-candidate-pr.py \
+            .github/scripts/report_required_ci.py \
+            .github/scripts/test_bind_candidate_pr.py \
+            .github/scripts/test_report_required_ci.py
+          python3 -m unittest discover \
+            -s .github/scripts -p 'test_*.py'
+          .github/scripts/test-materialize-candidate.sh
+          .github/scripts/test-check-release-pr.sh
+          .github/scripts/test-attach-release-source.sh
+          .github/scripts/test-bind-release-invocation.sh
+          .github/scripts/check-trusted-tool-pins.sh
+          .github/scripts/test-trusted-tool-pins.sh
+
+  trusted_stable:
+    name: Rust 1.98.0 (Linux)
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      RUSTFLAGS: -D warnings
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust 1.98.0
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache: false
+          components: clippy, rustfmt
+          toolchain: 1.98.0
+
+      # This section would benefit by a change to the action allowlist
+      - name: Install Rust validation tools
+        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2.83.2
+        with:
+          checksum: true
+          fallback: none
+          tool: cargo-audit@0.22.2,cargo-deny@0.20.2,cargo-machete@0.9.2
+
+      - name: Verify exact cargo-audit
+        run: test "$(cargo-audit --version)" = "cargo-audit 0.22.2"
+
+      - name: Restore trusted Rust build cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-bin: false
+          cache-targets: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Check xtask formatting
+        run: cargo fmt --manifest-path xtask/Cargo.toml --all --check
+
+      # Compare Cargo's source list with the committed source-package inventory.
+      - name: Check package contents
+        run: cargo xtask package-content
+
+      - name: Lint crate
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Lint xtask
+        run: >-
+          cargo clippy --locked --manifest-path xtask/Cargo.toml
+          --all-targets --all-features -- -D warnings
+
+      - name: Test crate
+        run: cargo test --all-features
+
+      - name: Test xtask
+        run: cargo test --locked --manifest-path xtask/Cargo.toml
+
+      - name: Check unused dependencies
+        run: cargo-machete --with-metadata
+
+      - name: Check crate dependency policy
+        run: cargo deny check bans licenses sources -D warnings
+
+      - name: Check xtask dependency policy
+        run: >-
+          cargo deny --manifest-path xtask/Cargo.toml --locked
+          check bans licenses sources -D warnings
+
+      - name: Audit crate dependencies
+        run: cargo audit
+
+      - name: Audit xtask dependencies
+        run: cargo audit --file xtask/Cargo.lock
+
+  trusted_msrv:
+    name: Rust 1.95.0 (Linux)
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    env:
+      RUSTFLAGS: -D warnings
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust 1.95.0
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache: false
+          toolchain: 1.95.0
+
+      - name: Test crate at the declared Rust version
+        run: cargo +1.95.0 test --all-features
+
+      - name: Test xtask at the declared Rust version
+        run: cargo +1.95.0 test --locked --manifest-path xtask/Cargo.toml
+
+  trusted_linux:
+    name: Linux result
+    if: ${{ always() }}
+    needs:
+      - trusted_policy
+      - trusted_stable
+      - trusted_msrv
+    runs-on: linux-amd64-cpu4
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Require every authoritative Linux lane
+        env:
+          MSRV_RESULT: ${{ needs.trusted_msrv.result }}
+          POLICY_RESULT: ${{ needs.trusted_policy.result }}
+          STABLE_RESULT: ${{ needs.trusted_stable.result }}
+        run: |
+          test "${POLICY_RESULT}" = success
+          test "${STABLE_RESULT}" = success
+          test "${MSRV_RESULT}" = success
+
+  trusted_portability:
+    name: Portability (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    continue-on-error: true
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      RUSTFLAGS: -D warnings
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS
+            runner: macos-latest
+          - name: Windows
+            runner: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Remove unused preinstalled Homebrew source
+        if: ${{ runner.os == 'macOS' }}
+        run: .github/scripts/remove-preinstalled-aws-tap.sh
+
+      - name: Set up Rust 1.98.0
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache: false
+          components: clippy, rustfmt
+          toolchain: 1.98.0
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Check xtask formatting
+        run: cargo fmt --manifest-path xtask/Cargo.toml --all --check
+
+      - name: Check package contents
+        run: cargo xtask package-content
+
+      - name: Lint crate
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Lint xtask
+        run: >-
+          cargo clippy --locked --manifest-path xtask/Cargo.toml
+          --all-targets --all-features -- -D warnings
+
+      - name: Test crate
+        run: cargo test --all-features
+
+      - name: Test xtask
+        run: cargo test --locked --manifest-path xtask/Cargo.toml

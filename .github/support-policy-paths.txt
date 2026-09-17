@@ -21,6 +21,8 @@
 .github/scripts/test_report_required_ci.py
 .github/support-policy-paths.txt
 .github/workflows/ci.yml
+.github/workflows/ci-trusted.yml
+.github/workflows/ci-candidate.yml
 .github/workflows/publish.yml
 .github/workflows/required-ci.yml
 .release-plz.toml

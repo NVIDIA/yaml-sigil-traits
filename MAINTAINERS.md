@@ -319,16 +319,16 @@ It is a separately authorized coordinator operation, not contributor intake.
    `main`. Record its exact base and head, then review the complete aggregate
    diff, resulting tree, and ordered linear series. Account for retained source
    work, coordinator changes, and every removed or superseded old-line commit.
-3. Compare the cumulative head's `.github/workflows/ci.yml` with exact
-   protected current `main`. If it is byte-identical, review and authorize
-   that head through the ordinary
-   `/ok to test <FULL-40-CHARACTER-HEAD-SHA>` path. Require the automatic
+3. Compare the cumulative head's `.github/workflows/ci.yml`,
+   `ci-trusted.yml`, and `ci-candidate.yml` with exact protected current
+   `main`. If all three are byte-identical, review and authorize that head
+   through `/ok to test <FULL-40-CHARACTER-HEAD-SHA>`. Require the automatic
    App-owned `Required CI` result for that exact head and current `main` base.
    That verdict validates candidate execution under the existing protected
    reporter; it does not empirically validate a reporter change proposed by
-   the head. If `ci.yml` differs, do not authorize its copied-ref run; follow
-   [Test a protected-policy change](#test-a-protected-policy-change) on
-   `ci-testing/*` and do not manufacture a promotion App check.
+   the head. If any of those files differs, use the staging procedure in
+   [Test a protected-policy change](#test-a-protected-policy-change);
+   do not manufacture a promotion App check.
 4. Treat either form of exact-head validation only as test evidence. It does
    not authenticate provenance or authorize promotion. If changed policy
    prevents the normal App check, proceed only through the separately
@@ -375,11 +375,21 @@ durable record.
 ### Test a protected-policy change
 
 Choose the test path from the exact reviewed workflow. Ordinary copied-ref
-CI requires `ci.yml` and every protected local callee to match current `main`.
-Keep that equality guard intact. If the workflow is unchanged, use the ordinary
-exact-head `/ok to test` path. Its verdict exercises existing protected policy;
+CI requires `.github/workflows/ci.yml`, `ci-trusted.yml`, and
+`ci-candidate.yml` to match current `main`. Keep that equality guard intact.
+If the workflows are unchanged, use the ordinary exact-head `/ok to test`
+path. Its verdict exercises existing protected policy;
 a reporter change still needs focused tests and an inert current-main canary
 after integration before the new reporter is considered operational.
+
+The `CI` workflow selects one local reusable workflow before expanding jobs.
+`Trusted CI` runs main, coordination/support where supported, and staging
+checks; `Candidate CI` runs explicitly admitted copied refs. The inactive
+route has a static skipped name. The trusted `Linux result` aggregate requires
+all authoritative policy and Linux jobs. Copied refs retain their policy/base
+attestation under `Candidate CI / Candidate CI (Linux)`. macOS and Windows
+remain advisory where present; the specification repository is Linux-only.
+The tool-pin source check validates both local callees independently.
 
 For changed workflow policy, use the separate maintainer staging route:
 
