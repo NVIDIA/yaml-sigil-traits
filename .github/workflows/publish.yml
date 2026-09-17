@@ -148,7 +148,7 @@ jobs:
           sha256sum --check "${RUNNER_TEMP}/release-xtask.sha256"
           test "$(cat "${RUNNER_TEMP}/release-policy.sha")" = "${GITHUB_SHA}"
           test "$(git rev-parse HEAD)" = "${SOURCE_SHA}"
-          args=(github release qualify --source-root . --mode "${MODE}" --source "${SOURCE_SHA}")
+          args=(github release qualify --base-ref refs/heads/main --source-root . --mode "${MODE}" --source "${SOURCE_SHA}")
           # Recovery alone binds the original run and attempt.
           case "${MODE}" in
             recover)
@@ -251,12 +251,12 @@ jobs:
           case "${MODE}" in
             push)
               test "${POLICY_SHA}" = "${SOURCE_SHA}"
-              "${RUNNER_TEMP}/release-xtask" github release qualify --source-root . \
+              "${RUNNER_TEMP}/release-xtask" github release qualify --base-ref refs/heads/main --source-root . \
                 --mode publish --source "${SOURCE_SHA}"
               ;;
             recover)
               git merge-base --is-ancestor "${SOURCE_SHA}" "${POLICY_SHA}"
-              "${RUNNER_TEMP}/release-xtask" github release qualify --source-root . \
+              "${RUNNER_TEMP}/release-xtask" github release qualify --base-ref refs/heads/main --source-root . \
                 --mode recover --source "${SOURCE_SHA}" \
                 --original-run-id "${ORIGINAL_RUN_ID}" \
                 --original-run-attempt "${ORIGINAL_ATTEMPT}"
@@ -370,7 +370,7 @@ jobs:
           set -euo pipefail
           sha256sum --check "${RUNNER_TEMP}/release-xtask.sha256"
           test "$(git rev-parse HEAD)" = "${SOURCE_SHA}"
-          "${RUNNER_TEMP}/release-xtask" github release finalize --source-root . \
+          "${RUNNER_TEMP}/release-xtask" github release finalize --base-ref refs/heads/main --source-root . \
             --phase await --source "${SOURCE_SHA}" --version "${VERSION}"
 
   finalization_approval:
@@ -492,6 +492,6 @@ jobs:
           set -euo pipefail
           sha256sum --check "${RUNNER_TEMP}/release-xtask.sha256"
           test "$(git rev-parse HEAD)" = "${SOURCE_SHA}"
-          "${RUNNER_TEMP}/release-xtask" github release finalize --source-root . \
+          "${RUNNER_TEMP}/release-xtask" github release finalize --base-ref refs/heads/main --source-root . \
             --phase reconcile --source "${SOURCE_SHA}" \
             --version "${VERSION}"

@@ -207,8 +207,8 @@ maintainer-selected version:
 
 ```shell
 cargo xtask release activate --version MAJOR.MINOR.PATCH
-cargo xtask release prepare --version VERSION
-cargo xtask release check --version VERSION
+cargo xtask release prepare --base-ref refs/heads/main --version VERSION
+cargo xtask release check --base-ref refs/heads/main --version VERSION
 ```
 
 `release activate` prepares only an unpublished `MAJOR.MINOR.PATCH-rc.0`

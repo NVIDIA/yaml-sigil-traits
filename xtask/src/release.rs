@@ -14,6 +14,9 @@ use clap::{Args, Subcommand};
 use semver::Version;
 use toml_edit::DocumentMut;
 
+use crate::release_base;
+use crate::release_policy::ReleaseLine;
+
 use crate::bounded_process::{self, VALIDATION_OUTPUT_LIMITS};
 use crate::release_policy::{RELEASE_PLZ_VERSION, TRAITS_PACKAGE};
 use crate::{cargo_metadata_output, package_content, safe_file};
@@ -54,12 +57,18 @@ enum ReleaseCommand {
     },
     /// Run pinned release-plz update on an exact clean manual branch.
     Prepare {
+        /// Canonical source base; mandatory for detached checkouts.
+        #[arg(long)]
+        base_ref: Option<String>,
         /// Exact version selected by the maintainer.
         #[arg(long)]
         version: Version,
     },
     /// Validate a prepared release transaction without publishing it.
     Check {
+        /// Canonical source base; mandatory for detached checkouts.
+        #[arg(long)]
+        base_ref: Option<String>,
         /// Exact version selected by the maintainer.
         #[arg(long)]
         version: Version,
@@ -69,8 +78,14 @@ enum ReleaseCommand {
 pub(crate) fn run(root: &Path, args: ReleaseArgs) -> Result<(), String> {
     match args.command {
         ReleaseCommand::Activate { version } => activate(root, &version),
-        ReleaseCommand::Prepare { version } => prepare(root, &version),
-        ReleaseCommand::Check { version } => check(root, &version),
+        ReleaseCommand::Prepare { version, base_ref } => {
+            let line = release_base::resolve(root, base_ref.as_deref())?;
+            prepare(root, &version, line)
+        }
+        ReleaseCommand::Check { version, base_ref } => {
+            let line = release_base::resolve(root, base_ref.as_deref())?;
+            check(root, &version, line)
+        }
     }
 }
 
@@ -78,7 +93,7 @@ fn activate(root: &Path, target: &Version) -> Result<(), String> {
     let current = manifest_version(root)?;
     let selected = activation_version(&current, target)?;
     require_activation_branch(root, target)?;
-    require_exact_git_state(root, true)?;
+    require_exact_git_state(root, true, ReleaseLine::Main)?;
 
     // rc.0 is a non-release safety stub for the coordination line. Keep
     // release-plz and the changelog out of this transition; release-plz first
@@ -139,10 +154,11 @@ fn set_activation_manifest_version(
     write_exact_file(root, relative, &document.to_string())
 }
 
-fn prepare(root: &Path, version: &Version) -> Result<(), String> {
+fn prepare(root: &Path, version: &Version, line: ReleaseLine) -> Result<(), String> {
+    release_base::validate_version(root, line, version, "v")?;
     validate_selected_release_version(version)?;
     require_branch(root, version)?;
-    require_exact_git_state(root, true)?;
+    require_exact_git_state(root, true, line)?;
     require_release_plz(root)?;
     let original = manifest_version(root)?;
 
@@ -164,18 +180,19 @@ fn prepare(root: &Path, version: &Version) -> Result<(), String> {
 
     let derived = manifest_version(root)?;
     if &derived != version {
-        apply_exact_version(root, &original, &derived, version)?;
+        apply_exact_version(root, &original, &derived, version, line)?;
     }
-    require_release_changes(root, false)?;
+    require_release_changes(root, false, line)?;
     validate_release_content(root, version)?;
     eprintln!("release: prepared source changes for {version}");
     Ok(())
 }
 
-fn check(root: &Path, version: &Version) -> Result<(), String> {
+fn check(root: &Path, version: &Version, line: ReleaseLine) -> Result<(), String> {
+    line.require_version(version)?;
     validate_selected_release_version(version)?;
     require_branch(root, version)?;
-    require_release_changes(root, true)?;
+    require_release_changes(root, true, line)?;
     validate_release_content(root, version)?;
     package_content::run(root).map_err(|error| error.to_string())?;
     eprintln!("release: validated the {version} source-only release transaction");
@@ -270,9 +287,10 @@ fn apply_exact_version(
     original: &Version,
     derived: &Version,
     selected: &Version,
+    line: ReleaseLine,
 ) -> Result<(), String> {
     let adjustment = require_exact_version_adjustment(original, derived, selected)?;
-    require_release_path_subset(root)?;
+    require_release_path_subset(root, line)?;
 
     // Pinned release-plz performs the exact maintainer selection only after
     // update has derived the changelog and preliminary version. This includes
@@ -379,11 +397,15 @@ fn require_branch(root: &Path, version: &Version) -> Result<(), String> {
     Ok(())
 }
 
-fn require_exact_git_state(root: &Path, clean_start: bool) -> Result<(), String> {
+fn require_exact_git_state(
+    root: &Path,
+    clean_start: bool,
+    line: ReleaseLine,
+) -> Result<(), String> {
     let head = git_line(root, &["rev-parse", "HEAD"])?;
-    let main = git_line(root, &["rev-parse", "origin/main"])?;
+    let main = git_line(root, &["rev-parse", &line.tracking_ref()])?;
     if head != main {
-        return Err("release preparation must start at exact origin/main".to_string());
+        return Err("release preparation must start at the exact selected origin base".to_string());
     }
     if clean_start && !git_line(root, &["status", "--porcelain"])?.is_empty() {
         return Err("release preparation requires a clean worktree".to_string());
@@ -391,21 +413,25 @@ fn require_exact_git_state(root: &Path, clean_start: bool) -> Result<(), String>
     Ok(())
 }
 
-fn require_release_changes(root: &Path, accept_committed: bool) -> Result<(), String> {
+fn require_release_changes(
+    root: &Path,
+    accept_committed: bool,
+    line: ReleaseLine,
+) -> Result<(), String> {
     let status = git_line(root, &["status", "--porcelain"])?;
     let dirty = !status.is_empty();
     if accept_committed && dirty {
         return Err("release check requires the sole release commit".to_string());
     }
     if !accept_committed && dirty {
-        require_exact_git_state(root, false)?;
+        require_exact_git_state(root, false, line)?;
     } else if accept_committed {
-        require_one_signed_commit(root)?;
+        require_one_signed_commit(root, line)?;
     } else {
         return Err("release-plz did not produce source changes".to_string());
     }
 
-    let actual = release_changed_paths(root)?;
+    let actual = release_changed_paths(root, line)?;
     let expected: BTreeSet<String> = RELEASE_PATHS
         .iter()
         .map(|path| (*path).to_string())
@@ -420,10 +446,16 @@ fn require_release_changes(root: &Path, accept_committed: bool) -> Result<(), St
     Ok(())
 }
 
-fn release_changed_paths(root: &Path) -> Result<BTreeSet<String>, String> {
+fn release_changed_paths(root: &Path, line: ReleaseLine) -> Result<BTreeSet<String>, String> {
     let mut actual = git_paths(
         root,
-        &["diff", "--name-only", "--no-renames", "-z", "origin/main"],
+        &[
+            "diff",
+            "--name-only",
+            "--no-renames",
+            "-z",
+            &line.tracking_ref(),
+        ],
     )?;
     actual.extend(git_paths(
         root,
@@ -432,8 +464,8 @@ fn release_changed_paths(root: &Path) -> Result<BTreeSet<String>, String> {
     Ok(actual)
 }
 
-fn require_release_path_subset(root: &Path) -> Result<(), String> {
-    let actual = release_changed_paths(root)?;
+fn require_release_path_subset(root: &Path, line: ReleaseLine) -> Result<(), String> {
+    let actual = release_changed_paths(root, line)?;
     if actual.is_empty() {
         return Err("release-plz produced no source changes".to_string());
     }
@@ -499,12 +531,21 @@ fn write_exact_file(root: &Path, relative: &Path, body: &str) -> Result<(), Stri
     Ok(())
 }
 
-fn require_one_signed_commit(root: &Path) -> Result<(), String> {
-    let main = git_line(root, &["rev-parse", "origin/main"])?;
-    let count = git_line(root, &["rev-list", "--count", "origin/main..HEAD"])?;
+fn require_one_signed_commit(root: &Path, line: ReleaseLine) -> Result<(), String> {
+    let main = git_line(root, &["rev-parse", &line.tracking_ref()])?;
+    let count = git_line(
+        root,
+        &[
+            "rev-list",
+            "--count",
+            &format!("{}..HEAD", line.tracking_ref()),
+        ],
+    )?;
     let parent = git_line(root, &["rev-parse", "HEAD^"])?;
     if count != "1" || parent != main {
-        return Err("release PR must contain one commit current with origin/main".to_string());
+        return Err(
+            "release PR must contain one commit current with the selected origin base".to_string(),
+        );
     }
     let raw = git_line(root, &["cat-file", "commit", "HEAD"])?;
     if !raw.contains("gpgsig -----BEGIN SSH SIGNATURE-----") {
@@ -828,6 +869,39 @@ mod tests {
     }
 
     #[test]
+    fn support_diff_and_starting_point_ignore_newer_main_changes() {
+        let fixture = git_fixture();
+        let root = fixture.path();
+        release_base::git(root, &["checkout", "--", "Cargo.toml", "CHANGELOG.md"]).unwrap();
+        release_base::git(
+            root,
+            &["update-ref", "refs/remotes/origin/support/0.5", "HEAD"],
+        )
+        .unwrap();
+        std::fs::write(root.join("README.md"), "newer main policy\n").unwrap();
+        release_base::git(root, &["add", "README.md"]).unwrap();
+        release_base::git(root, &["commit", "--quiet", "-m", "newer main"]).unwrap();
+        release_base::git(root, &["update-ref", "refs/remotes/origin/main", "HEAD"]).unwrap();
+        release_base::git(
+            root,
+            &["checkout", "--detach", "refs/remotes/origin/support/0.5"],
+        )
+        .unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname='changed'\n").unwrap();
+        std::fs::write(root.join("CHANGELOG.md"), "# Changelog\nchanged\n").unwrap();
+        let support = ReleaseLine::Support { major: 0, minor: 5 };
+        require_release_changes(root, false, support).unwrap();
+        assert!(require_release_changes(root, false, ReleaseLine::Main).is_err());
+        assert_eq!(release_changed_paths(root, support).unwrap().len(), 2);
+        assert_eq!(
+            release_changed_paths(root, ReleaseLine::Main)
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+
+    #[test]
     fn versions_and_release_paths_are_bounded() {
         assert!(validate_version(&Version::parse("1.2.3-rc.4").unwrap()).is_ok());
         assert!(validate_version(&Version::parse("1.2.3-rc.0").unwrap()).is_ok());
@@ -993,16 +1067,16 @@ mod tests {
     #[test]
     fn release_paths_include_tracked_deletions_and_untracked_files() {
         let bounded = git_fixture();
-        require_release_path_subset(bounded.path()).unwrap();
+        require_release_path_subset(bounded.path(), ReleaseLine::Main).unwrap();
 
         let deleted = git_fixture();
         std::fs::remove_file(deleted.path().join("README.md")).unwrap();
-        assert!(require_release_changes(deleted.path(), false).is_err());
+        assert!(require_release_changes(deleted.path(), false, ReleaseLine::Main).is_err());
 
         let untracked = git_fixture();
         std::fs::write(untracked.path().join("untracked.txt"), "unexpected\n").unwrap();
-        assert!(require_release_changes(untracked.path(), false).is_err());
-        assert!(require_release_path_subset(untracked.path()).is_err());
+        assert!(require_release_changes(untracked.path(), false, ReleaseLine::Main).is_err());
+        assert!(require_release_path_subset(untracked.path(), ReleaseLine::Main).is_err());
 
         let renamed = git_fixture();
         std::fs::remove_file(renamed.path().join("Cargo.toml")).unwrap();
@@ -1011,10 +1085,10 @@ mod tests {
             renamed.path().join("Cargo.toml"),
         )
         .unwrap();
-        assert!(require_release_changes(renamed.path(), false).is_err());
+        assert!(require_release_changes(renamed.path(), false, ReleaseLine::Main).is_err());
 
         let uncommitted = git_fixture();
-        assert!(require_release_changes(uncommitted.path(), true).is_err());
+        assert!(require_release_changes(uncommitted.path(), true, ReleaseLine::Main).is_err());
     }
 
     #[test]

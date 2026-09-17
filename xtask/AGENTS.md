@@ -13,9 +13,9 @@ clean `origin/main`. It does not invoke release-plz or edit a changelog, leaves
 only `Cargo.toml` changed, and never creates or updates a remote ref.
 
 The only provider-specific namespace is `cargo xtask github release`. Keep it
-limited to `qualify` and `finalize`:
+limited to typed qualification, finalization, and read-only support proposals:
 
-- Both commands require an explicit `--source-root` pointing to a distinct,
+- Qualification and finalization require `--source-root` pointing to a distinct,
   exact clean checkout. Keep compiled protected-main policy in place; never
   overwrite it with historical release source.
 - `qualify` reads exact GitHub and crates.io state and makes ordinary main
@@ -50,3 +50,17 @@ blob identities across exact commits solely to prove release-policy provenance.
 This narrow exception permits no workflow-content parsing, semantic validation,
 provider-policy snapshots, or general workflow checks. Keep the required path
 set and activation anchor under protected `main`; source trees remain data.
+
+`release prepare` and `release check` take `--base-ref refs/heads/main` or a
+canonical `refs/heads/support/M.N`. Detached checkouts must supply it. A named
+local branch may infer `main` only when it contains current `origin/main`.
+Support versions must match their base; preparation requires the next patch
+or the next RC for that patch. Keep `release activate` main-only.
+
+`github release start-support --repository OWNER/REPO --version M.N.P` is
+read-only. It binds the compiled repository and package family, checks exact
+current-main policy, verifies annotated App-tagged published source archives,
+and requires a stable main successor outside the old line. It prints the
+absent-ref push and a proposed enumerated inventory. It grants no activation
+or publication authority. Never replace its opaque Git blob comparisons with
+workflow-content inspection.
