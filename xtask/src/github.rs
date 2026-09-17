@@ -3,6 +3,7 @@
 
 //! Typed GitHub qualification and source-only release finalization.
 
+mod latest;
 mod support;
 mod transport;
 
@@ -22,7 +23,7 @@ use serde_json::{Value, json};
 
 use crate::crate_archive::{CratesIo, Registry, archive_vcs_commit, is_checksum, require_archive};
 use crate::release;
-use crate::release_policy::TRAITS_PACKAGE;
+use crate::release_policy::{ReleaseLine, TRAITS_PACKAGE};
 use crate::safe_file;
 use transport::{GhCli, Transport, percent_encode};
 
@@ -202,6 +203,7 @@ pub(crate) fn run(root: &Path, args: GithubArgs) -> Result<(), String> {
                         &context,
                         &version,
                         &observed_slug,
+                        ReleaseLine::from_base_ref(&base_ref)?,
                     )
                 }
             }
@@ -779,6 +781,7 @@ fn finalize(
     context: &Context,
     version: &Version,
     observed_slug: &str,
+    line: ReleaseLine,
 ) -> Result<(), String> {
     validate_source_version(root, version)?;
     // The App-authorized phase must still be executing the protected policy
@@ -794,6 +797,7 @@ fn finalize(
     validate_commit(&commit, &context.source, true)?;
     let body = release_body(root, version)?;
     let spec = ReleaseSpec {
+        line,
         version: version.clone(),
         tag: TRAITS_PACKAGE.tag(&version.to_string()),
         body,
@@ -857,6 +861,7 @@ fn validate_app_scope_payload(installation: &InstallationRepositories) -> Result
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ReleaseSpec {
+    line: ReleaseLine,
     version: Version,
     tag: String,
     body: String,
@@ -977,13 +982,15 @@ fn reconcile_release(
     tag_object_sha: &str,
     policy_sha: &str,
 ) -> Result<(), String> {
+    let latest = latest::Guard::capture(github, spec.line, &spec.tag)?;
     if inspect_release(github, spec)? {
         require_exact_tag_object(github, spec, tag_object_sha)?;
-        return Ok(());
+        return latest.verify(github);
     }
     require_ancestor_of_policy(github, &spec.source, policy_sha)?;
     require_live_policy_main(github, policy_sha)?;
     require_exact_tag_object(github, spec, tag_object_sha)?;
+    latest.require_unchanged(github)?;
     let mutation: Result<GitHubRelease, String> = github.mutate(
         "POST",
         &format!("repos/{REPOSITORY}/releases"),
@@ -995,6 +1002,8 @@ fn reconcile_release(
             "draft": false,
             "prerelease": !spec.version.pre.is_empty(),
             "generate_release_notes": false,
+            // The guarded request never regresses Latest during older recovery.
+            "make_latest": latest.request_value(),
         }),
     );
     match mutation {
@@ -1006,7 +1015,7 @@ fn reconcile_release(
         return Err("GitHub did not retain the immutable zero-asset Release".to_string());
     }
     require_exact_tag_object(github, spec, tag_object_sha)?;
-    Ok(())
+    latest.verify(github)
 }
 
 fn inspect_release(github: &mut impl Transport, spec: &ReleaseSpec) -> Result<bool, String> {
@@ -1381,6 +1390,9 @@ mod tests {
             &mut self,
             path: &str,
         ) -> Result<Option<T>, String> {
+            if path == format!("repos/{REPOSITORY}/releases/latest") {
+                return Ok(None);
+            }
             self.responses
                 .get(path)
                 .cloned()
@@ -1487,6 +1499,9 @@ mod tests {
             &mut self,
             path: &str,
         ) -> Result<Option<T>, String> {
+            if path == format!("repos/{REPOSITORY}/releases/latest") {
+                return Ok(None);
+            }
             let expected = format!("repos/{REPOSITORY}/git/ref/tags/{}", self.spec.tag);
             if path == expected {
                 Ok(None)
@@ -1569,6 +1584,9 @@ mod tests {
             &mut self,
             path: &str,
         ) -> Result<Option<T>, String> {
+            if path == format!("repos/{REPOSITORY}/releases/latest") {
+                return Ok(None);
+            }
             let expected = format!("repos/{REPOSITORY}/releases/tags/{}", self.spec.tag);
             if path == expected {
                 Ok(None)
@@ -1766,6 +1784,9 @@ mod tests {
             &mut self,
             path: &str,
         ) -> Result<Option<T>, String> {
+            if path == format!("repos/{REPOSITORY}/releases/latest") {
+                return Ok(None);
+            }
             let release_path = format!("repos/{REPOSITORY}/releases/tags/{}", self.spec.tag);
             let tag_path = format!("repos/{REPOSITORY}/git/ref/tags/{}", self.spec.tag);
             let value = if path == release_path {
@@ -1986,6 +2007,7 @@ mod tests {
 
     fn release_spec() -> ReleaseSpec {
         ReleaseSpec {
+            line: ReleaseLine::Main,
             version: Version::parse("0.4.0-rc.3").unwrap(),
             tag: "v0.4.0-rc.3".to_string(),
             body: "notes\n".to_string(),
@@ -2042,7 +2064,7 @@ mod tests {
             "name": spec.tag,
             "body": spec.body,
             "draft": false,
-            "prerelease": true,
+            "prerelease": !spec.version.pre.is_empty(),
             "immutable": true,
             "author": {
                 "login": APP_LOGIN,
@@ -2720,5 +2742,119 @@ mod tests {
         ));
         assert!(is_sha(&"a".repeat(40)));
         assert!(!is_sha(&"A".repeat(40)));
+    }
+
+    struct LatestReleaseTransport {
+        inner: FakeGithub,
+        spec: ReleaseSpec,
+        latest: Option<Value>,
+        posted: Option<Value>,
+    }
+
+    impl Transport for LatestReleaseTransport {
+        fn get<T: serde::de::DeserializeOwned>(&mut self, path: &str) -> Result<T, String> {
+            self.inner.get(path)
+        }
+        fn get_optional<T: serde::de::DeserializeOwned>(
+            &mut self,
+            path: &str,
+        ) -> Result<Option<T>, String> {
+            let value = if path == format!("repos/{REPOSITORY}/releases/latest") {
+                self.latest.clone()
+            } else if path == format!("repos/{REPOSITORY}/releases/tags/{}", self.spec.tag) {
+                self.posted
+                    .as_ref()
+                    .map(|_| github_release_json(&self.spec))
+            } else {
+                return self.inner.get_optional(path);
+            };
+            value
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|e| e.to_string())
+        }
+        fn mutate<T: serde::de::DeserializeOwned, P: serde::Serialize>(
+            &mut self,
+            method: &str,
+            path: &str,
+            payload: &P,
+        ) -> Result<T, String> {
+            assert!(
+                self.posted.is_none(),
+                "immutable replay attempted another POST"
+            );
+            assert_eq!(method, "POST");
+            assert_eq!(path, format!("repos/{REPOSITORY}/releases"));
+            let payload = serde_json::to_value(payload).unwrap();
+            if payload["make_latest"] == "true" {
+                self.latest = Some(json!({"id":1, "tag_name":self.spec.tag}));
+            }
+            self.posted = Some(payload);
+            serde_json::from_value(github_release_json(&self.spec)).map_err(|e| e.to_string())
+        }
+    }
+
+    #[test]
+    fn release_creation_sends_explicit_latest_and_verifies_both_recovery_directions() {
+        let policy = "b".repeat(40);
+        let object = "d".repeat(40);
+        for (line, version, prior, expected) in [
+            (ReleaseLine::Main, "0.6.0-rc.1", Some("0.5.1"), "false"),
+            (ReleaseLine::Main, "0.6.0", None, "true"),
+            (ReleaseLine::Main, "0.5.2", Some("0.6.0"), "false"),
+            (ReleaseLine::Main, "0.6.0", Some("0.5.1"), "true"),
+            (
+                ReleaseLine::Support { major: 0, minor: 5 },
+                "0.5.2",
+                Some("0.6.0"),
+                "false",
+            ),
+        ] {
+            let mut spec = release_spec();
+            spec.line = line;
+            spec.version = Version::parse(version).unwrap();
+            spec.tag = TRAITS_PACKAGE.tag(version);
+            let mut github = LatestReleaseTransport {
+                inner: FakeGithub {
+                    responses: BTreeMap::from([
+                        (
+                            format!("repos/{REPOSITORY}/git/ref/tags/{}", spec.tag),
+                            tag_reference_json(&spec, &object),
+                        ),
+                        (
+                            format!("repos/{REPOSITORY}/git/tags/{object}"),
+                            annotated_tag_json(&spec, &object),
+                        ),
+                        (
+                            format!("repos/{REPOSITORY}/git/ref/heads/main"),
+                            json!({"ref":"refs/heads/main","object":{"type":"commit","sha":policy}}),
+                        ),
+                        (
+                            format!(
+                                "repos/{REPOSITORY}/compare/{}...{policy}?per_page=1&page=1",
+                                spec.source
+                            ),
+                            json!({"status":"ahead","base_commit":{"sha":spec.source},"merge_base_commit":{"sha":spec.source}}),
+                        ),
+                    ]),
+                },
+                spec: spec.clone(),
+                latest: prior
+                    .map(|version| json!({"id":44,"tag_name":TRAITS_PACKAGE.tag(version)})),
+                posted: None,
+            };
+            let before = github.latest.clone();
+            reconcile_release(&mut github, &spec, &object, &policy).unwrap();
+            assert_eq!(github.posted.as_ref().unwrap()["make_latest"], expected);
+            if expected == "false" {
+                assert_eq!(github.latest, before);
+            } else {
+                assert_eq!(github.latest.as_ref().unwrap()["tag_name"], spec.tag);
+            }
+            // Replaying an exact immutable Release makes no second POST.
+            let posted = github.posted.clone();
+            reconcile_release(&mut github, &spec, &object, &policy).unwrap();
+            assert_eq!(github.posted, posted);
+        }
     }
 }

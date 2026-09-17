@@ -32,6 +32,7 @@ xtask/src/cargo_metadata_output.rs
 xtask/src/ci.rs
 xtask/src/crate_archive.rs
 xtask/src/github.rs
+xtask/src/github/latest.rs
 xtask/src/github/support.rs
 xtask/src/github/transport.rs
 xtask/src/main.rs

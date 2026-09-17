@@ -432,3 +432,18 @@ Preparation continues to use release-plz 0.3.160 for version and changelog
 changes. These command options alone do not enable support publication. Read
 [the maintainer procedure](MAINTAINERS.md#support-readiness-commands) for the
 read-only activation proposal and remaining activation boundary.
+
+## Latest selection during finalization
+
+The finalizer reads GitHub's current Latest release before creating a Release
+and sends `make_latest` explicitly. Stable main releases advance Latest;
+prereleases and support releases preserve it. Recovery of an older main
+version also preserves it, while recovery of a newer stable main version
+advances it. The decision precedes the write and is verified through the
+`releases/latest` endpoint afterward. Existing immutable Releases are retained.
+
+If Latest moves between qualification and creation, stop and requalify. If
+readback differs from the intended outcome, inspect the exact existing tags,
+Releases, and Latest selection before retrying. Never recreate an immutable
+Release to change its Latest status. Publication remains serialized across
+the repository.

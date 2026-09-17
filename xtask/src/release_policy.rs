@@ -97,6 +97,10 @@ impl ReleaseLine {
             .replacen("refs/heads/", "refs/remotes/origin/", 1)
     }
 
+    pub(crate) fn make_latest(self, version: &semver::Version) -> bool {
+        self == Self::Main && version.pre.is_empty()
+    }
+
     pub(crate) fn admits(self, version: &semver::Version) -> bool {
         match self {
             Self::Main => true,
@@ -180,6 +184,17 @@ impl ReleaseLine {
 mod release_line_tests {
     use super::ReleaseLine;
     use semver::Version;
+
+    #[test]
+    fn latest_intent_is_main_stable_only() {
+        let stable = Version::parse("0.5.2").unwrap();
+        let rc = Version::parse("0.5.2-rc.1").unwrap();
+        let support = ReleaseLine::Support { major: 0, minor: 5 };
+        assert!(ReleaseLine::Main.make_latest(&stable));
+        assert!(!ReleaseLine::Main.make_latest(&rc));
+        assert!(!support.make_latest(&stable));
+        assert!(!support.make_latest(&rc));
+    }
 
     #[test]
     fn canonical_support_bases_and_line_versions() {
