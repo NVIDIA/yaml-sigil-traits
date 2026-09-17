@@ -15,10 +15,11 @@ concurrency:
 
 jobs:
   report:
-    name: Report authorized candidate result
+    name: Report reviewed CI
     if: >-
       ${{ github.event.workflow_run.event == 'push' &&
-          startsWith(github.event.workflow_run.head_branch, 'pull-request/') }}
+          (startsWith(github.event.workflow_run.head_branch, 'pull-request/') ||
+           startsWith(github.event.workflow_run.head_branch, 'ci-testing/pr-')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # This main-only App-key environment is reviewer-free so the protected
@@ -58,6 +59,7 @@ jobs:
           --workflow-id "333755870"
           --workflow-path ".github/workflows/ci.yml"
           --job-name "Candidate CI (Linux)"
+          --staging-job-name "Trusted CI / Linux result"
           --app-slug "nvidia-yamlsigil-release-pr"
 
       - name: Create checks-only repository token
@@ -85,4 +87,5 @@ jobs:
           --workflow-id "333755870"
           --workflow-path ".github/workflows/ci.yml"
           --job-name "Candidate CI (Linux)"
+          --staging-job-name "Trusted CI / Linux result"
           --app-slug "nvidia-yamlsigil-release-pr"

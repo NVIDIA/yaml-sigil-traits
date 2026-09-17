@@ -12,6 +12,13 @@ Whenever a workflow or supporting policy changes, update the matching
 procedure in `MAINTAINERS.md` in the same change. Keep that runbook concise,
 coherent, and aligned with the executable behavior.
 
+Ordinary copied-ref tests require protected workflow equality. Reviewed
+maintainer staging uses a separate main-only route and canonical
+`ci-testing/pr-<number>-<head-sha>` refs. Follow `MAINTAINERS.md` for exact-head
+admission, the authoritative Linux aggregate, and automatic App reporting.
+The reporter must authenticate the original writer, exact source, current
+main ancestry and terminal result before its checks-only token can be used.
+
 Use [`CONTRIBUTING.md`](CONTRIBUTING.md) to choose `main` or an advertised
 breaking-change coordination base before starting work. Keep compatible and
 protected-policy changes on `main`; target the active coordination branch only
@@ -347,11 +354,11 @@ tools in fresh runner-temporary state, complete static policy checks before
 candidate executable work, and leave that executable phase terminal. The local
 command does not launch other operating systems. The checkout-free reporter
 uses the shared `protected-automation` environment and runs automatically from
-protected current `main` after candidate CI. Exact-head `/ok to test`
-authorization is the sole per-head human gate; a changed head requires fresh
-authorization. Before enabling external contributor execution, prove that
-one-human-step flow, the App-owned verdict, and zero retained output with a
-controlled canary.
+protected current `main` after candidate CI. For copied refs, exact-head
+`/ok to test` authorization is the sole per-head human test gate; a changed
+head requires fresh authorization. Before enabling external contributor
+execution, prove that one-human-step flow, the App-owned verdict, and zero
+retained output with a controlled canary.
 
 Validate shell scripts under `.github/scripts` with Shuck before landing
 changes. Install it from the `shuck-cli` crate and run it from the repository
