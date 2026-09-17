@@ -4,14 +4,22 @@
 # App token exists. A Cargo xtask would compile repository-controlled Rust at
 # the wrong trust boundary, while shell would make the bounded API checks
 # harder to type and fixture-test. Keep this file standard-library-only.
-"""Bind one copied-ref CI run before reporting the App-owned required check.
+"""Bind one reviewed CI run before reporting the App-owned required check.
 
 This protected GitHub policy runs checkout-free from exact live ``main``,
 before the checks-only App token exists, without compiling or executing
 candidate-controlled Rust, shell, or repository files. It accepts only a
-completed copied-ref run, requires every commit's raw-author DCO, and binds the
+completed copied-ref or explicitly staged run, requires raw-author DCO, and binds the
 repository, protected workflow, live base, pull request, copied ref, exact
 head, authoritative job, terminal conclusion, and zero artifacts.
+
+Ordinary copied refs must use protected workflow blobs. A canonical staging
+push instead records a writer's exact-head admission of reviewed new policy;
+it is main-only and must contain the current main's complete linear successor
+series. The original pushing user's current write permission is revalidated.
+Review of the staged workflow's executable inputs and absence of privilege is
+a maintainer admission control, not something this reporter parses or infers
+from a successful job. Unrelated staging refs never produce a required verdict.
 
 The ``inspect`` operation performs the complete read-only binding. The
 ``report`` operation repeats every mutable check after App-token creation,
@@ -54,6 +62,7 @@ SUPPORT_BRANCH = re.compile(rf"support/{VERSION_COMPONENT}\.{VERSION_COMPONENT}"
 SPEC_COORDINATION_BRANCH = re.compile(
     r"v[1-9][0-9]{0,8}(?:(?:alpha|beta)[1-9][0-9]{0,8})?"
 )
+STAGING_BRANCH = re.compile(r"ci-testing/pr-([1-9][0-9]{0,8})-([0-9a-f]{40})")
 TERMINAL_JOB_CONCLUSIONS = {
     "action_required",
     "cancelled",
@@ -168,6 +177,8 @@ class Policy:
     workflow_path: str
     job_name: str
     app_slug: str
+    workflow_policy_paths: tuple[str, ...] = ()
+    staging_job_name: str | None = None
 
     def validate(self) -> None:
         """Reject malformed or unsupported protected workflow constants."""
@@ -177,11 +188,16 @@ class Policy:
         _sha(self.policy_sha, "protected policy SHA")
         if self.workflow_id <= 0:
             raise ReporterError("expected workflow ID is malformed")
-        if not re.fullmatch(r"\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml", self.workflow_path):
-            raise ReporterError("expected workflow path is malformed")
+        paths = (self.workflow_path, *self.workflow_policy_paths)
+        if len(set(paths)) != len(paths):
+            raise ReporterError("protected workflow paths are duplicated")
+        for path in paths:
+            if not re.fullmatch(r"\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml", path):
+                raise ReporterError("expected workflow path is malformed")
         for label, value in (
             ("job name", self.job_name),
             ("App slug", self.app_slug),
+            ("staging job name", self.staging_job_name or self.job_name),
         ):
             if not value or len(value) > 128 or any(c in value for c in "\r\n"):
                 raise ReporterError(f"expected {label} is malformed")
@@ -201,6 +217,7 @@ class Binding:
     check_name: str
     conclusion: str
     details_url: str
+    staging_actor: str | None = None
     @property
     def check_conclusion(self) -> str:
         """Map every non-successful terminal CI result to a failed check."""
@@ -380,8 +397,44 @@ def read_event(path: Path) -> dict[str, Any]:
     return _mapping(value, "workflow event")
 
 
+def _staging_actor(
+    api: Api, repository_path: str, run: dict[str, Any], delivered: dict[str, Any]
+) -> str:
+    """Authenticate the original writer who admitted these exact staged bytes.
+
+    The actor is GitHub's original push actor, not the commit author or the
+    user requesting a rerun. No role is inferred from a fork or branch name.
+    Metadata access uses the existing read token before a checks token exists.
+    """
+
+    actor = _mapping(run.get("actor"), "staging push actor")
+    actor_id = _integer(actor.get("id"), "staging push actor ID")
+    login = _text(actor.get("login"), "staging push actor login")
+    if actor.get("type") != "User" or not re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9-]{0,38}", login
+    ):
+        raise ReporterError("staging admission requires a maintainer user")
+    delivered_actor = _mapping(delivered.get("actor"), "delivered staging actor")
+    for field in ("id", "login", "type"):
+        if delivered_actor.get(field) != actor.get(field):
+            raise ReporterError("delivered staging actor differs from the original push")
+    permission = _mapping(
+        api.get(f"{repository_path}/collaborators/{login}/permission"),
+        "staging actor permission",
+    )
+    user = _mapping(permission.get("user"), "staging permission user")
+    if (
+        permission.get("permission") not in {"write", "maintain", "admin"}
+        or _integer(user.get("id"), "staging permission user ID") != actor_id
+        or user.get("login") != login
+        or user.get("type") != "User"
+    ):
+        raise ReporterError("staging push actor is not a current repository writer")
+    return login
+
+
 def bind_candidate(api: Api, event: dict[str, Any], policy: Policy) -> Binding:
-    """Bind the triggering delivery to one fresh copied-ref CI attempt."""
+    """Bind one fresh copied-ref or writer-admitted staging CI attempt."""
 
     policy.validate()
     if event.get("action") != "completed":
@@ -414,10 +467,15 @@ def bind_candidate(api: Api, event: dict[str, Any], policy: Policy) -> Binding:
 
     head_branch = _text(run.get("head_branch"), "run head branch")
     branch_match = re.fullmatch(r"pull-request/([1-9][0-9]*)", head_branch)
-    if branch_match is None:
-        raise ReporterError("workflow run is not an exact copied pull-request ref")
-    pull_number = int(branch_match.group(1))
+    staging_match = STAGING_BRANCH.fullmatch(head_branch)
+    if branch_match is None and staging_match is None:
+        raise ReporterError("workflow run is not an exact copied or staged pull-request ref")
+    if staging_match is not None and not policy.staging_job_name:
+        raise ReporterError("protected policy has not enabled staging verdicts")
+    pull_number = int((branch_match or staging_match).group(1))
     head_sha = _sha(run.get("head_sha"), "run head SHA")
+    if staging_match is not None and staging_match.group(2) != head_sha:
+        raise ReporterError("staging ref does not name the exact run head")
     details_url = _text(run.get("html_url"), "run URL")
 
     main_ref = _mapping(
@@ -433,22 +491,19 @@ def bind_candidate(api: Api, event: dict[str, Any], policy: Policy) -> Binding:
     ):
         raise ReporterError("reporter policy is not current protected main")
 
-    protected_workflow = _workflow_blob(
-        api,
-        repository_path,
-        policy.workflow_path,
-        policy.policy_sha,
-        "protected",
-    )
-    candidate_workflow = _workflow_blob(
-        api,
-        repository_path,
-        policy.workflow_path,
-        head_sha,
-        "candidate",
-    )
-    if candidate_workflow != protected_workflow:
-        raise ReporterError("candidate workflow differs from protected policy")
+    # Ordinary admission authenticates every explicitly enumerated workflow
+    # blob, including local callees. Reviewed staging has separate authority
+    # to exercise changed policy and must never weaken this ordinary gate.
+    if staging_match is None:
+        for path in (policy.workflow_path, *policy.workflow_policy_paths):
+            protected_workflow = _workflow_blob(
+                api, repository_path, path, policy.policy_sha, "protected"
+            )
+            candidate_workflow = _workflow_blob(
+                api, repository_path, path, head_sha, "candidate"
+            )
+            if candidate_workflow != protected_workflow:
+                raise ReporterError("candidate workflow differs from protected policy")
 
     for field, expected, label in (
         ("id", run_id, "delivered run ID"),
@@ -474,6 +529,8 @@ def bind_candidate(api: Api, event: dict[str, Any], policy: Policy) -> Binding:
         policy.repository,
         _text(pull_base.get("ref"), "pull request base branch"),
     )
+    if staging_match is not None and base_ref != MAIN_REF:
+        raise ReporterError("reviewed policy staging requires a main pull request")
     base_sha = _sha(pull_base.get("sha"), "pull request base SHA")
     if base_ref == MAIN_REF:
         base_readback = main_ref
@@ -497,6 +554,11 @@ def bind_candidate(api: Api, event: dict[str, Any], policy: Policy) -> Binding:
     if _sha(pull_head.get("sha"), "current pull request head SHA") != head_sha:
         raise ReporterError("pull request head moved after candidate execution")
 
+    staging_actor = (
+        _staging_actor(api, repository_path, run, delivered)
+        if staging_match is not None else None
+    )
+
     expected_commits = _integer(pull.get("commits"), "pull request commit count")
     if expected_commits > MAX_PULL_COMMITS:
         raise ReporterError("pull request commit inventory exceeds its bound")
@@ -507,11 +569,22 @@ def bind_candidate(api: Api, event: dict[str, Any], policy: Policy) -> Binding:
     if len(commits) != expected_commits:
         raise ReporterError("pull request commit inventory is incomplete")
     commit_shas: list[str] = []
+    previous_sha = base_sha
     for index, value in enumerate(commits, 1):
         label = f"pull request commit {index}"
         commit = _mapping(value, label)
         commit_shas.append(_sha(commit.get("sha"), f"{label} SHA"))
         _require_raw_author_dco(commit, label)
+        # The complete ordered parent chain proves current-main ancestry and
+        # linearity without trusting a candidate-produced provenance value.
+        if staging_match is not None:
+            parents = _sequence(commit.get("parents"), f"{label} parents")
+            if len(parents) != 1 or _sha(
+                _mapping(parents[0], f"{label} parent").get("sha"),
+                f"{label} parent SHA",
+            ) != previous_sha:
+                raise ReporterError("staged commits are not linear successors of current main")
+            previous_sha = commit_shas[-1]
     if commit_shas[-1] != head_sha:
         raise ReporterError("pull request commit inventory does not end at the head")
     encoded_ref = urllib.parse.quote(f"heads/{head_branch}", safe="/")
@@ -535,11 +608,9 @@ def bind_candidate(api: Api, event: dict[str, Any], policy: Policy) -> Binding:
     job_items = _sequence(jobs.get("jobs"), "job inventory jobs")
     if jobs.get("total_count") != len(job_items) or len(job_items) > 100:
         raise ReporterError("job inventory is incomplete or oversized")
-    authoritative_name = attested_job_name(
-        policy.job_name,
-        policy.policy_sha,
-        base_ref,
-        base_sha,
+    authoritative_name = (
+        policy.staging_job_name if staging_match is not None
+        else attested_job_name(policy.job_name, policy.policy_sha, base_ref, base_sha)
     )
     authoritative = [
         job
@@ -547,7 +618,8 @@ def bind_candidate(api: Api, event: dict[str, Any], policy: Policy) -> Binding:
         if isinstance(job, dict) and job.get("name") == authoritative_name
     ]
     if len(authoritative) != 1:
-        raise ReporterError("attested authoritative Linux job is missing or duplicated")
+        admission = "staged" if staging_match is not None else "attested"
+        raise ReporterError(f"{admission} authoritative Linux job is missing or duplicated")
     job = authoritative[0]
     if _integer(job.get("run_id"), "job run ID") != run_id:
         raise ReporterError("authoritative job belongs to another run")
@@ -580,6 +652,7 @@ def bind_candidate(api: Api, event: dict[str, Any], policy: Policy) -> Binding:
         check_name=check_name,
         conclusion=conclusion,
         details_url=details_url,
+        staging_actor=staging_actor,
     )
 
 
@@ -657,8 +730,13 @@ def report_check(api: Api, policy: Policy, binding: Binding) -> int:
         )
 
     title = "Authorized candidate CI result"
+    admission = (
+        f"staged by `{binding.staging_actor}`"
+        if binding.staging_actor else "authorized through the copied-ref route"
+    )
     summary = (
-        "The exact copied pull-request head completed the authoritative "
+        f"Pull request #{binding.pull_number} at `{binding.head_sha}`, "
+        f"{admission}, completed the authoritative "
         f"Linux job for `{binding.base_ref}` at `{binding.base_sha}` "
         f"with conclusion `{binding.conclusion}`."
     )
@@ -709,7 +787,9 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--policy-sha", required=True)
     result.add_argument("--workflow-id", required=True, type=int)
     result.add_argument("--workflow-path", required=True)
+    result.add_argument("--workflow-policy-path", action="append", default=[])
     result.add_argument("--job-name", required=True)
+    result.add_argument("--staging-job-name")
     result.add_argument("--app-slug", required=True)
     return result
 
@@ -724,6 +804,8 @@ def run(arguments: argparse.Namespace) -> None:
         workflow_path=arguments.workflow_path,
         job_name=arguments.job_name,
         app_slug=arguments.app_slug,
+        workflow_policy_paths=tuple(arguments.workflow_policy_path),
+        staging_job_name=arguments.staging_job_name,
     )
     event = read_event(arguments.event)
     read_api = GitHubApi(os.environ.get("GITHUB_TOKEN", ""))

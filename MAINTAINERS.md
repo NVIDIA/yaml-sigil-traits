@@ -374,42 +374,53 @@ durable record.
 
 ### Test a protected-policy change
 
-The reporter deliberately rejects a candidate `ci.yml` that differs from
-protected current `main`. Do not weaken that binding to make a proposal pass.
-Choose the test path from the exact candidate workflow:
+Choose the test path from the exact reviewed workflow. Ordinary copied-ref
+CI requires `ci.yml` and every protected local callee to match current `main`.
+Keep that equality guard intact. If the workflow is unchanged, use the ordinary
+exact-head `/ok to test` path. Its verdict exercises existing protected policy;
+a reporter change still needs focused tests and an inert current-main canary
+after integration before the new reporter is considered operational.
 
-- If `ci.yml` is byte-identical to protected current `main`, use the
-  ordinary exact-head `/ok to test` path. Its App verdict validates candidate
-  execution under the existing protected reporter; it does not empirically
-  validate a reporter change proposed by the head. Give every reporter change
-  focused code review and tests, then run one inert current-main canary after
-  integration before declaring the new reporter operational.
-- If `ci.yml` differs, do not issue `/ok to test` for that head. Use the
-  following trusted staging procedure.
+For changed workflow policy, use the separate maintainer staging route:
 
-1. Complete the same exact-head review. Confirm the staging workflow has no
-   publication, OIDC, protected environment, secret, cache-save, or retained
-   artifact path.
-2. A writer pushes the exact reviewed, current-with-`main` head
-   without force to a new `ci-testing/<purpose>-<YYYYMMDD>` branch:
+1. Review the complete exact-head executable input set and require an open PR
+   targeting `main`, with a linear, DCO-compliant series rebased onto current
+   `main`. Confirm the staging workflow has no publication, OIDC, protected
+   environment, secret, cache-save, or retained-artifact path. Review every
+   authoritative Linux check and the aggregate named `Trusted CI / Linux result`.
+   That aggregate must fail unless all authoritative checks pass; advisory
+   platforms do not control its result.
+2. A writer permitted by the live `ci-testing/*` rules pushes the reviewed
+   head without force to a new canonical ref. Use the decimal PR number and
+   full lowercase 40-character head SHA in both positions:
 
    ```shell
-   git push origin <HEAD-SHA>:refs/heads/ci-testing/<purpose>-<YYYYMMDD>
+   git push origin <HEAD-SHA>:refs/heads/ci-testing/pr-<PR-NUMBER>-<HEAD-SHA>
    ```
 
-3. Bind the trusted push run to that ref and SHA. Require authoritative CI to
-   pass, inspect every advisory result, and require zero retained artifacts.
-4. If `Required CI` can bind without using changed policy, use the ordinary
-   merge path. Otherwise stop. Use the exceptional transaction below only
-   after proving the changed policy or a platform outage caused the evaluation
-   failure and equivalent exact-head validation passed.
-5. After integration, verify the workflow from exact current `main`. If
-   contributor admission changed, run one inert outside-account canary and
-   close it without merging.
-6. After the pull-request lifecycle and every bound run are terminal, read the
-   exact `ci-testing/*` ref. Treat an already absent ref as clean. Otherwise,
-   require it still equals the staged SHA before one deletion, then prove it
-   is absent. Stop if the ref moved or the result is ambiguous.
+   This push is exact-head test authorization, not merge authorization. A
+   changed head requires fresh review and a new ref. An external contributor
+   cannot perform this upstream staging operation; an eligible maintainer may
+   stage the contributor's reviewed head.
+3. Wait for automatic App-owned `Required CI` on that head and inspect advisory
+   results. The protected-main reporter authenticates the original pushing
+   user's current write permission, exact PR/ref/head, current-main parent
+   chain, CI workflow and attempt, unique Linux aggregate and zero artifacts.
+   It repeats mutable checks before writing. Staging may exercise changed
+   workflow bytes; ordinary copied refs still require protected blob equality.
+4. Use the ordinary passing-PR merge procedure after the required verdict and
+   merge review succeed. Other `ci-testing/*` names supply test evidence only.
+   A missing or rejected verdict remains blocking; inspect the reporter's
+   diagnostic and refresh stale bindings instead of manually creating a check.
+   A workflow without the expected aggregate cannot qualify automatically.
+   The exceptional procedure remains limited to its separately authorized
+   mechanism-failure or outage cases.
+5. After integration, verify exact current-main CI. If contributor admission
+   changed, run one inert outside-account canary and close it without merging.
+6. Once the PR and every bound run are terminal, read the staging ref and its
+   live deletion rules. Treat an absent ref as clean. Otherwise require the
+   reviewed SHA before one separately authorized deletion and absence proof.
+   Stop on ref drift, a blocked deletion, or an ambiguous response.
 
 For a release-policy change, also use the validation-only procedure in
 `RELEASING.md`. Never exercise publication from `ci-testing/*`. Review release-provenance
@@ -417,10 +428,6 @@ comparisons as exact Git path/blob identity checks. They may inspect only the
 reviewed inventory and Git object identities; workflow syntax and semantics
 remain in hosted policy tooling. A support-line activation still requires its
 own eligible stable release and separately authorized protection transaction.
-
-An external contributor cannot stage an upstream `ci-testing/*` ref. The
-permitted maintainer may stage the contributor's exact reviewed commit; that
-does not authorize integration.
 
 ### Merge an accepted, passing pull request
 

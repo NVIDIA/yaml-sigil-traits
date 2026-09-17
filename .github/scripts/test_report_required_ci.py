@@ -17,6 +17,7 @@ import copy
 import importlib.util
 import sys
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -237,6 +238,202 @@ def bind(event: dict[str, Any], responses: dict[tuple[str, str], Any]) -> Any:
     """Run ordinary candidate binding against an isolated fake API."""
 
     return reporter.bind_candidate(FakeApi(responses), event, policy())
+
+
+STAGING_JOB = "Trusted CI / Linux result"
+STAGING_REF = f"ci-testing/pr-{PULL}-{HEAD}"
+STAGING_ACTOR = {"id": 74, "login": "reviewing-writer", "type": "User"}
+PREFIX = f"repos/{REPOSITORY}"
+RUN_PATH = ("GET", f"{PREFIX}/actions/runs/{RUN_ID}")
+PULL_PATH = ("GET", f"{PREFIX}/pulls/{PULL}")
+COMMITS_PATH = ("GET", f"{PREFIX}/pulls/{PULL}/commits?per_page=100&page=1")
+JOBS_PATH = (
+    "GET", f"{PREFIX}/actions/runs/{RUN_ID}/attempts/{ATTEMPT}/jobs?per_page=100"
+)
+PERMISSION_PATH = ("GET", f"{PREFIX}/collaborators/reviewing-writer/permission")
+STAGED_REF_PATH = ("GET", f"{PREFIX}/git/ref/heads/{STAGING_REF}")
+
+
+def staged_fixture() -> tuple[dict[str, Any], dict[tuple[str, str], Any]]:
+    """Model a reviewed writer push of changed workflow bytes without a checkout."""
+
+    event, responses = fixture()
+    run = responses[RUN_PATH]
+    run["head_branch"] = STAGING_REF
+    run["actor"] = copy.deepcopy(STAGING_ACTOR)
+    # A rerunner is not the original actor whose exact-head admission matters.
+    run["triggering_actor"] = {"id": 99, "login": "rerunner", "type": "User"}
+    event["workflow_run"] = copy.deepcopy(run)
+    responses[PERMISSION_PATH] = {
+        "permission": "write", "user": copy.deepcopy(STAGING_ACTOR)
+    }
+    responses[COMMITS_PATH][0]["parents"] = [{"sha": POLICY_SHA}]
+    ref = responses.pop(("GET", f"{PREFIX}/git/ref/heads/pull-request/{PULL}"))
+    ref["ref"] = f"refs/heads/{STAGING_REF}"
+    responses[STAGED_REF_PATH] = ref
+    responses[JOBS_PATH]["jobs"][0]["name"] = STAGING_JOB
+    # Staging is explicitly allowed to test reviewed workflow changes. Any
+    # attempt to read/interpret those workflow bytes is an unexpected API call.
+    for sha in (POLICY_SHA, HEAD):
+        del responses[("GET", f"{PREFIX}/contents/.github/workflows/ci.yml?ref={sha}")]
+    return event, responses
+
+
+def bind_staged(event: dict[str, Any], responses: dict[tuple[str, str], Any]) -> Any:
+    """Run the separate staging route under protected enabled policy."""
+
+    return reporter.bind_candidate(
+        FakeApi(responses), event, replace(policy(), staging_job_name=STAGING_JOB)
+    )
+
+
+class StagingTests(unittest.TestCase):
+    def test_reviewed_workflow_changes_receive_main_verdict(self) -> None:
+        event, responses = staged_fixture()
+        binding = bind_staged(event, responses)
+        self.assertEqual(binding.head_sha, HEAD)
+        self.assertEqual(binding.base_sha, POLICY_SHA)
+        self.assertEqual(binding.check_name, "Required CI")
+        self.assertEqual(binding.staging_actor, "reviewing-writer")
+        self.assertEqual(binding.check_conclusion, "success")
+
+    def test_each_current_writer_role_is_eligible(self) -> None:
+        for role in ("write", "maintain", "admin"):
+            with self.subTest(role=role):
+                event, responses = staged_fixture()
+                responses[PERMISSION_PATH]["permission"] = role
+                self.assertEqual(bind_staged(event, responses).check_conclusion, "success")
+
+    def test_staging_is_explicitly_enabled_and_main_only(self) -> None:
+        event, responses = staged_fixture()
+        with self.assertRaisesRegex(reporter.ReporterError, "not enabled"):
+            reporter.bind_candidate(FakeApi(responses), event, policy())
+        for base in ("dev/0.6.0", "support/0.5"):
+            with self.subTest(base=base):
+                event, responses = staged_fixture()
+                responses[PULL_PATH]["base"]["ref"] = base
+                with self.assertRaisesRegex(reporter.ReporterError, "requires a main"):
+                    bind_staged(event, responses)
+
+    def test_complete_linear_series_proves_current_main_ancestry(self) -> None:
+        event, responses = staged_fixture()
+        first = copy.deepcopy(responses[COMMITS_PATH][0])
+        first["sha"] = "d" * 40
+        responses[COMMITS_PATH][0]["parents"] = [{"sha": first["sha"]}]
+        responses[COMMITS_PATH].insert(0, first)
+        responses[PULL_PATH]["commits"] = 2
+        self.assertEqual(bind_staged(event, responses).head_sha, HEAD)
+        responses[COMMITS_PATH][0]["parents"][0]["sha"] = "e" * 40
+        with self.assertRaisesRegex(reporter.ReporterError, "successors of current main"):
+            bind_staged(event, responses)
+
+    def test_all_non_successful_terminal_results_fail_the_required_check(self) -> None:
+        for conclusion in reporter.TERMINAL_JOB_CONCLUSIONS:
+            with self.subTest(conclusion=conclusion):
+                event, responses = staged_fixture()
+                responses[JOBS_PATH]["jobs"][0]["conclusion"] = conclusion
+                expected = "success" if conclusion == "success" else "failure"
+                self.assertEqual(bind_staged(event, responses).check_conclusion, expected)
+
+    def test_staging_rejects_every_inconsistent_authority_binding(self) -> None:
+        cases = {
+            "read-only actor": lambda e, r: r[PERMISSION_PATH].update(permission="read"),
+            "triage actor": lambda e, r: r[PERMISSION_PATH].update(permission="triage"),
+            "missing permission": lambda e, r: r[PERMISSION_PATH].pop("permission"),
+            "different permission user": lambda e, r: r[PERMISSION_PATH]["user"].update(id=75),
+            "renamed permission user": lambda e, r: r[PERMISSION_PATH]["user"].update(login="other"),
+            "bot pusher": lambda e, r: r[RUN_PATH]["actor"].update(type="Bot"),
+            "missing original actor": lambda e, r: r[RUN_PATH].pop("actor"),
+            "forged delivered actor": lambda e, r: e["workflow_run"]["actor"].update(id=75),
+            "wrong encoded head": lambda e, r: r[RUN_PATH].update(head_branch=f"ci-testing/pr-{PULL}-{'d' * 40}"),
+            "ad hoc staging ref": lambda e, r: r[RUN_PATH].update(head_branch="ci-testing/example-20260917"),
+            "noncanonical PR": lambda e, r: r[RUN_PATH].update(head_branch=f"ci-testing/pr-0{PULL}-{HEAD}"),
+            "moved PR head": lambda e, r: r[PULL_PATH]["head"].update(sha="d" * 40),
+            "closed PR": lambda e, r: r[PULL_PATH].update(state="closed"),
+            "moved staging ref": lambda e, r: r[STAGED_REF_PATH]["object"].update(sha="d" * 40),
+            "wrong main ancestry": lambda e, r: r[COMMITS_PATH][0].update(parents=[{"sha": "d" * 40}]),
+            "merge commit": lambda e, r: r[COMMITS_PATH][0]["parents"].append({"sha": "d" * 40}),
+            "root commit": lambda e, r: r[COMMITS_PATH][0].update(parents=[]),
+            "missing DCO": lambda e, r: r[COMMITS_PATH][0]["commit"].update(message="unsigned"),
+            "incomplete commits": lambda e, r: r[PULL_PATH].update(commits=2),
+            "stale attempt": lambda e, r: r[RUN_PATH].update(run_attempt=ATTEMPT + 1),
+            "different workflow": lambda e, r: r[RUN_PATH].update(workflow_id=WORKFLOW_ID + 1),
+            "different workflow path": lambda e, r: r[RUN_PATH].update(path=".github/workflows/other.yml"),
+            "different event": lambda e, r: r[RUN_PATH].update(event="workflow_dispatch"),
+            "missing aggregate": lambda e, r: r[JOBS_PATH]["jobs"][0].update(name="unrelated"),
+            "stale aggregate": lambda e, r: r[JOBS_PATH]["jobs"][0].update(run_attempt=ATTEMPT + 1),
+            "incomplete jobs": lambda e, r: r[JOBS_PATH].update(total_count=3),
+            "artifact": lambda e, r: r[("GET", f"{PREFIX}/actions/runs/{RUN_ID}/artifacts?per_page=1")].update(total_count=1),
+            "moved main": lambda e, r: r[("GET", f"{PREFIX}/git/ref/heads/main")]["object"].update(sha="e" * 40),
+        }
+        for label, mutate in cases.items():
+            with self.subTest(label=label):
+                event, responses = staged_fixture()
+                mutate(event, responses)
+                with self.assertRaises(reporter.ReporterError):
+                    bind_staged(event, responses)
+
+    def test_duplicate_staging_aggregate_is_rejected(self) -> None:
+        event, responses = staged_fixture()
+        jobs = responses[JOBS_PATH]
+        jobs["jobs"].append(copy.deepcopy(jobs["jobs"][0]))
+        jobs["total_count"] += 1
+        with self.assertRaisesRegex(reporter.ReporterError, "duplicated"):
+            bind_staged(event, responses)
+
+    def test_revoked_writer_before_reporting_cannot_create_a_check(self) -> None:
+        event, responses = staged_fixture()
+        read_api = FakeApi(responses)
+        app_api = FakeApi({("GET", "installation/repositories?per_page=100"): {
+            "total_count": 1, "repositories": [{"full_name": REPOSITORY}]
+        }})
+        original_get = read_api.get
+        reads = 0
+
+        def revoke(path: str) -> Any:
+            nonlocal reads
+            value = original_get(path)
+            if path == PERMISSION_PATH[1]:
+                reads += 1
+                if reads == 2:
+                    value["permission"] = "read"
+            return value
+
+        read_api.get = revoke
+        args = reporter.parser().parse_args([
+            "report", "--event", "unused.json", "--repository", REPOSITORY,
+            "--policy-sha", POLICY_SHA, "--workflow-id", str(WORKFLOW_ID),
+            "--workflow-path", ".github/workflows/ci.yml", "--job-name", "Candidate CI (Linux)",
+            "--staging-job-name", STAGING_JOB, "--app-slug", "nvidia-yamlsigil-release-pr",
+        ])
+        with mock.patch.object(reporter, "read_event", return_value=event), \
+             mock.patch.object(reporter, "GitHubApi", side_effect=[read_api, app_api]), \
+             mock.patch.dict(reporter.os.environ, {"APP_SLUG": "nvidia-yamlsigil-release-pr"}):
+            with self.assertRaisesRegex(reporter.ReporterError, "current repository writer"):
+                reporter.run(args)
+        self.assertEqual(reads, 2)
+        self.assertFalse(any(call[0] == "POST" for call in app_api.calls))
+
+
+class WorkflowBlobTests(unittest.TestCase):
+    def test_local_callee_must_match_protected_main(self) -> None:
+        event, responses = fixture()
+        path = ".github/workflows/ci-candidate.yml"
+        for sha in (POLICY_SHA, HEAD):
+            responses[("GET", f"{PREFIX}/contents/{path}?ref={sha}")] = {
+                "type": "file", "path": path, "sha": WORKFLOW_BLOB, "size": 1000
+            }
+        protected = replace(policy(), workflow_policy_paths=(path,))
+        self.assertEqual(reporter.bind_candidate(FakeApi(responses), event, protected).head_sha, HEAD)
+        responses[("GET", f"{PREFIX}/contents/{path}?ref={HEAD}")]["sha"] = "d" * 40
+        with self.assertRaisesRegex(reporter.ReporterError, "differs from protected"):
+            reporter.bind_candidate(FakeApi(responses), event, protected)
+
+    def test_policy_paths_are_regular_explicit_workflow_paths(self) -> None:
+        for path in ("../ci.yml", ".github/workflows/ci.yml", ".github/workflows/../ci.yml"):
+            with self.subTest(path=path):
+                with self.assertRaises(reporter.ReporterError):
+                    replace(policy(), workflow_policy_paths=(path,)).validate()
 
 
 class BindingTests(unittest.TestCase):
@@ -501,6 +698,30 @@ class BindingTests(unittest.TestCase):
 
 
 class ReportingTests(unittest.TestCase):
+    def test_staged_verdict_records_admission_and_is_idempotent(self) -> None:
+        event, responses = staged_fixture()
+        binding = bind_staged(event, responses)
+        check = {
+            "id": 88, "name": "Required CI", "head_sha": HEAD,
+            "external_id": binding.external_id, "status": "completed",
+            "conclusion": "success", "app": {"slug": policy().app_slug},
+        }
+        inventory_path = (
+            "GET", f"{PREFIX}/commits/{HEAD}/check-runs?"
+            "check_name=Required+CI&filter=all&per_page=100"
+        )
+        app_api = FakeApi({
+            inventory_path: {"total_count": 0, "check_runs": []},
+            ("POST", f"{PREFIX}/check-runs"): check,
+            ("GET", f"{PREFIX}/check-runs/88"): check,
+        })
+        self.assertEqual(reporter.report_check(app_api, policy(), binding), 88)
+        payload = next(call[2] for call in app_api.calls if call[0] == "POST")
+        self.assertIn("staged by `reviewing-writer`", payload["output"]["summary"])
+        app_api.responses[inventory_path] = {"total_count": 1, "check_runs": [check]}
+        self.assertEqual(reporter.report_check(app_api, policy(), binding), 88)
+        self.assertEqual(sum(call[0] == "POST" for call in app_api.calls), 1)
+
     def setUp(self) -> None:
         """Start each reporting case from fresh ordinary-candidate evidence."""
 
