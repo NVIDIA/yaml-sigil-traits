@@ -75,6 +75,7 @@ jobs:
             -s .github/scripts -p 'test_*.py'
           .github/scripts/test-materialize-candidate.sh
           .github/scripts/test-check-release-pr.sh
+          .github/scripts/test-attach-release-source.sh
           .github/scripts/check-trusted-tool-pins.sh
           .github/scripts/test-trusted-tool-pins.sh
 
@@ -729,6 +730,7 @@ jobs:
               -s .github/scripts -p 'test_*.py'
             .github/scripts/test-materialize-candidate.sh
             .github/scripts/test-check-release-pr.sh
+          .github/scripts/test-attach-release-source.sh
           else
             "${FIXED_CARGO}" "${cargo_config[@]}" test --all-features
             "${FIXED_CARGO}" "${cargo_config[@]}" test --locked \

@@ -428,3 +428,13 @@ ephemeral compilation remains permitted for validation.
 Async traits use native AFIT/RPITIT with explicit `+ Send` returned-future
 bounds and `Send + Sync` super-bounds. They are intentionally not object-safe;
 callers should use generic bounds such as `<S: AsyncSigner>`.
+
+`github release rebind-policy` owns the anonymous pre-authority rebind. Pass
+`--base-ref`, `--source-root`, `--source-sha`, `--version`, and
+`--operation fresh|recover` explicitly. Only current protected `main` supplies
+executing
+policy. Source attachment remains the small tested shell helper, identical
+across the two Rust repositories, and changes only the selected local refs.
+The per-line JSON inventory excludes itself; compare opaque Git blob IDs,
+never workflow contents. Recovery validates historical inventory and retained
+protected-base lineage without demanding current-main content.

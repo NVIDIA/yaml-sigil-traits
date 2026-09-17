@@ -4,6 +4,7 @@
 //! Typed GitHub qualification and source-only release finalization.
 
 mod latest;
+mod provenance;
 mod support;
 mod transport;
 
@@ -89,6 +90,8 @@ struct GithubReleaseArgs {
 
 #[derive(Subcommand)]
 enum GithubReleaseCommand {
+    /// Rebind current main and qualified source anonymously before authority.
+    RebindPolicy(provenance::RebindArgs),
     /// Validate and print a proposed support activation without mutation.
     StartSupport {
         #[arg(long)]
@@ -114,6 +117,8 @@ enum GithubReleaseCommand {
     },
     /// Reconcile the deterministic tag and immutable zero-asset Release.
     Finalize {
+        #[arg(long, value_enum)]
+        operation: provenance::Operation,
         #[arg(long)]
         base_ref: String,
         /// Separate checkout containing exact published source as data.
@@ -131,6 +136,7 @@ enum GithubReleaseCommand {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum QualificationMode {
     Push,
+    Release,
     Validate,
     Recover,
     Publish,
@@ -145,6 +151,7 @@ enum FinalizationPhase {
 pub(crate) fn run(root: &Path, args: GithubArgs) -> Result<(), String> {
     let GithubCommand::Release(args) = args.command;
     match args.command {
+        GithubReleaseCommand::RebindPolicy(args) => provenance::rebind(root, &args),
         GithubReleaseCommand::StartSupport {
             version,
             repository,
@@ -157,8 +164,20 @@ pub(crate) fn run(root: &Path, args: GithubArgs) -> Result<(), String> {
             original_run_id,
             original_run_attempt,
         } => {
-            support::require_main_base(&base_ref)?;
-            let context = Context::from_env(&source_root, &source)?;
+            let line = ReleaseLine::from_base_ref(&base_ref)?;
+            let mut context = Context::from_env(&source_root, &source)?;
+            context.line = line;
+            context.binding = Some(provenance::Binding::load(
+                &source_root,
+                &context.sha,
+                &source,
+                line,
+                if mode == QualificationMode::Recover {
+                    provenance::Operation::Recover
+                } else {
+                    provenance::Operation::Fresh
+                },
+            )?);
             require_separate_checkouts(root, &source_root, &context.sha, &source)?;
             release::check_manifest(root)?;
             require_api_token()?;
@@ -173,22 +192,50 @@ pub(crate) fn run(root: &Path, args: GithubArgs) -> Result<(), String> {
                 original_run_id,
                 original_run_attempt,
             )?;
-            result.write_outputs()
+            result.write_outputs(
+                &base_ref,
+                if mode == QualificationMode::Recover {
+                    "recover"
+                } else {
+                    "fresh"
+                },
+            )
         }
         GithubReleaseCommand::Finalize {
+            operation,
             base_ref,
             source_root,
             source,
             version,
             phase,
         } => {
-            support::require_main_base(&base_ref)?;
-            let context = Context::from_env(&source_root, &source)?;
+            let line = ReleaseLine::from_base_ref(&base_ref)?;
+            let mut context = Context::from_env(&source_root, &source)?;
+            context.line = line;
+            line.require_version(&version)?;
+            context.binding = Some(provenance::Binding::load(
+                &source_root,
+                &context.sha,
+                &source,
+                line,
+                operation,
+            )?);
             require_separate_checkouts(root, &source_root, &context.sha, &source)?;
             release::check_manifest(root)?;
             let mut registry = CratesIo::new();
             match phase {
                 FinalizationPhase::Await => {
+                    provenance::rebind(
+                        root,
+                        &provenance::RebindArgs {
+                            repository: None,
+                            base_ref: base_ref.clone(),
+                            operation,
+                            source_root: source_root.clone(),
+                            source_sha: source.clone(),
+                            version: version.clone(),
+                        },
+                    )?;
                     await_publication(&source_root, &mut registry, &context, &version)
                 }
                 FinalizationPhase::Reconcile => {
@@ -203,7 +250,6 @@ pub(crate) fn run(root: &Path, args: GithubArgs) -> Result<(), String> {
                         &context,
                         &version,
                         &observed_slug,
-                        ReleaseLine::from_base_ref(&base_ref)?,
                     )
                 }
             }
@@ -254,15 +300,28 @@ fn exact_checkout(root: &Path, sha: &str) -> Result<PathBuf, String> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Context {
+    line: ReleaseLine,
+    binding: Option<provenance::Binding>,
     source: String,
     event: String,
     sha: String,
 }
 
 impl Context {
+    fn rebind(&self, github: &mut impl Transport) -> Result<(), String> {
+        match &self.binding {
+            Some(binding) => binding.verify(github),
+            None => {
+                require_ancestor_of_policy(github, &self.source, &self.sha)?;
+                require_live_policy_main(github, &self.sha)
+            }
+        }
+    }
     fn from_env(root: &Path, source: &str) -> Result<Self, String> {
         require_sha(source, "release source")?;
-        if env::var("GITHUB_ACTIONS").as_deref() != Ok("true") {
+        if env::var("GITHUB_ACTIONS").as_deref() != Ok("true")
+            || env::var("GITHUB_REF").as_deref() != Ok("refs/heads/main")
+        {
             return Err("GitHub release commands run only in GitHub Actions".to_string());
         }
         if env::var("GITHUB_REPOSITORY").as_deref() != Ok(REPOSITORY) {
@@ -274,6 +333,8 @@ impl Context {
         require_sha(&sha, "workflow SHA")?;
         crate::crate_archive::require_clean_source(root, source)?;
         Ok(Self {
+            line: ReleaseLine::Main,
+            binding: None,
             source: source.to_string(),
             event,
             sha,
@@ -319,7 +380,7 @@ impl Qualification {
         }
     }
 
-    fn write_outputs(&self) -> Result<(), String> {
+    fn write_outputs(&self, base: &str, operation: &str) -> Result<(), String> {
         let path =
             env::var_os("GITHUB_OUTPUT").ok_or_else(|| "GITHUB_OUTPUT is required".to_string())?;
         let mut output = OpenOptions::new()
@@ -327,6 +388,8 @@ impl Qualification {
             .open(path)
             .map_err(|error| format!("open GITHUB_OUTPUT: {error}"))?;
         for (name, value) in [
+            ("base_ref", base.to_string()),
+            ("operation", operation.to_string()),
             ("qualified", self.qualified.to_string()),
             ("source", self.source.clone()),
             ("version", self.version.clone().unwrap_or_default()),
@@ -354,10 +417,16 @@ fn qualify(
 ) -> Result<Qualification, String> {
     release::check_manifest(root)?;
     require_live_policy_main(github, &context.sha)?;
+    context
+        .line
+        .require_version(&release::manifest_version(root)?)?;
+    if let Some(binding) = &context.binding {
+        binding.verify(github)?;
+    }
     match mode {
         QualificationMode::Validate => {
             if context.event != "workflow_dispatch"
-                || context.sha != context.source
+                || (context.line == ReleaseLine::Main && context.sha != context.source)
                 || original_run_id.is_some()
                 || original_run_attempt.is_some()
             {
@@ -367,8 +436,18 @@ fn qualify(
             }
             return Ok(Qualification::validation(&context.source));
         }
+        QualificationMode::Release => {
+            if context.line == ReleaseLine::Main
+                || context.event != "workflow_dispatch"
+                || original_run_id.is_some()
+                || original_run_attempt.is_some()
+            {
+                return Err("release dispatch requires one fresh support source".into());
+            }
+        }
         QualificationMode::Push => {
             if context.event != "push"
+                || context.line != ReleaseLine::Main
                 || context.sha != context.source
                 || original_run_id.is_some()
                 || original_run_attempt.is_some()
@@ -386,17 +465,30 @@ fn qualify(
             let attempt = original_run_attempt
                 .filter(|value| *value > 0)
                 .ok_or_else(|| "recovery requires original_run_attempt".to_string())?;
-            validate_original_run(github, &context.source, run_id, attempt)?;
-            require_ancestor_of_policy(github, &context.source, &context.sha)?;
+            if context.line == ReleaseLine::Main {
+                validate_original_run(github, &context.source, run_id, attempt)?;
+                require_ancestor_of_policy(github, &context.source, &context.sha)?;
+            } else {
+                eprintln!(
+                    "Support recovery audit context: run {run_id}, attempt {attempt}; package/source evidence supplies the binding."
+                );
+            }
         }
         QualificationMode::Publish => {
-            if context.event != "push"
+            if context.event
+                != if context.line == ReleaseLine::Main {
+                    "push"
+                } else {
+                    "workflow_dispatch"
+                }
                 || original_run_id.is_some()
                 || original_run_attempt.is_some()
             {
                 return Err("post-approval publication requalification is malformed".to_string());
             }
-            require_live_policy_main(github, &context.source)?;
+            if context.line == ReleaseLine::Main {
+                require_live_policy_main(github, &context.source)?;
+            }
         }
     }
 
@@ -404,7 +496,7 @@ fn qualify(
         "repos/{REPOSITORY}/commits/{}/pulls?per_page=100&page=1",
         context.source
     ))?;
-    let Some(release_pr) = select_merged_pull_request(&pulls)? else {
+    let Some(release_pr) = select_merged_pull_request(&pulls, context.line)? else {
         if mode == QualificationMode::Push {
             return Ok(Qualification::ordinary(&context.source));
         }
@@ -445,6 +537,12 @@ fn qualify(
     )?;
     validate_release_head_signature(&head_commit, &head_signature)?;
 
+    if matches!(
+        mode,
+        QualificationMode::Release | QualificationMode::Publish
+    ) {
+        support::require_fresh_progression(github, context.line, &version)?;
+    }
     let registry_state = match registry
         .exact_version(TRAITS_PACKAGE.package, &version.to_string())?
     {
@@ -463,6 +561,36 @@ fn qualify(
             "published"
         }
     };
+    if mode == QualificationMode::Recover && registry_state == "absent" {
+        return Err(
+            "zero-package recovery is forbidden; start a fresh release from the current tip".into(),
+        );
+    }
+    if mode == QualificationMode::Release && registry_state != "absent" {
+        return Err(
+            "support version is already published; use recovery for incomplete finalization".into(),
+        );
+    }
+    let spec = ReleaseSpec {
+        binding: context.binding.clone(),
+        line: context.line,
+        version: version.clone(),
+        tag: TRAITS_PACKAGE.tag(&version.to_string()),
+        body: release_body(root, &version)?,
+        source: context.source.clone(),
+        tagger_date: source_commit.commit.committer.date.clone(),
+    };
+    let tag = inspect_tag(github, &spec)?;
+    let release = inspect_release(github, &spec)?;
+    if (tag.is_some() || release) && registry_state == "absent" {
+        return Err("forge objects coexist with absent crate publication".into());
+    }
+    if release && tag.is_none() {
+        return Err("immutable Release has no retained annotated tag".into());
+    }
+    if let Some(binding) = &context.binding {
+        binding.verify(github)?;
+    }
     if mode == QualificationMode::Publish && registry_state != "absent" {
         return Err("release appeared on crates.io during environment approval".to_string());
     }
@@ -554,7 +682,10 @@ fn original_run_matches(
         && run.repository.full_name == REPOSITORY
 }
 
-fn select_merged_pull_request(pulls: &[PullRequest]) -> Result<Option<&PullRequest>, String> {
+fn select_merged_pull_request(
+    pulls: &[PullRequest],
+    line: ReleaseLine,
+) -> Result<Option<&PullRequest>, String> {
     if pulls.len() >= 100 {
         return Err("commit association inventory is incomplete or oversized".to_string());
     }
@@ -566,7 +697,7 @@ fn select_merged_pull_request(pulls: &[PullRequest]) -> Result<Option<&PullReque
             pull.number > 0
                 && pull.state == "closed"
                 && pull.merged_at.is_some()
-                && pull.base.reference == "main"
+                && format!("refs/heads/{}", pull.base.reference) == line.base_ref()
                 && pull.base.repository().full_name == REPOSITORY
         })
         .collect();
@@ -781,13 +912,11 @@ fn finalize(
     context: &Context,
     version: &Version,
     observed_slug: &str,
-    line: ReleaseLine,
 ) -> Result<(), String> {
     validate_source_version(root, version)?;
     // The App-authorized phase must still be executing the protected policy
     // that started this workflow, even when the release source is historical.
-    require_live_policy_main(github, &context.sha)?;
-    require_ancestor_of_policy(github, &context.source, &context.sha)?;
+    context.rebind(github)?;
     // Recheck the exact registry archive immediately in the App-authorized
     // phase; the preceding credential-free phase owns the bounded wait.
     verify_published_source(registry, context, version)?;
@@ -797,7 +926,8 @@ fn finalize(
     validate_commit(&commit, &context.source, true)?;
     let body = release_body(root, version)?;
     let spec = ReleaseSpec {
-        line,
+        binding: context.binding.clone(),
+        line: context.line,
         version: version.clone(),
         tag: TRAITS_PACKAGE.tag(&version.to_string()),
         body,
@@ -807,8 +937,7 @@ fn finalize(
 
     // Close the read/mutation gap: current protected policy and the retained
     // source lineage must still be exact immediately before the first write.
-    require_ancestor_of_policy(github, &context.source, &context.sha)?;
-    require_live_policy_main(github, &context.sha)?;
+    context.rebind(github)?;
     let tag_object_sha = reconcile_tag(github, &spec, &context.sha)?;
     reconcile_release(github, &spec, &tag_object_sha, &context.sha)?;
     eprintln!(
@@ -861,6 +990,7 @@ fn validate_app_scope_payload(installation: &InstallationRepositories) -> Result
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ReleaseSpec {
+    binding: Option<provenance::Binding>,
     line: ReleaseLine,
     version: Version,
     tag: String,
@@ -870,6 +1000,15 @@ struct ReleaseSpec {
 }
 
 impl ReleaseSpec {
+    fn rebind(&self, github: &mut impl Transport, main: &str) -> Result<(), String> {
+        match &self.binding {
+            Some(binding) => binding.verify(github),
+            None => {
+                require_ancestor_of_policy(github, &self.source, main)?;
+                require_live_policy_main(github, main)
+            }
+        }
+    }
     fn tag_message(&self) -> String {
         format!("Release {} {}", TRAITS_PACKAGE.package, self.version)
     }
@@ -883,8 +1022,7 @@ fn reconcile_tag(
     if let Some(object_sha) = inspect_tag(github, spec)? {
         return Ok(object_sha);
     }
-    require_ancestor_of_policy(github, &spec.source, policy_sha)?;
-    require_live_policy_main(github, policy_sha)?;
+    spec.rebind(github, policy_sha)?;
     let object: AnnotatedTag = github.mutate(
         "POST",
         &format!("repos/{REPOSITORY}/git/tags"),
@@ -904,8 +1042,7 @@ fn reconcile_tag(
     // The annotated object is not reachable until its ref exists. Rebind
     // current policy once more so a move between the two POSTs cannot expose
     // a tag authorized by stale policy.
-    require_ancestor_of_policy(github, &spec.source, policy_sha)?;
-    require_live_policy_main(github, policy_sha)?;
+    spec.rebind(github, policy_sha)?;
     let mutation: Result<GitRef, String> = github.mutate(
         "POST",
         &format!("repos/{REPOSITORY}/git/refs"),
@@ -987,8 +1124,7 @@ fn reconcile_release(
         require_exact_tag_object(github, spec, tag_object_sha)?;
         return latest.verify(github);
     }
-    require_ancestor_of_policy(github, &spec.source, policy_sha)?;
-    require_live_policy_main(github, policy_sha)?;
+    spec.rebind(github, policy_sha)?;
     require_exact_tag_object(github, spec, tag_object_sha)?;
     latest.require_unchanged(github)?;
     let mutation: Result<GitHubRelease, String> = github.mutate(
@@ -2007,6 +2143,7 @@ mod tests {
 
     fn release_spec() -> ReleaseSpec {
         ReleaseSpec {
+            binding: None,
             line: ReleaseLine::Main,
             version: Version::parse("0.4.0-rc.3").unwrap(),
             tag: "v0.4.0-rc.3".to_string(),
@@ -2076,25 +2213,105 @@ mod tests {
     }
 
     #[test]
+    fn support_recovery_needs_crate_evidence_without_claiming_original_run_binding() {
+        let root = crate::workspace_root();
+        let version = release::manifest_version(&root).unwrap();
+        let source = "a".repeat(40);
+        let policy = "b".repeat(40);
+        let head = "c".repeat(40);
+        let context = Context {
+            line: ReleaseLine::Support {
+                major: version.major,
+                minor: version.minor,
+            },
+            binding: None,
+            source: source.clone(),
+            event: "workflow_dispatch".into(),
+            sha: policy.clone(),
+        };
+        let pull_json = json!({"number":7,"state":"closed","merged_at":"2026-09-04T00:00:00Z",
+            "base":{"ref":format!("support/{}.{}",version.major,version.minor),"sha":policy,"repo":{"full_name":REPOSITORY}},
+            "head":{"ref":format!("release-plz-manual-{version}"),"sha":head,"repo":{"full_name":REPOSITORY}}});
+        let mut github = main_only_github(&policy, json!([]));
+        github.responses.insert(
+            format!("repos/{REPOSITORY}/commits/{source}/pulls?per_page=100&page=1"),
+            json!([pull_json]),
+        );
+        for sha in [&source, &head] {
+            let identity = json!({"name":RELEASE_AUTHOR_NAME,"email":RELEASE_AUTHOR_EMAIL,"date":"2026-09-04T00:00:00Z"});
+            let account =
+                json!({"login":RELEASE_SIGNER_LOGIN,"id":RELEASE_SIGNER_ID,"type":"User"});
+            github.responses.insert(format!("repos/{REPOSITORY}/commits/{sha}"), json!({"sha":sha,
+                "author":account,"committer":account,"parents":[{"sha":policy}],
+                "commit":{"author":identity,"committer":identity,"tree":{"sha":"e".repeat(40)},
+                    "message":format!("prepare\n\n{DCO_TRAILER}"),"verification":{"verified":true,"reason":"valid"}},
+                "files":RELEASE_PATHS.iter().map(|path|json!({"filename":path,"status":"modified"})).collect::<Vec<_>>() }));
+        }
+        github.responses.insert(
+            "graphql:release-signature".into(),
+            release_signature_response(&head, &source),
+        );
+        struct AbsentRegistry {
+            exact_version_calls: usize,
+        }
+        impl Registry for AbsentRegistry {
+            fn exact_version(
+                &mut self,
+                _package: &str,
+                _version: &str,
+            ) -> Result<Option<crate::crate_archive::RegistryVersion>, String> {
+                self.exact_version_calls += 1;
+                Ok(None)
+            }
+            fn download(&mut self, _package: &str, _version: &str) -> Result<Vec<u8>, String> {
+                Err("absent crate has no archive".into())
+            }
+        }
+        let mut registry = AbsentRegistry {
+            exact_version_calls: 0,
+        };
+        let error = qualify(
+            &root,
+            &mut github,
+            &mut registry,
+            &context,
+            QualificationMode::Recover,
+            Some(789),
+            Some(2),
+        )
+        .unwrap_err();
+        assert!(error.contains("zero-package"), "{error}");
+        assert_eq!(registry.exact_version_calls, 1);
+    }
+
+    #[test]
     fn pull_association_is_exact_and_unambiguous() {
         let valid = pull();
         assert_eq!(
-            select_merged_pull_request(std::slice::from_ref(&valid))
+            select_merged_pull_request(std::slice::from_ref(&valid), ReleaseLine::Main)
                 .unwrap()
                 .map(|pull| pull.number),
             Some(7)
         );
-        assert!(select_merged_pull_request(&[valid.clone(), valid]).is_err());
-        assert!(select_merged_pull_request(&vec![pull(); 100]).is_err());
+        assert!(select_merged_pull_request(&[valid.clone(), valid], ReleaseLine::Main).is_err());
+        assert!(select_merged_pull_request(&vec![pull(); 100], ReleaseLine::Main).is_err());
 
         let mut unmerged = pull();
         unmerged.state = "open".to_string();
         unmerged.merged_at = None;
-        assert!(select_merged_pull_request(&[unmerged]).unwrap().is_none());
+        assert!(
+            select_merged_pull_request(&[unmerged], ReleaseLine::Main)
+                .unwrap()
+                .is_none()
+        );
 
         let mut wrong_base = pull();
         wrong_base.base.reference = "develop".to_string();
-        assert!(select_merged_pull_request(&[wrong_base]).unwrap().is_none());
+        assert!(
+            select_merged_pull_request(&[wrong_base], ReleaseLine::Main)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -2116,7 +2333,7 @@ mod tests {
         });
         let observed: PullRequest = serde_json::from_value(payload).unwrap();
         assert_eq!(
-            select_merged_pull_request(&[observed])
+            select_merged_pull_request(&[observed], ReleaseLine::Main)
                 .unwrap()
                 .map(|pull| pull.number),
             Some(7)
@@ -2129,6 +2346,8 @@ mod tests {
         let mut github = main_only_github(&source, json!([]));
         let mut registry = CountingRegistry::default();
         let context = Context {
+            line: ReleaseLine::Main,
+            binding: None,
             source: source.clone(),
             event: "push".to_string(),
             sha: source,
@@ -2156,6 +2375,8 @@ mod tests {
         let mut github = main_only_github(&moved, json!([]));
         let mut registry = CountingRegistry::default();
         let context = Context {
+            line: ReleaseLine::Main,
+            binding: None,
             source: source.clone(),
             event: "push".to_string(),
             sha: policy,

@@ -64,3 +64,16 @@ and requires a stable main successor outside the old line. It prints the
 absent-ref push and a proposed enumerated inventory. It grants no activation
 or publication authority. Never replace its opaque Git blob comparisons with
 workflow-content inspection.
+
+`github release rebind-policy` is read-only and fetches exact protected refs
+anonymously into an isolated temporary object database. Local use requires
+`--repository`; Actions binds the default repository and main ref. Carry the
+qualified base, source, version, and fresh/recovery operation explicitly.
+
+Support qualification and finalization validate the reviewed per-line
+inventory. Current main selects the active line, fixed anchor, and required
+paths. A fresh source must be the protected support tip and match current
+policy. Recovery retains the original source on that lineage and checks
+`source blob == recorded blob == historical main blob`; the historical main
+commit must remain an ancestor of current main. Never let candidate-selected
+paths replace the trusted historical inventory or initial main seed.

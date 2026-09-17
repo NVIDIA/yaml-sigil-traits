@@ -45,6 +45,8 @@ jobs:
       contents: read
       pull-requests: read
     outputs:
+      base_ref: ${{ steps.qualify.outputs.base_ref }}
+      operation: ${{ steps.qualify.outputs.operation }}
       mode: ${{ steps.invocation.outputs.mode }}
       qualified: ${{ steps.qualify.outputs.qualified }}
       registry_state: ${{ steps.qualify.outputs.registry_state }}
@@ -238,14 +240,6 @@ jobs:
           test "$(git rev-parse HEAD)" = "${SOURCE_SHA}"
           # Refuse any release-plz executable other than the requested pin.
           test "$(release-plz --version)" = "release-plz 0.3.160"
-          git -c credential.helper= fetch --no-tags --no-recurse-submodules \
-            origin "+refs/heads/main:refs/remotes/origin/policy-main"
-          test "$(git rev-parse refs/remotes/origin/policy-main)" = "${POLICY_SHA}"
-          git update-ref refs/remotes/origin/main "${SOURCE_SHA}"
-          git switch --force-create main "${SOURCE_SHA}"
-          git branch --set-upstream-to=origin/main main
-          test "$(git rev-parse main)" = "${SOURCE_SHA}"
-          test "$(git rev-parse refs/remotes/origin/main)" = "${SOURCE_SHA}"
           # Fresh pushes freeze live main; recovery rebinds only its historical
           # source and original run coordinates under current protected policy.
           case "${MODE}" in
@@ -276,24 +270,17 @@ jobs:
           MODE: ${{ needs.qualify.outputs.mode }}
           POLICY_SHA: ${{ github.sha }}
           SOURCE_SHA: ${{ needs.qualify.outputs.source }}
+          RELEASE_OPERATION: ${{ needs.qualify.outputs.operation }}
+          QUALIFIED_VERSION: ${{ needs.qualify.outputs.version }}
         run: |
           set -euo pipefail
-          git -c credential.helper= fetch --no-tags --no-recurse-submodules \
-            origin "+refs/heads/main:refs/remotes/origin/publication-main"
-          test "$(git rev-parse refs/remotes/origin/publication-main)" = "${POLICY_SHA}"
-          # The fresh push must still be main; recovery may use only a retained
-          # ancestor of the exact protected policy that compiled the qualifier.
-          case "${MODE}" in
-            push)
-              test "${SOURCE_SHA}" = "${POLICY_SHA}"
-              ;;
-            recover)
-              git merge-base --is-ancestor "${SOURCE_SHA}" "${POLICY_SHA}"
-              ;;
-            *)
-              exit 1
-              ;;
-          esac
+          ../policy/.github/scripts/attach-release-source.sh "${SOURCE_SHA}" refs/heads/main
+          # Bind the executing policy and selected source immediately before
+          # the publisher receives its read token and registry authority.
+          "${RUNNER_TEMP}/release-xtask" github release rebind-policy \
+            --base-ref refs/heads/main --operation "${RELEASE_OPERATION}" \
+            --version "${QUALIFIED_VERSION}" \
+            --source-root . --source-sha "${SOURCE_SHA}"
           # Qualified release-plz is the sole Cargo publisher and receives the
           # read-only repository token plus this job's Trusted Publishing OIDC.
           GIT_TOKEN="${{ github.token }}" release-plz release \
@@ -351,13 +338,15 @@ jobs:
         env:
           POLICY_SHA: ${{ github.sha }}
           SOURCE_SHA: ${{ needs.qualify.outputs.source }}
+          RELEASE_OPERATION: ${{ needs.qualify.outputs.operation }}
+          QUALIFIED_VERSION: ${{ needs.qualify.outputs.version }}
         run: |
           set -euo pipefail
-          git -c credential.helper= fetch --no-tags --no-recurse-submodules \
-            origin "+refs/heads/main:refs/remotes/origin/policy-main"
-          test "$(cat "${RUNNER_TEMP}/release-policy.sha")" = "${POLICY_SHA}"
-          test "$(git rev-parse refs/remotes/origin/policy-main)" = "${POLICY_SHA}"
-          git merge-base --is-ancestor "${SOURCE_SHA}" "${POLICY_SHA}"
+          sha256sum --check "${RUNNER_TEMP}/release-xtask.sha256"
+          "${RUNNER_TEMP}/release-xtask" github release rebind-policy \
+            --base-ref refs/heads/main --operation "${RELEASE_OPERATION}" \
+            --version "${QUALIFIED_VERSION}" \
+            --source-root . --source-sha "${SOURCE_SHA}"
 
       # This credential-free phase owns the bounded registry wait. The App
       # token is minted only in the dependent finalizer after this succeeds.
@@ -365,12 +354,14 @@ jobs:
         working-directory: release-source
         env:
           SOURCE_SHA: ${{ needs.qualify.outputs.source }}
+          RELEASE_OPERATION: ${{ needs.qualify.outputs.operation }}
           VERSION: ${{ needs.qualify.outputs.version }}
         run: |
           set -euo pipefail
           sha256sum --check "${RUNNER_TEMP}/release-xtask.sha256"
           test "$(git rev-parse HEAD)" = "${SOURCE_SHA}"
           "${RUNNER_TEMP}/release-xtask" github release finalize --base-ref refs/heads/main --source-root . \
+            --operation "${RELEASE_OPERATION}" \
             --phase await --source "${SOURCE_SHA}" --version "${VERSION}"
 
   finalization_approval:
@@ -463,13 +454,15 @@ jobs:
         env:
           POLICY_SHA: ${{ github.sha }}
           SOURCE_SHA: ${{ needs.qualify.outputs.source }}
+          RELEASE_OPERATION: ${{ needs.qualify.outputs.operation }}
+          QUALIFIED_VERSION: ${{ needs.qualify.outputs.version }}
         run: |
           set -euo pipefail
-          git -c credential.helper= fetch --no-tags --no-recurse-submodules \
-            origin "+refs/heads/main:refs/remotes/origin/policy-main"
-          test "$(cat "${RUNNER_TEMP}/release-policy.sha")" = "${POLICY_SHA}"
-          test "$(git rev-parse refs/remotes/origin/policy-main)" = "${POLICY_SHA}"
-          git merge-base --is-ancestor "${SOURCE_SHA}" "${POLICY_SHA}"
+          sha256sum --check "${RUNNER_TEMP}/release-xtask.sha256"
+          "${RUNNER_TEMP}/release-xtask" github release rebind-policy \
+            --base-ref refs/heads/main --operation "${RELEASE_OPERATION}" \
+            --version "${QUALIFIED_VERSION}" \
+            --source-root . --source-sha "${SOURCE_SHA}"
 
       - name: Create repository-scoped App token
         id: app-token
@@ -487,11 +480,13 @@ jobs:
           APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           SOURCE_SHA: ${{ needs.qualify.outputs.source }}
+          RELEASE_OPERATION: ${{ needs.qualify.outputs.operation }}
           VERSION: ${{ needs.qualify.outputs.version }}
         run: |
           set -euo pipefail
           sha256sum --check "${RUNNER_TEMP}/release-xtask.sha256"
           test "$(git rev-parse HEAD)" = "${SOURCE_SHA}"
           "${RUNNER_TEMP}/release-xtask" github release finalize --base-ref refs/heads/main --source-root . \
+            --operation "${RELEASE_OPERATION}" \
             --phase reconcile --source "${SOURCE_SHA}" \
             --version "${VERSION}"
