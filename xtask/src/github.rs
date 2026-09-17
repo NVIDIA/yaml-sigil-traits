@@ -102,13 +102,15 @@ enum GithubReleaseCommand {
     /// Qualify a main push, validation dispatch, or same-source recovery.
     Qualify {
         #[arg(long)]
+        version: Option<Version>,
+        #[arg(long)]
         base_ref: String,
         /// Separate checkout containing exact release source as data.
         #[arg(long)]
         source_root: PathBuf,
-        #[arg(long, value_enum)]
+        #[arg(long, visible_alias = "operation", value_enum)]
         mode: QualificationMode,
-        #[arg(long, value_name = "SHA")]
+        #[arg(long, visible_alias = "source-sha", value_name = "SHA")]
         source: String,
         #[arg(long)]
         original_run_id: Option<u64>,
@@ -135,6 +137,7 @@ enum GithubReleaseCommand {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum QualificationMode {
+    #[value(alias = "auto")]
     Push,
     Release,
     Validate,
@@ -157,6 +160,7 @@ pub(crate) fn run(root: &Path, args: GithubArgs) -> Result<(), String> {
             repository,
         } => support::start(root, &version, repository.as_deref()),
         GithubReleaseCommand::Qualify {
+            version,
             base_ref,
             source_root,
             mode,
@@ -180,6 +184,13 @@ pub(crate) fn run(root: &Path, args: GithubArgs) -> Result<(), String> {
             )?);
             require_separate_checkouts(root, &source_root, &context.sha, &source)?;
             release::check_manifest(root)?;
+            if version.as_ref().is_some_and(|expected| {
+                release::manifest_version(&source_root).as_ref() != Ok(expected)
+            }) {
+                return Err(
+                    "qualified source version changed across the authority boundary".into(),
+                );
+            }
             require_api_token()?;
             let mut github = GhCli::new()?;
             let mut registry = CratesIo::new();

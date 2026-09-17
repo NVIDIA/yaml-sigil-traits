@@ -8,16 +8,20 @@ executable WebAssembly, installers, containers, or build artifacts.
 ## Prepare the release pull request
 
 Install the fixed toolchain and analyzer, then bind the release base to a clean
-current `origin/main`. `base_sha` is the later squash-parent expectation.
+selected base (`main`, or an already activated `support/M.N` with reviewed
+inventory and protection). `base_sha` is the later squash-parent expectation.
 
 ```shell
 rustup toolchain install 1.98.0 --component clippy,rustfmt
 export RUSTUP_TOOLCHAIN=1.98.0
-git fetch origin main --tags
-test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"
+base_ref="refs/heads/main" # Or the reviewed refs/heads/support/M.N.
+base_branch="${base_ref#refs/heads/}"
+git fetch origin "${base_ref}:refs/remotes/origin/${base_branch}" --tags
+test "$(git rev-parse HEAD)" = "$(git rev-parse "origin/${base_branch}")"
 test -z "$(git status --porcelain)"
-base_sha="$(git rev-parse origin/main)"
+base_sha="$(git rev-parse "origin/${base_branch}")"
 cargo binstall --force --locked --no-confirm release-plz@0.3.160
+# Bind version and changelog derivation to the reviewed analyzer.
 test "$(release-plz --version)" = "release-plz 0.3.160"
 ```
 
@@ -33,8 +37,8 @@ Both `prepare` and `check` reject `rc.0` as a release version.
 
 ```shell
 version="<SEMVER>"
-git switch --create "release-plz-manual-${version}" origin/main
-cargo xtask release prepare --base-ref refs/heads/main --version "${version}"
+git switch --create "release-plz-manual-${version}" "origin/${base_branch}"
+cargo xtask release prepare --base-ref "${base_ref}" --version "${version}"
 git diff --check
 git diff -- CHANGELOG.md Cargo.toml
 cargo xtask ci
@@ -59,7 +63,7 @@ git config user.email 267424412+ddurst-nvidia@users.noreply.github.com
 git add CHANGELOG.md Cargo.toml
 git commit -S --signoff -m "chore(release): prepare yaml-sigil-traits ${version}"
 git verify-commit HEAD
-cargo xtask release check --base-ref refs/heads/main --version "${version}"
+cargo xtask release check --base-ref "${base_ref}" --version "${version}"
 ```
 
 Push only the canonical branch and open its same-repository pull request.
@@ -67,7 +71,7 @@ Push only the canonical branch and open its same-repository pull request.
 ```shell
 git push origin "HEAD:refs/heads/release-plz-manual-${version}"
 gh pr create \
-  --base main \
+  --base "${base_branch}" \
   --head "release-plz-manual-${version}" \
   --title "chore(release): prepare yaml-sigil-traits ${version}" \
   --body "Prepare the reviewed source-only yaml-sigil-traits ${version} release."
@@ -86,18 +90,18 @@ gh pr comment "${pr_number}" \
 ```
 
 Wait until GitHub shows one open same-repository pull request from the
-canonical branch to `main`, the commit is Verified, and exact-head
-`Required CI` succeeds. At that unchanged reviewed head, give pinned
+canonical branch to the selected base, the commit is Verified, and exact-head
+base-specific `Required CI` succeeds. At that unchanged head, give pinned
 release-plz an existing process-scoped, read-only forge credential and retain
 the dry-run output outside the checkout:
 
 ```shell
 git fetch origin \
-  "+refs/heads/main:refs/remotes/origin/main" \
+  "+${base_ref}:refs/remotes/origin/${base_branch}" \
   "+refs/heads/release-plz-manual-${version}:refs/remotes/origin/release-plz-manual-${version}"
 release_head="$(git rev-parse HEAD)"
 test "$(git rev-parse "origin/release-plz-manual-${version}")" = "${release_head}"
-test "$(git rev-parse HEAD^)" = "$(git rev-parse origin/main)"
+test "$(git rev-parse HEAD^)" = "$(git rev-parse "origin/${base_branch}")"
 test -n "${READ_ONLY_GIT_TOKEN:-}"
 evidence="<APPROVED-EVIDENCE-DIR>/release-plz-dry-run-${release_head}.log"
 set -o pipefail
@@ -120,13 +124,14 @@ add the evidence file to the repository or upload it as a workflow artifact.
 If the pull-request head changes, treat the old evidence as superseded and
 repeat the exact-head checks and dry run.
 
-After `Required CI` succeeds, squash only the unchanged reviewed head. These
-checks prove tree equality, sole-parent history, DCO, GitHub verification, and
-PR association before treating the resulting `main` push as release authority.
+After base-specific `Required CI` succeeds, squash only the unchanged reviewed
+head. These checks prove tree equality, sole-parent history, DCO, GitHub
+verification, and PR association before treating the selected-base squash as
+release source.
 
 ```shell
-git fetch --no-tags origin main
-test "$(git rev-parse refs/remotes/origin/main)" = "${base_sha}"
+git fetch --no-tags origin "${base_ref}:refs/remotes/origin/${base_branch}"
+test "$(git rev-parse "refs/remotes/origin/${base_branch}")" = "${base_sha}"
 test "$(git rev-parse HEAD^)" = "${base_sha}"
 gh pr merge "${pr_number}" \
   --repo NVIDIA/yaml-sigil-traits \
@@ -134,20 +139,21 @@ gh pr merge "${pr_number}" \
   --match-head-commit "${release_head}" \
   --subject "chore(release): prepare yaml-sigil-traits ${version} (#${pr_number})" \
   --body "Signed-off-by: ddurst <267424412+ddurst-nvidia@users.noreply.github.com>"
-git fetch origin main
-main_sha="$(git rev-parse origin/main)"
-test "$(git rev-parse "${main_sha}^")" = "${base_sha}"
-test "$(git rev-parse "${main_sha}^{tree}")" = \
+git fetch origin "${base_ref}:refs/remotes/origin/${base_branch}"
+source_sha="$(git rev-parse "origin/${base_branch}")"
+test "$(git rev-parse "${source_sha}^")" = "${base_sha}"
+test "$(git rev-parse "${source_sha}^{tree}")" = \
   "$(git rev-parse "${release_head}^{tree}")"
-git show -s --format=%B "${main_sha}" | \
+git show -s --format=%B "${source_sha}" | \
   grep -Fx 'Signed-off-by: ddurst <267424412+ddurst-nvidia@users.noreply.github.com>'
-test "$(gh api "repos/NVIDIA/yaml-sigil-traits/commits/${main_sha}" \
+test "$(gh api "repos/NVIDIA/yaml-sigil-traits/commits/${source_sha}" \
   --jq .commit.verification.verified)" = true
-test "$(gh api "repos/NVIDIA/yaml-sigil-traits/commits/${main_sha}/pulls" \
+test "$(gh api "repos/NVIDIA/yaml-sigil-traits/commits/${source_sha}/pulls" \
   --jq "map(select(.number == ${pr_number})) | length")" = 1
 ```
 
-The resulting `publish.yml` run enters `crates-io` only for this qualified
+A main squash starts `publish.yml`; a support squash requires the explicit
+main dispatch below. The qualified run enters `crates-io` only for this qualified
 release. Approve its one exact publication deployment after binding the run,
 source, version, and absent target objects. release-plz is the sole publisher.
 
@@ -173,6 +179,7 @@ gh workflow run publish.yml \
   --repo NVIDIA/yaml-sigil-traits \
   --ref main \
   -f operation=validate \
+  -f base_ref=refs/heads/main \
   -f source_sha="${source_sha}"
 ```
 
@@ -186,6 +193,7 @@ gh workflow run publish.yml \
   --repo NVIDIA/yaml-sigil-traits \
   --ref main \
   -f operation=recover \
+  -f base_ref=refs/heads/main \
   -f source_sha="${source_sha}" \
   -f original_run_id="${original_run_id}" \
   -f original_run_attempt="${original_run_attempt}"
@@ -199,15 +207,18 @@ The separately reviewed `crates-io` environment remains the publication gate.
 After publication and the exact-source registry wait succeed, a secretless
 approval job waits for the `release-finalization` environment. Immediately
 before approving that deployment, a repository admin performs this read-only
-preflight. The
-`run_id` and `run_attempt` identify the current publication or recovery run,
+preflight from exact clean current main with a separate exact source checkout.
+The `run_id` and `run_attempt` identify the current publication or recovery run,
 while `source_sha` is the exact qualified release source:
 
 ```shell
 set -euo pipefail
 repository="NVIDIA/yaml-sigil-traits"
 workflow_id="337393638"
-operation="push" # Use "recover" only for a bounded recovery run.
+operation="push" # push, release, or recover.
+base_ref="refs/heads/main" # Or the reviewed refs/heads/support/M.N.
+version="EXACT_QUALIFIED_VERSION"
+source_root="/ABSOLUTE/PATH/TO/EXACT/RELEASE/SOURCE"
 policy_sha="FULL_CURRENT_MAIN_SHA"
 source_sha="FULL_QUALIFIED_RELEASE_SOURCE_SHA"
 run_id="CURRENT_RUN_ID"
@@ -232,25 +243,30 @@ test "$(gh api "repos/${repository}" --jq .default_branch)" = main
 test "$(gh api "repos/${repository}/git/ref/heads/main" \
   --jq .object.sha)" = "${policy_sha}"
 
-# Ordinary publication and recovery have different source-lineage bindings.
+# Main pushes and support dispatches retain distinct publication authority.
 case "${operation}" in
   push)
-    expected_event=push
+    test "${base_ref}" = refs/heads/main
     test "${source_sha}" = "${policy_sha}"
+    expected_event=push
+    release_operation=fresh
+    ;;
+  release)
+    test "${base_ref}" != refs/heads/main
+    expected_event=workflow_dispatch
+    release_operation=fresh
     ;;
   recover)
     expected_event=workflow_dispatch
-    comparison="$(gh api \
-      "repos/${repository}/compare/${source_sha}...${policy_sha}")"
-    jq -e --arg source "${source_sha}" \
-      '(.merge_base_commit.sha == $source) and
-       (.status == "ahead" or .status == "identical")' \
-      <<< "${comparison}"
+    release_operation=recover
     ;;
-  *)
-    exit 1
-    ;;
+  *) exit 1 ;;
 esac
+# Rebind exact separate checkouts, selected lineage, and historical inventory.
+cargo xtask github release rebind-policy \
+  --repository "${repository}" --base-ref "${base_ref}" \
+  --operation "${release_operation}" --version "${version}" \
+  --source-root "${source_root}" --source-sha "${source_sha}"
 
 run="$(gh api "repos/${repository}/actions/runs/${run_id}")"
 jq -e \
@@ -417,10 +433,53 @@ After finalization, verify the crates.io checksum and VCS commit, annotated tag
 target, stable-versus-prerelease flag, immutable zero-asset Release, and exact
 changelog body. Never replace a conflicting crate, tag, or Release.
 
+## Dispatch a support release
+
+After integration on an activated line, record its exact squash source and
+version. A support push runs CI only. Validate the selected tip using protected
+main policy before requesting publication:
+
+```shell
+base_ref="refs/heads/support/MAJOR.MINOR"
+version="MAJOR.MINOR.PATCH[-PRERELEASE]"
+source_sha="FULL_REVIEWED_SUPPORT_SQUASH_SHA"
+gh workflow run publish.yml --repo NVIDIA/yaml-sigil-traits --ref main \
+  -f operation=validate -f base_ref="${base_ref}" \
+  -f source_sha="${source_sha}" -f version="${version}"
+```
+
+After the validation succeeds and publication is authorized, dispatch the
+same source. The workflow requalifies it after the existing publication gate:
+
+```shell
+gh workflow run publish.yml --repo NVIDIA/yaml-sigil-traits --ref main \
+  -f operation=release -f base_ref="${base_ref}" \
+  -f source_sha="${source_sha}" -f version="${version}"
+```
+
+For an interrupted support release with published source packages, retain its
+original source and version even if the support tip has advanced. Record its
+run coordinates for audit and request fresh applicable environment approvals:
+
+```shell
+gh workflow run publish.yml --repo NVIDIA/yaml-sigil-traits --ref main \
+  -f operation=recover -f base_ref="${base_ref}" \
+  -f source_sha="FULL_ORIGINAL_SOURCE_SHA" -f version="ORIGINAL_VERSION" \
+  -f original_run_id="ORIGINAL_RUN_ID" -f original_run_attempt="ORIGINAL_ATTEMPT"
+```
+
+All dispatches execute on main and share repository-wide publication
+serialization. `validate` skips mutation jobs. `release` requires the current
+support tip and current policy equality; `recover` proves the original source's
+historical inventory and continued protected lineage. Every later job carries
+the qualified base, source, version, and fresh/recovery operation. The existing
+main-only environments, OIDC scope, App token scope, and approval boundaries
+also apply to support. Never rerun an old approval to avoid a fresh dispatch.
+
 ## Explicit release base
 
-The procedures above name `refs/heads/main` explicitly. Keep `--base-ref` on
-all detached invocations. For a future protected support line, use the same
+The procedures above select `base_ref` explicitly. Keep `--base-ref` on
+all detached invocations. For an activated protected support line, use the same
 manual release branch convention with `--base-ref refs/heads/support/M.N` in
 both preparation and checking. Fetch that base and its tags first; preparation
 starts at its exact remote-tracking tip. The selected version stays on `M.N`,
@@ -429,7 +488,7 @@ one ordinal or promotes that patch to stable. Duplicate versions, skipped
 patches, `rc.0`, and build metadata are rejected during preparation.
 
 Preparation continues to use release-plz 0.3.160 for version and changelog
-changes. These command options alone do not enable support publication. Read
+changes. Activation and publication require separate authorization. Read
 [the maintainer procedure](MAINTAINERS.md#support-readiness-commands) for the
 read-only activation proposal and remaining activation boundary.
 
