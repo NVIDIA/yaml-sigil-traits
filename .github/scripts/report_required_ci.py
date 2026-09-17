@@ -50,6 +50,7 @@ VERSION_COMPONENT = r"(?:0|[1-9][0-9]{0,8})"
 RUST_COORDINATION_BRANCH = re.compile(
     rf"dev/{VERSION_COMPONENT}\.{VERSION_COMPONENT}\.{VERSION_COMPONENT}"
 )
+SUPPORT_BRANCH = re.compile(rf"support/{VERSION_COMPONENT}\.{VERSION_COMPONENT}")
 SPEC_COORDINATION_BRANCH = re.compile(
     r"v[1-9][0-9]{0,8}(?:(?:alpha|beta)[1-9][0-9]{0,8})?"
 )
@@ -275,15 +276,16 @@ def base_policy(repository: str, branch: str) -> tuple[str, str]:
         "NVIDIA/yaml-sigil-rs",
         "NVIDIA/yaml-sigil-traits",
     }:
-        allowed = RUST_COORDINATION_BRANCH.fullmatch(branch) is not None
+        allowed = (RUST_COORDINATION_BRANCH.fullmatch(branch) is not None
+                   or SUPPORT_BRANCH.fullmatch(branch) is not None)
     else:
         allowed = SPEC_COORDINATION_BRANCH.fullmatch(branch) is not None
     if not allowed:
-        raise ReporterError("pull request base is not an allowed coordination branch")
+        raise ReporterError("pull request base is not an allowed contribution branch")
     full_ref = f"refs/heads/{branch}"
     check_name = f"Required CI [{full_ref}]"
     if len(check_name) > 128:
-        raise ReporterError("coordination required-check name is oversized")
+        raise ReporterError("contribution required-check name is oversized")
     return full_ref, check_name
 
 

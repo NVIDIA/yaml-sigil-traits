@@ -152,3 +152,11 @@ CI.
         maintained indefinitely and may be redistributed consistent with
         this project or the open source license(s) involved.
   ```
+
+## Compatible fixes for an older line
+
+Target an advertised `support/M.N` only after maintainers have opened that
+line. Keep the change compatible with that major/minor line and follow the
+same DCO and review process. Main supplies CI policy and the required check is
+specific to the selected support base. An older line receives fixes when
+practical; no fixed support duration or response time is promised.

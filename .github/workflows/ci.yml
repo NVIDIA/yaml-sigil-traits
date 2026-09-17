@@ -594,13 +594,14 @@ jobs:
         env:
           BASE_SHA: ${{ steps.candidate_pr.outputs.base_sha }}
           HEAD_SHA: ${{ github.sha }}
+          RELEASE_BASE_REF: ${{ steps.candidate_pr.outputs.base_ref }}
           YAML_SIGIL_RELEASE_PR_BRANCH: >-
             ${{ steps.candidate_pr.outputs.release_branch }}
         run: |
           release_version="${YAML_SIGIL_RELEASE_PR_BRANCH#release-plz-manual-}"
           "${POLICY_BIN}/check-release-pr.sh" \
             "${BASE_SHA}" "${HEAD_SHA}" \
-            "${YAML_SIGIL_RELEASE_PR_BRANCH}" "${release_version}"
+            "${YAML_SIGIL_RELEASE_PR_BRANCH}" "${release_version}" "${RELEASE_BASE_REF}"
         working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/source
 
       - name: Lint Markdown
@@ -679,6 +680,7 @@ jobs:
           FIXED_RUSTDOC: ${{ steps.fixed_tools.outputs.rustdoc }}
           FIXED_RUSTFMT: ${{ steps.fixed_tools.outputs.rustfmt }}
           FULL: ${{ matrix.full }}
+          RELEASE_BASE_REF: ${{ steps.candidate_pr.outputs.base_ref }}
           YAML_SIGIL_RELEASE_PR_BRANCH: >-
             ${{ steps.candidate_pr.outputs.release_branch }}
         shell: bash
@@ -706,7 +708,7 @@ jobs:
               release_version="${YAML_SIGIL_RELEASE_PR_BRANCH#release-plz-manual-}"
               "${FIXED_CARGO}" "${cargo_config[@]}" run --locked \
                 --manifest-path xtask/Cargo.toml -- \
-                release check --base-ref refs/heads/main --version "${release_version}"
+                release check --base-ref "${RELEASE_BASE_REF}" --version "${release_version}"
             fi
             "${FIXED_CARGO}" "${cargo_config[@]}" run --locked \
               --manifest-path xtask/Cargo.toml -- package-content

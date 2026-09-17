@@ -100,12 +100,13 @@ run_materializer_bound_in() {
   local base_ref="$5"
   local base_sha="$6"
   local head="$7"
+  local repository="${8:-NVIDIA/yaml-sigil-rs}"
   (
     cd "${destination}"
     env -u GITHUB_ACTIONS \
       RUNNER_TEMP="${fixture_root}" \
       YAML_SIGIL_MATERIALIZE_TEST_ORIGIN="${bare}" \
-      "${materializer}" NVIDIA/yaml-sigil-rs "${head}" pull-request/7 \
+      "${materializer}" "${repository}" "${head}" pull-request/7 \
       "${policy_sha}" "${base_ref}" "${base_sha}" \
       source-spec "${spec_repo}"
   )
@@ -116,6 +117,7 @@ run_materializer_in() {
   local spec_repo="$2"
   local destination="$3"
   local base_ref="${4:-refs/heads/main}"
+  local repository="${5:-NVIDIA/yaml-sigil-rs}"
   local policy_sha
   local base_sha
   local head
@@ -124,7 +126,7 @@ run_materializer_in() {
   head="$(git --git-dir="${bare}" rev-parse refs/heads/pull-request/7)"
   run_materializer_bound_in \
     "${bare}" "${spec_repo}" "${destination}" \
-    "${policy_sha}" "${base_ref}" "${base_sha}" "${head}"
+    "${policy_sha}" "${base_ref}" "${base_sha}" "${head}" "${repository}"
 }
 
 run_materializer() {
@@ -132,8 +134,9 @@ run_materializer() {
   local spec_repo="$2"
   local destination="$3"
   local base_ref="${4:-refs/heads/main}"
+  local repository="${5:-NVIDIA/yaml-sigil-rs}"
   mkdir "${destination}"
-  run_materializer_in "${bare}" "${spec_repo}" "${destination}" "${base_ref}"
+  run_materializer_in "${bare}" "${spec_repo}" "${destination}" "${base_ref}" "${repository}"
 }
 
 spec_repo="$(make_spec)"
@@ -172,6 +175,38 @@ coordination_repo="$(
 )"
 run_materializer "${coordination_repo}" "${spec_repo}" \
   "${fixture_root}/coordination-checkout" refs/heads/dev/0.6.0
+
+# Both Rust repositories admit a canonical support base under main policy.
+support_repo="$(make_candidate support '# no content filters' "${spec_repo}" false support/0.5)"
+for family in rs traits; do
+  run_materializer "${support_repo}" "${spec_repo}" \
+    "${fixture_root}/support-${family}-checkout" refs/heads/support/0.5 "NVIDIA/yaml-sigil-${family}"
+done
+
+# The specification keeps its own coordination vocabulary and rejects support.
+spec_coordination_repo="$(make_candidate spec-coordination '# no content filters' "${spec_repo}" false v2alpha1)"
+run_materializer "${spec_coordination_repo}" "${spec_repo}" \
+  "${fixture_root}/spec-coordination-checkout" refs/heads/v2alpha1 NVIDIA/yaml-sigil-spec
+# Rejection occurs before any support-source checkout for spec.
+if run_materializer "${support_repo}" "${spec_repo}" \
+  "${fixture_root}/spec-support-checkout" refs/heads/support/0.5 NVIDIA/yaml-sigil-spec; then
+  echo "spec support base was accepted" >&2
+  exit 1
+fi
+
+# Malformed support names cannot reuse an otherwise valid candidate binding.
+for base in support/0 support/0.5.1 support/00.5 support/0.05 support/1000000000.5; do
+  destination="${fixture_root}/invalid-${base//\//-}"
+  mkdir "${destination}"
+  # Each bad base must fail before fetching or materializing candidate content.
+  if run_materializer_bound_in "${support_repo}" "${spec_repo}" "${destination}" \
+    "$(git --git-dir="${support_repo}" rev-parse refs/heads/main)" "refs/heads/${base}" \
+    "$(git --git-dir="${support_repo}" rev-parse refs/heads/support/0.5)" \
+    "$(git --git-dir="${support_repo}" rev-parse refs/heads/pull-request/7)"; then
+    echo "malformed support base was accepted: ${base}" >&2
+    exit 1
+  fi
+done
 
 # A root Cargo configuration is safe only when its path, mode, and blob are
 # unchanged from protected current main.

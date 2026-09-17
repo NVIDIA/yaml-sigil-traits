@@ -6,8 +6,8 @@ set -euo pipefail
 
 # Accept only the exact immutable coordinates and release identifiers used by
 # the protected candidate workflow.
-if [[ "$#" -ne 4 ]]; then
-  echo "usage: check-release-pr.sh BASE_SHA HEAD_SHA RELEASE_BRANCH VERSION" >&2
+if [[ "$#" -ne 5 ]]; then
+  echo "usage: check-release-pr.sh BASE_SHA HEAD_SHA RELEASE_BRANCH VERSION BASE_REF" >&2
   exit 2
 fi
 
@@ -15,6 +15,8 @@ base_sha="$1"
 head_sha="$2"
 release_branch="$3"
 version="$4"
+base_ref="$5"
+version_component='(0|[1-9][0-9]{0,8})'
 semver='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*))?'
 
 # Bind the exact protected base, copied head, and canonical branch/version.
@@ -26,15 +28,31 @@ if [[ ! "${base_sha}" =~ ^[0-9a-f]{40}$ \
   exit 1
 fi
 
+# Release sources belong to main or the exact selected support version line.
+if [[ "${base_ref}" == refs/heads/main ]]; then
+  base_tracking=refs/remotes/origin/main
+elif [[ "${base_ref}" =~ ^refs/heads/support/${version_component}\.${version_component}$ ]]; then
+  support_line="${base_ref#refs/heads/support/}"
+  # A canonical branch cannot smuggle a release from a different minor line.
+  if [[ "${version}" != "${support_line}."* ]]; then
+    echo "release version differs from selected support line" >&2
+    exit 1
+  fi
+  base_tracking="refs/remotes/origin/support/${support_line}"
+else
+  echo "release base must be canonical main or support/M.N" >&2
+  exit 1
+fi
+
 git cat-file -e "${base_sha}^{commit}"
 git cat-file -e "${head_sha}^{commit}"
 
 # A release PR is one exact commit directly atop the protected current base.
 if [[ "$(git rev-parse HEAD)" != "${head_sha}" \
-  || "$(git rev-parse refs/remotes/origin/main)" != "${base_sha}" \
+  || "$(git rev-parse "${base_tracking}")" != "${base_sha}" \
   || "$(git rev-list --count "${base_sha}..${head_sha}")" != "1" \
   || "$(git rev-parse "${head_sha}^")" != "${base_sha}" ]]; then
-  echo "release PR is not one commit current with protected main" >&2
+  echo "release PR is not one commit current with the selected protected base" >&2
   exit 1
 fi
 

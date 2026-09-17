@@ -252,7 +252,7 @@ cargo +1.98.0 install --locked cargo-machete --version 0.9.2
 test "$(cargo-audit --version)" = "cargo-audit 0.22.2"
 ```
 
-Cargo Deny reads the repository-wide policy from `deny.toml` and the exact
+Cargo Deny reads the repository-wide policy from `deny.toml` and the crate-specific
 license exceptions for each graph from the nearest `deny.exceptions.toml`.
 The root check resolves the uncommitted crate graph, while the xtask check uses
 its committed lockfile.
@@ -315,7 +315,7 @@ The surviving provider helpers have deliberately narrow roles:
   YamlSigil repositories.
 - `bind-candidate-pr.py` anonymously binds the open pull request, exact
   contribution base, protected current `main`, copied ref, ordered commit
-  inventory, and optional main-only canonical release branch before source
+  inventory, and optional canonical main or support release branch before source
   materialization.
 - `materialize-candidate.sh` performs anonymous exact-head checkout and rejects
   content filters, candidate-selected submodule URLs, and ancestor Cargo

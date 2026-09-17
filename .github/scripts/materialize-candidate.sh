@@ -44,7 +44,8 @@ version_component='(0|[1-9][0-9]{0,8})'
 case "${repository}" in
   NVIDIA/yaml-sigil-rs | NVIDIA/yaml-sigil-traits)
     if [[ "${base_ref}" != "refs/heads/main" \
-      && ! "${base_ref}" =~ ^refs/heads/dev/${version_component}\.${version_component}\.${version_component}$ ]]; then
+      && ! "${base_ref}" =~ ^refs/heads/dev/${version_component}\.${version_component}\.${version_component}$ \
+      && ! "${base_ref}" =~ ^refs/heads/support/${version_component}\.${version_component}$ ]]; then
       echo "candidate contribution base is not allowed for this repository" >&2
       exit 1
     fi
