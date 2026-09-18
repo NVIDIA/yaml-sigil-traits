@@ -1,5 +1,7 @@
 # Maintainer guide
 
+<!-- Inert candidate admission check; close this pull request without merging. -->
+
 This is the concise human maintainer operations runbook for
 `yaml-sigil-traits`. Contributor and release procedures live in
 [`CONTRIBUTING.md`](CONTRIBUTING.md) and [`RELEASING.md`](RELEASING.md).
