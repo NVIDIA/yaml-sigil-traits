@@ -37,10 +37,10 @@ The modules group the contract by concern:
 - `algorithm` defines `AlgorithmId` and the canonical YAML `alg` string mapping.
 - `conformance` defines portable policy vocabulary for YAML signature documents,
   protobuf wire decoding, and outer-envelope conformance.
-- `signing` defines signing request, outcome, error, capability, key, and output
-  DTOs.
-- `transcription` defines compose and decompose request, response, error,
-  capability, artifact, and form DTOs.
+- `signing` defines requests and outcomes, with DTOs for keys and outputs.
+  It also defines errors and capabilities.
+- `transcription` defines compose and decompose requests and responses. Its
+  other DTOs describe artifacts and forms, errors and capabilities.
 - `verification` defines verification request support DTOs, verifier states,
   pre-verification DTOs, invocation errors, generic public-key DTOs, and
   options.
