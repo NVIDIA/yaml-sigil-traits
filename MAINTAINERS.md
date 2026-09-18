@@ -312,6 +312,11 @@ It is a separately authorized coordinator operation, not contributor intake.
 
 ### Close and promote a coordination line
 
+The shared candidate binder emits `promotion_branch` only for
+`yaml-sigil-rs`, whose content-based release guard needs the separate
+coordination-stub check. It is empty here; the traits release-path validator
+and this repository's promotion procedure remain independent.
+
 1. Freeze the line, remove unready work through review, finish migration
    guidance, replace temporary dependencies, and complete one final
    synchronization.
