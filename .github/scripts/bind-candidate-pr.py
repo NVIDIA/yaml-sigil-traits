@@ -11,13 +11,14 @@ ref, reviewed candidate SHA, protected-policy SHA, and runner-output path. It
 performs bounded, anonymous GitHub reads to prove that the pull request remains
 open; its candidate, contribution base, copied ref, ordered commit inventory,
 and protected ``main`` are current; and any release branch has the canonical
-same-repository shape.
+same-repository shape. Rs coordination promotions additionally bind the live
+repository-owned development source ref; their version is checked separately.
 
 Recoverable HTTP failures restart the complete binding, with at most three
 attempts sharing a two-minute budget for requests and retry waits.
 
-On success it appends only validated single-line base and release scalars to
-the caller-supplied runner-output file. That append is its sole mutation. It
+On success it appends only validated single-line base, release and promotion
+scalars to the caller-supplied runner-output file. That append is its sole mutation. It
 does not accept a token, check out source, execute candidate code, create a
 check, or change repository state. Missing, malformed, oversized, ambiguous,
 or stale evidence fails closed before candidate materialization. Commit DCO is
@@ -222,6 +223,7 @@ class CandidatePrBinding:
     base_sha: str
     check_name: str
     release_branch: str | None
+    promotion_branch: str | None = None
 
 
 def _mapping(value: Any, label: str) -> dict[str, Any]:
@@ -384,11 +386,32 @@ def bind_candidate_pr(
 
     head_ref = _text(head.get("ref"), "pull request head ref")
     if not head_ref.startswith(RELEASE_BRANCH_PREFIX):
+        promotion_branch = None
+        # Only rs needs an exception to its content-based release-PR guard.
+        # A fork with the same branch name must remain an ordinary candidate.
+        if (
+            repository == "NVIDIA/yaml-sigil-rs"
+            and base_ref == MAIN_REF
+            and RUST_COORDINATION_BRANCH.fullmatch(head_ref) is not None
+            and _repository(head.get("repo"), "promotion source repository") == repository
+        ):
+            source = _mapping(
+                api.get(f"{prefix}/git/ref/heads/{head_ref}"), "promotion source ref"
+            )
+            source_object = _mapping(source.get("object"), "promotion source object")
+            if (
+                source.get("ref") != f"refs/heads/{head_ref}"
+                or source_object.get("type") != "commit"
+                or _sha(source_object.get("sha"), "promotion source SHA") != head_sha
+            ):
+                raise BindingError("promotion source no longer points to the reviewed head")
+            promotion_branch = head_ref
         return CandidatePrBinding(
             base_ref=base_ref,
             base_sha=base_sha,
             check_name=check_name,
             release_branch=None,
+            promotion_branch=promotion_branch,
         )
     version = head_ref.removeprefix(RELEASE_BRANCH_PREFIX)
     if SEMVER.fullmatch(version) is None or _repository(
@@ -453,6 +476,7 @@ def append_output(path: Path, binding: CandidatePrBinding) -> None:
         "base_sha": binding.base_sha,
         "check_name": binding.check_name,
         "release_branch": binding.release_branch or "",
+        "promotion_branch": binding.promotion_branch or "",
     }
     if any(any(c in value for c in "\r\n") for value in values.values()):
         raise BindingError("candidate binding output is malformed")

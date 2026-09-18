@@ -158,6 +158,7 @@ class CandidatePrBindingTests(unittest.TestCase):
                     f"base_sha={COORDINATION_SHA}\n"
                     f"check_name=Required CI [{COORDINATION_REF}]\n"
                     "release_branch=\n"
+                    "promotion_branch=\n"
                 ),
             )
 
@@ -178,6 +179,65 @@ class CandidatePrBindingTests(unittest.TestCase):
         ]["sha"] = POLICY_SHA
         with self.assertRaisesRegex(binder.BindingError, "contribution base"):
             bind(responses)
+
+    def test_promotion_binds_the_current_repository_owned_source(self) -> None:
+        responses = fixture(COORDINATION_BRANCH)
+        responses[f"repos/{REPOSITORY}/git/ref/heads/{COORDINATION_BRANCH}"] = {
+            "ref": COORDINATION_REF,
+            "object": {"type": "commit", "sha": HEAD},
+        }
+        result = bind(responses)
+        self.assertEqual(result.promotion_branch, COORDINATION_BRANCH)
+        self.assertIsNone(result.release_branch)
+        self.assertEqual(result.base_ref, binder.MAIN_REF)
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory, "output")
+            binder.append_output(output, result)
+            self.assertIn(f"promotion_branch={COORDINATION_BRANCH}\n", output.read_text())
+
+        source_path = f"repos/{REPOSITORY}/git/ref/heads/{COORDINATION_BRANCH}"
+        for ref, kind, sha in (
+            ("refs/heads/dev/0.7.0", "commit", HEAD),
+            (COORDINATION_REF, "tag", HEAD),
+            (COORDINATION_REF, "commit", "d" * 40),
+            (COORDINATION_REF, "commit", "not-a-sha"),
+        ):
+            with self.subTest(ref=ref, kind=kind, sha=sha):
+                changed = copy.deepcopy(responses)
+                changed[source_path] = {"ref": ref, "object": {"type": kind, "sha": sha}}
+                with self.assertRaises(binder.BindingError):
+                    bind(changed)
+
+    def test_promotion_cannot_be_selected_by_a_fork_or_another_base(self) -> None:
+        fork = fixture(COORDINATION_BRANCH)
+        fork[f"repos/{REPOSITORY}/pulls/{PULL}"]["head"]["repo"]["full_name"] = "fork/repo"
+        self.assertIsNone(bind(fork).promotion_branch)
+        for base in (COORDINATION_BRANCH, "support/0.5"):
+            self.assertIsNone(bind(fixture(COORDINATION_BRANCH, base)).promotion_branch)
+        for branch in (
+            "dev/00.6.0", "dev/0.6", "dev/0.6.0-rc.0", "dev/0.6.0\n",
+            "dev/1000000000.0.0",
+        ):
+            with self.subTest(branch=branch):
+                if "\n" in branch:
+                    with self.assertRaises(binder.BindingError):
+                        bind(fixture(branch))
+                else:
+                    self.assertIsNone(bind(fixture(branch)).promotion_branch)
+
+    def test_promotion_exception_is_rs_only(self) -> None:
+        for repository in ("NVIDIA/yaml-sigil-spec", "NVIDIA/yaml-sigil-traits"):
+            responses = {
+                path.replace(REPOSITORY, repository): value
+                for path, value in fixture(COORDINATION_BRANCH).items()
+            }
+            pull = responses[f"repos/{repository}/pulls/{PULL}"]
+            for side in ("base", "head"):
+                pull[side]["repo"]["full_name"] = repository
+            result = binder.bind_candidate_pr(
+                FakeApi(responses), repository, COPIED_REF, HEAD, POLICY_SHA
+            )
+            self.assertIsNone(result.promotion_branch)
 
     def test_every_mutable_binding_rejects_drift(self) -> None:
         prefix = f"repos/{REPOSITORY}"
@@ -513,6 +573,21 @@ class HttpBindingTests(unittest.TestCase):
                 self.assertEqual(self.calls[4], self.pull_path)
                 self.assertEqual(self.sleeps, [1])
 
+    def test_retry_rebinds_promotion_source(self) -> None:
+        self.responses = fixture(COORDINATION_BRANCH)
+        source = f"repos/{REPOSITORY}/git/ref/heads/{COORDINATION_BRANCH}"
+        self.responses[source] = {
+            "ref": COORDINATION_REF, "object": {"type": "commit", "sha": HEAD}
+        }
+        self.fail(503, path=source)
+        self.after_wait = lambda: self.responses[source]["object"].__setitem__(
+            "sha", "d" * 40
+        )
+        with self.assertRaisesRegex(binder.BindingError, "promotion source"):
+            self.bind()
+        self.assertEqual(self.calls.count(self.pull_path), 2)
+        self.assertEqual(self.sleeps, [1])
+
     def test_cli_writes_only_one_complete_successful_binding(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory, "output")
@@ -523,7 +598,7 @@ class HttpBindingTests(unittest.TestCase):
                 self.fail(503, path=f"repos/{REPOSITORY}/git/ref/heads/main")
                 self.assertEqual(binder.main(), 0)
                 expected = (f"base_ref=refs/heads/main\nbase_sha={POLICY_SHA}\n"
-                            "check_name=Required CI\nrelease_branch=\n")
+                            "check_name=Required CI\nrelease_branch=\npromotion_branch=\n")
                 self.assertEqual(output.read_text(), expected)
                 self.fail(503, path=f"repos/{REPOSITORY}/git/ref/heads/main")
                 self.after_wait = lambda: self.responses[self.pull_path].__setitem__(
