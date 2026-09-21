@@ -379,6 +379,11 @@ durable record.
 
 ### Test a protected-policy change
 
+For dependency and tool refreshes, review the resolved Cargo graph and retain
+intentional compatibility-fixture pins. An Action revision and its installed
+tool version are separate inputs; verify both and use the same tool version
+locally. Changes to CI tool inputs require the staging route below.
+
 Choose the test path from the exact reviewed workflow. Ordinary copied-ref
 CI requires `.github/workflows/ci.yml`, `ci-trusted.yml`, and
 `ci-candidate.yml` to match current `main`. Keep that equality guard intact.

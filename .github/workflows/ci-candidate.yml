@@ -148,10 +148,11 @@ jobs:
 
       - name: Install Markdown linter
         if: ${{ matrix.full }}
+        # This section would benefit by a change to the action allowlist
         uses: rvben/rumdl@95a982d941d00cf41a0dcef4d0788bd15a29be1b # v0.2.54
         with:
           install-only: true
-          version: "0.2.54"
+          version: "0.2.75"
 
       # Fetch protected main before candidate source exists and stage every
       # policy executable that must survive materialization.

@@ -187,9 +187,10 @@ jobs:
           ref: ${{ needs.qualify.outputs.source }}
 
       - name: Install exact cargo-binstall
+        # This section would benefit by a change to the action allowlist
         uses: cargo-bins/cargo-binstall@732870f031d2fb36309d0deaf36abcc704a7be65 # v1.20.1
         with:
-          version: 1.20.1
+          version: 1.23.0
 
       - name: Install pinned release-plz
         run: |
