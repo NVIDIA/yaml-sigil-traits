@@ -51,7 +51,8 @@ request.
 
 Apply a fix needed by both lines to `main` first; the release coordinator moves
 it forward. Protected CI, admission, and release-policy changes always target
-`main`. Releases are prepared only from qualified `main`.
+`main`. Prepare releases from `main` or an activated support line, never
+from a coordination ref.
 
 Squash is the default integration method on either base. A trusted writer may
 preserve an intentional commit series only through the separately authorized

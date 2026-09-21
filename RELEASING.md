@@ -35,6 +35,10 @@ When update leaves the current `rc.N` unchanged, preparation also permits the
 next ordinal on the same version core.
 Both `prepare` and `check` reject `rc.0` as a release version.
 
+Release-plz `0.3.169` compares source using Cargo's package-file selection.
+Changes confined to excluded files may leave `update` unchanged. Keep exact
+version selection within the preparation rules above.
+
 ```shell
 version="<SEMVER>"
 git switch --create "release-plz-manual-${version}" "origin/${base_branch}"
