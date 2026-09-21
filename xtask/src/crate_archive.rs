@@ -261,7 +261,7 @@ pub(crate) fn require_archive(
         ));
     }
     let archive = registry.download(policy.package, version)?;
-    let actual = format!("{:x}", Sha256::digest(&archive));
+    let actual = hex(&Sha256::digest(&archive));
     if actual != record.checksum {
         return Err(format!(
             "crates.io archive checksum differs for {} {version}",
@@ -372,10 +372,10 @@ pub(crate) fn archive_inventory_sha256(files: &BTreeMap<String, ArchiveFile>) ->
         inventory_value(&mut digest, format!("size={}", file.body.len()).as_bytes());
         inventory_value(
             &mut digest,
-            format!("sha256={:x}", Sha256::digest(&file.body)).as_bytes(),
+            format!("sha256={}", hex(&Sha256::digest(&file.body))).as_bytes(),
         );
     }
-    format!("{:x}", digest.finalize())
+    hex(&digest.finalize())
 }
 
 #[cfg(test)]
@@ -384,7 +384,6 @@ fn inventory_value(digest: &mut Sha256, value: &[u8]) {
     digest.update([0]);
 }
 
-#[cfg(test)]
 fn hex(value: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut encoded = String::with_capacity(value.len() * 2);
@@ -669,7 +668,7 @@ fn cargo_archive_metadata(header: &tar::Header, package: &str) -> Result<Archive
         ));
     }
     Ok(ArchiveMetadata {
-        header_sha256: format!("{:x}", Sha256::digest(header.as_bytes())),
+        header_sha256: hex(&Sha256::digest(header.as_bytes())),
         entry_type,
         mode,
         uid,
