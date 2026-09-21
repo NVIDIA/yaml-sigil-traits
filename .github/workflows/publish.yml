@@ -187,15 +187,14 @@ jobs:
           ref: ${{ needs.qualify.outputs.source }}
 
       - name: Install exact cargo-binstall
-        # This section would benefit by a change to the action allowlist
-        uses: cargo-bins/cargo-binstall@732870f031d2fb36309d0deaf36abcc704a7be65 # v1.20.1
+        uses: cargo-bins/cargo-binstall@b874e25ea559687bec77e281e9b271aa1367b624 # v1.23.0
         with:
           version: 1.23.0
 
       - name: Install pinned release-plz
         run: |
           # Install the sole Cargo publisher at the reviewed version.
-          cargo binstall --force --locked --no-confirm release-plz@0.3.160
+          cargo binstall --force --locked --no-confirm release-plz@0.3.169
 
       - name: Requalify the selected source after approval
         id: requalify
@@ -211,7 +210,7 @@ jobs:
         run: |
           sha256sum --check "${RUNNER_TEMP}/release-xtask.sha256"
           # Refuse an analyzer version other than the reviewed publisher pin.
-          test "$(release-plz --version)" = "release-plz 0.3.160"
+          test "$(release-plz --version)" = "release-plz 0.3.169"
           # Fresh publication rechecks that the selected version is still absent.
           if [[ "${QUALIFY_MODE}" != recover ]]; then
             QUALIFY_MODE=publish

@@ -16,6 +16,7 @@ trap cleanup EXIT
 write_fixture() {
   local audit_spec="$1"
   local toolchain="$2"
+  local deny_spec="${3:-cargo-deny@0.20.2}"
   printf '%s\n' \
     'jobs:' \
     '  trusted:' \
@@ -25,7 +26,7 @@ write_fixture() {
     "          toolchain: ${toolchain}" \
     '      - uses: taiki-e/install-action@0123456789012345678901234567890123456789' \
     '        with:' \
-    "          tool: ${audit_spec},cargo-machete@0.9.2" \
+    "          tool: ${audit_spec},${deny_spec},cargo-machete@0.9.2" \
     > "${fixture_root}/ci.yml"
 }
 
@@ -46,7 +47,7 @@ write_matrix_fixture() {
     '          toolchain: ${{ matrix.toolchain }}' \
     '      - uses: taiki-e/install-action@0123456789012345678901234567890123456789' \
     '        with:' \
-    '          tool: cargo-audit@0.22.2,cargo-machete@0.9.2' \
+    '          tool: cargo-audit@0.22.2,cargo-deny@0.20.2,cargo-machete@0.9.2' \
     > "${fixture_root}/ci.yml"
 }
 
@@ -68,6 +69,24 @@ fi
 write_fixture cargo-audit@0.22.1 1.98.0
 if "${checker}" "${fixture_root}/ci.yml"; then
   echo "wrong cargo-audit version unexpectedly passed source lint" >&2
+  exit 1
+fi
+
+write_fixture cargo-audit@0.22.2 1.98.0 cargo-machete@0.9.2
+if "${checker}" "${fixture_root}/ci.yml"; then
+  echo "missing cargo-deny unexpectedly passed source lint" >&2
+  exit 1
+fi
+
+write_fixture cargo-audit@0.22.2 1.98.0 cargo-deny
+if "${checker}" "${fixture_root}/ci.yml"; then
+  echo "unversioned cargo-deny unexpectedly passed source lint" >&2
+  exit 1
+fi
+
+write_fixture cargo-audit@0.22.2 1.98.0 cargo-deny@0.20.1
+if "${checker}" "${fixture_root}/ci.yml"; then
+  echo "wrong cargo-deny version unexpectedly passed source lint" >&2
   exit 1
 fi
 

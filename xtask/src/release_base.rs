@@ -124,4 +124,113 @@ mod tests {
             ReleaseLine::Support { major: 0, minor: 5 }
         );
     }
+
+    #[test]
+    fn support_progression_uses_only_tags_reachable_from_selected_base() {
+        for tag_prefix in ["v", "yaml-sigil-core-v"] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            git(root, &["init", "--quiet", "--initial-branch=main"]).unwrap();
+            let commit = |message: &str| {
+                git(
+                    root,
+                    &[
+                        "-c",
+                        "user.name=Fixture",
+                        "-c",
+                        "user.email=fixture@example.invalid",
+                        "-c",
+                        "commit.gpgsign=false",
+                        "commit",
+                        "--allow-empty",
+                        "--quiet",
+                        "-m",
+                        message,
+                    ],
+                )
+                .unwrap();
+                git(root, &["rev-parse", "HEAD"]).unwrap()
+            };
+            let tag = |version: &str| {
+                git(
+                    root,
+                    &[
+                        "-c",
+                        "tag.gpgsign=false",
+                        "tag",
+                        &format!("{tag_prefix}{version}"),
+                    ],
+                )
+                .unwrap();
+            };
+            let line = ReleaseLine::Support { major: 0, minor: 5 };
+            let version = |value: &str| Version::parse(value).unwrap();
+
+            let baseline = commit("stable support baseline");
+            tag("0.5.1");
+            tag("1alpha1");
+            git(root, &["update-ref", &line.tracking_ref(), &baseline]).unwrap();
+
+            // Main's newer release tags are outside the selected support
+            // history, even while HEAD and origin/main point to that commit.
+            let main = commit("later main releases");
+            tag("0.5.2");
+            tag("0.6.0");
+            git(root, &["update-ref", "refs/remotes/origin/main", &main]).unwrap();
+            for selected in ["0.5.2", "0.5.2-rc.1"] {
+                validate_version(root, line, &version(selected), tag_prefix).unwrap();
+            }
+
+            git(
+                root,
+                &[
+                    "checkout",
+                    "--quiet",
+                    "-b",
+                    "release-plz-manual-0.5.2",
+                    &baseline,
+                ],
+            )
+            .unwrap();
+            assert!(resolve(root, None).unwrap_err().contains("--base-ref"));
+            assert_eq!(resolve(root, Some(&line.base_ref())).unwrap(), line);
+
+            // Only moving the selected tracking ref makes the RC part of
+            // the progression baseline; a tag on the local head is not enough.
+            let release_candidate = commit("support release candidate");
+            tag("0.5.2-rc.1");
+            validate_version(root, line, &version("0.5.2-rc.1"), tag_prefix).unwrap();
+            git(
+                root,
+                &["update-ref", &line.tracking_ref(), &release_candidate],
+            )
+            .unwrap();
+            for selected in ["0.5.2-rc.2", "0.5.2"] {
+                validate_version(root, line, &version(selected), tag_prefix).unwrap();
+            }
+            for rejected in [
+                "0.5.1",
+                "0.5.2-rc.0",
+                "0.5.2-rc.1",
+                "0.5.2-rc.3",
+                "0.5.2+build",
+                "0.5.3",
+                "0.6.0",
+            ] {
+                assert!(
+                    validate_version(root, line, &version(rejected), tag_prefix).is_err(),
+                    "{tag_prefix}{rejected}"
+                );
+            }
+            assert_eq!(
+                git(root, &["rev-parse", "refs/remotes/origin/main"]).unwrap(),
+                main
+            );
+            assert_eq!(
+                git(root, &["rev-parse", &line.tracking_ref()]).unwrap(),
+                release_candidate
+            );
+            assert!(git(root, &["status", "--porcelain"]).unwrap().is_empty());
+        }
+    }
 }

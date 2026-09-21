@@ -223,9 +223,9 @@ cargo xtask release check --base-ref refs/heads/main --version VERSION
 `release activate` prepares only an unpublished `MAJOR.MINOR.PATCH-rc.0`
 coordination state from exact clean `origin/main`; follow `MAINTAINERS.md` for
 its separate protected-ref transaction. `prepare` requires pinned release-plz
-`0.3.160`, exact clean `origin/main`, and
-the canonical `release-plz-manual-VERSION` branch. `check` requires its sole
-SSH-signed, DCO-signed commit current with `origin/main` and verifies the
+`0.3.169`, the exact clean selected remote-tracking base, and the canonical
+`release-plz-manual-VERSION` branch. `check` requires its sole SSH-signed,
+DCO-signed commit current with that selected base and verifies the
 branch, exact paths, source package, version, changelog, and release-plz
 policy. It is credential-free and does not run `release-plz release`. Follow
 `RELEASING.md` for the separate maintainer-operated exact-head dry run. These
@@ -250,7 +250,7 @@ cargo audit --file xtask/Cargo.lock
 ```
 
 Use exact Rust `1.98.0` to install `rumdl`, cargo-audit `0.22.2`,
-`cargo-deny`, and `cargo-machete` before running the wrapper:
+cargo-deny `0.20.2`, and cargo-machete `0.9.2` before running the wrapper:
 
 ```shell
 rustup toolchain install 1.98.0 --component clippy,rustfmt
@@ -259,6 +259,7 @@ cargo +1.98.0 install --locked cargo-audit --version 0.22.2
 cargo +1.98.0 install --locked cargo-deny --version 0.20.2
 cargo +1.98.0 install --locked cargo-machete --version 0.9.2
 test "$(cargo-audit --version)" = "cargo-audit 0.22.2"
+test "$(cargo-deny --version)" = "cargo-deny 0.20.2"
 ```
 
 Cargo Deny reads the repository-wide policy from `deny.toml` and the crate-specific
@@ -266,7 +267,8 @@ license exceptions for each graph from the nearest `deny.exceptions.toml`.
 The root check resolves the uncommitted crate graph, while the xtask check uses
 its committed lockfile.
 
-Keep the cargo-machete version aligned with hosted CI. The
+Keep the cargo-audit, cargo-deny, and cargo-machete versions aligned with
+hosted CI. The
 `--with-metadata` check resolves normal, development, and build dependency
 names across all features, but remains an unused-dependency heuristic; retain
 the all-target, all-feature Clippy and test checks as the compilation proof.

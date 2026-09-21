@@ -137,10 +137,9 @@ jobs:
           components: clippy, rustfmt
           toolchain: ${{ matrix.toolchain }}
 
-      # This section would benefit by a change to the action allowlist
       - name: Install Rust validation tools
         if: ${{ matrix.full }}
-        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2.83.2
+        uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3 # v2.87.16
         with:
           checksum: true
           fallback: none
@@ -280,6 +279,8 @@ jobs:
             done
             test "$("${POLICY_BIN}/cargo-audit" --version)" = \
               "cargo-audit 0.22.2"
+            test "$("${POLICY_BIN}/cargo-deny" --version)" = \
+              "cargo-deny 0.20.2"
             install -m 0500 \
               "${CANDIDATE_STATE}/actionlint/actionlint" \
               "${POLICY_BIN}/actionlint"

@@ -35,7 +35,7 @@ pub(crate) const TRAITS_POLICY: ReleasePolicy = ReleasePolicy {
     packages: &[TRAITS_PACKAGE],
 };
 
-pub(crate) const RELEASE_PLZ_VERSION: &str = "0.3.160";
+pub(crate) const RELEASE_PLZ_VERSION: &str = "0.3.169";
 
 #[cfg(test)]
 mod tests {
@@ -46,7 +46,7 @@ mod tests {
         assert_eq!(TRAITS_PACKAGE.package, "yaml-sigil-traits");
         assert_eq!(TRAITS_POLICY.packages, &[TRAITS_PACKAGE]);
         assert_eq!(TRAITS_PACKAGE.tag("0.4.0-rc.3"), "v0.4.0-rc.3");
-        assert_eq!(RELEASE_PLZ_VERSION, "0.3.160");
+        assert_eq!(RELEASE_PLZ_VERSION, "0.3.169");
     }
 }
 

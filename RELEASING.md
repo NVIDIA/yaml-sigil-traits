@@ -20,9 +20,9 @@ git fetch origin "${base_ref}:refs/remotes/origin/${base_branch}" --tags
 test "$(git rev-parse HEAD)" = "$(git rev-parse "origin/${base_branch}")"
 test -z "$(git status --porcelain)"
 base_sha="$(git rev-parse "origin/${base_branch}")"
-cargo binstall --force --locked --no-confirm release-plz@0.3.160
+cargo binstall --force --locked --no-confirm release-plz@0.3.169
 # Bind version and changelog derivation to the reviewed analyzer.
-test "$(release-plz --version)" = "release-plz 0.3.160"
+test "$(release-plz --version)" = "release-plz 0.3.169"
 ```
 
 Create a new canonical branch. If current `main` carries an unpublished
@@ -487,7 +487,7 @@ uses the patch after the last stable release, and advances an existing RC by
 one ordinal or promotes that patch to stable. Duplicate versions, skipped
 patches, `rc.0`, and build metadata are rejected during preparation.
 
-Preparation continues to use release-plz 0.3.160 for version and changelog
+Preparation continues to use release-plz 0.3.169 for version and changelog
 changes. Activation and publication require separate authorization. Read
 [the maintainer procedure](MAINTAINERS.md#support-readiness-commands) for the
 read-only activation proposal and remaining activation boundary.

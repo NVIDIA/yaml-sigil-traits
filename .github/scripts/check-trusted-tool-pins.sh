@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Enforce the reviewed Rust, cargo-audit, and release registry source pins.
+# Enforce reviewed Rust, dependency-policy, and release registry source pins.
 # This is a narrow supply-chain lint, not a workflow graph or permissions parser.
 set -euo pipefail
 
@@ -15,6 +15,7 @@ fi
 workflow="$1"
 release_workflow="${2:-.github/workflows/publish.yml}"
 expected_audit="cargo-audit@0.22.2"
+expected_deny="cargo-deny@0.20.2"
 expected_toolchain="1.98.0"
 compatibility_toolchain="1.95.0"
 expected_registry_index="sparse+https://index.crates.io/"
@@ -35,13 +36,14 @@ if [[ ! -f "${release_workflow}" || -L "${release_workflow}" ]]; then
 fi
 
 # Keep install-action tool inventories on one reviewable line. Multiline tool
-# scalars could hide an unversioned cargo-audit entry from this focused check.
+# scalars could hide an unversioned policy tool from this focused check.
 if grep -Eq '^[[:space:]]*tool:[[:space:]]*[>|]' "${workflow}"; then
   echo "trusted tool inventories must use an inline scalar" >&2
   exit 1
 fi
 
 audit_specs=0
+deny_specs=0
 while IFS= read -r line; do
   [[ "${line}" == *"tool:"* ]] || continue
   value="${line#*tool:}"
@@ -57,12 +59,23 @@ while IFS= read -r line; do
           exit 1
         fi
         ;;
+      cargo-deny*)
+        deny_specs=$((deny_specs + 1))
+        if [[ "${tool}" != "${expected_deny}" ]]; then
+          echo "trusted cargo-deny install is not pinned to ${expected_deny}" >&2
+          exit 1
+        fi
+        ;;
     esac
   done
 done < "${workflow}"
 
 if ((audit_specs == 0)); then
   echo "trusted cargo-audit install is missing" >&2
+  exit 1
+fi
+if ((deny_specs == 0)); then
+  echo "trusted cargo-deny install is missing" >&2
   exit 1
 fi
 

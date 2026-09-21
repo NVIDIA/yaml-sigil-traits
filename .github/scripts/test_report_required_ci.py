@@ -6,7 +6,7 @@
 """Deterministic trust-boundary tests for the checkout-free Python reporter.
 
 The fixtures model bounded GitHub REST responses and verify the automatic
-candidate binding, DCO policy, base-specific check identity, App scope,
+candidate binding, DCO policy, repository-specific bases and check identity, App scope,
 idempotency, and fail-closed behavior. They perform no network access or
 repository mutation and are not a second workflow-policy implementation.
 """
@@ -76,11 +76,11 @@ class FakeApi:
         return copy.deepcopy(value)
 
 
-def policy() -> Any:
-    """Build the exact protected reporter constants used by all fixtures."""
+def policy(repository: str = REPOSITORY) -> Any:
+    """Build the protected reporter constants for one supported repository."""
 
     return reporter.Policy(
-        repository=REPOSITORY,
+        repository=repository,
         policy_sha=POLICY_SHA,
         workflow_id=WORKFLOW_ID,
         workflow_path=".github/workflows/ci.yml",
@@ -92,6 +92,8 @@ def policy() -> Any:
 def fixture(
     base_branch: str = "main",
     base_sha: str | None = None,
+    *,
+    repository: str = REPOSITORY,
 ) -> tuple[dict[str, Any], dict[tuple[str, str], Any]]:
     """Build a complete ordinary copied-ref delivery and API inventory."""
 
@@ -104,31 +106,31 @@ def fixture(
         "path": ".github/workflows/ci.yml",
         "event": "push",
         "status": "completed",
-        "repository": {"full_name": REPOSITORY},
+        "repository": {"full_name": repository},
         "head_branch": f"pull-request/{PULL}",
         "head_sha": HEAD,
-        "html_url": f"https://github.com/{REPOSITORY}/actions/runs/{RUN_ID}",
+        "html_url": f"https://github.com/{repository}/actions/runs/{RUN_ID}",
     }
     event = {
         "action": "completed",
-        "repository": {"full_name": REPOSITORY},
+        "repository": {"full_name": repository},
         "workflow_run": copy.deepcopy(run),
     }
     paths = {
         (
             "GET",
-            f"repos/{REPOSITORY}/actions/runs/{RUN_ID}",
+            f"repos/{repository}/actions/runs/{RUN_ID}",
         ): run,
         (
             "GET",
-            f"repos/{REPOSITORY}/git/ref/heads/main",
+            f"repos/{repository}/git/ref/heads/main",
         ): {
             "ref": "refs/heads/main",
             "object": {"type": "commit", "sha": POLICY_SHA},
         },
         (
             "GET",
-            f"repos/{REPOSITORY}/contents/.github/workflows/ci.yml?ref={POLICY_SHA}",
+            f"repos/{repository}/contents/.github/workflows/ci.yml?ref={POLICY_SHA}",
         ): {
             "type": "file",
             "path": ".github/workflows/ci.yml",
@@ -137,7 +139,7 @@ def fixture(
         },
         (
             "GET",
-            f"repos/{REPOSITORY}/contents/.github/workflows/ci.yml?ref={HEAD}",
+            f"repos/{repository}/contents/.github/workflows/ci.yml?ref={HEAD}",
         ): {
             "type": "file",
             "path": ".github/workflows/ci.yml",
@@ -146,7 +148,7 @@ def fixture(
         },
         (
             "GET",
-            f"repos/{REPOSITORY}/pulls/{PULL}",
+            f"repos/{repository}/pulls/{PULL}",
         ): {
             "number": PULL,
             "state": "open",
@@ -154,13 +156,13 @@ def fixture(
             "base": {
                 "ref": base_branch,
                 "sha": base_sha,
-                "repo": {"full_name": REPOSITORY},
+                "repo": {"full_name": repository},
             },
             "head": {"sha": HEAD, "ref": "feature", "repo": {"full_name": "fork/repo"}},
         },
         (
             "GET",
-            f"repos/{REPOSITORY}/pulls/{PULL}/commits?per_page=100&page=1",
+            f"repos/{repository}/pulls/{PULL}/commits?per_page=100&page=1",
         ): [
             {
                 "sha": HEAD,
@@ -187,14 +189,14 @@ def fixture(
         ],
         (
             "GET",
-            f"repos/{REPOSITORY}/git/ref/heads/pull-request/{PULL}",
+            f"repos/{repository}/git/ref/heads/pull-request/{PULL}",
         ): {
             "ref": f"refs/heads/pull-request/{PULL}",
             "object": {"type": "commit", "sha": HEAD},
         },
         (
             "GET",
-            f"repos/{REPOSITORY}/actions/runs/{RUN_ID}/attempts/{ATTEMPT}/jobs?per_page=100",
+            f"repos/{repository}/actions/runs/{RUN_ID}/attempts/{ATTEMPT}/jobs?per_page=100",
         ): {
             "total_count": 2,
             "jobs": [
@@ -223,11 +225,11 @@ def fixture(
         },
         (
             "GET",
-            f"repos/{REPOSITORY}/actions/runs/{RUN_ID}/artifacts?per_page=1",
+            f"repos/{repository}/actions/runs/{RUN_ID}/artifacts?per_page=1",
         ): {"total_count": 0, "artifacts": []},
     }
     if base_branch != "main":
-        paths[("GET", f"repos/{REPOSITORY}/git/ref/heads/{base_branch}")] = {
+        paths[("GET", f"repos/{repository}/git/ref/heads/{base_branch}")] = {
             "ref": f"refs/heads/{base_branch}",
             "object": {"type": "commit", "sha": base_sha},
         }
@@ -417,25 +419,58 @@ class StagingTests(unittest.TestCase):
 
 class WorkflowBlobTests(unittest.TestCase):
     def test_reusable_caller_preserves_binding_and_all_callee_blobs(self) -> None:
-        event, responses = fixture()
+        repositories = {
+            "NVIDIA/yaml-sigil-rs": ("main", "dev/0.6.0", "support/0.5"),
+            "NVIDIA/yaml-sigil-traits": ("main", "dev/0.6.0", "support/0.5"),
+            "NVIDIA/yaml-sigil-spec": ("main", "v2alpha1"),
+        }
         name = "Candidate CI / Candidate CI (Linux)"
-        paths = (".github/workflows/ci-trusted.yml", ".github/workflows/ci-candidate.yml")
-        protected = replace(policy(), job_name=name, workflow_policy_paths=paths)
-        responses[JOBS_PATH]["jobs"][0]["name"] = reporter.attested_job_name(
-            name, POLICY_SHA, "refs/heads/main", POLICY_SHA
+        paths = (
+            ".github/workflows/ci.yml",
+            ".github/workflows/ci-trusted.yml",
+            ".github/workflows/ci-candidate.yml",
         )
-        for path in paths:
-            for sha in (POLICY_SHA, HEAD):
-                responses[("GET", f"{PREFIX}/contents/{path}?ref={sha}")] = {
-                    "type": "file", "path": path, "sha": WORKFLOW_BLOB, "size": 1000
-                }
-        self.assertEqual(reporter.bind_candidate(FakeApi(responses), event, protected).head_sha, HEAD)
-        for path in paths:
-            with self.subTest(path=path):
-                changed = copy.deepcopy(responses)
-                changed[("GET", f"{PREFIX}/contents/{path}?ref={HEAD}")]["sha"] = "d" * 40
-                with self.assertRaisesRegex(reporter.ReporterError, "differs from protected"):
-                    reporter.bind_candidate(FakeApi(changed), event, protected)
+        for repository, branches in repositories.items():
+            for branch in branches:
+                with self.subTest(repository=repository, base=branch):
+                    event, responses = fixture(branch, repository=repository)
+                    prefix = f"repos/{repository}"
+                    base_ref = f"refs/heads/{branch}"
+                    base_sha = POLICY_SHA if branch == "main" else COORDINATION_SHA
+                    protected = replace(
+                        policy(repository), job_name=name, workflow_policy_paths=paths[1:]
+                    )
+                    jobs_path = (
+                        "GET",
+                        f"{prefix}/actions/runs/{RUN_ID}/attempts/{ATTEMPT}/jobs?per_page=100",
+                    )
+                    responses[jobs_path]["jobs"][0]["name"] = reporter.attested_job_name(
+                        name, POLICY_SHA, base_ref, base_sha
+                    )
+                    # Every base authenticates caller and callee blobs against
+                    # protected main, independently of its contribution object.
+                    for path in paths:
+                        for sha in (POLICY_SHA, HEAD):
+                            responses[("GET", f"{prefix}/contents/{path}?ref={sha}")] = {
+                                "type": "file", "path": path,
+                                "sha": WORKFLOW_BLOB, "size": 1000,
+                            }
+                    binding = reporter.bind_candidate(FakeApi(responses), event, protected)
+                    self.assertEqual(binding.head_sha, HEAD)
+                    self.assertEqual(binding.base_ref, base_ref)
+                    self.assertEqual(binding.base_sha, base_sha)
+                    self.assertEqual(
+                        binding.check_name,
+                        "Required CI" if branch == "main" else f"Required CI [{base_ref}]",
+                    )
+                    for path in paths:
+                        with self.subTest(path=path):
+                            changed = copy.deepcopy(responses)
+                            changed[("GET", f"{prefix}/contents/{path}?ref={HEAD}")]["sha"] = "e" * 40
+                            with self.assertRaisesRegex(
+                                reporter.ReporterError, "differs from protected"
+                            ):
+                                reporter.bind_candidate(FakeApi(changed), event, protected)
 
     def test_local_callee_must_match_protected_main(self) -> None:
         event, responses = fixture()
@@ -487,7 +522,7 @@ class BindingTests(unittest.TestCase):
         with self.assertRaisesRegex(reporter.ReporterError, "no protected"):
             reporter.base_policy("NVIDIA/another-repository", "main")
 
-    def test_support_checks_are_exact_and_spec_rejects_support(self) -> None:
+    def test_support_checks_are_exact_and_spec_rejects_rust_bases(self) -> None:
         event, responses = fixture("support/0.5")
         support = bind(event, responses)
         self.assertEqual(support.check_name, "Required CI [refs/heads/support/0.5]")
@@ -501,8 +536,9 @@ class BindingTests(unittest.TestCase):
             for branch in ("support/0", "support/0.5.1", "support/00.5", "support/0.05", "support/1000000000.5"):
                 with self.assertRaises(reporter.ReporterError):
                     reporter.base_policy(repo, branch)
-        with self.assertRaises(reporter.ReporterError):
-            reporter.base_policy("NVIDIA/yaml-sigil-spec", "support/0.5")
+        for branch in ("dev/0.6.0", "support/0.5"):
+            with self.subTest(spec_base=branch), self.assertRaises(reporter.ReporterError):
+                reporter.base_policy("NVIDIA/yaml-sigil-spec", branch)
 
     def test_policy_and_contribution_objects_cannot_be_swapped(self) -> None:
         event, responses = fixture(COORDINATION_BRANCH)

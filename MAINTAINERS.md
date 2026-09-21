@@ -101,7 +101,8 @@ Landing coordination support does not activate a line. Use this procedure only
 for a concrete approved next version, with one separately reviewed repository-
 administrator activation packet and explicit authorization for its exact
 objects and settings. The activation version is an unpublished `rc.0`
-placeholder; release preparation remains main-only.
+placeholder. Prepare releases from `main` or an activated support line, never
+from a coordination ref.
 
 1. Select exactly one unused `dev/MAJOR.MINOR.PATCH` line. Record exact
    current `main`, the full coordination and
@@ -383,6 +384,14 @@ For dependency and tool refreshes, review the resolved Cargo graph and retain
 intentional compatibility-fixture pins. An Action revision and its installed
 tool version are separate inputs; verify both and use the same tool version
 locally. Changes to CI tool inputs require the staging route below.
+
+Keep the shared CI installer revision aligned across all three YamlSigil
+repositories. Retain explicit tool versions, checksum enforcement, and disabled
+fallback. Verify installed dependency-policy tools before candidate
+materialization, and exercise the candidate route after adopting an upgrade.
+
+The release workflow installs release-plz `0.3.169` directly through
+cargo-binstall `1.23.0`. Keep local preparation on the same CLI version.
 
 Choose the test path from the exact reviewed workflow. Ordinary copied-ref
 CI requires `.github/workflows/ci.yml`, `ci-trusted.yml`, and
