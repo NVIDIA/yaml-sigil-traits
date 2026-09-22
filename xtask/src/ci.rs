@@ -1,184 +1,206 @@
 // SPDX-FileCopyrightText: Copyright 2026 NVIDIA CORPORATION & AFFILIATES
 // SPDX-License-Identifier: Apache-2.0
 
-//! Provider-neutral local validation.
+//! Provider-neutral checks for the crate and the isolated developer workspace.
 
 use std::io;
 use std::path::Path;
-use std::process::Command;
 
+use clap::{Args, ValueEnum};
+
+use crate::features::FeatureArgs;
+use crate::process::{self, CommandSpec, Probe};
 use crate::{package_content, release};
 
-const REQUIRED_TOOLS: &[(&str, &str)] = &[
-    (
-        "cargo-machete",
-        "cargo install --locked cargo-machete --version 0.9.2",
-    ),
-    (
-        "cargo-deny",
-        "cargo install --locked cargo-deny --version 0.20.2",
-    ),
-    (
-        "cargo-audit",
-        "cargo +1.98.0 install --locked cargo-audit --version 0.22.2",
-    ),
-];
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct Step {
-    label: &'static str,
-    program: &'static str,
-    args: &'static [&'static str],
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum CheckStep {
+    Markdown,
+    Fmt,
+    PackageContent,
+    Check,
+    Clippy,
+    Test,
+    Machete,
+    Deny,
+    Audit,
 }
 
-const PRE_PACKAGE_STEPS: &[Step] = &[
-    Step {
-        label: "Markdown lint",
-        program: "rumdl",
-        args: &["check", "."],
-    },
-    Step {
-        label: "Rust formatting",
-        program: "cargo",
-        args: &["fmt", "--all", "--check"],
-    },
-    Step {
-        label: "xtask formatting",
-        program: "cargo",
-        args: &[
-            "fmt",
-            "--manifest-path",
-            "xtask/Cargo.toml",
-            "--all",
-            "--check",
-        ],
-    },
+const REGISTRY: &[CheckStep] = &[
+    CheckStep::Markdown,
+    CheckStep::Fmt,
+    CheckStep::PackageContent,
+    CheckStep::Check,
+    CheckStep::Clippy,
+    CheckStep::Test,
+    CheckStep::Machete,
+    CheckStep::Deny,
+    CheckStep::Audit,
 ];
 
-const POST_PACKAGE_STEPS: &[Step] = &[
-    Step {
-        label: "Rust lint",
-        program: "cargo",
-        args: &[
-            "clippy",
-            "--all-targets",
-            "--all-features",
-            "--",
-            "-D",
-            "warnings",
-        ],
-    },
-    Step {
-        label: "xtask lint",
-        program: "cargo",
-        args: &[
-            "clippy",
-            "--locked",
-            "--manifest-path",
-            "xtask/Cargo.toml",
-            "--all-targets",
-            "--all-features",
-            "--",
-            "-D",
-            "warnings",
-        ],
-    },
-    Step {
-        label: "Rust tests",
-        program: "cargo",
-        args: &["test", "--all-features"],
-    },
-    Step {
-        label: "xtask tests",
-        program: "cargo",
-        args: &["test", "--locked", "--manifest-path", "xtask/Cargo.toml"],
-    },
-    Step {
-        label: "Unused Rust dependencies",
-        program: "cargo-machete",
-        args: &["--with-metadata"],
-    },
-    Step {
-        label: "Rust dependency policy",
-        program: "cargo-deny",
-        args: &["check", "bans", "licenses", "sources", "-D", "warnings"],
-    },
-    Step {
-        label: "xtask dependency policy",
-        program: "cargo-deny",
-        args: &[
-            "--manifest-path",
-            "xtask/Cargo.toml",
-            "--locked",
-            "check",
-            "bans",
-            "licenses",
-            "sources",
-            "-D",
-            "warnings",
-        ],
-    },
-    Step {
-        label: "Rust dependency audit",
-        program: "cargo",
-        args: &["audit"],
-    },
-    Step {
-        label: "xtask dependency audit",
-        program: "cargo",
-        args: &["audit", "--file", "xtask/Cargo.lock"],
-    },
-];
+#[derive(Args, Debug, Default)]
+pub(crate) struct CheckArgs {
+    /// Run only these checks, in registry order.
+    #[arg(
+        long,
+        value_delimiter = ',',
+        value_name = "STEP,...",
+        conflicts_with = "exclude"
+    )]
+    pub(crate) only: Vec<CheckStep>,
+    /// Run every check except these.
+    #[arg(long, value_delimiter = ',', value_name = "STEP,...")]
+    pub(crate) exclude: Vec<CheckStep>,
+    #[command(flatten)]
+    pub(crate) features: FeatureArgs,
+}
 
-pub(crate) fn run(root: &Path) -> io::Result<()> {
-    for (program, install) in REQUIRED_TOOLS {
-        require_tool(program, install)?;
+impl CheckArgs {
+    pub(crate) fn selected(&self) -> io::Result<Vec<CheckStep>> {
+        let selected: Vec<_> = REGISTRY
+            .iter()
+            .copied()
+            .filter(|step| self.only.is_empty() || self.only.contains(step))
+            .filter(|step| !self.exclude.contains(step))
+            .collect();
+        if selected.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "selection contains no checks",
+            ));
+        }
+        Ok(selected)
     }
-    for step in PRE_PACKAGE_STEPS {
-        run_step(root, *step)?;
+}
+
+impl CheckStep {
+    fn probes(self) -> Vec<Probe> {
+        match self {
+            Self::Markdown => vec![Probe::tool("rumdl", "cargo install rumdl")],
+            Self::Fmt => vec![Probe::cargo_tool(
+                "rustfmt",
+                "fmt",
+                "rustup component add rustfmt",
+            )],
+            Self::Clippy => vec![Probe::cargo_tool(
+                "Clippy",
+                "clippy",
+                "rustup component add clippy",
+            )],
+            Self::PackageContent | Self::Check | Self::Test => vec![Probe::cargo()],
+            Self::Machete => vec![Probe::tool(
+                "cargo-machete",
+                "cargo install --locked cargo-machete --version 0.9.2",
+            )],
+            Self::Deny => vec![Probe::tool(
+                "cargo-deny",
+                "cargo install --locked cargo-deny --version 0.20.2",
+            )],
+            Self::Audit => vec![
+                Probe::cargo(),
+                Probe::tool(
+                    "cargo-audit",
+                    "cargo +1.98.0 install --locked cargo-audit --version 0.22.2",
+                ),
+            ],
+        }
     }
-    release::check_manifest(root).map_err(io::Error::other)?;
-    package_content::run(root)?;
-    for step in POST_PACKAGE_STEPS {
-        run_step(root, *step)?;
+
+    fn commands(self, features: &FeatureArgs) -> Vec<CommandSpec> {
+        match self {
+            Self::Markdown => vec![CommandSpec::new("rumdl", &["check", "."])],
+            Self::Fmt => vec![
+                CommandSpec::cargo(&["fmt", "--all", "--check"]),
+                CommandSpec::cargo(&[
+                    "fmt",
+                    "--manifest-path",
+                    "xtask/Cargo.toml",
+                    "--all",
+                    "--check",
+                ]),
+            ],
+            Self::Check | Self::Clippy | Self::Test => {
+                let subcommand = match self {
+                    Self::Check => "check",
+                    Self::Clippy => "clippy",
+                    Self::Test => "test",
+                    _ => unreachable!(),
+                };
+                let mut root = CommandSpec::cargo(&[subcommand]);
+                let mut xtask = CommandSpec::cargo(&[
+                    subcommand,
+                    "--locked",
+                    "--manifest-path",
+                    "xtask/Cargo.toml",
+                ]);
+                for command in [&mut root, &mut xtask] {
+                    if self != Self::Test {
+                        command.args.push("--all-targets".into());
+                    }
+                }
+                root.args.extend(features.cargo_args());
+                xtask.args.push("--all-features".into());
+                for command in [&mut root, &mut xtask] {
+                    if self == Self::Clippy {
+                        command
+                            .args
+                            .extend(["--", "-D", "warnings"].map(Into::into));
+                    }
+                }
+                vec![root, xtask]
+            }
+            Self::Machete => vec![CommandSpec::new("cargo-machete", &["--with-metadata"])],
+            Self::Deny => {
+                let mut root = CommandSpec::new("cargo-deny", &[]);
+                root.args.extend(features.cargo_args());
+                root.args.extend(
+                    ["check", "bans", "licenses", "sources", "-D", "warnings"].map(Into::into),
+                );
+                vec![
+                    root,
+                    CommandSpec::new(
+                        "cargo-deny",
+                        &[
+                            "--manifest-path",
+                            "xtask/Cargo.toml",
+                            "--locked",
+                            "--all-features",
+                            "check",
+                            "bans",
+                            "licenses",
+                            "sources",
+                            "-D",
+                            "warnings",
+                        ],
+                    ),
+                ]
+            }
+            Self::Audit => vec![
+                CommandSpec::cargo(&["audit"]),
+                CommandSpec::cargo(&["audit", "--file", "xtask/Cargo.lock"]),
+            ],
+            Self::PackageContent => Vec::new(),
+        }
+    }
+}
+
+pub(crate) fn run(root: &Path, args: &CheckArgs) -> io::Result<()> {
+    let selected = args.selected()?;
+    process::require_unique(root, selected.iter().flat_map(|step| step.probes()))?;
+    for step in selected {
+        if step == CheckStep::PackageContent {
+            release::check_manifest(root).map_err(io::Error::other)?;
+            package_content::run(root)?;
+        }
+        if step == CheckStep::Audit && !root.join("Cargo.lock").try_exists()? {
+            // The public library deliberately has no committed lockfile. A
+            // standalone audit needs the same resolved graph as a normal build.
+            CommandSpec::cargo(&["generate-lockfile"]).run(root)?;
+        }
+        for command in step.commands(&args.features) {
+            command.run(root)?;
+        }
     }
     Ok(())
-}
-
-fn require_tool(program: &str, install: &str) -> io::Result<()> {
-    match Command::new(program).arg("--version").status() {
-        Ok(status) if status.success() => Ok(()),
-        Ok(status) => Err(io::Error::other(format!(
-            "{program} --version failed with {status}; install with `{install}`"
-        ))),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("{program} is required; install with `{install}`"),
-        )),
-        Err(error) => Err(error),
-    }
-}
-
-fn run_step(root: &Path, step: Step) -> io::Result<()> {
-    eprintln!(
-        "+ {} {} (cwd {})",
-        step.program,
-        step.args.join(" "),
-        root.display()
-    );
-    let status = Command::new(step.program)
-        .args(step.args)
-        .current_dir(root)
-        .status()
-        .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", step.label)))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(io::Error::other(format!(
-            "{} failed with {status}",
-            step.label
-        )))
-    }
 }
 
 #[cfg(test)]
@@ -186,24 +208,87 @@ mod tests {
     use super::*;
 
     #[test]
-    fn complete_sequence_keeps_release_mutation_out() {
-        let commands: Vec<_> = PRE_PACKAGE_STEPS
-            .iter()
-            .chain(POST_PACKAGE_STEPS)
-            .map(|step| {
-                std::iter::once(step.program)
-                    .chain(step.args.iter().copied())
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            })
-            .collect();
+    fn selection_is_deduplicated_and_ordered() {
+        assert_eq!(CheckArgs::default().selected().unwrap(), REGISTRY);
+        let args = CheckArgs {
+            only: vec![CheckStep::Test, CheckStep::Fmt, CheckStep::Test],
+            ..CheckArgs::default()
+        };
+        assert_eq!(args.selected().unwrap(), [CheckStep::Fmt, CheckStep::Test]);
         assert!(
-            commands
-                .iter()
-                .any(|line| line == "cargo test --all-features")
+            CheckArgs {
+                exclude: REGISTRY.to_vec(),
+                ..CheckArgs::default()
+            }
+            .selected()
+            .is_err()
         );
-        assert!(commands.iter().any(|line| line == "cargo audit"));
-        assert!(commands.iter().all(|line| !line.contains("publish")));
-        assert!(commands.iter().all(|line| !line.contains("release-plz")));
+    }
+
+    #[test]
+    fn both_workspaces_keep_their_lockfile_and_feature_policy() {
+        let features = FeatureArgs {
+            features: vec!["product-feature".into()],
+            no_default_features: true,
+            ..FeatureArgs::default()
+        };
+        for step in [
+            CheckStep::Check,
+            CheckStep::Clippy,
+            CheckStep::Test,
+            CheckStep::Deny,
+        ] {
+            let commands = step.commands(&features);
+            assert_eq!(commands.len(), 2);
+            assert!(!commands[0].args.contains(&"--locked".into()));
+            assert!(commands[1].args.contains(&"--locked".into()));
+            assert!(commands[1].args.contains(&"xtask/Cargo.toml".into()));
+            assert!(commands[0].args.contains(&"--no-default-features".into()));
+            assert!(commands[0].args.contains(&"product-feature".into()));
+            assert!(!commands[0].args.contains(&"--all-features".into()));
+            assert!(commands[1].args.contains(&"--all-features".into()));
+            assert!(!commands[1].args.contains(&"product-feature".into()));
+            assert!(!commands[1].args.contains(&"--no-default-features".into()));
+        }
+        for command in CheckStep::Fmt.commands(&features) {
+            assert!(!command.args.contains(&"--no-default-features".into()));
+        }
+    }
+
+    #[test]
+    fn default_checks_preserve_both_dependency_graphs_and_denied_warnings() {
+        assert_eq!(CheckStep::Deny.commands(&FeatureArgs::default()).len(), 2);
+        let audits = CheckStep::Audit.commands(&FeatureArgs::default());
+        assert_eq!(audits[0].args, ["audit"]);
+        assert_eq!(audits[1].args, ["audit", "--file", "xtask/Cargo.lock"]);
+        for command in CheckStep::Clippy.commands(&FeatureArgs::default()) {
+            assert!(command.args.contains(&"--all-targets".into()));
+            assert!(command.args.contains(&"--all-features".into()));
+            assert!(
+                command
+                    .args
+                    .ends_with(&["--".into(), "-D".into(), "warnings".into()])
+            );
+        }
+        assert_eq!(
+            CheckStep::Machete.commands(&FeatureArgs::default())[0].program,
+            "cargo-machete"
+        );
+    }
+
+    #[test]
+    fn narrow_checks_do_not_require_unselected_tools() {
+        let args = CheckArgs {
+            only: vec![CheckStep::Fmt],
+            ..CheckArgs::default()
+        };
+        let probes: Vec<_> = args
+            .selected()
+            .unwrap()
+            .into_iter()
+            .flat_map(CheckStep::probes)
+            .collect();
+        assert_eq!(probes.len(), 1);
+        assert_eq!(probes[0].name, "rustfmt");
     }
 }

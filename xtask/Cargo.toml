@@ -10,7 +10,7 @@ edition = "2024"
 rust-version = "1.95"
 publish = false
 # Keep the developer tool's target inventory explicit; only the declared
-# binary below participates in validation.
+# library and binary below participate in validation.
 autobenches = false
 autobins = false
 autoexamples = false
@@ -20,13 +20,16 @@ build = false
 license = "Apache-2.0"
 description = "Developer-only tasks for yaml-sigil-traits."
 
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
 name = "xtask"
 path = "src/main.rs"
 
 [dependencies]
 cargo_metadata = { version = "=0.23.1", default-features = false }
-clap = { version = "4.6", features = ["derive"] }
+clap = { version = "4.6.7", features = ["derive"] }
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 semver = "1.0"
 serde = { version = "1.0", features = ["derive"] }
@@ -46,8 +49,11 @@ windows-sys = { version = "=0.61.2", features = [
   "Win32_Foundation",
   "Win32_Security",
   "Win32_Storage_FileSystem",
+  "Win32_System_Com",
   "Win32_System_Diagnostics_ToolHelp",
   "Win32_System_IO",
   "Win32_System_JobObjects",
   "Win32_System_Threading",
+  "Win32_UI_Shell",
+  "Win32_UI_WindowsAndMessaging",
 ] }

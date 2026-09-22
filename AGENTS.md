@@ -215,8 +215,18 @@ review.
 Run the complete non-release CI validation sequence from the repository root:
 
 ```shell
-cargo xtask ci
+cargo xtask check
 ```
+
+`ci` is a visible alias for `check`. Both accept `--only=STEP,...` or
+`--exclude=STEP,...`, run selected steps in registry order, and fail at the
+first error. Unknown, empty, and conflicting selections are errors. For
+example, use `cargo xtask check --only=fmt,clippy,test` during development.
+
+The public crate defaults to all features. Pass `--features=FEATURE,...` and
+optionally `--no-default-features` to choose another feature set;
+`--all-features` conflicts with either explicit option. The isolated xtask
+workspace always receives its own all-feature checks with `--locked`.
 
 Prepare and validate a locally owned release transaction with the exact
 maintainer-selected version:
@@ -238,20 +248,23 @@ policy. It is credential-free and does not run `release-plz release`. Follow
 `RELEASING.md` for the separate maintainer-operated exact-head dry run. These
 xtask commands do not publish or use credentials.
 
-The command runs these checks in order:
+`check` runs these commands in order. Before the package-content comparison,
+it also validates the manifest's release policy without changing files.
 
 ```shell
 rumdl check .
 cargo fmt --all --check
 cargo fmt --manifest-path xtask/Cargo.toml --all --check
 cargo package --list --allow-dirty --exclude-lockfile --package yaml-sigil-traits
+cargo check --all-targets --all-features
+cargo check --locked --manifest-path xtask/Cargo.toml --all-targets --all-features
 cargo clippy --all-targets --all-features -- -D warnings
 cargo clippy --locked --manifest-path xtask/Cargo.toml --all-targets --all-features -- -D warnings
 cargo test --all-features
-cargo test --locked --manifest-path xtask/Cargo.toml
+cargo test --locked --manifest-path xtask/Cargo.toml --all-features
 cargo-machete --with-metadata
-cargo deny check bans licenses sources -D warnings
-cargo deny --manifest-path xtask/Cargo.toml --locked check bans licenses sources -D warnings
+cargo-deny --all-features check bans licenses sources -D warnings
+cargo-deny --manifest-path xtask/Cargo.toml --locked --all-features check bans licenses sources -D warnings
 cargo audit
 cargo audit --file xtask/Cargo.lock
 ```
@@ -280,11 +293,22 @@ hosted CI. The
 names across all features, but remains an unused-dependency heuristic; retain
 the all-target, all-feature Clippy and test checks as the compilation proof.
 
-Treat `cargo xtask ci` as the provider-neutral local validation entry point.
+Treat `cargo xtask check` as the provider-neutral local validation entry point.
 Keep its command plan and this exact-command documentation aligned. Do not make
 the xtask parse, include, or test configuration owned by a hosted CI provider.
 Validate provider-specific workflow syntax and policy with provider-appropriate
 tooling instead.
+
+Use `cargo xtask coverage` for public-crate coverage and
+`cargo xtask coverage-open` to generate and open a fresh report. Both support
+LLVM and Tarpaulin engines; read `xtask/AGENTS.md` for prerequisites, report
+paths, and platform behavior. This library has no image, profiling workload,
+or MCP commands.
+
+Prefer typed xtasks for Cargo-aware, cross-platform development orchestration.
+Before migrating an overlapping Python helper, inspect its callers and propose
+the change. Obtain approval before replacing a mature helper or its callers.
+Keep Python when its API, data-processing, or testing libraries fit the task.
 
 The only permitted provider-specific xtask namespace is
 `cargo xtask github`. Keep it limited to typed, repository-owned GitHub
@@ -306,7 +330,7 @@ Within GitHub Actions, bind repository selection to GitHub's default
 with compiled repository and package policy. Do not use the mutable `CI`
 variable as a trust switch. The GitHub release commands are workflow-only.
 
-`cargo xtask ci` and every non-`github` command must remain provider-neutral
+`cargo xtask check` and every non-`github` command must remain provider-neutral
 and credential-free.
 
 Python is permitted here only for the pre-checkout candidate binder, the
@@ -351,10 +375,13 @@ Release qualification and deterministic release-object reconciliation belong
 in the two typed `cargo xtask github release` commands, not in additional
 Python or shell helpers.
 
-Hosted CI should expose equivalent validation commands as independent steps
-where practical. It may also add provider-specific policy checks that do not
-belong in the local command sequence. Document intentional differences between
-hosted and local validation.
+Hosted trusted Rust validation uses `check --exclude=markdown`; a separate
+policy job owns Markdown and provider checks. Trusted macOS and Windows jobs
+select `fmt,package-content,check,clippy,test`. Candidate validation keeps fixed
+tool paths and Cargo overrides in its terminal phase, with equivalent direct
+Rust commands. Dependency and policy checks run before candidate execution.
+The independent MSRV lane runs only crate and xtask tests. Keep these workflow
+mappings aligned by review; the xtask must not inspect workflow declarations.
 
 Hosted CI runs authoritative Rust `1.98.0` and an independent Rust `1.95.0`
 lane on NVIDIA Linux runners. GitHub-hosted macOS and Windows jobs are
@@ -387,7 +414,7 @@ shellcheck .github/scripts/check-pull-request-commits.sh
 ```
 
 Hosted CI runs its pinned ShellCheck Action for these provider-specific scripts.
-Keep this validation outside `cargo xtask ci`.
+Keep this validation outside `cargo xtask check`.
 
 Treat every hosted Action `uses:` pin update as a potential
 validation-behavior change. Compare the current and candidate immutable SHAs,

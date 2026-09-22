@@ -125,17 +125,43 @@ The development toolchain follows Rust `stable` through
 `1.95.0`, as declared in `Cargo.toml`.
 
 ```shell
-cargo xtask ci
+cargo xtask check
 cargo package
 ```
 
-`cargo xtask ci` also checks Markdown, the standalone xtask workspace, and
-dependency advisories. The GitHub Actions workflow runs the same validation as
-independent steps. `cargo package` performs separate local package assembly and
+`cargo xtask check` validates Markdown, formatting, package contents, Rust
+compilation, Clippy, tests, and both workspaces' dependencies. `cargo xtask ci`
+is an alias for the same command. Run a subset with
+`cargo xtask check --only=fmt,clippy,test`, or omit checks with
+`--exclude=STEP,...`. Checks run in registry order and stop at the first error.
+
+Checks use all public-crate features by default. `--features=FEATURE,...` and
+`--no-default-features` select a different set without changing the standalone
+xtask workspace's validation. The public crate has no optional features today.
+The GitHub Actions workflows use the same Rust checks, with separate
+provider-policy and MSRV lanes.
+
+`cargo package` performs separate local package assembly and
 verification without uploading anything; it is not part of the non-release CI
 sequence. Cargo rejects uncommitted changes to packaged files. Use
 `cargo package --allow-dirty` for pre-commit validation, then rerun
 `cargo package` after committing.
+
+Generate public-crate coverage with either engine:
+
+```shell
+cargo xtask coverage
+cargo xtask coverage --engine=tarpaulin
+cargo xtask coverage-open
+```
+
+Install `cargo-llvm-cov` and the `llvm-tools-preview` Rust component for the
+default engine, or `cargo-tarpaulin` for Tarpaulin. Reports appear at
+`target/coverage/llvm-cov/html/index.html` and
+`target/coverage/tarpaulin/tarpaulin-report.html`. `coverage --open` and
+`coverage-open` both generate a fresh report before opening it, and accept the
+same engine and feature options. Coverage covers library and integration tests;
+the regular check command also runs doctests.
 
 ## Publishing
 
