@@ -123,11 +123,11 @@ a proposed specification update for impact on this crate.
 6. Run the crate quality loop:
 
    ```shell
-   cargo xtask ci
+   cargo xtask check
    cargo package --allow-dirty
    ```
 
-   `cargo xtask ci` is the complete non-release validation gate. Keep the
+   `cargo xtask check` is the complete non-release validation gate. Keep the
    package assembly and verification step separate because CI does not package
    or publish artifacts. The pre-commit package check needs `--allow-dirty`
    because this workflow leaves the reviewed update uncommitted. When the task

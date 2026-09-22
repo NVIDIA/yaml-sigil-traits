@@ -108,46 +108,9 @@ jobs:
           cache-targets: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Check formatting
-        run: cargo fmt --all --check
-
-      - name: Check xtask formatting
-        run: cargo fmt --manifest-path xtask/Cargo.toml --all --check
-
-      # Compare Cargo's source list with the committed source-package inventory.
-      - name: Check package contents
-        run: cargo xtask package-content
-
-      - name: Lint crate
-        run: cargo clippy --all-targets --all-features -- -D warnings
-
-      - name: Lint xtask
-        run: >-
-          cargo clippy --locked --manifest-path xtask/Cargo.toml
-          --all-targets --all-features -- -D warnings
-
-      - name: Test crate
-        run: cargo test --all-features
-
-      - name: Test xtask
-        run: cargo test --locked --manifest-path xtask/Cargo.toml
-
-      - name: Check unused dependencies
-        run: cargo-machete --with-metadata
-
-      - name: Check crate dependency policy
-        run: cargo deny check bans licenses sources -D warnings
-
-      - name: Check xtask dependency policy
-        run: >-
-          cargo deny --manifest-path xtask/Cargo.toml --locked
-          check bans licenses sources -D warnings
-
-      - name: Audit crate dependencies
-        run: cargo audit
-
-      - name: Audit xtask dependencies
-        run: cargo audit --file xtask/Cargo.lock
+      # Markdown and provider-specific policy checks run in trusted_policy.
+      - name: Run Rust validation
+        run: cargo xtask check --exclude=markdown
 
   trusted_msrv:
     name: Rust 1.95.0 (Linux)
@@ -230,25 +193,5 @@ jobs:
           components: clippy, rustfmt
           toolchain: 1.98.0
 
-      - name: Check formatting
-        run: cargo fmt --all --check
-
-      - name: Check xtask formatting
-        run: cargo fmt --manifest-path xtask/Cargo.toml --all --check
-
-      - name: Check package contents
-        run: cargo xtask package-content
-
-      - name: Lint crate
-        run: cargo clippy --all-targets --all-features -- -D warnings
-
-      - name: Lint xtask
-        run: >-
-          cargo clippy --locked --manifest-path xtask/Cargo.toml
-          --all-targets --all-features -- -D warnings
-
-      - name: Test crate
-        run: cargo test --all-features
-
-      - name: Test xtask
-        run: cargo test --locked --manifest-path xtask/Cargo.toml
+      - name: Run portable Rust validation
+        run: cargo xtask check --only=fmt,package-content,check,clippy,test

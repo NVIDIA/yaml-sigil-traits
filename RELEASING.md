@@ -45,7 +45,7 @@ git switch --create "release-plz-manual-${version}" "origin/${base_branch}"
 cargo xtask release prepare --base-ref "${base_ref}" --version "${version}"
 git diff --check
 git diff -- CHANGELOG.md Cargo.toml
-cargo xtask ci
+cargo xtask check
 ```
 
 Stop if the diff contains anything except `CHANGELOG.md` and `Cargo.toml`, or

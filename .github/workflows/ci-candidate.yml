@@ -371,7 +371,7 @@ jobs:
           RUSTC: ${{ steps.fixed_tools.outputs.rustc }}
           RUSTDOC: ${{ steps.fixed_tools.outputs.rustdoc }}
         run: >-
-          "${POLICY_BIN}/cargo-deny" check bans licenses sources -D warnings
+          "${POLICY_BIN}/cargo-deny" --all-features check bans licenses sources -D warnings
         working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/source
 
       - name: Check xtask dependency policy
@@ -381,7 +381,7 @@ jobs:
           RUSTC: ${{ steps.fixed_tools.outputs.rustc }}
           RUSTDOC: ${{ steps.fixed_tools.outputs.rustdoc }}
         run: >-
-          "${POLICY_BIN}/cargo-deny" --manifest-path xtask/Cargo.toml --locked
+          "${POLICY_BIN}/cargo-deny" --manifest-path xtask/Cargo.toml --locked --all-features
           check bans licenses sources -D warnings
         working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/source
 
@@ -400,6 +400,8 @@ jobs:
       # This is the only candidate-executable phase. It uses paths selected
       # before materialization, bypasses Cargo aliases and wrappers, and is the
       # final step so GITHUB_ENV/GITHUB_PATH writes have no later consumer.
+      # Keep direct commands aligned with xtask checks while retaining the
+      # fixed tool paths and Cargo overrides at this boundary.
       - name: Execute candidate validation (terminal)
         env:
           FIXED_CARGO: ${{ steps.fixed_tools.outputs.cargo }}
@@ -442,6 +444,9 @@ jobs:
             fi
             "${FIXED_CARGO}" "${cargo_config[@]}" run --locked \
               --manifest-path xtask/Cargo.toml -- package-content
+            "${FIXED_CARGO}" "${cargo_config[@]}" check --all-targets --all-features
+            "${FIXED_CARGO}" "${cargo_config[@]}" check --locked \
+              --manifest-path xtask/Cargo.toml --all-targets --all-features
             "${FIXED_CARGO_CLIPPY}" clippy "${cargo_config[@]}" \
               --all-targets --all-features -- -D warnings
             "${FIXED_CARGO_CLIPPY}" clippy "${cargo_config[@]}" --locked \
@@ -449,7 +454,7 @@ jobs:
               --all-targets --all-features -- -D warnings
             "${FIXED_CARGO}" "${cargo_config[@]}" test --all-features
             "${FIXED_CARGO}" "${cargo_config[@]}" test --locked \
-              --manifest-path xtask/Cargo.toml
+              --manifest-path xtask/Cargo.toml --all-features
             "${FIXED_PYTHON}" -m py_compile \
               .github/scripts/bind-candidate-pr.py \
               .github/scripts/report_required_ci.py \
@@ -689,12 +694,21 @@ jobs:
             --config 'build.rustc-workspace-wrapper=""'
           )
           "${FIXED_RUSTUP}" run 1.98.0 cargo-fmt fmt --all --check
+          "${FIXED_RUSTUP}" run 1.98.0 cargo-fmt fmt \
+            --manifest-path xtask/Cargo.toml --all --check
           "${FIXED_RUSTUP}" run 1.98.0 cargo "${cargo_config[@]}" run --locked \
             --manifest-path xtask/Cargo.toml -- package-content
+          "${FIXED_RUSTUP}" run 1.98.0 cargo "${cargo_config[@]}" check \
+            --all-targets --all-features
+          "${FIXED_RUSTUP}" run 1.98.0 cargo "${cargo_config[@]}" check --locked \
+            --manifest-path xtask/Cargo.toml --all-targets --all-features
           "${FIXED_RUSTUP}" run 1.98.0 cargo-clippy clippy \
             "${cargo_config[@]}" --all-targets --all-features -- -D warnings
+          "${FIXED_RUSTUP}" run 1.98.0 cargo-clippy clippy \
+            "${cargo_config[@]}" --locked --manifest-path xtask/Cargo.toml \
+            --all-targets --all-features -- -D warnings
           "${FIXED_RUSTUP}" run 1.98.0 cargo "${cargo_config[@]}" \
             test --all-features
           "${FIXED_RUSTUP}" run 1.98.0 cargo "${cargo_config[@]}" test --locked \
-            --manifest-path xtask/Cargo.toml
+            --manifest-path xtask/Cargo.toml --all-features
         working-directory: ${{ runner.temp }}/yaml-sigil-candidate-state/source
