@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1-rc.1](https://github.com/NVIDIA/yaml-sigil-traits/compare/v0.4.0...v0.4.1-rc.1) - 2026-09-22
+
+### Changed
+
+- Clarify signing and transcription documentation and contributor guidance.
+- Update repository CI and source-release automation, including support-line
+  handling, release-candidate progression, and release-plz 0.3.169.
+
+Public traits, data types, runtime behavior, dependencies, and the minimum
+supported Rust version remain unchanged from 0.4.0.
+
 ## [0.4.0](https://github.com/NVIDIA/yaml-sigil-traits/compare/v0.4.0-rc.3...v0.4.0) - 2026-09-06
 
 ### Fixed
