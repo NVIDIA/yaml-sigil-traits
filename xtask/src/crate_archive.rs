@@ -608,7 +608,7 @@ fn cargo_archive_metadata(header: &tar::Header, package: &str) -> Result<Archive
         ));
     }
     // The GNU tar header stores the raw type flag at byte 156. Cargo 1.95
-    // emits the canonical ASCII `0` regular-file spelling, not the NUL alias.
+    // emits the canonical ASCII `0` regular-file spelling. Reject the NUL alias.
     let entry_type = header.as_bytes()[GNU_TYPEFLAG_OFFSET];
     if entry_type != tar::EntryType::file().as_byte() {
         return Err(format!(

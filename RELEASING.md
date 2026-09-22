@@ -173,10 +173,9 @@ Every release job retains two distinct checkouts: `policy` from protected
 current `main`, and `release-source` at the qualified source SHA. Only `policy`
 compiles the typed release command. `qualify` and both `finalize` phases receive
 `--source-root` explicitly and reject identical, nested, dirty, or incorrectly
-bound checkouts. Source remains data even during historical recovery. The
-policy checkout must still match the workflow's main SHA; a changed main
-requires a fresh dispatch. Existing original-run and registry checks remain
-required.
+bound checkouts. Treat source as data, including during historical recovery.
+The policy checkout must match the workflow's main SHA; a changed main
+requires a fresh dispatch. Require the original-run and registry checks.
 
 The `validate` workflow dispatch checks the protected current-main release
 policy and makes every mutation job skip. It has no OIDC, App token, or
@@ -482,7 +481,7 @@ All dispatches execute on main and share repository-wide publication
 serialization. `validate` skips mutation jobs. `release` requires the current
 support tip and current policy equality; `recover` proves the original source's
 historical inventory and continued protected lineage. Every later job carries
-the qualified base, source, version, and fresh/recovery operation. The existing
+the qualified base, source, version, and fresh/recovery operation. The
 main-only environments, OIDC scope, App token scope, and approval boundaries
 also apply to support. Never rerun an old approval to avoid a fresh dispatch.
 
@@ -497,8 +496,8 @@ uses the patch after the last stable release, and advances an existing RC by
 one ordinal or promotes that patch to stable. Duplicate versions, skipped
 patches, `rc.0`, and build metadata are rejected during preparation.
 
-Preparation continues to use release-plz 0.3.169 for version and changelog
-changes. Activation and publication require separate authorization. Read
+Use release-plz 0.3.169 to prepare version and changelog changes.
+Activation and publication require separate authorization. Read
 [the maintainer procedure](MAINTAINERS.md#support-readiness-commands) for the
 read-only activation proposal and remaining activation boundary.
 
@@ -514,7 +513,7 @@ advances it. The decision precedes the write and is verified through the
 If Latest moves between qualification and creation, stop and requalify. If
 readback differs from the intended outcome, inspect the exact existing tags,
 Releases, and Latest selection before retrying. Never recreate an immutable
-Release to change its Latest status. Publication remains serialized across
+Release to change its Latest status. Publication is serialized across
 the repository.
 
 ## Source provenance before release authority
@@ -537,14 +536,11 @@ publication. Support uses its exact `refs/heads/support/M.N` base and reviewed
 `.github/support-lines/M.N.json` inventory. Recovery checks the source's
 historical inventory against its recorded main commit, retains the fixed
 activation anchor, and requires that source to remain on the protected support
-lineage. Main recovery continues to validate its original push run. Support
-run IDs are audit context, not source proof.
+lineage. Main recovery validates its original push run. Use support run IDs
+for audit context; source proof comes from the published source and its lineage.
 
-Do not recover a version with no published crate. For the four-crate workspace,
-only an ordered nonempty publication prefix without tags or Releases may
-resume publishing. Once all crates are public, recovery may complete missing
-forge objects while verifying every existing object. The single-crate traits
-case requires its crate to be published before recovery. Any inconsistent
-partial state fails closed. Follow
+Recovery requires the `yaml-sigil-traits` crate to be published. It may complete
+missing forge objects after verifying the published archive and every existing
+object. Inconsistent partial state fails closed. Follow
 [the provenance runbook](MAINTAINERS.md#maintain-support-provenance-and-recover-an-interrupted-release)
 for reviewed inventory updates and fresh approvals.

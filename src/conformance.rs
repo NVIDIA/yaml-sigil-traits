@@ -3,36 +3,34 @@
 
 //! Portable conformance and capability vocabulary shared by the public trait DTOs.
 //!
-//! Build-specific policy defaults and YAML-backend helpers live in
-//! `yaml-sigil-core`; this module owns only the protobuf/YAML-backend-free
-//! enum vocabulary needed by downstream trait implementations.
+//! Implementations advertise these policies through capability DTOs. They
+//! own the parser backends and policy defaults; this module defines the enum
+//! vocabulary without depending on a YAML or protobuf backend.
 
-/// Duplicate keys in the signature-document YAML mapping (e.g. two `alg:` keys).
+/// Policy for duplicate keys in a signature-document YAML mapping, such as two `alg:` keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum YamlSignatureDocumentDuplicateKeyPolicy {
-    /// With every optional YAML backend enabled in CI (`cargo test --all-features`),
-    /// parsing the signature document returns an error whose message contains
-    /// `"duplicate"`.
+    /// The parser rejects duplicate signature-document keys with an error
+    /// message containing `"duplicate"`.
     RejectedAtParse,
 }
 
 /// Unknown top-level keys in the signature-document mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum YamlSignatureDocumentUnknownFieldPolicy {
-    /// Default: serde without `deny_unknown_fields`; extra keys are dropped at parse.
+    /// The parser drops unknown keys.
     IgnoredAtParse,
-    /// Parse-time rejection, e.g. when `yaml-sigil-core` enables
-    /// `yaml-strict-unknown-fields`.
+    /// The parser rejects unknown keys.
     RejectedAtParse,
-    /// Verify-time rejection after enumerating signature-document keys.
+    /// The verifier rejects unknown keys after enumerating the signature document.
     RejectedAtVerify,
 }
 
-/// How protobuf `SignedYamlArtifact` wire bytes are decoded in this workspace.
+/// Advertised decoding behavior for protobuf `SignedYamlArtifact` wire bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProtobufWireDecodeAdvertisement {
-    /// Stock **buffa** or **prost** generated `decode`; no custom decoder and no Strict / Permissive /
-    /// SignatureStrict profile flag.
+    /// Use a stock generated `buffa` or `prost` decoder without a
+    /// Strict, Permissive, or SignatureStrict profile flag.
     UnprofiledStockDecoder,
 }
 
@@ -41,6 +39,7 @@ pub enum ProtobufWireDecodeAdvertisement {
 pub enum OuterConformance {
     /// Reject unknown outer fields and duplicate outer `payload` / `signature`.
     Strict,
-    /// Reject duplicate outer `signature`; permissive on other outer unknowns; last-wins `payload`.
+    /// Reject duplicate outer `signature` fields, accept unknown outer fields,
+    /// and use the last outer `payload` value.
     SignatureStrict,
 }

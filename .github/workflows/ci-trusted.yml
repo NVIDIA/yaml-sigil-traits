@@ -44,7 +44,6 @@ jobs:
       - name: Lint GitHub Actions workflows
         uses: devops-actions/actionlint@ec02b36684b2f574f1d219ad0a43b082e46bf3e4 # v0.1.13 (actionlint v1.7.12)
 
-      # This section would benefit by a change to the action allowlist
       - name: Lint shell scripts
         uses: ludeeus/action-shellcheck@00cae500b08a931fb5698e11e79bfbd38e612a38 # 2.0.0
         with:

@@ -69,9 +69,9 @@ pub fn sign_with<S: Signer>(
 }
 ```
 
-Use the async traits through generic bounds. The async traits use native
-AFIT/RPITIT with explicit `+ Send` returned-future bounds and `Send + Sync`
-super-bounds, so they are intentionally not object-safe.
+Use the async traits through generic bounds. Their native `impl Future`
+returns have `Send` bounds, and implementations must be `Send + Sync`.
+The async traits are not object-safe.
 
 ```rust
 use yaml_sigil_traits::verification::{
@@ -92,7 +92,7 @@ pub async fn verify_with<V: AsyncVerifier>(
 ```
 
 `PublicKeys` carries caller-supplied verification keys indexed by algorithm.
-The artifact's unsigned `keyid` remains a deployment-specific lookup hint.
+The artifact's unsigned `keyid` is a deployment-specific lookup hint.
 Concrete implementation crates own key parsing and may narrow behavior, such
 as requiring a configured trust store. Document those narrowings in the
 implementation crate.

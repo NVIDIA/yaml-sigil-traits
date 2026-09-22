@@ -1,25 +1,23 @@
 // SPDX-FileCopyrightText: Copyright 2026 NVIDIA CORPORATION & AFFILIATES
 // SPDX-License-Identifier: Apache-2.0
 
-//! Shared trait + DTO surface for the YamlSigil v1alpha1 APIs.
+//! Shared Rust traits and data types for the YamlSigil v1alpha1 APIs.
 //!
-//! Houses the synchronous + async extension-trait pairs and the
-//! request/response/error/capability DTOs their method signatures reference:
+//! Use the synchronous or async traits with their request, response, error,
+//! and capability types:
 //!
 //! - [`signing::Signer`] / [`signing::AsyncSigner`]
 //! - [`transcription::Transcriber`] / [`transcription::AsyncTranscriber`]
 //! - [`verification::Verifier`] / [`verification::AsyncVerifier`]
 //!
-//! The free-function implementations and the `Default*` ZSTs live in the three
-//! API crates (`yaml-sigil-signing`, `yaml-sigil-transcription`,
-//! `yaml-sigil-verification`), which depend on this crate and re-export these
-//! items so existing import paths (e.g. `yaml_sigil_signing::Signer`) keep
-//! working.
+//! Implementation crates own free-function APIs, default zero-sized types,
+//! parsing, and cryptography. The `yaml-sigil-signing`,
+//! `yaml-sigil-transcription`, and `yaml-sigil-verification` crates depend on
+//! this crate and re-export its traits and data types.
 //!
-//! The async traits use native AFIT/RPITIT with explicit `+ Send` bounds and
-//! `Send + Sync` super-bounds (no `async-trait`), so they are not object-safe —
-//! use generic bounds (`<S: AsyncSigner>`), not `&dyn AsyncSigner`. See
-//! this repository's `AGENTS.md`.
+//! Async traits return native `impl Future` values with `Send` bounds and
+//! require `Send + Sync` implementations. Use generic bounds such as
+//! `<S: AsyncSigner>`; these traits are not object-safe.
 
 pub mod algorithm;
 pub mod conformance;

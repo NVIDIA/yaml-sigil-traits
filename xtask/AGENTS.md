@@ -130,7 +130,7 @@ and both coverage engines when changing their command plans. Unit tests must
 cover selector and feature behavior, both workspace policies, prerequisite
 diagnostics, and generation-before-opening without requiring a browser.
 
-The existing release commands may compare reviewed path names and opaque Git
+The release commands may compare reviewed path names and opaque Git
 blob identities across exact commits solely to prove release-policy provenance.
 This narrow exception permits no workflow-content parsing, semantic validation,
 provider-policy snapshots, or general workflow checks. Keep the required path
