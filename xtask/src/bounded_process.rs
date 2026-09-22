@@ -190,11 +190,10 @@ mod platform {
                 let adopted = direct_children()?
                     .difference(&self.baseline)
                     .copied()
-                    // The test harness and a future concurrent caller may
-                    // have unrelated direct children in the caller's process
-                    // group. Descendants launched by this module begin in a
-                    // dedicated group; a setsid escape necessarily has a
-                    // different group too. Leave unrelated children alone.
+                    // Concurrent callers and tests can own direct children
+                    // in the caller's process group. This module launches
+                    // descendants in a separate group; a setsid descendant
+                    // also has a different group. Leave unrelated children alone.
                     .filter(|raw| {
                         Pid::from_raw(*raw).is_some_and(|pid| {
                             getpgid(Some(pid)).is_ok_and(|group| group != self.caller_group)

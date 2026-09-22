@@ -52,9 +52,8 @@ a proposed specification update for impact on this crate.
    git -C source-spec checkout --detach "$new_spec"
    ```
 
-3. Review the spec delta that can affect trait vocabulary. Treat this as a
-   starting point, not a closed list. First inspect the full repository diff
-   stat so unlisted spec files are not missed:
+3. Review the spec delta that can affect trait vocabulary. First inspect the
+   full repository diff stat to identify all changed files:
 
    ```shell
    git -C source-spec diff --stat "$old_spec..$new_spec"

@@ -3,11 +3,10 @@
 
 //! Canonical algorithm identifiers and YAML `alg:` string mapping.
 //!
-//! Per the `yaml-sigil-spec` README "The Signature Document": YAML `alg:` and
-//! JSON Schema use the unprefixed canonical names;
-//! the protobuf `Algorithm` enum uses Buf-prefixed constants
-//! (`ALGORITHM_…_…`). This module keeps the portable, protobuf-crate-free
-//! contract identifier. Protobuf enum conversions live in `yaml-sigil-core`.
+//! YAML `alg` values and JSON Schema use unprefixed canonical names. The
+//! protobuf `Algorithm` enum uses Buf-prefixed constants (`ALGORITHM_…_…`).
+//! This module defines portable identifiers without a protobuf dependency.
+//! `yaml-sigil-core` converts between these identifiers and protobuf enums.
 //!
 //! The identifiers refer to Ed25519 as specified by RFC 8032 and to P-256
 //! domain parameters from *Standards for Efficient Cryptography 2 (SEC 2)*.
@@ -15,7 +14,7 @@
 //! standards material is not relicensed under this file's Apache-2.0
 //! declaration; see the repository `THIRD_PARTY_NOTICES.md`.
 
-/// Implementation-authoritative algorithm identifiers (wire + YAML).
+/// Algorithm identifiers shared by the protobuf and YAML forms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AlgorithmId {
     /// Ed25519 PureEdDSA, raw `R || S` 64 octets, canonical-encoding rejection.

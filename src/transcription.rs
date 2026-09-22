@@ -1,13 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2026 NVIDIA CORPORATION & AFFILIATES
 // SPDX-License-Identifier: Apache-2.0
 
-//! Transcription API: the `Transcriber` / `AsyncTranscriber` extension-trait
-//! pair and the request/response/error/capability DTOs their signatures
-//! reference.
+//! Transcription traits and their request, response, error, and capability types.
 //!
-//! The free-function surface (`compose`, `decompose`, …) and the
-//! `DefaultTranscriber` / `DefaultAsyncTranscriber` ZSTs live in
-//! `yaml-sigil-transcription`, which re-exports these items.
+//! `yaml-sigil-transcription` re-exports these types and provides `compose`
+//! and `decompose`, with the `DefaultTranscriber` and
+//! `DefaultAsyncTranscriber` zero-sized types.
 
 use crate::OuterConformance;
 use thiserror::Error;
@@ -27,7 +25,7 @@ pub enum DecomposeOutcome {
     MalformedAttemptedSigned,
 }
 
-/// Recovered abstract Artifact when [`DecomposeOutcome`] is `Ok`.
+/// Payload and signature carrier recovered by successful decomposition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AbstractArtifact {
     pub payload: Vec<u8>,
@@ -94,7 +92,10 @@ pub struct ComposeRequest<'a> {
 pub struct DecomposeRequest<'a> {
     pub artifact: &'a [u8],
     pub form: TranscriptionForm,
-    /// Required for protobuf; must be `Unspecified` only for YAML (not represented — use invocation error if set wrongly).
+    /// Use `Some` for protobuf and `None` for YAML.
+    ///
+    /// Report [`TranscriberInvocationError::InvalidOrUnsupportedOuterConformance`]
+    /// if the policy does not match the requested form.
     pub outer_conformance: Option<OuterConformance>,
 }
 
@@ -108,8 +109,7 @@ pub struct TranscriberCapabilities {
     pub implementation_version: &'static str,
 }
 
-/// Public extension point: any transcriber implementation in the workspace (or
-/// downstream) implements this trait. Mirrors the free-function surface.
+/// Synchronous transcription contract for interchangeable implementations.
 pub trait Transcriber {
     /// Capability surface this transcriber advertises.
     fn capabilities(&self) -> TranscriberCapabilities;
@@ -119,13 +119,11 @@ pub trait Transcriber {
     fn decompose(&self, req: &DecomposeRequest<'_>) -> DecomposeResponse;
 }
 
-/// Async sibling of [`Transcriber`]. Same method semantics; `compose` and
-/// `decompose` return `Future`s instead of being synchronous.
+/// Async transcription with the same method semantics as [`Transcriber`].
 ///
-/// Trait shape uses native AFIT/RPITIT with explicit `+ Send` on returned
-/// futures and `Send + Sync` super-bounds. Not object-safe — use generic
-/// bounds (`<T: AsyncTranscriber>`), not `&dyn AsyncTranscriber`. See
-/// this repository's `AGENTS.md`.
+/// `compose` and `decompose` return native `impl Future` values with `Send`
+/// bounds. Implementations must be `Send + Sync`. Use generic bounds such as
+/// `<T: AsyncTranscriber>`; this trait is not object-safe.
 pub trait AsyncTranscriber: Send + Sync {
     /// Capability surface this transcriber advertises.
     fn capabilities(&self) -> TranscriberCapabilities;

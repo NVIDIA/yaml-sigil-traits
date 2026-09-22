@@ -45,7 +45,7 @@ cargo clippy --locked --manifest-path xtask/Cargo.toml --all-targets --all-featu
 cargo test --locked --manifest-path xtask/Cargo.toml
 ```
 
-The existing release commands may compare reviewed path names and opaque Git
+The release commands may compare reviewed path names and opaque Git
 blob identities across exact commits solely to prove release-policy provenance.
 This narrow exception permits no workflow-content parsing, semantic validation,
 provider-policy snapshots, or general workflow checks. Keep the required path
