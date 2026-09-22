@@ -97,6 +97,9 @@ from other forbidden responses; HTTP 403 alone does not establish the cause.
 
 ### Create and activate a coordination line
 
+Coordination branches are optional, temporary contribution bases. Generic CI
+routing supports explicitly activated lines; it does not require one to exist.
+
 Landing coordination support does not activate a line. Use this procedure only
 for a concrete approved next version, with one separately reviewed repository-
 administrator activation packet and explicit authorization for its exact
@@ -246,6 +249,9 @@ intentionally distinct.
 
 ### Synchronize a coordination line
 
+Synchronize only an active, unpromoted coordination line. A ref retained
+solely for recovery is closed to intake and routine synchronization.
+
 Synchronization rebases the complete next-line series onto current `main`.
 It is a separately authorized coordinator operation, not contributor intake.
 
@@ -356,11 +362,23 @@ and this repository's promotion procedure remain independent.
 
 ### Retire, abandon, or restart a line
 
-After the first accepted main-origin version for a promoted line, delete its
-coordination and rollback refs through a separately authorized cleanup. To
-abandon an unpromoted line, first stop intake and close or retarget its pull
-requests. In either case, record both exact heads and use one exact lease per
-existing ref. Treat an already absent rollback ref as clean:
+After successful promotion and validation on `main`, retire the coordination
+and rollback refs through a separately authorized cleanup. Do not wait for a
+later release.
+
+A maintainer may retain the refs only for a documented recovery need with a
+named owner and a deletion deadline no more than 14 days after promotion.
+Retained recovery refs are closed to contribution intake and routine
+synchronization. Subsequent work targets `main` unless a support line is
+separately activated.
+
+`support/M.N` branches follow the separate
+[support provenance and recovery procedure](#maintain-support-provenance-and-recover-an-interrupted-release).
+The coordination-line retirement deadline does not apply to support branches.
+
+To abandon an unpromoted line, first stop intake and close or retarget its
+pull requests. In either case, record both exact heads and use one exact lease
+per existing ref. Treat an already absent rollback ref as clean:
 
 ```shell
 git push --force-with-lease=refs/heads/<LINE>:<LINE-SHA> \
@@ -374,9 +392,9 @@ settings only after both refs are absent; restore and digest-compare every
 temporary exception and prove tag protection unchanged. A never-promoted line
 may restart only as a new activation from then-current `main`, after both old
 refs are absent and all eligibility and review evidence is fresh. After
-promotion, corrections use the ordinary reviewed `main` path. Do not create an
-archive ref; the closed pull requests and existing commit history are the
-durable record.
+promotion, corrections use the ordinary reviewed `main` path or a separately
+activated support line. Do not create an archive ref; the closed pull requests
+and existing commit history are the durable record.
 
 ### Test a protected-policy change
 

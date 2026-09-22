@@ -49,6 +49,13 @@ or its migration documentation and tests. Do not invent a coordination branch.
 When compatibility is uncertain, ask a maintainer before opening the pull
 request.
 
+Coordination branches are optional, temporary contribution bases. After
+promotion and successful validation on `main`, target `main` for subsequent
+work unless maintainers advertise a separately activated support line.
+Retained recovery refs are closed to contribution intake and routine
+synchronization. Follow the
+[retirement procedure](MAINTAINERS.md#retire-abandon-or-restart-a-line).
+
 Apply a fix needed by both lines to `main` first; the release coordinator moves
 it forward. Protected CI, admission, and release-policy changes always target
 `main`. Prepare releases from `main` or an activated support line, never
