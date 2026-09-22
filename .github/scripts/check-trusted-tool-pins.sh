@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 
 # Enforce reviewed Rust, dependency-policy, and release registry source pins.
-# This is a narrow supply-chain lint, not a workflow graph or permissions parser.
 set -euo pipefail
 
 # With no fixture arguments, validate both fixed local callees independently.
@@ -20,7 +19,7 @@ expected_toolchain="1.98.0"
 compatibility_toolchain="1.95.0"
 expected_registry_index="sparse+https://index.crates.io/"
 expected_registry_protocol="sparse"
-# This is a literal GitHub expression admitted by the source check, not shell.
+# Preserve this literal GitHub expression for the source check.
 # shellcheck disable=SC2016
 matrix_toolchain='${{ matrix.toolchain }}'
 

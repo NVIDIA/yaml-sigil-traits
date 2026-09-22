@@ -1,8 +1,8 @@
 # Maintainer guide
 
-This is the concise human maintainer operations runbook for
-`yaml-sigil-traits`. Contributor and release procedures live in
-[`CONTRIBUTING.md`](CONTRIBUTING.md) and [`RELEASING.md`](RELEASING.md).
+Use this runbook for maintainer operations in `yaml-sigil-traits`. Read
+[`CONTRIBUTING.md`](CONTRIBUTING.md) for contributor guidance and
+[`RELEASING.md`](RELEASING.md) for release procedures.
 
 If an agent performs repository work, require it to read
 [`AGENTS.md`](AGENTS.md) first. That file defines agent-specific skill and
@@ -100,12 +100,11 @@ from other forbidden responses; HTTP 403 alone does not establish the cause.
 Coordination branches are optional, temporary contribution bases. Generic CI
 routing supports explicitly activated lines; it does not require one to exist.
 
-Landing coordination support does not activate a line. Use this procedure only
-for a concrete approved next version, with one separately reviewed repository-
-administrator activation packet and explicit authorization for its exact
-objects and settings. The activation version is an unpublished `rc.0`
-placeholder. Prepare releases from `main` or an activated support line, never
-from a coordination ref.
+Activate a coordination line only for an approved next version. Obtain a
+separately reviewed repository-administrator activation packet and explicit
+authorization for its exact objects and settings. The activation version is
+an unpublished `rc.0` placeholder. Prepare releases from `main` or an activated
+support line, never from a coordination ref.
 
 1. Select exactly one unused `dev/MAJOR.MINOR.PATCH` line. Record exact
    current `main`, the full coordination and
@@ -177,9 +176,8 @@ from a coordination ref.
 
 ### Test a coordination-line pull request
 
-Use this only after a `dev/MAJOR.MINOR.PATCH` base has been explicitly
-activated, advertised, and protected. Landing this runbook or its workflow
-support does not activate a line.
+Use this procedure only for a `dev/MAJOR.MINOR.PATCH` base that maintainers
+have explicitly activated, advertised, and protected.
 
 1. Record the full current protected-policy, contribution-base, and candidate
    objects:
@@ -240,9 +238,8 @@ intentionally distinct.
      origin "<NEW-SHA>:${destination}"
    ```
 
-   The exact lease is a stale-ref compare-and-swap guard, not permission to
-   rewrite history. Never use a generic force option or retry an ambiguous
-   update.
+   The exact lease rejects an update if the ref has moved. Keep the update a
+   fast-forward. Never use a generic force option or retry an ambiguous update.
 4. Restore protection before interpreting the update. Read back the ref,
    terminal pull-request association, retained commits, signatures, DCO,
    branch CI, artifacts, deployments, and unchanged tag protection.
@@ -253,7 +250,7 @@ Synchronize only an active, unpromoted coordination line. A ref retained
 solely for recovery is closed to intake and routine synchronization.
 
 Synchronization rebases the complete next-line series onto current `main`.
-It is a separately authorized coordinator operation, not contributor intake.
+Obtain separate coordinator authorization before synchronizing a line.
 
 1. Pause intake. Record exact `main`, coordination, previous-main-base, and
    rollback objects plus complete applicable rules and active runs.
@@ -415,17 +412,17 @@ Choose the test path from the exact reviewed workflow. Ordinary copied-ref
 CI requires `.github/workflows/ci.yml`, `ci-trusted.yml`, and
 `ci-candidate.yml` to match current `main`. Keep that equality guard intact.
 If the workflows are unchanged, use the ordinary exact-head `/ok to test`
-path. Its verdict exercises existing protected policy;
-a reporter change still needs focused tests and an inert current-main canary
-after integration before the new reporter is considered operational.
+path. Its verdict exercises protected policy. For a reporter change, run
+focused tests and an inert canary against current `main` after integration
+before relying on the updated reporter.
 
 The `CI` workflow selects one local reusable workflow before expanding jobs.
-`Trusted CI` runs main, coordination/support where supported, and staging
-checks; `Candidate CI` runs explicitly admitted copied refs. The inactive
+`Trusted CI` runs `main`, coordination and support branches where supported,
+and staging refs; `Candidate CI` runs explicitly admitted copied refs. The inactive
 route has a static skipped name. The trusted `Linux result` aggregate requires
 all authoritative policy and Linux jobs. Copied refs retain their policy/base
 attestation under `Candidate CI / Candidate CI (Linux)`. macOS and Windows
-remain advisory where present; the specification repository is Linux-only.
+jobs are advisory where present; the specification repository is Linux-only.
 The tool-pin source check validates both local callees independently.
 
 For changed workflow policy, use the separate maintainer staging route:
@@ -445,16 +442,16 @@ For changed workflow policy, use the separate maintainer staging route:
    git push origin <HEAD-SHA>:refs/heads/ci-testing/pr-<PR-NUMBER>-<HEAD-SHA>
    ```
 
-   This push is exact-head test authorization, not merge authorization. A
-   changed head requires fresh review and a new ref. An external contributor
-   cannot perform this upstream staging operation; an eligible maintainer may
-   stage the contributor's reviewed head.
+   This push authorizes testing of the exact head. Obtain separate approval to
+   merge it. A changed head requires fresh review and a new ref. An external
+   contributor cannot perform this upstream staging operation; an eligible
+   maintainer may stage the contributor's reviewed head.
 3. Wait for automatic App-owned `Required CI` on that head and inspect advisory
    results. The protected-main reporter authenticates the original pushing
    user's current write permission, exact PR/ref/head, current-main parent
    chain, CI workflow and attempt, unique Linux aggregate and zero artifacts.
    It repeats mutable checks before writing. Staging may exercise changed
-   workflow bytes; ordinary copied refs still require protected blob equality.
+   workflow bytes; ordinary copied refs require protected blob equality.
 4. Use the ordinary passing-PR merge procedure after the required verdict and
    merge review succeed. Other `ci-testing/*` names supply test evidence only.
    A missing or rejected verdict remains blocking; inspect the reporter's
@@ -473,7 +470,7 @@ For a release-policy change, also use the validation-only procedure in
 `RELEASING.md`. Never exercise publication from `ci-testing/*`. Review release-provenance
 comparisons as exact Git path/blob identity checks. They may inspect only the
 reviewed inventory and Git object identities; workflow syntax and semantics
-remain in hosted policy tooling. A support-line activation still requires its
+belong in hosted policy tooling. A support-line activation requires its
 own eligible stable release and separately authorized protection transaction.
 
 ### Merge an accepted, passing pull request
@@ -600,8 +597,8 @@ erase, or rewrite `main` for a revert.
 
 Use this only for an explicitly authorized, fully reviewed head that the
 normal required-check path cannot evaluate for one of the causes above. It
-requires equivalent exact-head validation and repository-admin access, not an
-organization-owner settings change.
+requires equivalent exact-head validation and repository-admin access. Keep
+organization settings unchanged.
 
 1. Freeze the exact old `main`, target head, pull request, active runs, and
    every rule applicable to `main`. Prove every requirement except the named
@@ -654,10 +651,9 @@ choose the smallest accurate type. Follow the sign-off requirements in
 
 ## Repository development guidance
 
-Repository scope, commands, documentation and style, third-party material
-and attribution, coordinated Buf upgrades, and other working guidance remain
-in [`AGENTS.md`](AGENTS.md). Agents performing maintainer operations must
-read both files completely.
+Read [`AGENTS.md`](AGENTS.md) for repository scope, development commands,
+documentation style, and third-party attribution. Agents performing maintainer
+operations must read both files completely.
 
 ## Support readiness commands
 
@@ -684,7 +680,7 @@ The enumerated seed is `.github/support-policy-paths.txt`; maintain it when
 load-bearing release policy gains a file. Inventories exclude themselves.
 
 This readiness command applies no settings, creates no refs, and publishes
-nothing. Opening a line still requires the separately reviewed protection and
+nothing. Opening a line requires the separately reviewed protection and
 activation transaction. The workflow admits an activated support line only
 through a dispatch on protected main; a support push runs CI without publication.
 
@@ -700,23 +696,23 @@ advances it. The decision precedes the write and is verified through the
 If Latest moves between qualification and creation, stop and requalify. If
 readback differs from the intended outcome, inspect the exact existing tags,
 Releases, and Latest selection before retrying. Never recreate an immutable
-Release to change its Latest status. Publication remains serialized across
+Release to change its Latest status. Publication is serialized across
 the repository.
 
 ## Review support-line contributions
 
 After a line is separately activated and advertised, its PR base may be the
 canonical `support/M.N`, with each component between 0 and 999999999 and no
-leading zeros. Protected current main still supplies candidate policy. Bind
+leading zeros. Protected current main supplies candidate policy. Bind
 the exact main policy, support-base SHA, and reviewed head, then require the
 App-owned `Required CI [refs/heads/support/M.N]` result for that same triple.
 A main or another line's check does not qualify the head.
 
-Ordinary backports use the existing candidate path. A same-repository
+Test ordinary backports through the candidate path. A same-repository
 `release-plz-manual-VERSION` branch may target support only when its version's
 major and minor match the base. Detached validation receives that exact base
-explicitly; release paths and package validators retain their repository's
-existing boundaries. Support admission creates no publication authority and
+explicitly; apply this repository's release-path and package-validation rules.
+Support admission creates no publication authority and
 activates no support ref or ruleset.
 
 ### Maintain support provenance and recover an interrupted release
@@ -741,16 +737,14 @@ requires published source-package evidence, exact release-PR binding, valid
 historical inventory, and any existing deterministic annotated tags and
 immutable Releases. It does not require the old source to match newer main
 content. The support run ID and attempt are audit context only; main recovery
-retains its original push-run validation. Every recovery requires a fresh
-dispatch and the existing applicable environment approvals.
+requires its original push-run validation. Every recovery requires a fresh
+dispatch and the applicable environment approvals.
 
-Zero-package recovery is rejected. Start a fresh release from the current tip
-when nothing was published. Partial crate publication must be a dependency-
-ordered prefix with no forge objects; all crates must be public before any
-tag or Release can exist. A Release without its exact retained tag, a
-conflicting tag, or a mismatched source archive requires investigation rather
-than replacement. The one-crate traits repository has no nonempty partial
-crate prefix.
+Recovery requires the published `yaml-sigil-traits` source package. Start a
+fresh release from the current tip when nothing was published. Verify the
+published crate before creating a tag or Release. Investigate a Release
+without its exact retained tag, a conflicting tag, or a mismatched source
+archive; do not replace those objects to force recovery.
 
 The workflow calls `github release rebind-policy` with explicit base, source,
 version, and fresh/recovery operation before publication authority and before
@@ -777,7 +771,7 @@ qualification after their release PR squash; `release` dispatch is support-only.
 Recovery always uses a fresh main dispatch with `operation=recover`, the
 original base, source, version, run ID, and attempt. It never substitutes the
 current support tip. A support recovery must already have published source
-packages; original-run coordinates provide audit context. Main recovery still
+packages; original-run coordinates provide audit context. Main recovery
 validates its original main-push run.
 
 The protected-main input binder rejects noncanonical bases, source IDs,
@@ -785,6 +779,6 @@ versions, and invalid operation combinations before source checkout. Typed
 qualification proves the selected source and inventory. Requalification after
 approval, anonymous policy rebind, registry confirmation, and finalization
 retain the same base/source/version/operation. A changed main policy requires
-a new dispatch. All privileged jobs and existing environments remain main-only,
+a new dispatch. All privileged jobs and environments are main-only,
 and publication is serialized across the whole repository. Each recovery
 receives fresh applicable environment approvals; an older approval is not reused.

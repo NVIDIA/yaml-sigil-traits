@@ -1,12 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2026 NVIDIA CORPORATION & AFFILIATES
 // SPDX-License-Identifier: Apache-2.0
 
-//! Verification API: the `Verifier` / `AsyncVerifier` extension-trait pair and
-//! the request/response/error/capability DTOs their signatures reference.
+//! Verification traits and their request, response, error, and capability types.
 //!
-//! The verify free-function surface (`verify`, `pre_verify`, …) and the
-//! `DefaultVerifier` / `DefaultAsyncVerifier` ZSTs live in
-//! `yaml-sigil-verification`, which re-exports these items.
+//! `yaml-sigil-verification` re-exports these types and provides verification
+//! functions such as `verify` and `pre_verify`, with the `DefaultVerifier`
+//! and `DefaultAsyncVerifier` zero-sized types.
 
 use std::convert::TryFrom;
 use std::fmt;
@@ -24,31 +23,25 @@ pub enum ArtifactForm {
     Proto,
 }
 
-/// Conformance posture advertised by this build (IDL `ConformanceProfile`).
+/// Conformance profile advertised by a verifier (IDL `ConformanceProfile`).
 ///
-/// The three variants mirror the IDL's `CONFORMANCE_PROFILE_{STRICT,PERMISSIVE,SIGNATURE_STRICT}`
-/// values; the IDL's `CONFORMANCE_PROFILE_UNSPECIFIED` is intentionally not modeled here because
-/// `source-spec/verification-api.md` § "Conformance Profiles" declares it non-conforming for any
-/// verifier that supports a wire form. The enum is `pub` so downstream `Verifier`
-/// implementations can advertise whichever profile they actually satisfy.
+/// Advertise one profile that the implementation satisfies across every supported
+/// wire form. These variants mirror the IDL's
+/// `CONFORMANCE_PROFILE_{STRICT,PERMISSIVE,SIGNATURE_STRICT}` values.
+/// `CONFORMANCE_PROFILE_UNSPECIFIED` is excluded because the specification
+/// requires a concrete profile when a verifier supports a wire form.
 ///
-/// `verifier_capabilities` (the default `DefaultVerifier` advertisement) always returns
-/// [`AdvertisedConformanceProfile::Permissive`]. The spec requires Strict / SignatureStrict to
-/// reject **duplicate known singular fields on both wire forms**; this workspace's protobuf
-/// inner-decode path uses stock `buffa` / `prost` decoders, which apply last-wins to duplicate
-/// scalars and merge to duplicate messages (Permissive behavior). The
-/// `yaml-sigil-core`'s `yaml-strict-unknown-fields` feature tightens YAML signature-document
-/// parsing (rejecting unknown mapping keys at parse) but does NOT change the protobuf-side
-/// duplicate behavior; it would be non-conforming to advertise Strict in that cell because the
-/// spec demands uniform rejection across both forms. See
-/// the `yaml-sigil-rs` conformance validation notes
-/// (§5a "resolved upstream") for the rationale; now formalized normatively in
-/// `source-spec/verification-api.md` § "Strict inner-protobuf decode is not parser-emergent".
+/// Strict and SignatureStrict require rejection of duplicate known singular
+/// fields in both wire forms. Stock `buffa` and `prost` decoders use the last
+/// duplicate scalar and merge duplicate messages. A verifier using those
+/// decoders must enforce the profile's duplicate-field rules separately to
+/// advertise Strict or SignatureStrict. Rejecting unknown YAML mapping keys
+/// alone does not establish either profile.
 ///
-/// The unified profile applies to both wire forms (the IDL field rename
-/// `protobuf_conformance_profile` → `conformance_profile` followed the same commit `ce35681`).
-/// See also [`VerifierCapabilities::protobuf_wire_decode`] and the YAML policy fields on
-/// [`VerifierCapabilities`].
+/// See the specification's [conformance profiles] and the decoder and YAML
+/// policy fields on [`VerifierCapabilities`].
+///
+/// [conformance profiles]: https://github.com/NVIDIA/yaml-sigil-spec/blob/main/verification-api.md#conformance-profiles
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AdvertisedConformanceProfile {
     Strict,
@@ -59,18 +52,15 @@ pub enum AdvertisedConformanceProfile {
 /// Typed verifier capability surface (mirrors `VerifierCapabilitiesResponse` in `verification.proto`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifierCapabilities {
-    /// Advertised conformance profile (IDL field `conformance_profile`; renamed from
-    /// `protobuf_conformance_profile` in source-spec commit `ce35681` to reflect the
-    /// unified-across-wire-forms semantics). See
-    /// `source-spec/verification-api.md` § "Conformance Profiles".
+    /// Profile satisfied across every supported wire form (IDL `conformance_profile`).
     pub conformance_profile: AdvertisedConformanceProfile,
-    /// Stock buffa/prost `decode` for `SignedYamlArtifact`; no profile-driven unknown-field policy.
+    /// Advertised protobuf decoder behavior for `SignedYamlArtifact`.
     pub protobuf_wire_decode: ProtobufWireDecodeAdvertisement,
     /// How duplicate keys in the signature-document YAML mapping behave when this verifier parses YAML.
     pub yaml_signature_duplicate_key_policy: YamlSignatureDocumentDuplicateKeyPolicy,
     /// Default unknown-field policy (see `yaml_signature_unknown_field_policies` for strict options).
     pub yaml_signature_unknown_field_policy: YamlSignatureDocumentUnknownFieldPolicy,
-    /// Policies this build can apply (default ignore-at-parse; optional strict parse/verify).
+    /// Unknown-field policies this implementation can apply.
     pub yaml_signature_unknown_field_policies: Vec<YamlSignatureDocumentUnknownFieldPolicy>,
     pub supported_forms: &'static [ArtifactForm],
     pub supported_algorithms: &'static [AlgorithmId],
@@ -92,7 +82,7 @@ pub enum VerifierState {
     },
     /// No signing attempt (YAML only; protobuf inputs never produce this).
     Unsigned,
-    /// Structural or metadata validation failed before or instead of successful crypto.
+    /// Structural or metadata validation failed before cryptographic verification.
     ///
     /// This includes empty decoded signature octets. Full verification applies that check before
     /// runtime algorithm-support classification.
@@ -157,7 +147,7 @@ impl<Ed25519: ?Sized, P256: ?Sized> Clone for PublicKeys<'_, Ed25519, P256> {
 
 impl<Ed25519: ?Sized, P256: ?Sized> Copy for PublicKeys<'_, Ed25519, P256> {}
 
-/// Optional knobs for algorithm support (defaults implement both wire algorithms).
+/// Algorithm selection and parsing options. Both algorithms are enabled by default.
 #[derive(Debug, Clone)]
 pub struct VerifierOptions {
     pub verify_ed25519: bool,
@@ -221,7 +211,7 @@ pub struct UnverifiedSignature {
     pub signature_octets: Vec<u8>,
 }
 
-/// Reified pre-verification result (IDL `PreVerifyResponse`).
+/// Pre-verification result (IDL `PreVerifyResponse`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreVerifyResponse {
     pub outcome: PreVerifyOutcome,
@@ -243,15 +233,12 @@ impl TryFrom<i32> for ArtifactForm {
     }
 }
 
-/// Public extension point: any verifier implementation in the workspace (or downstream)
-/// implements this trait. Mirrors the free-function surface so callers can swap
-/// implementations behind `&dyn Verifier` or generic bounds.
+/// Synchronous verification contract for interchangeable implementations.
 ///
-/// Downstream implementations (e.g. those with a configured `TrustedKey`
-/// set) MAY document additional contract narrowings — for example, ignoring the
-/// caller-supplied `keys` argument and consulting their own trust store. Such
-/// narrowings belong in the implementation crate's README, not in this trait's
-/// contract.
+/// Use generic bounds or trait objects with explicit associated key types.
+/// An implementation may narrow this contract, such as consulting its own
+/// trust store and ignoring the caller-supplied `keys` argument. Document any
+/// narrowing in the implementation crate's README.
 pub trait Verifier {
     /// Concrete Ed25519 verifying-key type accepted by this implementation.
     type Ed25519VerifyingKey: ?Sized;
@@ -260,7 +247,7 @@ pub trait Verifier {
 
     /// Capability surface this verifier advertises.
     fn capabilities(&self) -> VerifierCapabilities;
-    /// Structural + metadata pre-verify (IDL `PreVerify`).
+    /// Extract structure and signature metadata (IDL `PreVerify`).
     ///
     /// This stage does not enforce the runtime non-empty signature rule or classify runtime
     /// algorithm support.
@@ -303,14 +290,11 @@ pub trait Verifier {
     ) -> Result<VerifierState, InvocationError>;
 }
 
-/// Async sibling of [`Verifier`]. Same method semantics; the verify and
-/// pre-verify entries return `Future`s instead of being synchronous.
+/// Async verification with the same method semantics as [`Verifier`].
 ///
-/// Trait shape uses native AFIT/RPITIT with explicit `+ Send` on every
-/// returned future and `Send + Sync` super-bounds on the trait. This is the
-/// forward-compatible choice (no `async-trait` heap allocation) at the cost of
-/// not being object-safe — use generic bounds (`<V: AsyncVerifier>`), not
-/// `&dyn AsyncVerifier`. See this repository's `AGENTS.md`.
+/// Verification and pre-verification return native `impl Future` values with
+/// `Send` bounds. Implementations must be `Send + Sync`. Use generic bounds
+/// such as `<V: AsyncVerifier>`; this trait is not object-safe.
 pub trait AsyncVerifier: Send + Sync {
     /// Concrete Ed25519 verifying-key type accepted by this implementation.
     type Ed25519VerifyingKey: Sync + ?Sized;
@@ -319,7 +303,7 @@ pub trait AsyncVerifier: Send + Sync {
 
     /// Capability surface this verifier advertises.
     fn capabilities(&self) -> VerifierCapabilities;
-    /// Structural + metadata pre-verify (IDL `PreVerify`).
+    /// Extract structure and signature metadata (IDL `PreVerify`).
     ///
     /// This stage does not enforce the runtime non-empty signature rule or classify runtime
     /// algorithm support.

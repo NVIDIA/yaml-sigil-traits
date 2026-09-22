@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Verify that release-plz source attachment changes only only the selected local refs and
+# Verify that release-plz source attachment changes only the selected local refs and
 # rejects a dirty or mismatched checkout.
 set -euo pipefail
 

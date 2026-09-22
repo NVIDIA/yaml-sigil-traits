@@ -193,8 +193,8 @@ done < "${attribute_result}"
 rm -f -- "${attribute_result}"
 trap - EXIT
 
-# Disable the well-known LFS process explicitly in addition to rejecting all
-# filter attributes, then perform one ordinary detached checkout.
+# Disable the LFS process for the detached checkout. Filter attributes have
+# already been rejected above.
 git -c credential.helper= \
   -c filter.lfs.process= \
   -c filter.lfs.smudge= \

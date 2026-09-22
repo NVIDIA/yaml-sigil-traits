@@ -1,12 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2026 NVIDIA CORPORATION & AFFILIATES
 // SPDX-License-Identifier: Apache-2.0
 
-//! Signing API: the `Signer` / `AsyncSigner` extension-trait pair and the
-//! request/response/error/capability DTOs their signatures reference.
+//! Signing traits and their request, response, error, and capability types.
 //!
-//! The free-function surface (`sign`, `sign_yaml`, `sign_proto`, …) and the
-//! `DefaultSigner` / `DefaultAsyncSigner` ZSTs live in `yaml-sigil-signing`,
-//! which re-exports these items.
+//! `yaml-sigil-signing` re-exports these types and provides the `sign`,
+//! `sign_yaml`, and `sign_proto` functions, with the `DefaultSigner` and
+//! `DefaultAsyncSigner` zero-sized types.
 
 use std::fmt;
 
@@ -51,9 +50,10 @@ pub enum SignInvocationError {
 
 /// Sign-time failures after request-shape validation (IDL `SignerError`), plus output extensions.
 ///
-/// [`InvalidAlgorithmParameters`](SignError::InvalidAlgorithmParameters) are also returned by
-/// convenience wrappers `sign_yaml` / `sign_proto` when mapping [`SignInvocationError`], so
-/// existing callers keep stable `Result<_, SignError>` typing.
+/// The `sign_yaml` and `sign_proto` convenience wrappers map
+/// [`SignInvocationError`] into this error type, including
+/// [`InvalidAlgorithmParameters`](SignError::InvalidAlgorithmParameters),
+/// and return `Result<_, SignError>`.
 #[derive(Debug, Error)]
 pub enum SignError {
     #[error("invalid payload bytes (UTF-8, BOM, or line terminator rules)")]
@@ -76,7 +76,7 @@ pub enum SignError {
     YamlSerialize(String),
 }
 
-/// Unified signing outcome: success, invocation error, or sign-time error.
+/// Signing success or an error from invocation validation or signing.
 #[derive(Debug)]
 pub enum SignOutcome {
     Success(SignSuccess),
@@ -92,7 +92,7 @@ pub struct SignSuccess {
     pub modified_payload: Vec<u8>,
 }
 
-/// Unified sign request (subset of IDL `SignRequest`: no private-key handle).
+/// Signing request corresponding to IDL `SignRequest`, with a borrowed key.
 pub struct SignRequest<'a, Ed25519: ?Sized, P256: ?Sized> {
     pub payload: &'a [u8],
     pub algorithm: AlgorithmId,
@@ -105,7 +105,7 @@ pub struct SignRequest<'a, Ed25519: ?Sized, P256: ?Sized> {
     pub algorithm_parameters: &'a [u8],
 }
 
-/// Private key material for supported algorithms (never logged).
+/// Borrowed signing keys for supported algorithms. `Debug` redacts key material.
 pub enum SigningKey<'a, Ed25519: ?Sized, P256: ?Sized> {
     Ed25519(&'a Ed25519),
     EcdsaP256Sha256(&'a P256),
@@ -128,14 +128,12 @@ impl<Ed25519: ?Sized, P256: ?Sized> fmt::Debug for SigningKey<'_, Ed25519, P256>
     }
 }
 
-/// Public extension point: any signer implementation in the workspace (or downstream)
-/// implements this trait. Mirrors the free-function surface so callers can swap
-/// implementations behind `&dyn Signer` or generic bounds.
+/// Synchronous signing contract for interchangeable implementations.
 ///
-/// Downstream implementations MAY document additional contract narrowings — for
-/// example, ignoring `req.key` when the signer owns no key. Such narrowings
-/// belong in the implementation crate's README,
-/// not in this trait's contract.
+/// Use generic bounds or trait objects with explicit associated key types.
+///
+/// An implementation may narrow this contract, such as ignoring `req.key`
+/// when it owns no key. Document any narrowing in the implementation crate's README.
 pub trait Signer {
     /// Concrete Ed25519 signing-key type accepted by this implementation.
     type Ed25519SigningKey: ?Sized;
@@ -151,17 +149,13 @@ pub trait Signer {
     ) -> SignOutcome;
 }
 
-/// Async sibling of [`Signer`]. Same method semantics; the only difference is
-/// that [`AsyncSigner::sign`] returns a `Future`.
+/// Async signing with the same method semantics as [`Signer`].
 ///
-/// Trait shape uses native AFIT/RPITIT with explicit `+ Send` on the returned
-/// future and `Send + Sync` super-bounds on the trait. This is the
-/// forward-compatible choice (no `async-trait` heap allocation) at the cost of
-/// not being object-safe — use generic bounds (`<S: AsyncSigner>`), not
-/// `&dyn AsyncSigner`. See this repository's `AGENTS.md`.
+/// [`AsyncSigner::sign`] returns a native `impl Future` with a `Send` bound.
+/// Implementations must be `Send + Sync`. Use generic bounds such as
+/// `<S: AsyncSigner>`; this trait is not object-safe.
 ///
-/// Downstream implementations MAY document the same contract narrowings
-/// the sync trait permits.
+/// Implementations may document the contract narrowings permitted by [`Signer`].
 pub trait AsyncSigner: Send + Sync {
     /// Concrete Ed25519 signing-key type accepted by this implementation.
     type Ed25519SigningKey: Sync + ?Sized;

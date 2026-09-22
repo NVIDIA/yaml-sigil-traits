@@ -1805,8 +1805,8 @@ mod tests {
         let source = repository();
         let source_sha = crate::release_base::git(source.path(), &["rev-parse", "HEAD"]).unwrap();
         require_separate_checkouts(policy.path(), source.path(), sha, &source_sha).unwrap();
-        // Ignore the nested repository in its enclosing policy checkout, so
-        // the rejection exercises independent Git roots rather than dirtiness.
+        // Keep the enclosing worktree clean so this case isolates rejection
+        // of nested Git roots.
         std::fs::write(policy.path().join(".git/info/exclude"), "/nested/\n").unwrap();
         let nested = policy.path().join("nested");
         std::fs::create_dir(&nested).unwrap();

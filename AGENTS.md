@@ -120,16 +120,13 @@ unchanged when the imported delta affects attribution only.
 These rules apply to Markdown files in this trait crate, including README files,
 release notes, and documentation that explains the public trait and DTO
 contract.
-Use GitHub Flavored Markdown as the source dialect unless a file documents a
-narrower renderer requirement.
+Write like you are explaining the contract to a colleague. Describe the relevant
+behavior and whether this crate, the pinned specification, or an implementation
+owns it.
 
-Write like you are explaining the contract to a colleague. Be direct, specific,
-and concise. Be accurate about which behavior belongs to this crate, the pinned
-specification, or downstream implementations.
-
-The Markdown dialect target is GitHub Flavored Markdown (GFM), as rendered by
-GitHub repository views. Rely on GitHub's generated document outline for
-navigation.
+Use GitHub Flavored Markdown (GFM), as rendered in GitHub repository views,
+unless a file documents a narrower renderer requirement. Rely on GitHub's
+generated document outline for navigation.
 
 ### Voice And Tone
 
@@ -295,7 +292,7 @@ permissions, secrets, expressions, Action pins, or historical workflow files.
 Accept tokens only through environment variables; never log them, serialize
 them into fixtures, or pass them as command-line arguments.
 
-The existing release commands may compare reviewed path names and opaque Git
+The release commands may compare reviewed path names and opaque Git
 blob identities across exact commits solely to prove release-policy provenance.
 This narrow exception permits no workflow-content parsing, semantic validation,
 provider-policy snapshots, or general workflow checks. Keep the required path
@@ -347,9 +344,9 @@ The surviving provider helpers have deliberately narrow roles:
 - `remove-preinstalled-aws-tap.sh` performs one bounded macOS host cleanup
   before Rust setup.
 
-Release qualification and deterministic release-object reconciliation belong
-in the two typed `cargo xtask github release` commands, not in additional
-Python or shell helpers.
+Implement release qualification and deterministic release-object reconciliation
+in the typed `cargo xtask github release` commands. Do not add Python or shell
+helpers for those operations.
 
 Hosted CI should expose equivalent validation commands as independent steps
 where practical. It may also add provider-specific policy checks that do not
@@ -424,8 +421,8 @@ comparison. Keep the raw command, generated-path model, committed inventory,
 hosted check, and xtask tests aligned whenever package metadata or contents
 change.
 
-The following package-validation guidance refers to full archive assembly and
-verification, not the static path-list comparison above. Use
+Full package validation assembles and verifies the archive separately from the
+static path-list comparison. Use
 `cargo package --allow-dirty` to validate an intentional uncommitted change to
 packaged files. After committing, rerun the clean-worktree command below.
 
@@ -450,16 +447,16 @@ callers should use generic bounds such as `<S: AsyncSigner>`.
 `github release rebind-policy` owns the anonymous pre-authority rebind. Pass
 `--base-ref`, `--source-root`, `--source-sha`, `--version`, and
 `--operation fresh|recover` explicitly. Only current protected `main` supplies
-executing
-policy. Source attachment remains the small tested shell helper, identical
-across the two Rust repositories, and changes only the selected local refs.
+executing policy. Use the shared, tested shell helper for source attachment.
+Keep it identical across the two Rust repositories; it changes only selected
+local refs.
 The per-line JSON inventory excludes itself; compare opaque Git blob IDs,
 never workflow contents. Recovery validates historical inventory and retained
 protected-base lineage without demanding current-main content.
 
 ## Support release dispatch boundary
 
-Support push CI runs the existing nonpublishing matrix. The publication workflow
+Support push CI runs the nonpublishing matrix. The publication workflow
 runs only on main; its protected-main input helper binds canonical base, exact
 source, optional initial version, and operation before source checkout. Every
 later authority boundary passes the qualified version explicitly. Keep

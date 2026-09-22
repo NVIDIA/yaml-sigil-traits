@@ -39,7 +39,7 @@ enum Task {
     PackageContent,
     /// Prepare or validate a locally owned release pull request.
     Release(release::ReleaseArgs),
-    /// Run the two typed GitHub release operations.
+    /// Run typed GitHub release operations.
     Github(github::GithubArgs),
 }
 

@@ -95,8 +95,8 @@ for path in "${changed_paths[@]}"; do
   esac
 done
 
-# Both allowed paths must remain direct regular files, not deletions, links, or
-# executable files whose names happen to pass the changed-path allowlist.
+# Require allowed paths to exist as non-executable regular files.
+# The path allowlist alone cannot establish their file types.
 if [[ "${seen_cargo}" != true || "${seen_changelog}" != true \
   || "$(git ls-tree "${head_sha}" -- Cargo.toml | cut -d ' ' -f 1-2)" != "100644 blob" \
   || "$(git ls-tree "${head_sha}" -- CHANGELOG.md | cut -d ' ' -f 1-2)" != "100644 blob" ]]; then
