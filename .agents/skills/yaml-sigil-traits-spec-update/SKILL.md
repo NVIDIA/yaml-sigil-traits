@@ -82,7 +82,10 @@ a proposed specification update for impact on this crate.
 
 4. Map spec changes to the crate surface:
 
-   - `src/lib.rs`: crate-level contract documentation, modules, and re-exports.
+   - `src/lib.rs`: crate-level contract documentation and the explicit
+     `yaml_sigil_traits::v1alpha1` namespace. Its module and root re-exports
+     share identity with the unqualified `v1alpha1` default paths. Keep both
+     surfaces aligned without duplicating traits or DTO definitions.
    - `src/algorithm.rs`: canonical YAML `alg` strings, protobuf enum slots,
      algorithm additions, and algorithm deprecations.
    - `src/signing.rs`: signing request, response, capability, and error
@@ -94,7 +97,8 @@ a proposed specification update for impact on this crate.
      verification key types.
    - `src/conformance.rs`: advertised conformance profiles and policy enums.
    - `tests/key_bindings.rs`: generic key DTO behavior, associated key types,
-     object safety, and async returned-future bounds.
+     object safety, async returned-future bounds, and interoperability between
+     explicit `v1alpha1` and default imports.
    - `README.md`: human-facing contract and implementation key-binding
      guidance.
 

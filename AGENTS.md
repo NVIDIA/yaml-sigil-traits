@@ -62,6 +62,14 @@ choose the smallest accurate type. Follow the sign-off requirements in
 
 ## Scope
 
+Expose the current contract through `yaml_sigil_traits::v1alpha1` and prefer
+that namespace in public examples. Keep the unqualified modules and root
+exports as the same `v1alpha1` definitions. Preserve trait and DTO identity,
+associated key types, object safety, and async bounds across both paths.
+The specification identifier is independent of the crate's SemVer. Keep
+namespace re-exports explicit and exercise both paths in external-consumer
+tests when changing the public surface.
+
 Keep this crate independent from the rest of the YamlSigil Rust implementation.
 It may depend on crypto/error crates needed to type public DTOs, but it must not
 depend on any crate delivered by the `yaml-sigil-rs` workspace.
