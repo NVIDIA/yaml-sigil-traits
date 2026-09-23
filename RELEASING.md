@@ -38,7 +38,9 @@ release credentials, runs `release-plz update` first, and uses pinned
 `release-plz set-version` only for a bounded maintainer-selected version
 adjustment. It accepts changes only to the manifest and changelog.
 When update leaves the current `rc.N` unchanged, preparation also permits the
-next ordinal on the same version core.
+next ordinal or the stable release on the same version core. An empty update
+is allowed before this bounded selection. The completed preparation must
+change both `Cargo.toml` and `CHANGELOG.md`.
 Both `prepare` and `check` reject `rc.0` as a release version.
 
 Release-plz `0.3.169` compares source using Cargo's package-file selection.

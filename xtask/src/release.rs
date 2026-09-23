@@ -292,10 +292,9 @@ fn apply_exact_version(
     let adjustment = require_exact_version_adjustment(original, derived, selected)?;
     require_release_path_subset(root, line)?;
 
-    // Pinned release-plz performs the exact maintainer selection only after
-    // update has derived the changelog and preliminary version. This includes
-    // replacing the non-release rc.0 activation stub with the first real RC or
-    // stable version.
+    // Pinned release-plz performs the bounded maintainer selection after
+    // update, including when the prerelease source is unchanged. The final
+    // source checks still require both the manifest and changelog to change.
     let status = release_plz_set_version(root, selected)
         .status()
         .map_err(|error| format!("run release-plz set-version: {error}"))?;
@@ -465,10 +464,9 @@ fn release_changed_paths(root: &Path, line: ReleaseLine) -> Result<BTreeSet<Stri
 }
 
 fn require_release_path_subset(root: &Path, line: ReleaseLine) -> Result<(), String> {
+    // An unchanged update can still need an exact-version selection. Only
+    // the completed preparation must contain the full, nonempty release diff.
     let actual = release_changed_paths(root, line)?;
-    if actual.is_empty() {
-        return Err("release-plz produced no source changes".to_string());
-    }
     let allowed = RELEASE_PATHS.iter().copied().collect::<BTreeSet<_>>();
     for path in actual {
         if !allowed.contains(path.as_str()) {
@@ -821,6 +819,181 @@ fn one_line(bytes: &[u8], label: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    mod preparation {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fn prepare_with_fixture(case: &str) -> (Result<(), String>, String) {
+            let temporary = tempfile::tempdir().unwrap();
+            let root = temporary.path().join("source");
+            let bin = temporary.path().join("bin");
+            fs::create_dir(&root).unwrap();
+            fs::create_dir(&bin).unwrap();
+            fs::create_dir(root.join("src")).unwrap();
+            let manifest = "[package]\nname = \"yaml-sigil-traits\"\n\
+                            version = \"0.4.1-rc.2\"\nedition = \"2024\"\n\
+                            publish = [\"crates-io\"]\n";
+            fs::write(root.join("Cargo.toml"), manifest).unwrap();
+            fs::write(root.join("src/lib.rs"), "").unwrap();
+            fs::write(
+                root.join("CHANGELOG.md"),
+                "# Changelog\n\n## [0.4.1-rc.2]\n",
+            )
+            .unwrap();
+            fs::write(root.join("README.md"), "fixture\n").unwrap();
+            fs::write(root.join(".gitignore"), "/Cargo.lock\n/target/\n").unwrap();
+            fs::copy(
+                crate::workspace_root().join(RELEASE_CONFIG),
+                root.join(RELEASE_CONFIG),
+            )
+            .unwrap();
+            for args in [
+                vec![
+                    "init",
+                    "--quiet",
+                    "--initial-branch=release-plz-manual-0.4.1",
+                ],
+                vec!["add", "."],
+                vec![
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "published prerelease fixture",
+                ],
+                vec!["update-ref", "refs/remotes/origin/main", "HEAD"],
+            ] {
+                release_base::git(&root, &args).unwrap();
+            }
+            fs::write(
+                temporary.path().join("selected-manifest"),
+                manifest.replace("0.4.1-rc.2", "0.4.1"),
+            )
+            .unwrap();
+            fs::write(
+                temporary.path().join("selected-changelog"),
+                "# Changelog\n\n## [0.4.1]\n\n## [0.4.1-rc.2]\n",
+            )
+            .unwrap();
+            let stub = bin.join("release-plz");
+            fs::write(
+                &stub,
+                r#"#!/bin/sh
+set -eu
+printf '%s\n' "$1" >> "$YAML_SIGIL_TEST_RELEASE_DIRECTORY/calls"
+# Model a successful update, including out-of-policy edits for rejection tests.
+case "$1" in
+    --version)
+        printf 'release-plz %s\n' "$YAML_SIGIL_TEST_RELEASE_PLZ_VERSION"
+        ;;
+    update)
+        test "$*" = 'update --config .release-plz.toml --manifest-path Cargo.toml'
+        # A valid update is unchanged; these cases exercise the path boundary.
+        case "$YAML_SIGIL_TEST_RELEASE_CASE" in
+            unexpected-tracked) printf 'unexpected\n' >> README.md ;;
+            unexpected-untracked) printf 'unexpected\n' > unexpected.txt ;;
+        esac
+        ;;
+    set-version)
+        test "$*" = 'set-version 0.4.1 --manifest-path Cargo.toml --config .release-plz.toml'
+        # The final gate must reject a successful selection that writes no files.
+        if [ "$YAML_SIGIL_TEST_RELEASE_CASE" != empty-final ]; then
+            cp "$YAML_SIGIL_TEST_RELEASE_DIRECTORY/selected-manifest" Cargo.toml
+            cp "$YAML_SIGIL_TEST_RELEASE_DIRECTORY/selected-changelog" CHANGELOG.md
+        fi
+        ;;
+    *) exit 1 ;;
+esac
+"#,
+            )
+            .unwrap();
+            fs::set_permissions(&stub, fs::Permissions::from_mode(0o700)).unwrap();
+
+            // Scope PATH to a child test process so parallel tests keep their
+            // own tool environment. The stub and transcript stay outside Git.
+            let search_path = std::env::var_os("PATH").unwrap_or_default();
+            let path = std::env::join_paths(
+                std::iter::once(bin).chain(std::env::split_paths(&search_path)),
+            )
+            .unwrap();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "release::tests::preparation::run_prepare",
+                    "--nocapture",
+                    "--quiet",
+                ])
+                .env("PATH", path)
+                .env("CARGO_NET_OFFLINE", "true")
+                .env_remove("YAML_SIGIL_RELEASE_PR_BRANCH")
+                .env("YAML_SIGIL_TEST_RELEASE_DIRECTORY", temporary.path())
+                .env("YAML_SIGIL_TEST_RELEASE_CASE", case)
+                .env("YAML_SIGIL_TEST_RELEASE_PLZ_VERSION", RELEASE_PLZ_VERSION)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "prepare fixture failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let result =
+                serde_json::from_slice(&fs::read(temporary.path().join("result.json")).unwrap())
+                    .unwrap();
+            let calls = fs::read_to_string(temporary.path().join("calls")).unwrap();
+            (result, calls)
+        }
+
+        #[test]
+        #[ignore = "spawned explicitly by the release preparation regression"]
+        fn run_prepare() {
+            let directory = std::env::var_os("YAML_SIGIL_TEST_RELEASE_DIRECTORY").unwrap();
+            let directory = Path::new(&directory);
+            let result = prepare(
+                &directory.join("source"),
+                &Version::parse("0.4.1").unwrap(),
+                ReleaseLine::Main,
+            );
+            fs::write(
+                directory.join("result.json"),
+                serde_json::to_vec(&result).unwrap(),
+            )
+            .unwrap();
+        }
+
+        #[test]
+        fn unchanged_update_can_promote_current_rc_to_stable() {
+            let (result, calls) = prepare_with_fixture("complete");
+            assert_eq!(result, Ok(()));
+            assert_eq!(calls, "--version\nupdate\nset-version\n");
+        }
+
+        #[test]
+        fn unexpected_update_paths_stop_before_exact_selection() {
+            for case in ["unexpected-tracked", "unexpected-untracked"] {
+                let (result, calls) = prepare_with_fixture(case);
+                assert!(result.unwrap_err().contains("changed unexpected path"));
+                assert_eq!(calls, "--version\nupdate\n");
+            }
+        }
+
+        #[test]
+        fn unchanged_update_and_selection_cannot_leave_empty_final_source() {
+            let (result, calls) = prepare_with_fixture("empty-final");
+            assert_eq!(
+                result.unwrap_err(),
+                "release-plz did not produce source changes"
+            );
+            assert_eq!(calls, "--version\nupdate\nset-version\n");
+        }
+    }
 
     fn git_fixture() -> tempfile::TempDir {
         let temporary = tempfile::tempdir().unwrap();
