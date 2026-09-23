@@ -5,6 +5,12 @@ The protected finalizer then creates one annotated tag and one immutable,
 zero-asset GitHub Release. Do not attach or retain compiled executables,
 executable WebAssembly, installers, containers, or build artifacts.
 
+Coordination and rollback refs are not prerequisites for preparing or
+publishing from `main`. After a coordination line is promoted, follow the
+[retirement procedure](MAINTAINERS.md#retire-abandon-or-restart-a-line).
+Activated `support/M.N` lines retain their separate requirements for protected
+lineage and recovery.
+
 ## Prepare the release pull request
 
 Install the fixed toolchain and analyzer, then bind the release base to a clean
