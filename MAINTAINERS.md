@@ -66,8 +66,10 @@ Route breaking or dependent next-line work only to an advertised, protected
    exact head. Never reuse a stale command or verdict.
 
 Release preparation can advance an unchanged `rc.N` to its immediate successor
-on the same version core. Pinned release-plz applies that explicit selection
-after `update`; follow `RELEASING.md` for the normal source checks and approvals.
+or the stable release on the same version core. Pinned release-plz applies that
+explicit selection after `update`, including when `update` produces no source
+changes. The completed preparation still requires both `Cargo.toml` and
+`CHANGELOG.md` to change. Follow `RELEASING.md` for the source checks and approvals.
 
 ### Maintain dependency license exceptions
 
