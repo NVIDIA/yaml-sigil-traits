@@ -186,6 +186,6 @@ patent/IP, and non-endorsement notices are collected in
 [`THIRD_PARTY_NOTICES.md`](https://github.com/NVIDIA/yaml-sigil-traits/blob/main/THIRD_PARTY_NOTICES.md).
 
 The pinned specification has its own complete notice at
-[`source-spec/THIRD_PARTY_NOTICES.md`](https://github.com/NVIDIA/yaml-sigil-spec/blob/98140c77464af0a1cae2c6a650a1adeb9493e5f2/THIRD_PARTY_NOTICES.md).
+[`source-spec/THIRD_PARTY_NOTICES.md`](https://github.com/NVIDIA/yaml-sigil-spec/blob/30b143f09630448abbace14cfae2188279536f56/THIRD_PARTY_NOTICES.md).
 The crate package excludes `source-spec/`; repository distributions that
 initialize the submodule must preserve that notice.
