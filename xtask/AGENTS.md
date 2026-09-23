@@ -32,10 +32,11 @@ the selected tools and distinguish missing tools from tools that cannot run.
 Share Cargo feature options across `check`, `coverage`, and `coverage-open`.
 Default to `--all-features` only when no feature option is supplied. Allow
 `--features` with `--no-default-features`; reject `--all-features` with either.
-Apply feature selection to public-crate compilation, linting, tests, dependency
-policy, and coverage. Keep xtask validation locked and all-feature regardless
-of the public-crate selection. Formatting receives no feature flags. A narrow
-audit generates the ignored root lockfile if it does not exist.
+Apply feature selection to public-crate compilation, linting, tests, and
+coverage. Dependency-policy checks always use all features in both graphs.
+Keep xtask validation locked and all-feature regardless of the public-crate
+selection. Formatting receives no feature flags. A narrow audit generates the
+ignored root lockfile if it does not exist.
 
 Coverage runs the public crate's library and integration tests. LLVM coverage
 is the default; `--engine=tarpaulin` selects Tarpaulin. Keep separate reports:
@@ -71,12 +72,15 @@ Do not add `image`, `profile`, `profile-open`, or MCP commands: this library
 owns no images, representative profiling workload, or MCP server.
 
 Humans must keep workflows and scripts aligned with the command registry.
-Trusted CI uses selected `check` steps. Candidate CI keeps its fixed tools and
-Cargo overrides, completes policy checks first, and executes equivalent direct
-commands only in its terminal phase. Keep workflow syntax and policy validation
-outside this crate. Retain the bounded Python candidate-binding and reporting
-helpers for their JSON and API work. Inspect callers and obtain approval before
-replacing mature helpers; do not migrate them solely to change the language.
+Trusted CI runs directly invokable checks as independent steps and scopes
+`check --only=package-content` to release-manifest policy and source inventory.
+Candidate CI keeps its fixed tools and Cargo overrides, completes policy checks
+first, and runs equivalent direct commands and the standalone package-content
+comparison only in its terminal phase. Keep workflow syntax and policy
+validation outside this crate. Retain the bounded Python candidate-binding and
+reporting helpers for their JSON and API work. Inspect callers and obtain
+approval before replacing mature helpers; do not migrate them solely to change
+the language.
 
 `cargo xtask check`, `coverage`, `package-content`, and `release` are
 provider-neutral and credential-free. They may run ordinary development commands,
@@ -118,7 +122,7 @@ Run these checks after changes:
 ```shell
 cargo fmt --manifest-path xtask/Cargo.toml --all --check
 cargo clippy --locked --manifest-path xtask/Cargo.toml --all-targets --all-features -- -D warnings
-cargo test --locked --manifest-path xtask/Cargo.toml
+cargo test --locked --manifest-path xtask/Cargo.toml --all-features
 ```
 
 Also exercise a narrow selection such as `cargo xtask check --only=fmt,check`

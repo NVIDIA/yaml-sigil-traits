@@ -109,8 +109,56 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # Markdown and provider-specific policy checks run in trusted_policy.
-      - name: Run Rust validation
-        run: cargo xtask check --exclude=markdown
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Check xtask formatting
+        run: cargo fmt --manifest-path xtask/Cargo.toml --all --check
+
+      # Validate release-manifest policy and compare the source inventory.
+      # Markdown runs in trusted_policy; formatting, compilation, Clippy,
+      # tests, and dependency checks run as separate steps.
+      - name: Check release manifest and package contents
+        run: cargo xtask check --only=package-content
+
+      - name: Check crate compilation
+        run: cargo check --all-targets --all-features
+
+      - name: Check xtask compilation
+        run: >-
+          cargo check --locked --manifest-path xtask/Cargo.toml
+          --all-targets --all-features
+
+      - name: Lint crate
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Lint xtask
+        run: >-
+          cargo clippy --locked --manifest-path xtask/Cargo.toml
+          --all-targets --all-features -- -D warnings
+
+      - name: Test crate
+        run: cargo test --all-features
+
+      - name: Test xtask
+        run: cargo test --locked --manifest-path xtask/Cargo.toml --all-features
+
+      - name: Check unused dependencies
+        run: cargo-machete --with-metadata
+
+      - name: Check crate dependency policy
+        run: cargo-deny --all-features check bans licenses sources -D warnings
+
+      - name: Check xtask dependency policy
+        run: >-
+          cargo-deny --manifest-path xtask/Cargo.toml --locked --all-features
+          check bans licenses sources -D warnings
+
+      - name: Audit crate dependencies
+        run: cargo audit
+
+      - name: Audit xtask dependencies
+        run: cargo audit --file xtask/Cargo.lock
 
   trusted_msrv:
     name: Rust 1.95.0 (Linux)
@@ -193,5 +241,36 @@ jobs:
           components: clippy, rustfmt
           toolchain: 1.98.0
 
-      - name: Run portable Rust validation
-        run: cargo xtask check --only=fmt,package-content,check,clippy,test
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Check xtask formatting
+        run: cargo fmt --manifest-path xtask/Cargo.toml --all --check
+
+      # Only validate release-manifest policy and source inventory here.
+      # Formatting and Rust checks run separately; Linux owns Markdown,
+      # dependency checks, and provider policy.
+      - name: Check release manifest and package contents
+        run: cargo xtask check --only=package-content
+
+      - name: Check crate compilation
+        run: cargo check --all-targets --all-features
+
+      - name: Check xtask compilation
+        run: >-
+          cargo check --locked --manifest-path xtask/Cargo.toml
+          --all-targets --all-features
+
+      - name: Lint crate
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Lint xtask
+        run: >-
+          cargo clippy --locked --manifest-path xtask/Cargo.toml
+          --all-targets --all-features -- -D warnings
+
+      - name: Test crate
+        run: cargo test --all-features
+
+      - name: Test xtask
+        run: cargo test --locked --manifest-path xtask/Cargo.toml --all-features

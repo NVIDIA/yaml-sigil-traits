@@ -223,10 +223,11 @@ cargo xtask check
 first error. Unknown, empty, and conflicting selections are errors. For
 example, use `cargo xtask check --only=fmt,clippy,test` during development.
 
-The public crate defaults to all features. Pass `--features=FEATURE,...` and
-optionally `--no-default-features` to choose another feature set;
-`--all-features` conflicts with either explicit option. The isolated xtask
-workspace always receives its own all-feature checks with `--locked`.
+Public-crate compilation, Clippy, tests, and coverage default to all features.
+Pass `--features=FEATURE,...` and optionally `--no-default-features` to choose
+another feature set; `--all-features` conflicts with either explicit option.
+The isolated xtask workspace always receives its own all-feature checks with
+`--locked`.
 
 Prepare and validate a locally owned release transaction with the exact
 maintainer-selected version:
@@ -285,7 +286,8 @@ test "$(cargo-deny --version)" = "cargo-deny 0.20.2"
 Cargo Deny reads the repository-wide policy from `deny.toml` and the crate-specific
 license exceptions for each graph from the nearest `deny.exceptions.toml`.
 The root check resolves the uncommitted crate graph, while the xtask check uses
-its committed lockfile.
+its committed lockfile. Both dependency-policy checks use all features,
+regardless of the selected public-crate compilation features.
 
 Keep the cargo-audit, cargo-deny, and cargo-machete versions aligned with
 hosted CI. The
@@ -375,13 +377,17 @@ Release qualification and deterministic release-object reconciliation belong
 in the two typed `cargo xtask github release` commands, not in additional
 Python or shell helpers.
 
-Hosted trusted Rust validation uses `check --exclude=markdown`; a separate
-policy job owns Markdown and provider checks. Trusted macOS and Windows jobs
-select `fmt,package-content,check,clippy,test`. Candidate validation keeps fixed
-tool paths and Cargo overrides in its terminal phase, with equivalent direct
-Rust commands. Dependency and policy checks run before candidate execution.
-The independent MSRV lane runs only crate and xtask tests. Keep these workflow
-mappings aligned by review; the xtask must not inspect workflow declarations.
+Hosted trusted Rust validation exposes formatting, compilation, Clippy, tests,
+and dependency checks as independent steps. A scoped
+`check --only=package-content` step validates release-manifest policy and the
+source inventory. A separate policy job owns Markdown and provider checks.
+Trusted macOS and Windows jobs run formatting, package policy, compilation,
+Clippy, and tests. Candidate validation keeps fixed tool paths and Cargo
+overrides in its terminal phase, with equivalent direct Rust commands and the
+standalone package-content comparison. Dependency and policy checks run before
+candidate execution. The independent MSRV lane runs only crate and xtask tests.
+Keep these workflow mappings aligned by review; the xtask must not inspect
+workflow declarations.
 
 Hosted CI runs authoritative Rust `1.98.0` and an independent Rust `1.95.0`
 lane on NVIDIA Linux runners. GitHub-hosted macOS and Windows jobs are

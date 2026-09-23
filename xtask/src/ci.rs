@@ -150,13 +150,21 @@ impl CheckStep {
             }
             Self::Machete => vec![CommandSpec::new("cargo-machete", &["--with-metadata"])],
             Self::Deny => {
-                let mut root = CommandSpec::new("cargo-deny", &[]);
-                root.args.extend(features.cargo_args());
-                root.args.extend(
-                    ["check", "bans", "licenses", "sources", "-D", "warnings"].map(Into::into),
-                );
+                // Dependency policy checks both complete graphs even when
+                // compilation selects fewer public-crate features.
                 vec![
-                    root,
+                    CommandSpec::new(
+                        "cargo-deny",
+                        &[
+                            "--all-features",
+                            "check",
+                            "bans",
+                            "licenses",
+                            "sources",
+                            "-D",
+                            "warnings",
+                        ],
+                    ),
                     CommandSpec::new(
                         "cargo-deny",
                         &[
@@ -232,12 +240,7 @@ mod tests {
             no_default_features: true,
             ..FeatureArgs::default()
         };
-        for step in [
-            CheckStep::Check,
-            CheckStep::Clippy,
-            CheckStep::Test,
-            CheckStep::Deny,
-        ] {
+        for step in [CheckStep::Check, CheckStep::Clippy, CheckStep::Test] {
             let commands = step.commands(&features);
             assert_eq!(commands.len(), 2);
             assert!(!commands[0].args.contains(&"--locked".into()));
@@ -249,6 +252,15 @@ mod tests {
             assert!(commands[1].args.contains(&"--all-features".into()));
             assert!(!commands[1].args.contains(&"product-feature".into()));
             assert!(!commands[1].args.contains(&"--no-default-features".into()));
+        }
+        let policy = CheckStep::Deny.commands(&features);
+        assert!(!policy[0].args.contains(&"--locked".into()));
+        assert!(policy[1].args.contains(&"--locked".into()));
+        assert!(policy[1].args.contains(&"xtask/Cargo.toml".into()));
+        for command in policy {
+            assert!(command.args.contains(&"--all-features".into()));
+            assert!(!command.args.contains(&"product-feature".into()));
+            assert!(!command.args.contains(&"--no-default-features".into()));
         }
         for command in CheckStep::Fmt.commands(&features) {
             assert!(!command.args.contains(&"--no-default-features".into()));

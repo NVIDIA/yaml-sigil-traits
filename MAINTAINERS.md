@@ -655,12 +655,14 @@ choose the smallest accurate type. Follow the sign-off requirements in
 ## Repository development guidance
 
 Run `cargo xtask check` for the complete local validation gate; `ci` is an
-alias. Trusted Linux CI runs `check --exclude=markdown` because its policy job
-owns Markdown and provider checks. Trusted portability jobs select
-`fmt,package-content,check,clippy,test`. The independent MSRV lane runs tests.
-Candidate workflows retain direct commands with fixed tool paths and Cargo
-overrides in the terminal executable phase. Keep those commands aligned with
-the xtask registry while preserving the earlier independent policy checks.
+alias. Trusted CI runs formatting, compilation, Clippy, and tests as independent
+steps. Its scoped `check --only=package-content` step validates release-manifest
+policy and the source inventory. Linux also runs dependency checks, Markdown,
+and provider checks; the independent MSRV lane runs tests. Candidate workflows
+retain direct commands and the standalone package-content comparison with fixed
+tool paths and Cargo overrides in the terminal executable phase. Keep those
+commands aligned with the xtask registry while preserving the earlier
+independent policy checks.
 
 Repository scope, commands, documentation and style, third-party material
 and attribution, coordinated Buf upgrades, and other working guidance remain

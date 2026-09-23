@@ -135,11 +135,12 @@ is an alias for the same command. Run a subset with
 `cargo xtask check --only=fmt,clippy,test`, or omit checks with
 `--exclude=STEP,...`. Checks run in registry order and stop at the first error.
 
-Checks use all public-crate features by default. `--features=FEATURE,...` and
-`--no-default-features` select a different set without changing the standalone
-xtask workspace's validation. The public crate has no optional features today.
-The GitHub Actions workflows use the same Rust checks, with separate
-provider-policy and MSRV lanes.
+Compilation, Clippy, tests, and coverage use all public-crate features by
+default. `--features=FEATURE,...` and `--no-default-features` select a different
+set without changing the standalone xtask workspace's validation. Dependency
+policy checks always inspect all features in both graphs. The public crate has
+no optional features today. The GitHub Actions workflows expose Rust checks as
+independent steps, with separate provider-policy and MSRV lanes.
 
 `cargo package` performs separate local package assembly and
 verification without uploading anything; it is not part of the non-release CI
