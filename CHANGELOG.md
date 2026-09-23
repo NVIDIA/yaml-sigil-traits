@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1](https://github.com/NVIDIA/yaml-sigil-traits/compare/v0.4.1-rc.1...v0.4.1) - 2026-09-23
+
+### Added
+
+- Add `yaml_sigil_traits::v1alpha1` as an explicit namespace for the existing
+  trait and data contract. Unqualified imports name the same definitions
+  ([#127](https://github.com/NVIDIA/yaml-sigil-traits/pull/127)).
+
+### Fixed
+
+- Expose hosted checks individually and retain complete dependency-policy
+  validation.
+
+### Changed
+
+- Update the specification pin to `30b143f`
+  ([#126](https://github.com/NVIDIA/yaml-sigil-traits/pull/126)).
+- Clarify trait contracts and release guidance, align development checks, and
+  add optional library coverage.
+- Document retirement of completed coordination branches
+  ([#123](https://github.com/NVIDIA/yaml-sigil-traits/pull/123)).
+
 ## [0.4.1-rc.2](https://github.com/NVIDIA/yaml-sigil-traits/compare/v0.4.1-rc.1...v0.4.1-rc.2) - 2026-09-23
 
 ### Added
