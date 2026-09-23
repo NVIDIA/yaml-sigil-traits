@@ -17,7 +17,16 @@ helper functions exposed by those traits.
 
 ## Contract surface
 
-This crate exposes the portable contract for these API areas.
+Select the contract through `yaml_sigil_traits::v1alpha1`. Its modules and
+root exports mirror the existing crate surface. For example,
+`v1alpha1::signing::Signer` and `signing::Signer` name the same trait, and
+`v1alpha1::AlgorithmId` and `AlgorithmId` name the same type. Implementations
+and values work across both import styles without adapters or conversions.
+
+The unqualified paths remain supported as the `v1alpha1` default. The
+specification identifier `v1alpha1` is independent of this crate's SemVer.
+
+This namespace exposes the portable contract for these API areas.
 
 | API | Sync trait | Async trait | Capability DTO |
 |-----|------------|-------------|----------------|
@@ -59,7 +68,7 @@ keys without constructing or parsing them.
 Use the synchronous traits through generic bounds or trait objects.
 
 ```rust
-use yaml_sigil_traits::signing::{SignOutcome, SignRequest, Signer};
+use yaml_sigil_traits::v1alpha1::signing::{SignOutcome, SignRequest, Signer};
 
 pub fn sign_with<S: Signer>(
     signer: &S,
@@ -74,7 +83,7 @@ returns have `Send` bounds, and implementations must be `Send + Sync`.
 The async traits are not object-safe.
 
 ```rust
-use yaml_sigil_traits::verification::{
+use yaml_sigil_traits::v1alpha1::verification::{
     ArtifactForm, AsyncVerifier, InvocationError, PublicKeys, VerifierOptions,
     VerifierState,
 };
