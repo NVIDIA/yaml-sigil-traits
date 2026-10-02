@@ -63,6 +63,24 @@ Signer and verifier implementations choose the concrete key types they accept.
 The shared `SigningKey`, `SignRequest`, and `PublicKeys` data types borrow those
 keys without constructing or parsing them.
 
+## Portable contract
+
+Disable default features for allocator-free algorithm, conformance, resource,
+and error vocabulary. Enable `alloc` for the sync and async extension traits,
+owned write results, and allocating metadata. `std` includes `alloc`.
+
+Sign and transcription requests carry `resource_limits`. `VerifierOptions`
+and `PreVerifyOptions` carry that policy plus observation selection; their
+operation defaults are unbounded. `ArtifactResourceLimits::default()` selects
+an explicitly requested 4 MiB ceiling. Primary results are flat typed errors.
+
+Decomposition, pre-verification, and verified payloads borrow the original
+artifact, independently of temporary keys, options, requests, and pre-responses.
+Pre-responses retain `source_artifact` so implementations can recheck its
+encoded size under a subsequent verification policy. Signing and composition
+own output vectors. These Rust API changes preserve `v1alpha1` specification
+identifiers, artifact formats, and cryptographic profiles.
+
 ## Trait usage
 
 Use the synchronous traits through generic bounds or trait objects.
@@ -84,16 +102,16 @@ The async traits are not object-safe.
 
 ```rust
 use yaml_sigil_traits::v1alpha1::verification::{
-    ArtifactForm, AsyncVerifier, InvocationError, PublicKeys, VerifierOptions,
-    VerifierState,
+    ArtifactForm, AsyncVerifier, PublicKeys, VerifierOptions, VerifyError,
+    VerifyResult,
 };
 
-pub async fn verify_with<V: AsyncVerifier>(
+pub async fn verify_with<'input, V: AsyncVerifier>(
     verifier: &V,
-    artifact: &[u8],
+    artifact: &'input [u8],
     form: ArtifactForm,
     keys: &PublicKeys<'_, V::Ed25519VerifyingKey, V::P256VerifyingKey>,
-) -> Result<VerifierState, InvocationError> {
+) -> Result<VerifyResult<'input>, VerifyError> {
     verifier
         .verify(artifact, form, keys, VerifierOptions::default())
         .await
@@ -147,9 +165,10 @@ is an alias for the same command. Run a subset with
 Compilation, Clippy, tests, and coverage use all public-crate features by
 default. `--features=FEATURE,...` and `--no-default-features` select a different
 set without changing the standalone xtask workspace's validation. Dependency
-policy checks always inspect all features in both graphs. The public crate has
-no optional features today. The GitHub Actions workflows expose Rust checks as
-independent steps, with separate provider-policy and MSRV lanes.
+policy checks always inspect all features in both graphs. The public crate
+defaults to `std`; `alloc` enables its allocating DTOs and
+extension traits without requiring `std`. The GitHub Actions workflows expose
+Rust checks as independent steps, with separate provider-policy and MSRV lanes.
 
 `cargo package` performs separate local package assembly and
 verification without uploading anything; it is not part of the non-release CI

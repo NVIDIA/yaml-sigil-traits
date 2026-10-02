@@ -41,4 +41,9 @@ inherent_method_must_use_added = "warn"
 unsafe_code = "forbid"
 
 [dependencies]
-thiserror = "2.0"
+thiserror = { version = "2.0", default-features = false }
+
+[features]
+default = ["std"]
+alloc = []
+std = ["alloc", "thiserror/std"]

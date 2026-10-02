@@ -3,12 +3,12 @@
 
 //! Shared Rust traits and data types for the YamlSigil v1alpha1 APIs.
 //!
-//! Use the synchronous or async traits with their request, response, error,
-//! and capability types:
+//! With `alloc`, use the synchronous or async traits with their request,
+//! response, error, and capability types:
 //!
-//! - [`v1alpha1::signing::Signer`] / [`v1alpha1::signing::AsyncSigner`]
-//! - [`v1alpha1::transcription::Transcriber`] / [`v1alpha1::transcription::AsyncTranscriber`]
-//! - [`v1alpha1::verification::Verifier`] / [`v1alpha1::verification::AsyncVerifier`]
+//! - [`v1alpha1::signing`]: `Signer` / `AsyncSigner`
+//! - [`v1alpha1::transcription`]: `Transcriber` / `AsyncTranscriber`
+//! - [`v1alpha1::verification`]: `Verifier` / `AsyncVerifier`
 //!
 //! Select [`v1alpha1`] explicitly in new integrations. The unqualified paths
 //! remain the default for this specification version and name the same traits
@@ -24,16 +24,33 @@
 //! require `Send + Sync` implementations. Use generic bounds such as
 //! `<S: AsyncSigner>`; these traits are not object-safe.
 
+#![cfg_attr(not(feature = "std"), no_std)]
+
+#[cfg(feature = "alloc")]
+extern crate alloc;
+#[cfg(all(test, not(feature = "std")))]
+extern crate std;
+
 pub mod algorithm;
+pub mod codec;
 pub mod conformance;
+pub mod resource;
 pub mod signing;
 pub mod transcription;
 pub mod verification;
 
 pub use algorithm::AlgorithmId;
+pub use codec::{
+    ArtifactDecodeError, ArtifactEncodeError, DecodeError, DecodeErrorKind, EncodeError,
+    EncodeErrorKind,
+};
 pub use conformance::{
     OuterConformance, ProtobufWireDecodeAdvertisement, YamlSignatureDocumentDuplicateKeyPolicy,
     YamlSignatureDocumentUnknownFieldPolicy,
+};
+pub use resource::{
+    ArtifactResourceError, ArtifactResourceErrorKind, ArtifactResourceForm, ArtifactResourceLimits,
+    ArtifactResourceResult, DEFAULT_MAX_ARTIFACT_BYTES,
 };
 
 /// The YamlSigil `v1alpha1` trait and data contract.
@@ -51,8 +68,11 @@ pub use conformance::{
 /// ```
 pub mod v1alpha1 {
     pub use crate::{
-        AlgorithmId, OuterConformance, ProtobufWireDecodeAdvertisement,
+        AlgorithmId, ArtifactDecodeError, ArtifactEncodeError, ArtifactResourceError,
+        ArtifactResourceErrorKind, ArtifactResourceForm, ArtifactResourceLimits,
+        ArtifactResourceResult, DEFAULT_MAX_ARTIFACT_BYTES, DecodeError, DecodeErrorKind,
+        EncodeError, EncodeErrorKind, OuterConformance, ProtobufWireDecodeAdvertisement,
         YamlSignatureDocumentDuplicateKeyPolicy, YamlSignatureDocumentUnknownFieldPolicy,
-        algorithm, conformance, signing, transcription, verification,
+        algorithm, codec, conformance, resource, signing, transcription, verification,
     };
 }

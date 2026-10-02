@@ -9,8 +9,10 @@ README.md
 SECURITY.md
 THIRD_PARTY_NOTICES.md
 src/algorithm.rs
+src/codec.rs
 src/conformance.rs
 src/lib.rs
+src/resource.rs
 src/signing.rs
 src/transcription.rs
 src/verification.rs
