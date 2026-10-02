@@ -1,14 +1,16 @@
 // SPDX-FileCopyrightText: Copyright 2026 NVIDIA CORPORATION & AFFILIATES
 // SPDX-License-Identifier: Apache-2.0
 
+#![cfg(feature = "alloc")]
+
 use yaml_sigil_traits::signing::{
     AsyncSigner, OutputForm, SignError, SignOutcome, SignRequest, Signer, SignerCapabilities,
     SigningKey,
 };
 use yaml_sigil_traits::verification::{
-    AdvertisedConformanceProfile, ArtifactForm, AsyncVerifier, InvocationError, PreVerifyOutcome,
-    PreVerifyResponse, PublicKeys, Verifier, VerifierCapabilities, VerifierOptions, VerifierState,
-    VerifyResult,
+    AdvertisedConformanceProfile, ArtifactForm, AsyncVerifier, InvocationError, PreVerifyOptions,
+    PreVerifyOutcome, PreVerifyResponse, PublicKeys, Verifier, VerifierCapabilities,
+    VerifierOptions, VerifyError, VerifyResult,
 };
 use yaml_sigil_traits::{
     AlgorithmId, ProtobufWireDecodeAdvertisement, YamlSignatureDocumentDuplicateKeyPolicy,
@@ -46,7 +48,7 @@ fn verifier_capabilities() -> VerifierCapabilities {
             YamlSignatureDocumentDuplicateKeyPolicy::RejectedAtParse,
         yaml_signature_unknown_field_policy:
             YamlSignatureDocumentUnknownFieldPolicy::RejectedAtParse,
-        yaml_signature_unknown_field_policies: vec![
+        yaml_signature_unknown_field_policies: &[
             YamlSignatureDocumentUnknownFieldPolicy::RejectedAtParse,
         ],
         supported_forms: &[ArtifactForm::Yaml],
@@ -58,8 +60,9 @@ fn verifier_capabilities() -> VerifierCapabilities {
     }
 }
 
-fn pre_verify_response(form: ArtifactForm) -> PreVerifyResponse {
+fn pre_verify_response(input: &[u8], form: ArtifactForm) -> PreVerifyResponse<'_> {
     PreVerifyResponse {
+        source_artifact: input,
         outcome: PreVerifyOutcome::Unsigned,
         form,
         unverified_payload_bytes: None,
@@ -82,7 +85,7 @@ impl Signer for LocalSigner {
         &self,
         _req: &SignRequest<'_, Self::Ed25519SigningKey, Self::P256SigningKey>,
     ) -> SignOutcome {
-        SignOutcome::Signer(SignError::KeyOperationFailure)
+        Err(SignError::KeyOperationFailure)
     }
 }
 
@@ -100,7 +103,7 @@ impl AsyncSigner for LocalAsyncSigner {
         &self,
         _req: &SignRequest<'_, Self::Ed25519SigningKey, Self::P256SigningKey>,
     ) -> SignOutcome {
-        SignOutcome::Signer(SignError::KeyOperationFailure)
+        Err(SignError::KeyOperationFailure)
     }
 }
 
@@ -109,49 +112,33 @@ struct LocalVerifier;
 impl Verifier for LocalVerifier {
     type Ed25519VerifyingKey = LocalEd25519VerifyingKey;
     type P256VerifyingKey = LocalP256VerifyingKey;
-
     fn capabilities(&self) -> VerifierCapabilities {
         verifier_capabilities()
     }
-
-    fn pre_verify(
+    fn pre_verify<'input>(
         &self,
-        _input_bytes: &[u8],
+        input: &'input [u8],
         form: ArtifactForm,
-        _allow_unsigned: bool,
-        _include_parser_observations: bool,
-    ) -> PreVerifyResponse {
-        pre_verify_response(form)
+        _options: PreVerifyOptions,
+    ) -> Result<PreVerifyResponse<'input>, VerifyError> {
+        Ok(pre_verify_response(input, form))
     }
-
-    fn verify(
+    fn verify<'input>(
         &self,
-        _input_bytes: &[u8],
+        _input: &'input [u8],
         _form: ArtifactForm,
         _keys: &PublicKeys<'_, Self::Ed25519VerifyingKey, Self::P256VerifyingKey>,
-        _options: VerifierOptions,
-    ) -> Result<VerifierState, InvocationError> {
-        Err(InvocationError::KeyResolutionFailure)
+        _options: VerifierOptions<'_>,
+    ) -> Result<VerifyResult<'input>, VerifyError> {
+        Err(InvocationError::KeyResolutionFailure.into())
     }
-
-    fn verify_with_metadata(
+    fn verify_from_pre_verify<'input>(
         &self,
-        _input_bytes: &[u8],
-        _form: ArtifactForm,
+        _pre: &PreVerifyResponse<'input>,
         _keys: &PublicKeys<'_, Self::Ed25519VerifyingKey, Self::P256VerifyingKey>,
-        _options: VerifierOptions,
-        _include_parser_observations: bool,
-    ) -> Result<VerifyResult, InvocationError> {
-        Err(InvocationError::KeyResolutionFailure)
-    }
-
-    fn verify_from_pre_verify(
-        &self,
-        _pre: &PreVerifyResponse,
-        _keys: &PublicKeys<'_, Self::Ed25519VerifyingKey, Self::P256VerifyingKey>,
-        _options: VerifierOptions,
-    ) -> Result<VerifierState, InvocationError> {
-        Err(InvocationError::KeyResolutionFailure)
+        _options: VerifierOptions<'_>,
+    ) -> Result<VerifyResult<'input>, VerifyError> {
+        Err(InvocationError::KeyResolutionFailure.into())
     }
 }
 
@@ -160,49 +147,33 @@ struct LocalAsyncVerifier;
 impl AsyncVerifier for LocalAsyncVerifier {
     type Ed25519VerifyingKey = LocalEd25519VerifyingKey;
     type P256VerifyingKey = LocalP256VerifyingKey;
-
     fn capabilities(&self) -> VerifierCapabilities {
         verifier_capabilities()
     }
-
-    async fn pre_verify(
-        &self,
-        _input_bytes: &[u8],
+    async fn pre_verify<'call, 'input: 'call>(
+        &'call self,
+        input: &'input [u8],
         form: ArtifactForm,
-        _allow_unsigned: bool,
-        _include_parser_observations: bool,
-    ) -> PreVerifyResponse {
-        pre_verify_response(form)
+        _options: PreVerifyOptions,
+    ) -> Result<PreVerifyResponse<'input>, VerifyError> {
+        Ok(pre_verify_response(input, form))
     }
-
-    async fn verify(
-        &self,
-        _input_bytes: &[u8],
+    async fn verify<'call, 'input: 'call>(
+        &'call self,
+        _input: &'input [u8],
         _form: ArtifactForm,
-        _keys: &PublicKeys<'_, Self::Ed25519VerifyingKey, Self::P256VerifyingKey>,
-        _options: VerifierOptions,
-    ) -> Result<VerifierState, InvocationError> {
-        Err(InvocationError::KeyResolutionFailure)
+        _keys: &'call PublicKeys<'_, Self::Ed25519VerifyingKey, Self::P256VerifyingKey>,
+        _options: VerifierOptions<'call>,
+    ) -> Result<VerifyResult<'input>, VerifyError> {
+        Err(InvocationError::KeyResolutionFailure.into())
     }
-
-    async fn verify_with_metadata(
-        &self,
-        _input_bytes: &[u8],
-        _form: ArtifactForm,
-        _keys: &PublicKeys<'_, Self::Ed25519VerifyingKey, Self::P256VerifyingKey>,
-        _options: VerifierOptions,
-        _include_parser_observations: bool,
-    ) -> Result<VerifyResult, InvocationError> {
-        Err(InvocationError::KeyResolutionFailure)
-    }
-
-    async fn verify_from_pre_verify(
-        &self,
-        _pre: &PreVerifyResponse,
-        _keys: &PublicKeys<'_, Self::Ed25519VerifyingKey, Self::P256VerifyingKey>,
-        _options: VerifierOptions,
-    ) -> Result<VerifierState, InvocationError> {
-        Err(InvocationError::KeyResolutionFailure)
+    async fn verify_from_pre_verify<'call, 'input: 'call>(
+        &'call self,
+        _pre: &'call PreVerifyResponse<'input>,
+        _keys: &'call PublicKeys<'_, Self::Ed25519VerifyingKey, Self::P256VerifyingKey>,
+        _options: VerifierOptions<'call>,
+    ) -> Result<VerifyResult<'input>, VerifyError> {
+        Err(InvocationError::KeyResolutionFailure.into())
     }
 }
 
@@ -250,6 +221,7 @@ fn synchronous_traits_remain_object_safe_with_explicit_key_bindings() {
 fn async_trait_futures_are_send_with_local_key_types() {
     let signing_key = LocalEd25519SigningKey;
     let request = SignRequest {
+        resource_limits: yaml_sigil_traits::ArtifactResourceLimits::unbounded(),
         payload: b"payload\n",
         algorithm: AlgorithmId::Ed25519,
         key: SigningKey::<LocalEd25519SigningKey, LocalP256SigningKey>::Ed25519(&signing_key),
@@ -287,7 +259,7 @@ impl v1alpha1::signing::Signer for VersionedSigner {
         &self,
         _req: &SignRequest<'_, Self::Ed25519SigningKey, Self::P256SigningKey>,
     ) -> v1alpha1::signing::SignOutcome {
-        SignOutcome::Signer(SignError::KeyOperationFailure)
+        Err(SignError::KeyOperationFailure)
     }
 }
 
@@ -295,6 +267,7 @@ impl v1alpha1::signing::Signer for VersionedSigner {
 fn signer_implementations_and_borrowed_requests_cross_namespace_paths() {
     let key = LocalEd25519SigningKey;
     let request = v1alpha1::signing::SignRequest {
+        resource_limits: yaml_sigil_traits::ArtifactResourceLimits::unbounded(),
         payload: b"namespace: v1alpha1\n",
         algorithm: v1alpha1::algorithm::AlgorithmId::Ed25519,
         key: SigningKey::<LocalEd25519SigningKey, LocalP256SigningKey>::Ed25519(&key),
@@ -317,11 +290,11 @@ fn signer_implementations_and_borrowed_requests_cross_namespace_paths() {
         &VersionedSigner;
     assert!(matches!(
         old_implementation.sign(default_request),
-        SignOutcome::Signer(SignError::KeyOperationFailure)
+        Err(SignError::KeyOperationFailure)
     ));
     assert!(matches!(
         new_implementation.sign(versioned_request),
-        v1alpha1::signing::SignOutcome::Signer(v1alpha1::signing::SignError::KeyOperationFailure)
+        Err(v1alpha1::signing::SignError::KeyOperationFailure)
     ));
     let capabilities: v1alpha1::signing::SignerCapabilities = signer_capabilities();
     assert_eq!(new_implementation.capabilities(), capabilities);
@@ -344,7 +317,16 @@ fn verifier_objects_keys_and_results_cross_namespace_paths() {
         LocalEd25519VerifyingKey,
         LocalP256VerifyingKey,
     > = default_keys;
-    let pre: PreVerifyResponse = verifier.pre_verify(b"payload\n", ArtifactForm::Yaml, true, false);
+    let pre: PreVerifyResponse = verifier
+        .pre_verify(
+            b"payload\n",
+            ArtifactForm::Yaml,
+            PreVerifyOptions {
+                allow_unsigned: true,
+                ..PreVerifyOptions::default()
+            },
+        )
+        .unwrap();
     let versioned_pre: v1alpha1::verification::PreVerifyResponse = pre;
     assert_eq!(
         verifier.verify_from_pre_verify(
@@ -352,7 +334,9 @@ fn verifier_objects_keys_and_results_cross_namespace_paths() {
             &versioned_keys,
             v1alpha1::verification::VerifierOptions::default(),
         ),
-        Err(v1alpha1::verification::InvocationError::KeyResolutionFailure)
+        Err(v1alpha1::verification::VerifyError::Invocation(
+            InvocationError::KeyResolutionFailure
+        ))
     );
     let policy: v1alpha1::YamlSignatureDocumentUnknownFieldPolicy =
         YamlSignatureDocumentUnknownFieldPolicy::RejectedAtParse;
@@ -380,17 +364,19 @@ impl v1alpha1::transcription::Transcriber for VersionedTranscriber {
     }
 
     fn compose(&self, _req: &transcription::ComposeRequest<'_>) -> transcription::ComposeOutcome {
-        transcription::ComposeOutcome::Invocation(
+        Err(yaml_sigil_traits::transcription::ComposeError::Invocation(
             transcription::TranscriberInvocationError::InvalidOrUnsupportedForm,
-        )
+        ))
     }
 
-    fn decompose(
+    fn decompose<'input>(
         &self,
-        _req: &transcription::DecomposeRequest<'_>,
-    ) -> transcription::DecomposeResponse {
-        transcription::DecomposeResponse::Invocation(
-            transcription::TranscriberInvocationError::InvalidOrUnsupportedForm,
+        _req: &transcription::DecomposeRequest<'input>,
+    ) -> transcription::DecomposeResponse<'input> {
+        Err(
+            yaml_sigil_traits::transcription::DecomposeError::Invocation(
+                transcription::TranscriberInvocationError::InvalidOrUnsupportedForm,
+            ),
         )
     }
 }
@@ -407,10 +393,10 @@ impl v1alpha1::transcription::AsyncTranscriber for VersionedTranscriber {
         transcription::Transcriber::compose(self, req)
     }
 
-    async fn decompose(
-        &self,
-        req: &transcription::DecomposeRequest<'_>,
-    ) -> transcription::DecomposeResponse {
+    async fn decompose<'call, 'input: 'call>(
+        &'call self,
+        req: &'call transcription::DecomposeRequest<'input>,
+    ) -> transcription::DecomposeResponse<'input> {
         transcription::Transcriber::decompose(self, req)
     }
 }
@@ -418,22 +404,23 @@ impl v1alpha1::transcription::AsyncTranscriber for VersionedTranscriber {
 #[test]
 fn transcription_objects_and_owned_dtos_cross_namespace_paths() {
     let versioned = v1alpha1::transcription::AbstractArtifact {
-        payload: b"payload\n".to_vec(),
-        signature_carrier: Vec::new(),
+        payload: b"payload\n",
+        signature_carrier: &[],
     };
     let default: transcription::AbstractArtifact = versioned;
     let round_trip: v1alpha1::transcription::AbstractArtifact = default;
     let request = v1alpha1::transcription::ComposeRequest {
-        payload: &round_trip.payload,
-        signature_carrier: &round_trip.signature_carrier,
+        resource_limits: yaml_sigil_traits::ArtifactResourceLimits::unbounded(),
+        payload: round_trip.payload,
+        signature_carrier: round_trip.signature_carrier,
         form: transcription::TranscriptionForm::Yaml,
     };
     let transcriber: &dyn transcription::Transcriber = &VersionedTranscriber;
     assert!(matches!(
         transcriber.compose(&request),
-        v1alpha1::transcription::ComposeOutcome::Invocation(
+        Err(yaml_sigil_traits::transcription::ComposeError::Invocation(
             v1alpha1::transcription::TranscriberInvocationError::InvalidOrUnsupportedForm
-        )
+        ))
     ));
 }
 
@@ -441,6 +428,7 @@ fn transcription_objects_and_owned_dtos_cross_namespace_paths() {
 fn versioned_async_traits_preserve_send_futures_and_borrowed_inputs() {
     let key = LocalEd25519SigningKey;
     let request = v1alpha1::signing::SignRequest {
+        resource_limits: yaml_sigil_traits::ArtifactResourceLimits::unbounded(),
         payload: b"payload\n",
         algorithm: v1alpha1::AlgorithmId::Ed25519,
         key: v1alpha1::signing::SigningKey::<LocalEd25519SigningKey, LocalP256SigningKey>::Ed25519(
@@ -467,6 +455,7 @@ fn versioned_async_traits_preserve_send_futures_and_borrowed_inputs() {
         VerifierOptions::default(),
     ));
     let compose = transcription::ComposeRequest {
+        resource_limits: yaml_sigil_traits::ArtifactResourceLimits::unbounded(),
         payload: request.payload,
         signature_carrier: &[],
         form: transcription::TranscriptionForm::Yaml,
@@ -476,6 +465,7 @@ fn versioned_async_traits_preserve_send_futures_and_borrowed_inputs() {
         &compose,
     ));
     let decompose = transcription::DecomposeRequest {
+        resource_limits: yaml_sigil_traits::ArtifactResourceLimits::unbounded(),
         artifact: request.payload,
         form: transcription::TranscriptionForm::Protobuf,
         outer_conformance: Some(v1alpha1::OuterConformance::Strict),

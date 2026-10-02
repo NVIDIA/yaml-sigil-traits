@@ -4,10 +4,13 @@
 //! Signing traits and their request, response, error, and capability types.
 //!
 //! `yaml-sigil-signing` re-exports these types and provides the `sign`,
-//! `sign_yaml`, and `sign_proto` functions, with the `DefaultSigner` and
+//! caller-RNG signing functions, with the `DefaultSigner` and
 //! `DefaultAsyncSigner` zero-sized types.
 
-use std::fmt;
+use crate::{ArtifactResourceError, ArtifactResourceLimits, EncodeError};
+#[cfg(feature = "alloc")]
+use alloc::{string::String, vec::Vec};
+use core::fmt;
 
 use crate::{
     AlgorithmId, ProtobufWireDecodeAdvertisement, YamlSignatureDocumentDuplicateKeyPolicy,
@@ -48,44 +51,35 @@ pub enum SignInvocationError {
     InvalidKeyid,
 }
 
-/// Sign-time failures after request-shape validation (IDL `SignerError`), plus output extensions.
-///
-/// The `sign_yaml` and `sign_proto` convenience wrappers map
-/// [`SignInvocationError`] into this error type, including
-/// [`InvalidAlgorithmParameters`](SignError::InvalidAlgorithmParameters),
-/// and return `Result<_, SignError>`.
-#[derive(Debug, Error)]
+/// Failures of the primary signing operation, separated by stage.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum SignError {
+    #[error(transparent)]
+    Invocation(#[from] SignInvocationError),
+    #[error(transparent)]
+    Resource(#[from] ArtifactResourceError),
+    #[error(transparent)]
+    Encoding(#[from] EncodeError),
     #[error("invalid payload bytes (UTF-8, BOM, or line terminator rules)")]
     InvalidPayloadBytes,
     #[error("non-empty payload missing trailing newline and caller did not authorize appending LF")]
     PayloadLineTerminatorRefusal,
-    #[error("unsupported or invalid algorithm selection")]
-    InvalidOrUnsupportedAlgorithm,
-    #[error("invalid algorithm parameters")]
-    InvalidAlgorithmParameters,
-    #[error("invalid or unsupported output form")]
-    InvalidOrUnsupportedOutputForm,
-    #[error("invalid keyid (empty, over 1024 UTF-8 octets, or contains CR or LF)")]
-    InvalidKeyid,
     #[error("key operation failed")]
     KeyOperationFailure,
     #[error("YAML validation failed at sign time")]
     YamlValidationFailure,
+    #[cfg(feature = "alloc")]
     #[error("YAML serialization failed: {0}")]
     YamlSerialize(String),
 }
 
-/// Signing success or an error from invocation validation or signing.
-#[derive(Debug)]
-pub enum SignOutcome {
-    Success(SignSuccess),
-    Invocation(SignInvocationError),
-    Signer(SignError),
-}
+/// Owned signing output or a categorized error.
+#[cfg(feature = "alloc")]
+pub type SignOutcome = Result<SignSuccess, SignError>;
 
 /// Successful signing output (IDL `SignSuccess`).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(feature = "alloc")]
 pub struct SignSuccess {
     pub artifact: Vec<u8>,
     /// Populated when the signer appended one LF for the line-terminator rule.
@@ -103,6 +97,8 @@ pub struct SignRequest<'a, Ed25519: ?Sized, P256: ?Sized> {
     pub append_missing_final_newline: bool,
     pub output_form: OutputForm,
     pub algorithm_parameters: &'a [u8],
+    /// Complete-output policy; use `unbounded()` to disable its ceiling.
+    pub resource_limits: ArtifactResourceLimits,
 }
 
 /// Borrowed signing keys for supported algorithms. `Debug` redacts key material.
@@ -134,6 +130,7 @@ impl<Ed25519: ?Sized, P256: ?Sized> fmt::Debug for SigningKey<'_, Ed25519, P256>
 ///
 /// An implementation may narrow this contract, such as ignoring `req.key`
 /// when it owns no key. Document any narrowing in the implementation crate's README.
+#[cfg(feature = "alloc")]
 pub trait Signer {
     /// Concrete Ed25519 signing-key type accepted by this implementation.
     type Ed25519SigningKey: ?Sized;
@@ -156,6 +153,7 @@ pub trait Signer {
 /// `<S: AsyncSigner>`; this trait is not object-safe.
 ///
 /// Implementations may document the contract narrowings permitted by [`Signer`].
+#[cfg(feature = "alloc")]
 pub trait AsyncSigner: Send + Sync {
     /// Concrete Ed25519 signing-key type accepted by this implementation.
     type Ed25519SigningKey: Sync + ?Sized;
