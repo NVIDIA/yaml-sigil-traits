@@ -2225,8 +2225,26 @@ mod tests {
 
     #[test]
     fn support_recovery_needs_crate_evidence_without_claiming_original_run_binding() {
-        let root = crate::workspace_root();
-        let version = release::manifest_version(&root).unwrap();
+        // Recovery models a real support release independently of the checkout's
+        // current stable, prerelease, or unpublished coordination-stub version.
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        let version = Version::new(1, 2, 3);
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "").unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"yaml-sigil-traits\"\nversion = \"{version}\"\n\
+                 edition = \"2024\"\npublish = [\"crates-io\"]\n"
+            ),
+        )
+        .unwrap();
+        std::fs::copy(
+            crate::workspace_root().join(".release-plz.toml"),
+            root.join(".release-plz.toml"),
+        )
+        .unwrap();
         let source = "a".repeat(40);
         let policy = "b".repeat(40);
         let head = "c".repeat(40);
@@ -2282,7 +2300,7 @@ mod tests {
             exact_version_calls: 0,
         };
         let error = qualify(
-            &root,
+            root,
             &mut github,
             &mut registry,
             &context,
