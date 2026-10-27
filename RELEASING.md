@@ -39,7 +39,10 @@ release credentials, runs `release-plz update` first, and uses pinned
 adjustment. It accepts changes only to the manifest and changelog.
 When update leaves the current `rc.N` unchanged, preparation also permits the
 next ordinal or the stable release on the same version core. An empty update
-is allowed before this bounded selection. The completed preparation must
+is allowed before this bounded selection. When a stable package is unchanged,
+preparation permits only `rc.1` of the immediate next patch, such as `0.4.1`
+to `0.4.2-rc.1`. It rejects skipped patches, later RC ordinals, and build
+metadata for that selection. The completed preparation must
 change both `Cargo.toml` and `CHANGELOG.md`.
 Both `prepare` and `check` reject `rc.0` as a release version.
 
