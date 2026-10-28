@@ -361,9 +361,23 @@ fn require_exact_version_adjustment(
     if same_core && new_prerelease {
         return Ok("started the release-plz-derived version as a prerelease");
     }
+    // Tooling fixes can leave published package contents unchanged. Limit this
+    // explicit selection to the first RC of the immediate next patch.
+    let unchanged_next_patch_rc = original.pre.is_empty()
+        && original.build.is_empty()
+        && derived == original
+        && selected.major == original.major
+        && selected.minor == original.minor
+        && original.patch.checked_add(1) == Some(selected.patch)
+        && selected.pre.as_str() == "rc.1"
+        && selected.build.is_empty();
+    if unchanged_next_patch_rc {
+        return Ok("started the next patch RC from unchanged stable package contents");
+    }
     Err(format!(
         "release-plz derived {derived}, not selected release {selected}; only a new \
-         prerelease, the first same-core release from rc.0, the next unchanged \
+         prerelease, the first next-patch RC from unchanged stable package \
+         contents, the first same-core release from rc.0, the next unchanged \
          RC, or promotion of the current same-core prerelease is supported"
     ))
 }
@@ -826,20 +840,30 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
 
         fn prepare_with_fixture(case: &str) -> (Result<(), String>, String) {
+            prepare_with_versions(case, "0.4.1-rc.2", "0.4.1")
+        }
+
+        fn prepare_with_versions(
+            case: &str,
+            original: &str,
+            selected: &str,
+        ) -> (Result<(), String>, String) {
             let temporary = tempfile::tempdir().unwrap();
             let root = temporary.path().join("source");
             let bin = temporary.path().join("bin");
             fs::create_dir(&root).unwrap();
             fs::create_dir(&bin).unwrap();
             fs::create_dir(root.join("src")).unwrap();
-            let manifest = "[package]\nname = \"yaml-sigil-traits\"\n\
-                            version = \"0.4.1-rc.2\"\nedition = \"2024\"\n\
-                            publish = [\"crates-io\"]\n";
-            fs::write(root.join("Cargo.toml"), manifest).unwrap();
+            let manifest = format!(
+                "[package]\nname = \"yaml-sigil-traits\"\n\
+                 version = \"{original}\"\nedition = \"2024\"\n\
+                 publish = [\"crates-io\"]\n"
+            );
+            fs::write(root.join("Cargo.toml"), &manifest).unwrap();
             fs::write(root.join("src/lib.rs"), "").unwrap();
             fs::write(
                 root.join("CHANGELOG.md"),
-                "# Changelog\n\n## [0.4.1-rc.2]\n",
+                format!("# Changelog\n\n## [{original}]\n"),
             )
             .unwrap();
             fs::write(root.join("README.md"), "fixture\n").unwrap();
@@ -849,12 +873,9 @@ mod tests {
                 root.join(RELEASE_CONFIG),
             )
             .unwrap();
+            let branch = format!("--initial-branch=release-plz-manual-{selected}");
             for args in [
-                vec![
-                    "init",
-                    "--quiet",
-                    "--initial-branch=release-plz-manual-0.4.1",
-                ],
+                vec!["init", "--quiet", &branch],
                 vec!["add", "."],
                 vec![
                     "-c",
@@ -874,12 +895,12 @@ mod tests {
             }
             fs::write(
                 temporary.path().join("selected-manifest"),
-                manifest.replace("0.4.1-rc.2", "0.4.1"),
+                manifest.replace(original, selected),
             )
             .unwrap();
             fs::write(
                 temporary.path().join("selected-changelog"),
-                "# Changelog\n\n## [0.4.1]\n\n## [0.4.1-rc.2]\n",
+                format!("# Changelog\n\n## [{selected}]\n\n## [{original}]\n"),
             )
             .unwrap();
             let stub = bin.join("release-plz");
@@ -902,7 +923,7 @@ case "$1" in
         esac
         ;;
     set-version)
-        test "$*" = 'set-version 0.4.1 --manifest-path Cargo.toml --config .release-plz.toml'
+        test "$*" = "set-version $YAML_SIGIL_TEST_RELEASE_SELECTED --manifest-path Cargo.toml --config .release-plz.toml"
         # The final gate must reject a successful selection that writes no files.
         if [ "$YAML_SIGIL_TEST_RELEASE_CASE" != empty-final ]; then
             cp "$YAML_SIGIL_TEST_RELEASE_DIRECTORY/selected-manifest" Cargo.toml
@@ -936,6 +957,7 @@ esac
                 .env_remove("YAML_SIGIL_RELEASE_PR_BRANCH")
                 .env("YAML_SIGIL_TEST_RELEASE_DIRECTORY", temporary.path())
                 .env("YAML_SIGIL_TEST_RELEASE_CASE", case)
+                .env("YAML_SIGIL_TEST_RELEASE_SELECTED", selected)
                 .env("YAML_SIGIL_TEST_RELEASE_PLZ_VERSION", RELEASE_PLZ_VERSION)
                 .output()
                 .unwrap();
@@ -958,7 +980,8 @@ esac
             let directory = Path::new(&directory);
             let result = prepare(
                 &directory.join("source"),
-                &Version::parse("0.4.1").unwrap(),
+                &Version::parse(&std::env::var("YAML_SIGIL_TEST_RELEASE_SELECTED").unwrap())
+                    .unwrap(),
                 ReleaseLine::Main,
             );
             fs::write(
@@ -971,6 +994,13 @@ esac
         #[test]
         fn unchanged_update_can_promote_current_rc_to_stable() {
             let (result, calls) = prepare_with_fixture("complete");
+            assert_eq!(result, Ok(()));
+            assert_eq!(calls, "--version\nupdate\nset-version\n");
+        }
+
+        #[test]
+        fn unchanged_stable_update_can_start_next_patch_rc() {
+            let (result, calls) = prepare_with_versions("complete", "0.4.1", "0.4.2-rc.1");
             assert_eq!(result, Ok(()));
             assert_eq!(calls, "--version\nupdate\nset-version\n");
         }
@@ -1089,6 +1119,51 @@ esac
             "## [1.2.30](https://example.invalid)",
             "## [1.2.3]"
         ));
+    }
+
+    #[test]
+    fn unchanged_stable_package_contents_allow_only_the_first_next_patch_rc() {
+        for (original, selected) in [("0.4.1", "0.4.2-rc.1"), ("1.2.3", "1.2.4-rc.1")] {
+            let original = Version::parse(original).unwrap();
+            assert!(
+                require_exact_version_adjustment(
+                    &original,
+                    &original,
+                    &Version::parse(selected).unwrap(),
+                )
+                .is_ok()
+            );
+        }
+        for (original, derived, selected) in [
+            ("0.4.1", "0.4.1", "0.4.1-rc.1"),
+            ("0.4.1", "0.4.1", "0.4.2"),
+            ("0.4.1", "0.4.1", "0.4.2-rc.0"),
+            ("0.4.1", "0.4.1", "0.4.2-rc.2"),
+            ("0.4.1", "0.4.1", "0.4.2-beta.1"),
+            ("0.4.1", "0.4.1", "0.4.2-rc.1.preview"),
+            ("0.4.1", "0.4.1", "0.4.2-rc.1+local"),
+            ("0.4.1", "0.4.1", "0.4.3-rc.1"),
+            ("0.4.1", "0.4.1", "0.5.0-rc.1"),
+            ("0.4.1", "0.4.1", "1.0.0-rc.1"),
+            ("0.4.1+local", "0.4.1+local", "0.4.2-rc.1"),
+            ("0.4.1", "0.5.0", "0.4.2-rc.1"),
+            ("0.4.1-rc.1", "0.4.1-rc.1", "0.4.2-rc.1"),
+            (
+                "0.4.18446744073709551615",
+                "0.4.18446744073709551615",
+                "0.4.0-rc.1",
+            ),
+        ] {
+            assert!(
+                require_exact_version_adjustment(
+                    &Version::parse(original).unwrap(),
+                    &Version::parse(derived).unwrap(),
+                    &Version::parse(selected).unwrap(),
+                )
+                .is_err(),
+                "unexpected adjustment from {original}, derived {derived}, to {selected}"
+            );
+        }
     }
 
     #[test]

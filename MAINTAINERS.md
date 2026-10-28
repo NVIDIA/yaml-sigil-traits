@@ -68,7 +68,9 @@ Route breaking or dependent next-line work only to an advertised, protected
 Release preparation can advance an unchanged `rc.N` to its immediate successor
 or the stable release on the same version core. Pinned release-plz applies that
 explicit selection after `update`, including when `update` produces no source
-changes. The completed preparation still requires both `Cargo.toml` and
+changes. Unchanged stable package contents may start only the immediate next
+patch's `rc.1`, such as `0.4.1` to `0.4.2-rc.1`. The completed preparation
+still requires both `Cargo.toml` and
 `CHANGELOG.md` to change. Follow `RELEASING.md` for the source checks and approvals.
 
 ### Maintain dependency license exceptions
